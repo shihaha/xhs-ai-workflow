@@ -160,16 +160,23 @@ def _stable_key(item: RankItemInput) -> str:
     if content_url is not None:
         return f"url:{content_url}"
     payload = json.dumps(
-        {
-            "user_id": item.user_id,
-            "title": item.title,
-            "publish_date": item.publish_date,
-            "raw_evidence": item.raw_evidence,
-        },
+        _semantic_identity(item),
         ensure_ascii=False,
         sort_keys=True,
     )
-    return f"raw:{sha256(payload.encode('utf-8')).hexdigest()}"
+    return f"semantic:{sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _semantic_identity(item: RankItemInput) -> dict[str, Any]:
+    identity: dict[str, Any] = {
+        "user_id": item.user_id,
+        "title": item.title,
+        "publish_date": item.publish_date,
+        "author_name": item.author_name,
+    }
+    if not any(value for value in identity.values()):
+        identity["source_url"] = str(item.source_url)
+    return identity
 
 
 def _canonical_content_url(source_url: str) -> str | None:

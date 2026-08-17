@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+
+import pytest
 
 from backend.app.adapters.qianfan_playwright import QianfanPlaywrightAdapter
 from backend.app.adapters.contracts import CollectionRequest, CollectionResult
@@ -9,7 +12,7 @@ from backend.app.db import Database
 from backend.app.features.radar.models import RankItemInput, RankSnapshotInput
 from backend.app.features.radar.service import RadarService
 from backend.app.models.jobs import JobState
-from backend.app.services.jobs import JobService
+from backend.app.services.jobs import JobNotFound, JobService
 
 
 BOARDS = ("阅读榜", "引流榜", "热卖榜", "成交榜")
@@ -120,7 +123,12 @@ def test_fallback_dedupe_keeps_distinct_notes_from_one_user(tmp_path: Path) -> N
         source_url="https://ark.xiaohongshu.com/api/rank",
         raw_evidence={"noteTitle": "第一篇", "rank": 3},
     )
-    first_duplicate = first.model_copy(update={"rank_no": 8})
+    first_duplicate = first.model_copy(
+        update={
+            "rank_no": 8,
+            "raw_evidence": {"noteTitle": "第一篇", "rank": 8, "read": "10万以上"},
+        }
+    )
     second = RankItemInput(
         rank_no=4,
         title="第二篇",
@@ -201,6 +209,8 @@ class _FakePage:
         self.closed = False
         self.goto_error: Exception | None = None
         self.locator_error: Exception | None = None
+        self.remove_listener_error: Exception | None = None
+        self.close_error: Exception | None = None
         self._response_handler: object | None = None
 
     def on(self, event: str, handler: object) -> None:
@@ -229,9 +239,28 @@ class _FakePage:
 
     def remove_listener(self, event: str, handler: object) -> None:
         self.removed_listeners.append((event, handler))
+        if self.remove_listener_error is not None:
+            raise self.remove_listener_error
 
     def close(self) -> None:
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _ranking_page(items: list[dict[str, object]]) -> _FakePage:
+    return _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<section class='note-rank'><table></table></section>",
+        selectors={"input[type='password']": 0, ".note-rank table": 1},
+        responses=[
+            _FakeResponse(
+                "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
+                200,
+                {"data": {"dataList": items}},
+            )
+        ],
+    )
 
 
 def test_controlled_adapter_returns_needs_human_with_raw_page_on_login() -> None:
@@ -335,7 +364,7 @@ def test_capture_waits_for_delayed_ranking_response_and_cleans_listener() -> Non
     page = _FakePage(
         url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
         html="<main>loading</main>",
-        selectors={"input[type='password']": 0, ".note-rank table": 0},
+        selectors={"input[type='password']": 0, ".note-rank table": 1},
         responses=[
             _FakeResponse(
                 "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
@@ -361,6 +390,43 @@ def test_capture_waits_for_delayed_ranking_response_and_cleans_listener() -> Non
     assert outcome.status == "captured"
     assert outcome.raw_evidence["responses"][0]["body"] == response_body
     assert len(page.removed_listeners) == 1
+
+
+def test_cleanup_failures_are_evidence_and_do_not_replace_captured_result() -> None:
+    """Listener/page cleanup errors must be recorded after, not override, the capture fact."""
+    response_body = {"data": {"dataList": [{"rank": 1, "noteId": "cleanup-note"}]}}
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<section class='note-rank'><table></table></section>",
+        selectors={"input[type='password']": 0, ".note-rank table": 1},
+        responses=[
+            _FakeResponse(
+                "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
+                200,
+                response_body,
+            )
+        ],
+    )
+    page.remove_listener_error = RuntimeError("listener cleanup failed")
+    page.close_error = RuntimeError("page close failed")
+
+    outcome = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, owns_page=True
+    ).capture_visible_page()
+
+    assert outcome.status == "captured"
+    assert outcome.raw_evidence["cleanup_errors"] == [
+        {
+            "stage": "listener_cleanup",
+            "type": "RuntimeError",
+            "message": "listener cleanup failed",
+        },
+        {
+            "stage": "page_close",
+            "type": "RuntimeError",
+            "message": "page close failed",
+        },
+    ]
 
 
 def test_navigation_failure_is_needs_human_with_evidence_and_owned_page_cleanup() -> None:
@@ -489,6 +555,7 @@ def test_collect_rankings_returns_contract_and_attaches_raw_job_evidence(
     )
     assert persisted_evidence["raw_evidence"]["responses"][0]["body"] == response_body
     assert response_body["data"]["dataList"][0] == result.items[0].raw_evidence["item"]
+    assert jobs.get(job.id).state is JobState.succeeded
 
 
 def test_collect_rankings_maps_login_to_needs_human_job_and_contract(
@@ -522,3 +589,173 @@ def test_collect_rankings_maps_login_to_needs_human_job_and_contract(
     persisted_job = jobs.get(job.id)
     assert persisted_job.state is JobState.needs_human
     assert len(persisted_job.artifacts) == 1
+
+
+def test_collect_rankings_maps_layout_timeout_to_needs_human_job(
+    tmp_path: Path,
+) -> None:
+    """Missing layout and XHR evidence must terminally pause the claimed job for review."""
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3")
+    jobs = JobService(database, runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<main>changed</main>",
+        selectors={"input[type='password']": 0, ".note-rank table": 0},
+    )
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: page,
+        job_service=jobs,
+        runtime_dir=runtime_dir,
+        timeout_seconds=0,
+    )
+
+    result = adapter.collect_rankings(
+        CollectionRequest(
+            capability="rankings", parameters={"job_id": job.id}, expected_count=1
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert result.detail == "layout_changed"
+    persisted = jobs.get(job.id)
+    assert persisted.state is JobState.needs_human
+    assert persisted.error_category == "layout_changed"
+
+
+def test_collect_rankings_without_expected_count_is_incomplete_and_needs_human_job(
+    tmp_path: Path,
+) -> None:
+    """Observed rows cannot establish N/N when the caller did not supply a known total."""
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3")
+    jobs = JobService(database, runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    page = _ranking_page([{"rank": 1, "noteId": "unknown-total"}])
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, job_service=jobs, runtime_dir=runtime_dir
+    )
+
+    result = adapter.collect_rankings(
+        CollectionRequest(capability="rankings", parameters={"job_id": job.id})
+    )
+
+    assert result.status == "partial"
+    assert result.detail == "expected_count_unknown"
+    assert result.expected_count is None
+    assert result.succeeded_count == 1
+    assert result.complete is False
+    persisted = jobs.get(job.id)
+    assert persisted.state is JobState.needs_human
+    assert persisted.error_category == "expected_count_unknown"
+
+
+def test_partial_collection_moves_claimed_job_to_needs_human(tmp_path: Path) -> None:
+    """A known missing row must produce partial facts and never leave the job running."""
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3")
+    jobs = JobService(database, runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    page = _ranking_page([{"rank": 1, "noteId": "one-of-two"}])
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, job_service=jobs, runtime_dir=runtime_dir
+    )
+
+    result = adapter.collect_rankings(
+        CollectionRequest(
+            capability="rankings", parameters={"job_id": job.id}, expected_count=2
+        )
+    )
+
+    assert result.status == "partial"
+    assert result.detail == "expected_items_missing"
+    assert result.complete is False
+    persisted = jobs.get(job.id)
+    assert persisted.state is JobState.needs_human
+    assert persisted.error_category == "expected_items_missing"
+
+
+def test_observed_count_over_expected_fails_result_and_job(tmp_path: Path) -> None:
+    """More observed rows than the caller's known total is contradictory and must fail."""
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3")
+    jobs = JobService(database, runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    page = _ranking_page(
+        [
+            {"rank": 1, "noteId": "unexpected-a"},
+            {"rank": 2, "noteId": "unexpected-b"},
+        ]
+    )
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, job_service=jobs, runtime_dir=runtime_dir
+    )
+
+    result = adapter.collect_rankings(
+        CollectionRequest(
+            capability="rankings", parameters={"job_id": job.id}, expected_count=1
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.detail == "observed_count_exceeds_expected"
+    assert result.complete is False
+    persisted = jobs.get(job.id)
+    assert persisted.state is JobState.failed
+    assert persisted.error_category == "observed_count_exceeds_expected"
+
+
+@pytest.mark.parametrize(
+    "job_id",
+    ["../../../../escaped", "not-a-uuid"],
+)
+def test_invalid_job_id_is_rejected_before_any_evidence_write(
+    tmp_path: Path, job_id: str
+) -> None:
+    """A path-like or noncanonical job id must never influence a filesystem target."""
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3")
+    jobs = JobService(database, runtime_dir=runtime_dir)
+    page = _ranking_page([{"rank": 1, "noteId": "safe-note"}])
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, job_service=jobs, runtime_dir=runtime_dir
+    )
+
+    with pytest.raises(ValueError, match="canonical UUID"):
+        adapter.collect_rankings(
+            CollectionRequest(
+                capability="rankings",
+                parameters={"job_id": job_id},
+                expected_count=1,
+            )
+        )
+
+    assert not (runtime_dir / "evidence").exists()
+    assert list(tmp_path.glob("escaped*.json")) == []
+
+
+def test_nonexistent_job_is_rejected_before_any_evidence_write(tmp_path: Path) -> None:
+    """A well-formed but unknown job UUID must be checked before mkdir or file creation."""
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3")
+    jobs = JobService(database, runtime_dir=runtime_dir)
+    page = _ranking_page([{"rank": 1, "noteId": "safe-note"}])
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, job_service=jobs, runtime_dir=runtime_dir
+    )
+
+    with pytest.raises(JobNotFound, match="does not exist"):
+        adapter.collect_rankings(
+            CollectionRequest(
+                capability="rankings",
+                parameters={"job_id": str(uuid4())},
+                expected_count=1,
+            )
+        )
+
+    assert not (runtime_dir / "evidence").exists()

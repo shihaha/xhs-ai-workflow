@@ -67,3 +67,46 @@ def test_collection_result_rejects_duplicate_success_ids_that_falsely_claim_nn()
             missing_items=[],
             complete=True,
         )
+
+
+@pytest.mark.parametrize("result_status", ["partial", "failed", "needs_human"])
+def test_collection_result_rejects_complete_non_success_status(
+    result_status: str,
+) -> None:
+    """No non-success status may simultaneously claim an exact completed result."""
+    with pytest.raises(ValidationError):
+        CollectionResult(
+            status=result_status,
+            items=[_item("note-1")],
+            expected_count=1,
+            succeeded_count=1,
+            complete=True,
+        )
+
+
+def test_collection_result_rejects_incomplete_succeeded_status() -> None:
+    """A succeeded label must not hide unknown or missing expected results."""
+    with pytest.raises(ValidationError):
+        CollectionResult(
+            status="succeeded",
+            items=[_item("note-1")],
+            expected_count=None,
+            succeeded_count=1,
+            complete=False,
+        )
+
+
+def test_failed_zero_expected_result_can_remain_incomplete() -> None:
+    """Exact normalized counts do not erase a separately observed collection contradiction."""
+    result = CollectionResult(
+        status="failed",
+        detail="observed_count_exceeds_expected",
+        items=[],
+        expected_count=0,
+        succeeded_count=0,
+        missing_items=[],
+        complete=False,
+    )
+
+    assert result.status == "failed"
+    assert result.complete is False

@@ -9,7 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
@@ -65,6 +65,7 @@ class QianfanPlaywrightAdapter:
 
     def collect_rankings(self, request: CollectionRequest) -> CollectionResult:
         """Implement the normalized collector contract and link capture evidence to a job."""
+        job_id = self._validated_job_id(request)
         outcome = self.capture_visible_page()
         items = (
             _normalized_items(outcome.raw_evidence)
@@ -81,18 +82,19 @@ class QianfanPlaywrightAdapter:
                 ),
                 raw_evidence=outcome.raw_evidence,
             )
-        artifact_paths = self._persist_job_evidence(request, outcome)
+        artifact_paths = self._persist_job_evidence(job_id, outcome)
         if outcome.status == "needs_human":
-            expected_count = request.expected_count if request.expected_count else 1
+            expected_count = request.expected_count
+            missing_count = expected_count if expected_count is not None else 1
             missing_items = [
                 MissingCollectionItem(
                     reference=f"qianfan_ranking:{index + 1}",
                     reason=outcome.reason or "needs_human",
                     raw_evidence=outcome.raw_evidence,
                 )
-                for index in range(expected_count)
+                for index in range(missing_count)
             ]
-            return CollectionResult(
+            result = CollectionResult(
                 status="needs_human",
                 detail=outcome.reason,
                 evidence_artifacts=artifact_paths,
@@ -102,21 +104,57 @@ class QianfanPlaywrightAdapter:
                 missing_items=missing_items,
                 complete=False,
             )
-        requested_count = request.expected_count
-        expected_count = max(requested_count or len(items), len(items))
+            self._finalize_job(job_id, result)
+            return result
+
+        expected_count = request.expected_count
+        if expected_count is None:
+            result = CollectionResult(
+                status="partial",
+                detail="expected_count_unknown",
+                evidence_artifacts=artifact_paths,
+                items=items,
+                expected_count=None,
+                succeeded_count=len(items),
+                missing_items=[],
+                complete=False,
+            )
+            self._finalize_job(job_id, result)
+            return result
+        if len(items) > expected_count:
+            missing_items = [
+                MissingCollectionItem(
+                    reference=f"qianfan_ranking:{index + 1}",
+                    reason="observed_count_exceeds_expected",
+                    raw_evidence={"capture": outcome.raw_evidence},
+                )
+                for index in range(expected_count)
+            ]
+            result = CollectionResult(
+                status="failed",
+                detail="observed_count_exceeds_expected",
+                evidence_artifacts=artifact_paths,
+                items=[],
+                expected_count=expected_count,
+                succeeded_count=0,
+                missing_items=missing_items,
+                complete=False,
+            )
+            self._finalize_job(job_id, result)
+            return result
         missing_count = expected_count - len(items)
         missing_items = [
             MissingCollectionItem(
                 reference=f"qianfan_ranking:{len(items) + index + 1}",
-                reason="not_observed",
+                reason="expected_item_not_observed",
                 raw_evidence={"capture": outcome.raw_evidence},
             )
             for index in range(missing_count)
         ]
         complete = missing_count == 0
-        return CollectionResult(
+        result = CollectionResult(
             status="succeeded" if complete else "partial",
-            detail=None if complete else "Expected ranking items were not all observed.",
+            detail=None if complete else "expected_items_missing",
             evidence_artifacts=artifact_paths,
             items=items,
             expected_count=expected_count,
@@ -124,6 +162,8 @@ class QianfanPlaywrightAdapter:
             missing_items=missing_items,
             complete=complete,
         )
+        self._finalize_job(job_id, result)
+        return result
 
     def capture_visible_page(self) -> QianfanCaptureOutcome:
         page = self._page_factory()
@@ -131,81 +171,126 @@ class QianfanPlaywrightAdapter:
         capture_errors: list[dict[str, str]] = []
         handler = lambda response: _record_response(response, responses)
         listener_added = False
+        outcome: QianfanCaptureOutcome | None = None
+        cleanup_errors: list[dict[str, str]] = []
         try:
             if hasattr(page, "on"):
                 page.on("response", handler)
                 listener_added = True
+            outcome = self._observe_page(page, responses, capture_errors)
+        finally:
+            if listener_added and hasattr(page, "remove_listener"):
+                try:
+                    page.remove_listener("response", handler)
+                except Exception as error:
+                    cleanup_errors.append(_capture_error("listener_cleanup", error))
+            if self._owns_page and hasattr(page, "close"):
+                try:
+                    page.close()
+                except Exception as error:
+                    cleanup_errors.append(_capture_error("page_close", error))
+        assert outcome is not None
+        if cleanup_errors:
+            outcome.raw_evidence["cleanup_errors"] = cleanup_errors
+        return outcome
+
+    def _observe_page(
+        self,
+        page: Any,
+        responses: list[dict[str, Any]],
+        capture_errors: list[dict[str, str]],
+    ) -> QianfanCaptureOutcome:
+        try:
+            page.goto(QIANFAN_RANK_URL, wait_until="domcontentloaded")
+        except Exception as error:
+            capture_errors.append(_capture_error("navigation", error))
+            return QianfanCaptureOutcome(
+                status="needs_human",
+                reason="navigation_failed",
+                raw_evidence=_raw_page_evidence(
+                    page, responses, capture_errors=capture_errors
+                ),
+            )
+
+        deadline = self._monotonic() + self._timeout_seconds
+        table_observed = False
+        while True:
             try:
-                page.goto(QIANFAN_RANK_URL, wait_until="domcontentloaded")
+                is_login = "/login" in str(page.url) or (
+                    page.locator("input[type='password']").count() > 0
+                )
+                table_observed = (
+                    page.locator(".note-rank table").count() > 0 or table_observed
+                )
             except Exception as error:
-                capture_errors.append(_capture_error("navigation", error))
+                capture_errors.append(_capture_error("layout", error))
                 return QianfanCaptureOutcome(
                     status="needs_human",
-                    reason="navigation_failed",
+                    reason="layout_changed",
                     raw_evidence=_raw_page_evidence(
                         page, responses, capture_errors=capture_errors
                     ),
                 )
+            if is_login:
+                return QianfanCaptureOutcome(
+                    status="needs_human",
+                    reason="login_required",
+                    raw_evidence=_raw_page_evidence(page, responses),
+                )
+            if responses:
+                return QianfanCaptureOutcome(
+                    status="captured",
+                    raw_evidence=_raw_page_evidence(page, responses),
+                )
+            if self._monotonic() >= deadline:
+                return QianfanCaptureOutcome(
+                    status="needs_human",
+                    reason="response_not_observed" if table_observed else "layout_changed",
+                    raw_evidence=_raw_page_evidence(page, responses),
+                )
+            self._sleep(self._poll_interval)
 
-            deadline = self._monotonic() + self._timeout_seconds
-            while True:
-                try:
-                    is_login = "/login" in str(page.url) or (
-                        page.locator("input[type='password']").count() > 0
-                    )
-                    has_table = page.locator(".note-rank table").count() > 0
-                except Exception as error:
-                    capture_errors.append(_capture_error("layout", error))
-                    return QianfanCaptureOutcome(
-                        status="needs_human",
-                        reason="layout_changed",
-                        raw_evidence=_raw_page_evidence(
-                            page, responses, capture_errors=capture_errors
-                        ),
-                    )
-                if is_login:
-                    return QianfanCaptureOutcome(
-                        status="needs_human",
-                        reason="login_required",
-                        raw_evidence=_raw_page_evidence(page, responses),
-                    )
-                if responses or has_table:
-                    return QianfanCaptureOutcome(
-                        status="captured",
-                        raw_evidence=_raw_page_evidence(page, responses),
-                    )
-                if self._monotonic() >= deadline:
-                    return QianfanCaptureOutcome(
-                        status="needs_human",
-                        reason="layout_changed",
-                        raw_evidence=_raw_page_evidence(page, responses),
-                    )
-                self._sleep(self._poll_interval)
-        finally:
-            if listener_added and hasattr(page, "remove_listener"):
-                page.remove_listener("response", handler)
-            if self._owns_page and hasattr(page, "close"):
-                page.close()
-
-    def _persist_job_evidence(
-        self, request: CollectionRequest, outcome: QianfanCaptureOutcome
-    ) -> list[str]:
-        job_id = request.parameters.get("job_id")
-        if not job_id:
-            return []
+    def _validated_job_id(self, request: CollectionRequest) -> str | None:
+        raw_job_id = request.parameters.get("job_id")
+        if raw_job_id is None:
+            return None
         if self._job_service is None or self._runtime_dir is None:
             raise RuntimeError(
                 "job_service and runtime_dir are required when a collection job_id is supplied."
             )
+        if not isinstance(raw_job_id, str):
+            raise ValueError("collection job_id must be a canonical UUID string.")
+        try:
+            parsed = UUID(raw_job_id)
+        except (ValueError, AttributeError) as error:
+            raise ValueError("collection job_id must be a canonical UUID string.") from error
+        if parsed.version != 4 or str(parsed) != raw_job_id:
+            raise ValueError("collection job_id must be a canonical UUID string.")
+        job = self._job_service.get(raw_job_id)
+        if job.state is not JobState.running:
+            raise ValueError("collection job must be claimed and running.")
+        return raw_job_id
+
+    def _persist_job_evidence(
+        self, job_id: str | None, outcome: QianfanCaptureOutcome
+    ) -> list[str]:
+        if not job_id:
+            return []
+        assert self._job_service is not None
+        assert self._runtime_dir is not None
         relative_path = Path("evidence") / "qianfan" / f"{job_id}-{uuid4().hex}.json"
-        absolute_path = self._runtime_dir / relative_path
+        absolute_path = (self._runtime_dir / relative_path).resolve()
+        try:
+            absolute_path.relative_to(self._runtime_dir)
+        except ValueError as error:
+            raise ValueError("Qianfan evidence path escapes runtime storage.") from error
         absolute_path.parent.mkdir(parents=True, exist_ok=True)
         absolute_path.write_text(
             json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         artifact = self._job_service.attach_artifact(
-            str(job_id),
+            job_id,
             kind="qianfan_raw_capture",
             path=relative_path.as_posix(),
             metadata={
@@ -215,7 +300,7 @@ class QianfanPlaywrightAdapter:
             },
         )
         self._job_service.append_log(
-            str(job_id),
+            job_id,
             level="info" if outcome.status == "captured" else "warning",
             message=(
                 "Qianfan ranking capture evidence persisted."
@@ -223,14 +308,34 @@ class QianfanPlaywrightAdapter:
                 else f"Qianfan ranking capture needs human: {outcome.reason}."
             ),
         )
-        if outcome.status == "needs_human":
+        return [artifact.path]
+
+    def _finalize_job(self, job_id: str | None, result: CollectionResult) -> None:
+        if job_id is None:
+            return
+        assert self._job_service is not None
+        if result.status == "succeeded":
             self._job_service.transition(
-                str(job_id),
+                job_id,
+                JobState.succeeded,
+                progress_current=result.succeeded_count,
+                progress_total=result.expected_count,
+                current_stage="qianfan_complete",
+            )
+        elif result.status == "failed":
+            self._job_service.transition(
+                job_id,
+                JobState.failed,
+                current_stage="qianfan_failed",
+                error_category=result.detail or "collection_failed",
+            )
+        else:
+            self._job_service.transition(
+                job_id,
                 JobState.needs_human,
                 current_stage="qianfan_needs_human",
-                error_category=outcome.reason,
+                error_category=result.detail or result.status,
             )
-        return [artifact.path]
 
 
 def _record_response(response: Any, sink: list[dict[str, Any]]) -> None:

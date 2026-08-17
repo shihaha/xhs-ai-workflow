@@ -36,7 +36,7 @@ class MissingCollectionItem(BaseModel):
 class CollectionResult(BaseModel):
     """Accounted collection output; completion is invalid unless the N/N facts match."""
 
-    status: Literal["succeeded", "partial", "needs_human", "failed"] = "succeeded"
+    status: Literal["succeeded", "partial", "needs_human", "failed"] = "partial"
     detail: str | None = Field(default=None, max_length=1000)
     evidence_artifacts: list[str] = Field(default_factory=list)
     items: list[CollectionItem] = Field(default_factory=list)
@@ -52,8 +52,10 @@ class CollectionResult(BaseModel):
             raise ValueError("Collection result items must have distinct stable ids.")
         if self.succeeded_count != len(self.items):
             raise ValueError("succeeded_count must equal the number of stored items.")
-        if self.status == "needs_human" and self.complete:
-            raise ValueError("needs_human collection results cannot be complete.")
+        if self.status == "succeeded" and not self.complete:
+            raise ValueError("succeeded collection results must be complete.")
+        if self.status != "succeeded" and self.complete:
+            raise ValueError("only succeeded collection results can be complete.")
         if self.expected_count is None:
             if self.complete:
                 raise ValueError("complete collection results require an expected_count.")
@@ -62,8 +64,8 @@ class CollectionResult(BaseModel):
             raise ValueError(
                 "expected_count must equal succeeded items plus explicitly missing items."
             )
-        if self.complete != (self.expected_count == self.succeeded_count):
-            raise ValueError("complete must reflect whether succeeded_count equals expected_count.")
+        if self.complete and self.expected_count != self.succeeded_count:
+            raise ValueError("complete requires succeeded_count to equal expected_count.")
         return self
 
 
