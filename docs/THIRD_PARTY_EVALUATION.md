@@ -21,7 +21,7 @@ git clone --depth 1 https://github.com/NanmiCoder/MediaCrawler.git D:\AI_WORKSPA
 python tools/probe_xhs_adapter.py --repo-root D:\AI_WORKSPACE_RUNTIME\xhs-intelligence-workbench\third_party
 ```
 
-探针只运行了 `git rev-parse --short HEAD`、`git remote get-url origin` 并检查项目元数据；来源仅接受官方 GitHub 仓库的 HTTPS 或 `git@github.com:` SSH 等价形式。没有启动候选程序、读取浏览器 Cookie、扫码登录或发起平台请求。
+探针只运行了 `git rev-parse --short HEAD`、`git remote get-url origin` 并检查项目元数据；来源仅接受无凭据、无 query/fragment、默认端口的 `https://github.com/owner/repository(.git)`，或显式 `git@github.com:owner/repository(.git)` 形式。没有启动候选程序、读取浏览器 Cookie、扫码登录或发起平台请求。
 
 | 候选 | 源地址 | 本机原始证据 | 结果 | 可考虑的只读边界 |
 |---|---|---|---|---|

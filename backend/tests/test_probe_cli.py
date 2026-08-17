@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROBE_SCRIPT = PROJECT_ROOT / "tools" / "probe_xhs_adapter.py"
@@ -166,3 +167,46 @@ def test_probe_rejects_a_candidate_with_an_unrelated_origin(tmp_path: Path) -> N
     result = json.loads(completed.stdout)["candidates"][0]
     assert result["status"] == "unavailable"
     assert result["origin"] == "https://github.com/unrelated/repository.git"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "file://github.com/xpzouying/xiaohongshu-mcp.git",
+        "git://github.com/xpzouying/xiaohongshu-mcp.git",
+        "ssh://github.com/xpzouying/xiaohongshu-mcp.git",
+        "https://user:secret@github.com/xpzouying/xiaohongshu-mcp.git",
+        "https://github.com:8443/xpzouying/xiaohongshu-mcp.git",
+        "https://github.com/xpzouying/xiaohongshu-mcp.git?ref=main",
+        "https://github.com/xpzouying/xiaohongshu-mcp.git#readme",
+    ],
+)
+def test_probe_rejects_nonapproved_origin_forms(
+    tmp_path: Path, origin: str
+) -> None:
+    """Accepting alternate URL schemes or URL decorations lets a non-approved remote impersonate GitHub."""
+    repository = tmp_path / "third-party" / "xiaohongshu-mcp"
+    _initialize_repository(
+        repository,
+        {"README.md": "fixture", "go.mod": "module fixture"},
+        origin=origin,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PROBE_SCRIPT),
+            "--candidate",
+            "xiaohongshu-mcp",
+            "--repo-root",
+            str(repository.parent),
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = json.loads(completed.stdout)["candidates"][0]
+    assert result["status"] == "unavailable"
+    assert result["origin"] == origin

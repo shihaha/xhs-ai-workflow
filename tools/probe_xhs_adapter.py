@@ -116,12 +116,26 @@ def probe(candidate: Candidate, repository_root: Path) -> dict[str, Any]:
 
 def _normalized_github_repository(origin: str) -> str | None:
     """Return a comparable GitHub owner/repository identity for HTTPS and SSH remotes."""
-    value = origin.strip().removesuffix("/")
+    value = origin.strip()
     if value.startswith("git@github.com:"):
         path = value.removeprefix("git@github.com:")
     else:
         parsed = urlparse(value)
-        if parsed.hostname is None or parsed.hostname.casefold() != "github.com":
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname is None
+            or parsed.hostname.casefold() != "github.com"
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in (None, 443)
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
             return None
         path = parsed.path.lstrip("/")
     if path.endswith(".git"):
