@@ -55,3 +55,15 @@ def test_collection_result_requires_each_missing_item_to_account_for_partial_nn(
             missing_items=[],
             complete=False,
         )
+
+
+def test_collection_result_rejects_duplicate_success_ids_that_falsely_claim_nn() -> None:
+    """Counting the same item twice would falsely represent one saved item as a 2/2 collection."""
+    with pytest.raises(ValidationError):
+        CollectionResult(
+            items=[_item("note-1"), _item("note-1")],
+            expected_count=2,
+            succeeded_count=2,
+            missing_items=[],
+            complete=True,
+        )

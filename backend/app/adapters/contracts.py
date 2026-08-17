@@ -44,6 +44,9 @@ class CollectionResult(BaseModel):
 
     @model_validator(mode="after")
     def account_for_every_expected_item(self) -> "CollectionResult":
+        item_ids = [item.id for item in self.items]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("Collection result items must have distinct stable ids.")
         if self.succeeded_count != len(self.items):
             raise ValueError("succeeded_count must equal the number of stored items.")
         if self.expected_count is None:

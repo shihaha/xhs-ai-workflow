@@ -6,7 +6,7 @@
 
 ## 状态定义
 
-- `unavailable`：本地候选仓库缺失、Git 修订不可读或项目元数据不完整。
+- `unavailable`：本地候选仓库缺失、Git 修订或 `origin` 不可读、`origin` 与官方 GitHub 仓库不匹配，或项目元数据不完整。
 - `unverified`：本地源码及其修订可读，但尚未在真实小红书登录态下验证读取能力。
 - 本次没有 `verified` 结果。缺少用户提供的登录态时，绝不将候选标记为成功或已验证。
 
@@ -21,13 +21,13 @@ git clone --depth 1 https://github.com/NanmiCoder/MediaCrawler.git D:\AI_WORKSPA
 python tools/probe_xhs_adapter.py --repo-root D:\AI_WORKSPACE_RUNTIME\xhs-intelligence-workbench\third_party
 ```
 
-探针只运行了 `git rev-parse --short HEAD` 并检查项目元数据；没有启动候选程序、读取浏览器 Cookie、扫码登录或发起平台请求。
+探针只运行了 `git rev-parse --short HEAD`、`git remote get-url origin` 并检查项目元数据；来源仅接受官方 GitHub 仓库的 HTTPS 或 `git@github.com:` SSH 等价形式。没有启动候选程序、读取浏览器 Cookie、扫码登录或发起平台请求。
 
 | 候选 | 源地址 | 本机原始证据 | 结果 | 可考虑的只读边界 |
 |---|---|---|---|---|
-| `xiaohongshu-mcp` | https://github.com/xpzouying/xiaohongshu-mcp.git | `git rev-parse --short HEAD` → `84511f1`; `README.md`、`go.mod` 存在 | `unverified` | 搜索、推荐列表、笔记详情、账号资料；其 README 同时列出发布能力，适配器不得暴露该能力。 |
-| `xhs-cli` | https://github.com/jackwener/xhs-cli.git | `git rev-parse --short HEAD` → `3ce7141`; `README.md`、`pyproject.toml` 存在 | `unverified` | `search`、`read`、`user` 等 JSON 输出；README 同时列出互动和发帖命令，适配器必须使用只读 allowlist。 |
-| `MediaCrawler` | https://github.com/NanmiCoder/MediaCrawler.git | `git rev-parse --short HEAD` → `d6f7c5b`; `README.md`、`pyproject.toml` 存在 | `unverified` | 小红书关键词、帖子与创作者读取；README 明示使用浏览器登录态，未提供真实登录前不可验证。 |
+| `xiaohongshu-mcp` | https://github.com/xpzouying/xiaohongshu-mcp.git | `git rev-parse --short HEAD` → `84511f1`; `git remote get-url origin` → `https://github.com/xpzouying/xiaohongshu-mcp.git`; `README.md`、`go.mod` 存在 | `unverified` | 搜索、推荐列表、笔记详情、账号资料；其 README 同时列出发布能力，适配器不得暴露该能力。 |
+| `xhs-cli` | https://github.com/jackwener/xhs-cli.git | `git rev-parse --short HEAD` → `3ce7141`; `git remote get-url origin` → `https://github.com/jackwener/xhs-cli.git`; `README.md`、`pyproject.toml` 存在 | `unverified` | `search`、`read`、`user` 等 JSON 输出；README 同时列出互动和发帖命令，适配器必须使用只读 allowlist。 |
+| `MediaCrawler` | https://github.com/NanmiCoder/MediaCrawler.git | `git rev-parse --short HEAD` → `d6f7c5b`; `git remote get-url origin` → `https://github.com/NanmiCoder/MediaCrawler.git`; `README.md`、`pyproject.toml` 存在 | `unverified` | 小红书关键词、帖子与创作者读取；README 明示使用浏览器登录态，未提供真实登录前不可验证。 |
 
 ## 采用门槛
 

@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 from typing import Any
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ def probe(candidate: Candidate, repository_root: Path) -> dict[str, Any]:
         "repository_path": str(repository),
         "login_dependent": True,
         "status": "unavailable",
+        "origin": None,
         "checks": [],
     }
     if not repository.is_dir():
@@ -80,6 +82,10 @@ def probe(candidate: Candidate, repository_root: Path) -> dict[str, Any]:
 
     revision = _run(["git", "rev-parse", "--short", "HEAD"], cwd=repository)
     result["checks"].append(revision)
+    origin_check = _run(["git", "remote", "get-url", "origin"], cwd=repository)
+    result["checks"].append(origin_check)
+    if origin_check["returncode"] == 0:
+        result["origin"] = origin_check["stdout"]
     expected_files = {
         expected_file: (repository / expected_file).is_file()
         for expected_file in candidate.expected_files
@@ -87,6 +93,14 @@ def probe(candidate: Candidate, repository_root: Path) -> dict[str, Any]:
     result["checks"].append({"expected_files": expected_files})
     if revision["returncode"] != 0:
         result["reason"] = "Repository is present but its Git revision is not readable."
+        return result
+    if origin_check["returncode"] != 0:
+        result["reason"] = "Repository has no readable origin remote."
+        return result
+    if _normalized_github_repository(origin_check["stdout"]) != _normalized_github_repository(
+        candidate.repository_url
+    ):
+        result["reason"] = "Repository origin does not match the official candidate source."
         return result
     if not all(expected_files.values()):
         result["reason"] = "Repository is missing expected project metadata."
@@ -98,6 +112,24 @@ def probe(candidate: Candidate, repository_root: Path) -> dict[str, Any]:
         "candidate is not live-verified."
     )
     return result
+
+
+def _normalized_github_repository(origin: str) -> str | None:
+    """Return a comparable GitHub owner/repository identity for HTTPS and SSH remotes."""
+    value = origin.strip().removesuffix("/")
+    if value.startswith("git@github.com:"):
+        path = value.removeprefix("git@github.com:")
+    else:
+        parsed = urlparse(value)
+        if parsed.hostname is None or parsed.hostname.casefold() != "github.com":
+            return None
+        path = parsed.path.lstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) != 2 or not all(parts):
+        return None
+    return "/".join(part.casefold() for part in parts)
 
 
 def _selected_candidates(name: str) -> tuple[Candidate, ...]:
