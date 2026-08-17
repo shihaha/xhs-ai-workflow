@@ -137,13 +137,8 @@ class ContentService:
             except UnsafeContentPath as error:
                 raise ContentValidationError(str(error)) from error
             except IntegrityError as error:
-                try:
-                    read_contained_regular(self.runtime_dir, managed_path)
-                    candidate = self.runtime_dir.joinpath(*__import__("pathlib").PurePosixPath(managed_path).parts)
-                    if not candidate.is_symlink() and not (hasattr(candidate, "is_junction") and candidate.is_junction()):
-                        candidate.unlink(missing_ok=True)
-                except UnsafeContentPath:
-                    pass
+                if managed_path is not None:
+                    remove_contained_regular(self.runtime_dir, managed_path)
                 raise ContentStateError("Concurrent material version conflict; retry the request.") from error
             except Exception:
                 raise

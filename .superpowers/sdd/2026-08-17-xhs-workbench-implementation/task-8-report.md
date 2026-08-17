@@ -214,3 +214,46 @@ git diff --check
 ```
 
 Compilation and diff checks exited 0; Git emitted only the repository's Windows LF/CRLF notices. Live Bailian and Android-device validation remain `not_run` because no live key or device was supplied; no live-provider or real-device behavior is claimed.
+
+## Fix round 4: ownership-proven cleanup and literal-safe schema validation
+
+The three confirmed review groups were captured in `test_round4_hardening.py` before production changes.
+
+Initial RED:
+
+```text
+python -m pytest backend/tests/content/test_round4_hardening.py -q
+5 failed, 2 passed in 1.44s
+```
+
+The named-CHECK fixtures were then isolated from unrelated index recreation effects and observed RED for their intended literal comparison behavior:
+
+```text
+python -m pytest backend/tests/content/test_round4_hardening.py -q -k schema
+3 failed, 4 deselected in 0.48s
+```
+
+Implemented review findings:
+
+- Material-version conflict cleanup now uses the same runtime-contained, handle-bound deletion helper as package cleanup. The service no longer performs a path-based unlink after a commit conflict; unsafe or replaced targets are retained.
+- Startup recovery proves a stranded artifact path is exclusively owned by its `building` package before deletion: the path must have the expected package/item shape, have exactly one package owner and conflict with no managed material. Ambiguous, material-owned, ready-package-owned and unexpected paths are retained while the stranded row is still marked `failed`.
+- SQL definition normalization now removes layout whitespace only outside quoted tokens. String literals and quoted identifiers remain byte-distinct, so named CHECK constraints, the SHA GLOB and the terminal-review partial-index predicate are compared without erasing meaningful literal differences. Populated malformed schemas fail closed.
+- Round-3 invariants remain covered by the focused suite: configured runtime separation, handle-bound deletion, post-reservation failure CAS, pre-decode image caps and Windows-safe deterministic ZIP names.
+
+Round-4 GREEN and verification:
+
+```text
+python -m pytest backend/tests/content/test_round4_hardening.py -q
+7 passed in 1.28s
+
+python -m pytest backend/tests/content -q
+80 passed in 7.13s
+
+python -m pytest backend/tests -q
+393 passed, 1 skipped in 19.56s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only the repository's Windows LF/CRLF notices. Live Bailian and Android-device validation remain `not_run` because no live key or device was supplied; this round makes no live-provider or real-device claim.

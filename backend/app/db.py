@@ -1,7 +1,8 @@
 """SQLite database lifecycle for durable local workbench facts."""
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import re
 
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Connection
@@ -97,15 +98,33 @@ class Database:
         if not _content_schema_valid(inspector):
             raise SchemaMigrationError("Task 8 schema validation failed.")
         with self.engine.begin() as connection:
-            stranded_paths = connection.execute(
-                text("SELECT path FROM content_packages WHERE status='building'")
-            ).scalars().all()
+            stranded_packages = connection.execute(
+                text(
+                    "SELECT id, content_item_id, path FROM content_packages "
+                    "WHERE status='building'"
+                )
+            ).mappings().all()
             if self.runtime_dir is not None:
                 from backend.app.features.content.export import remove_contained_regular
 
-                for relative_path in stranded_paths:
+                material_paths = set(
+                    connection.execute(
+                        text("SELECT path FROM content_product_materials")
+                    ).scalars().all()
+                )
+                package_path_owners: dict[str, set[str]] = {}
+                for package_id, relative_path in connection.execute(
+                    text("SELECT id, path FROM content_packages")
+                ):
                     if isinstance(relative_path, str):
-                        remove_contained_regular(self.runtime_dir, relative_path)
+                        package_path_owners.setdefault(relative_path, set()).add(package_id)
+                for package in stranded_packages:
+                    if _building_package_owns_artifact(
+                        package,
+                        material_paths=material_paths,
+                        package_path_owners=package_path_owners,
+                    ):
+                        remove_contained_regular(self.runtime_dir, package["path"])
             connection.execute(
                 text(
                     "UPDATE content_packages SET status='failed', "
@@ -342,18 +361,18 @@ def _content_schema_valid(inspector: object) -> bool:
             "content_product_materials": {
                 "ck_material_version_positive": "version>0",
                 "ck_material_size_positive": "size_bytes>0",
-                "ck_material_sha_format": "length(sha256)=64andsha256notglob*[^0-9a-f]*",
-                "ck_material_kind": "kindin(source,output_image)",
+                "ck_material_sha_format": "length(sha256)=64andsha256notglob'*[^0-9a-f]*'",
+                "ck_material_kind": "kindin('source','output_image')",
             },
             "content_items": {
-                "ck_content_item_status": "statusin(research,draft,review,rejected,approved,exported)",
+                "ck_content_item_status": "statusin('research','draft','review','rejected','approved','exported')",
             },
             "content_revisions": {"ck_revision_number_positive": "number>0"},
-            "content_reviews": {"ck_review_decision": "decisionin(approve,reject,regenerate)"},
+            "content_reviews": {"ck_review_decision": "decisionin('approve','reject','regenerate')"},
             "content_packages": {
-                "ck_package_status": "statusin(building,ready,failed)",
+                "ck_package_status": "statusin('building','ready','failed')",
                 "ck_package_size_nonnegative": "size_bytes>=0",
-                "ck_package_sha_format": "length(sha256)=64andsha256notglob*[^0-9a-f]*",
+                "ck_package_sha_format": "length(sha256)=64andsha256notglob'*[^0-9a-f]*'",
             },
         }
         for table, expected in required_checks.items():
@@ -415,7 +434,7 @@ def _content_schema_valid(inspector: object) -> bool:
             "content_revisions": {"ix_content_revisions_content_item_id": (("content_item_id",), False, "")},
             "content_reviews": {
                 "ix_content_reviews_content_item_id": (("content_item_id",), False, ""),
-                "uq_review_terminal_revision": (("revision_id",), True, "decisionin(approve,reject)"),
+                "uq_review_terminal_revision": (("revision_id",), True, "decisionin('approve','reject')"),
             },
             "content_packages": {"ix_content_packages_content_item_id": (("content_item_id",), False, "")},
         }
@@ -435,5 +454,75 @@ def _content_schema_valid(inspector: object) -> bool:
 
 
 def _compact_sql(value: object) -> str:
+    """Normalize SQL layout without changing quoted literal or identifier bytes."""
+
     rendered = "" if value is None else str(value)
-    return "".join(rendered.lower().split()).replace('"', "").replace("'", "")
+    compact: list[str] = []
+    index = 0
+    while index < len(rendered):
+        char = rendered[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            delimiter = char
+            compact.append(char)
+            index += 1
+            while index < len(rendered):
+                char = rendered[index]
+                compact.append(char)
+                index += 1
+                if char == delimiter:
+                    if index < len(rendered) and rendered[index] == delimiter:
+                        compact.append(rendered[index])
+                        index += 1
+                        continue
+                    break
+            continue
+        if char == "[":
+            compact.append(char)
+            index += 1
+            while index < len(rendered):
+                char = rendered[index]
+                compact.append(char)
+                index += 1
+                if char == "]":
+                    if index < len(rendered) and rendered[index] == "]":
+                        compact.append(rendered[index])
+                        index += 1
+                        continue
+                    break
+            continue
+        compact.append(char.lower())
+        index += 1
+    return "".join(compact)
+
+
+_PACKAGE_FILENAME = re.compile(r"^(?P<id>[0-9a-f-]{36})(?:-[0-9a-f]{32})?\.zip$")
+
+
+def _building_package_owns_artifact(
+    package: object,
+    *,
+    material_paths: set[object],
+    package_path_owners: dict[str, set[str]],
+) -> bool:
+    """Prove a stranded path is exclusively the artifact reserved by this package."""
+
+    try:
+        package_id = package["id"]  # type: ignore[index]
+        content_item_id = package["content_item_id"]  # type: ignore[index]
+        relative_path = package["path"]  # type: ignore[index]
+        if not all(isinstance(value, str) and value for value in (package_id, content_item_id, relative_path)):
+            return False
+        if relative_path in material_paths:
+            return False
+        if package_path_owners.get(relative_path) != {package_id}:
+            return False
+        path = PurePosixPath(relative_path)
+        if path.parts[:2] != ("content-packages", content_item_id) or len(path.parts) != 3:
+            return False
+        match = _PACKAGE_FILENAME.fullmatch(path.name)
+        return match is not None and match.group("id") == package_id
+    except (KeyError, TypeError, ValueError):
+        return False
