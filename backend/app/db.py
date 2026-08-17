@@ -1072,16 +1072,64 @@ _PACKAGE_PATH_UPDATE_TRIGGER = _reference_guard_trigger(
     "ck_gc_package_path_update", "content_packages", "UPDATE OF path"
 )
 
-_CLEANUP_CAPTURES_REFERENCE_WHEN = """
-NEW.quarantine_path IS NOT NULL
-AND NEW.state IN ('claimed','quarantined','deleted','needs_human')
-AND EXISTS (
+_CLEANUP_QUARANTINE_REFERENCE_EXISTS = """
+EXISTS (
     SELECT 1 FROM (
         SELECT path FROM content_product_materials
         UNION ALL SELECT path FROM content_packages
     ) AS reference
     WHERE windows_artifact_path_key(reference.path)
           = windows_artifact_path_key(NEW.quarantine_path)
+)
+"""
+
+_CLEANUP_ORIGINAL_REFERENCE_EXISTS = """
+EXISTS (
+    SELECT 1 FROM (
+        SELECT path FROM content_product_materials
+        UNION ALL SELECT path FROM content_packages
+    ) AS reference
+    WHERE windows_artifact_path_key(reference.path)
+          = windows_artifact_path_key(NEW.relative_path)
+)
+"""
+
+_CLEANUP_LIVE_REFERENCE_EXCEPTION = f"""
+NEW.state = 'needs_human'
+AND COALESCE(NEW.last_error_category, '') = 'live_reference'
+AND NEW.quarantine_path IS NOT NULL
+AND NEW.quarantine_volume_id IS NOT NULL
+AND NEW.quarantine_file_id IS NOT NULL
+AND NEW.quarantine_size_bytes IS NOT NULL
+AND NEW.quarantine_mtime_ns IS NOT NULL
+AND {_CLEANUP_QUARANTINE_REFERENCE_EXISTS}
+"""
+
+_CLEANUP_MOVED_LIVE_REFERENCE_FACT = f"""
+NEW.state = 'needs_human'
+AND COALESCE(NEW.last_error_category, '') = 'live_reference'
+AND NEW.quarantine_path IS NOT NULL
+AND NEW.quarantine_volume_id IS NOT NULL
+AND NEW.quarantine_file_id IS NOT NULL
+AND NEW.quarantine_size_bytes IS NOT NULL
+AND NEW.quarantine_mtime_ns IS NOT NULL
+AND (
+    {_CLEANUP_QUARANTINE_REFERENCE_EXISTS}
+    OR {_CLEANUP_ORIGINAL_REFERENCE_EXISTS}
+)
+"""
+
+_CLEANUP_CAPTURES_REFERENCE_WHEN = f"""
+(
+    NEW.quarantine_path IS NOT NULL
+    AND NEW.state IN ('claimed','quarantined','deleted','needs_human')
+    AND {_CLEANUP_QUARANTINE_REFERENCE_EXISTS}
+    AND NOT ({_CLEANUP_LIVE_REFERENCE_EXCEPTION})
+)
+OR (
+    NEW.quarantine_path IS NOT NULL
+    AND COALESCE(NEW.last_error_category, '') = 'live_reference'
+    AND NOT ({_CLEANUP_MOVED_LIVE_REFERENCE_FACT})
 )
 """
 
@@ -1096,7 +1144,9 @@ END
 
 _CLEANUP_REFERENCE_UPDATE_TRIGGER = f"""
 CREATE TRIGGER ck_gc_cleanup_reference_update
-BEFORE UPDATE OF quarantine_path, state ON artifact_gc_queue
+BEFORE UPDATE OF quarantine_path, state, last_error_category,
+quarantine_volume_id, quarantine_file_id, quarantine_size_bytes,
+quarantine_mtime_ns ON artifact_gc_queue
 WHEN {_CLEANUP_CAPTURES_REFERENCE_WHEN}
 BEGIN
     SELECT RAISE(ABORT, 'quarantine path conflicts with an existing artifact reference');
@@ -1153,14 +1203,33 @@ def _artifact_reference_guard_data_valid(connection: Connection) -> bool:
     try:
         return connection.scalar(
             text(
-                "SELECT 1 FROM ("
-                "SELECT material.path AS path FROM content_product_materials AS material "
-                "UNION ALL SELECT package.path AS path FROM content_packages AS package"
-                ") AS reference JOIN artifact_gc_queue AS cleanup "
-                "ON windows_artifact_path_key(reference.path) "
-                "= windows_artifact_path_key(cleanup.quarantine_path) "
-                "WHERE cleanup.quarantine_path IS NOT NULL "
+                "WITH artifact_reference(path) AS ("
+                "SELECT material.path FROM content_product_materials AS material "
+                "UNION ALL SELECT package.path FROM content_packages AS package"
+                ") SELECT 1 FROM artifact_gc_queue AS cleanup WHERE ("
+                "cleanup.quarantine_path IS NOT NULL "
                 "AND cleanup.state IN ('claimed','quarantined','deleted','needs_human') "
+                "AND EXISTS (SELECT 1 FROM artifact_reference WHERE "
+                "windows_artifact_path_key(artifact_reference.path) "
+                "= windows_artifact_path_key(cleanup.quarantine_path)) "
+                "AND NOT (cleanup.state='needs_human' "
+                "AND COALESCE(cleanup.last_error_category,'')='live_reference' "
+                "AND cleanup.quarantine_volume_id IS NOT NULL "
+                "AND cleanup.quarantine_file_id IS NOT NULL "
+                "AND cleanup.quarantine_size_bytes IS NOT NULL "
+                "AND cleanup.quarantine_mtime_ns IS NOT NULL)) OR ("
+                "cleanup.quarantine_path IS NOT NULL "
+                "AND COALESCE(cleanup.last_error_category,'')='live_reference' "
+                "AND NOT ("
+                "cleanup.state='needs_human' AND cleanup.quarantine_path IS NOT NULL "
+                "AND cleanup.quarantine_volume_id IS NOT NULL "
+                "AND cleanup.quarantine_file_id IS NOT NULL "
+                "AND cleanup.quarantine_size_bytes IS NOT NULL "
+                "AND cleanup.quarantine_mtime_ns IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM artifact_reference WHERE "
+                "windows_artifact_path_key(artifact_reference.path) IN ("
+                "windows_artifact_path_key(cleanup.quarantine_path), "
+                "windows_artifact_path_key(cleanup.relative_path))))) "
                 "LIMIT 1"
             )
         ) is None

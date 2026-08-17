@@ -530,6 +530,60 @@ def test_reference_created_during_move_blocks_finalization_and_retains_quarantin
     assert (runtime / "artifacts-quarantine" / record.id / "material.bin").exists()
 
 
+def test_preexisting_future_quarantine_reference_is_durable_needs_human(
+    cleanup_environment,
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    candidate = _candidate(
+        runtime,
+        clock,
+        relative_path="orphaned/Café.PNG",
+    )
+    record = service.enqueue(candidate)
+    quarantine_path = f"artifacts-quarantine/{record.id}/Café.PNG"
+    _insert_material_reference(
+        database,
+        material_id=str(uuid4()),
+        relative_path=(
+            f"ARTIFACTS-QUARANTINE/{record.id}/Cafe\u0301.png."
+        ),
+        digest=candidate.expected_sha256,
+        size_bytes=candidate.expected_size_bytes,
+        created_at=clock.now(),
+    )
+
+    result = service.process_one(record.id)
+
+    assert result.state == "needs_human"
+    assert result.last_error_category == "live_reference"
+    assert result.quarantine_path == quarantine_path
+    assert result.quarantine_volume_id is not None
+    assert result.quarantine_file_id is not None
+    assert result.lease_token is None
+    assert result.lease_expires_at is None
+    assert not (runtime / candidate.relative_path).exists()
+    assert (runtime / quarantine_path).exists()
+
+    restarted = ArtifactCleanupService(
+        database, runtime_dir=runtime, clock=clock.now
+    )
+    persisted = restarted.get_record(record.id)
+    assert persisted == result
+    assert restarted.process_one(record.id) == result
+    clock.advance(timedelta(minutes=6))
+    assert restarted.recover_expired_leases() == 0
+
+    with pytest.raises(IntegrityError, match="quarantine path"):
+        _insert_material_reference(
+            database,
+            material_id=str(uuid4()),
+            relative_path=quarantine_path.swapcase(),
+            digest=candidate.expected_sha256,
+            size_bytes=candidate.expected_size_bytes,
+            created_at=clock.now(),
+        )
+
+
 def test_quarantined_record_continues_after_service_restart(cleanup_environment) -> None:
     database, runtime, clock, service, _ = cleanup_environment
     record = service.enqueue(_candidate(runtime, clock))

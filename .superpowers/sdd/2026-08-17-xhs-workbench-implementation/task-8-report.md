@@ -707,3 +707,55 @@ Compilation and diff checks exited 0; Git emitted only the repository's Windows
 LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
 remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
 remains blocked pending redesign Tasks 3—5 and independent review.
+
+## Approved quarantine redesign — Task 2 fix round 4/5
+
+The remaining live-lock was reproduced before the production change. The first
+focused run had two expected behavior failures and one test-harness error: a material
+could reserve the deterministic future quarantine path while the cleanup was still
+pending and leave the moved record claimed; a fabricated
+`needs_human/live_reference` moved fact without any matching reference was accepted;
+and the startup fixture initially used a raw SQLite connection without the required
+deterministic UDF. The fixture was corrected to use the real configured engine, and
+the startup validation regression is retained alongside the two direct regressions.
+
+Implemented review finding:
+
+- The reverse cleanup guard now has one narrow moved-file exception. It accepts a
+  conflicting quarantine path only when the row becomes `needs_human`, the category
+  is exactly `live_reference`, the complete persisted physical identity is present,
+  and a material/package reference is Windows-equivalent to the quarantine path.
+- Existing live-reference outcomes against the original path remain valid. A moved
+  live-reference fact must have a complete identity and a persisted reference to the
+  original or quarantine path; fabricated moved facts fail closed.
+- A pending cleanup ignores only a reference to its deterministic not-yet-existing
+  destination long enough to perform the verified move. Immediately after the move,
+  the same case/NFC/trailing-dot-equivalent reference becomes `live_reference` and
+  is persisted by one expiry-aware CAS with the lease cleared.
+- The material/package forward guards still reserve every protected quarantine
+  path. A second equivalent reference is rejected, and `needs_human` records are
+  neither claimable nor recoverable as expired leases.
+- Startup data validation mirrors the trigger exception: the one explicit moved
+  conflict is accepted, while a claimed `live_reference` moved fact without a real
+  reference or complete identity makes database startup fail closed.
+
+Final fix-round verification:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py backend/tests/content/test_artifact_cleanup_schema.py backend/tests/content/test_round3_hardening.py backend/tests/content/test_round5_hardening.py -q
+112 passed in 14.68s
+
+python -m pytest backend/tests/content -q
+174 passed in 18.83s
+
+python -m pytest backend/tests -q
+487 passed, 1 skipped in 34.58s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only the repository's Windows
+LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
+remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
+remains blocked pending redesign Tasks 3—5 and independent review.

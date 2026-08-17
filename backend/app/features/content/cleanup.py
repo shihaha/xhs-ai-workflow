@@ -16,7 +16,12 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from pydantic import ValidationError
 
-from backend.app.db import Database, canonical_artifact_path_key, is_canonical_uuid_text
+from backend.app.db import (
+    Database,
+    canonical_artifact_path_key,
+    is_canonical_uuid_text,
+    windows_artifact_reference_path_key,
+)
 from backend.app.features.content import export as content_export
 from backend.app.features.content.export import (
     ArtifactPathInspection,
@@ -866,6 +871,23 @@ class ArtifactCleanupService:
     ) -> str | None:
         materials, packages, cleanups = snapshot
 
+        quarantine_key = windows_artifact_reference_path_key(
+            (
+                PurePosixPath("artifacts-quarantine")
+                / record.id
+                / PurePosixPath(record.relative_path).name
+            ).as_posix()
+        )
+        quarantine_absolute = self.runtime_dir.joinpath(
+            *PurePosixPath(
+                f"artifacts-quarantine/{record.id}/"
+                f"{PurePosixPath(record.relative_path).name}"
+            ).parts
+        )
+        artifact_is_quarantined = (
+            artifact.path is not None and artifact.path == quarantine_absolute
+        )
+
         references: list[tuple[str, str]] = []
         for material_id, material_path in materials:
             if record.owner_type == "material" and material_id == record.owner_id:
@@ -897,6 +919,15 @@ class ArtifactCleanupService:
 
         for _kind, relative_path in references:
             reference_key = canonical_artifact_path_key(relative_path)
+            windows_reference_key = windows_artifact_reference_path_key(relative_path)
+            if quarantine_key is not None and windows_reference_key == quarantine_key:
+                if artifact_is_quarantined:
+                    return "live_reference"
+                # A reference may reserve the deterministic destination while this
+                # cleanup is still pending.  Preserve that fact after the move;
+                # treating the not-yet-existing destination as an ambiguous source
+                # reference would strand the original bytes instead.
+                continue
             if reference_key is None:
                 return "ambiguous_reference"
             if reference_key == record.path_key:

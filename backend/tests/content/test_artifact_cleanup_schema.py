@@ -337,6 +337,106 @@ def test_cleanup_insert_and_update_cannot_capture_existing_references(
         service.database.close()
 
 
+def test_live_reference_exception_requires_real_conflict_and_complete_identity(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "live-reference-exception.sqlite3", runtime_dir=tmp_path)
+    pending = _insert_cleanup(database)
+    quarantine_path = f"artifacts-quarantine/{pending.id}/Café.ZIP"
+    try:
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE artifact_gc_queue SET state='needs_human', "
+                        "last_error_category='live_reference', quarantine_path=:path, "
+                        "quarantine_volume_id=1, quarantine_file_id=2, "
+                        "quarantine_size_bytes=12, quarantine_mtime_ns=3 "
+                        "WHERE id=:id"
+                    ),
+                    {"path": quarantine_path, "id": pending.id},
+                )
+
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                text(
+                    "INSERT INTO content_product_materials "
+                    "(id,product_id,logical_name,logical_key,version,path,sha256,"
+                    "size_bytes,media_type,kind,created_at) VALUES "
+                    "(:id,:product_id,'guard.txt','guard.txt',1,:path,:sha256,"
+                    "12,'text/plain','source',CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "id": str(uuid4()),
+                    "product_id": str(uuid4()),
+                    "path": (
+                        f"ARTIFACTS-QUARANTINE/{pending.id}/Cafe\u0301.zip."
+                    ),
+                    "sha256": "a" * 64,
+                },
+            )
+            connection.commit()
+
+        with database.engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    "UPDATE artifact_gc_queue SET state='needs_human', "
+                    "last_error_category='live_reference', quarantine_path=:path, "
+                    "quarantine_volume_id=1, quarantine_file_id=2, "
+                    "quarantine_size_bytes=12, quarantine_mtime_ns=3 "
+                    "WHERE id=:id"
+                ),
+                {"path": quarantine_path, "id": pending.id},
+            )
+            assert result.rowcount == 1
+    finally:
+        database.close()
+
+    reopened = Database(
+        tmp_path / "live-reference-exception.sqlite3", runtime_dir=tmp_path
+    )
+    try:
+        with reopened.session() as session:
+            persisted = session.get(content_models.ArtifactCleanupRecord, pending.id)
+            assert persisted is not None
+            assert persisted.state == "needs_human"
+            assert persisted.last_error_category == "live_reference"
+    finally:
+        reopened.close()
+
+
+def test_startup_rejects_fabricated_live_reference_exception(tmp_path: Path) -> None:
+    path = tmp_path / "fabricated-live-reference.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    pending = _insert_cleanup(database)
+    with database.engine.begin() as connection:
+        trigger_sql = connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='ck_gc_cleanup_reference_update'"
+            )
+        ).scalar_one()
+        connection.execute(text("DROP TRIGGER ck_gc_cleanup_reference_update"))
+        connection.execute(
+            text(
+                "UPDATE artifact_gc_queue SET state='needs_human', "
+                "last_error_category='live_reference', quarantine_path=:path, "
+                "quarantine_volume_id=1, quarantine_file_id=2, "
+                "quarantine_size_bytes=12, quarantine_mtime_ns=3 WHERE id=:id"
+            ),
+            {
+                "path": f"artifacts-quarantine/{pending.id}/file.zip",
+                "id": pending.id,
+            },
+        )
+        connection.execute(text(trigger_sql))
+    database.close()
+
+    with pytest.raises(SchemaMigrationError, match="reference guard"):
+        Database(path, runtime_dir=tmp_path)
+
+
 def test_reference_guard_marker_detects_missing_reverse_trigger(
     tmp_path: Path,
 ) -> None:
