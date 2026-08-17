@@ -321,9 +321,12 @@ class JobService:
                 kind=artifact.kind, path=artifact.path, metadata=artifact.metadata_json
             )
 
-    def recover_expired_running(self) -> int:
+    def recover_expired_running(
+        self, *, worker_job_types: tuple[str, ...] = ()
+    ) -> int:
         """Turn abandoned running leases into an explicit human-action state."""
         now = _utc_now()
+        physical_worker_types = frozenset(worker_job_types)
         with self.database.session() as session:
             records = session.scalars(
                 select(JobRecord).where(
@@ -336,11 +339,20 @@ class JobService:
                 record.state = JobState.needs_human
                 record.lease_expires_at = None
                 record.updated_at = now
+                if record.type in physical_worker_types:
+                    record.current_stage = "worker_restart_required"
+                    record.error_category = "worker_restart_required"
+                    message = (
+                        "Physical worker restart required; unsafe device navigation "
+                        "was not resumed automatically."
+                    )
+                else:
+                    message = "Running lease expired; human recovery required."
                 session.add(
                     JobLogRecord(
                         job_id=record.id,
                         level="warning",
-                        message="Running lease expired; human recovery required.",
+                        message=message,
                         created_at=now,
                     )
                 )

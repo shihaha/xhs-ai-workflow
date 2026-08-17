@@ -29,6 +29,7 @@ from backend.app.services.jobs import InvalidJobTransition, JobService
 
 _IMAGE_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg"}
 ANDROID_SHOP_JOB_TYPE = "android_shop_collection"
+ANDROID_SHOP_JOB_TYPES = ("shop_collection", ANDROID_SHOP_JOB_TYPE)
 
 
 class ShopVerificationMissing(BaseModel):
@@ -136,7 +137,8 @@ class ShopCollectionService:
     ) -> None:
         self.job_service = job_service
         self.device_adapter = device_adapter
-        self.job_service.recover_interrupted_workers(job_type=ANDROID_SHOP_JOB_TYPE)
+        for job_type in ANDROID_SHOP_JOB_TYPES:
+            self.job_service.recover_interrupted_workers(job_type=job_type)
         self._executor = (
             ThreadPoolExecutor(
                 max_workers=max(1, max_workers),

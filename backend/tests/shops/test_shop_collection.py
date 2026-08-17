@@ -643,6 +643,8 @@ def test_duplicate_url_card_is_an_explicit_rejected_observation(tmp_path: Path) 
     assert len(result.rejected_items) == 1
     assert result.rejected_items[0].reason == "duplicate_source_url"
     assert result.rejected_items[0].raw_evidence["source_url"] == duplicate
+    assert len(result.missing_items) == 1
+    assert result.missing_items[0].reference == "expected_product:2"
 
 
 def test_overlapping_viewports_use_unique_urls_for_nn_and_keep_duplicate_evidence(

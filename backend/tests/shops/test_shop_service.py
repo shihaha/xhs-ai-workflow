@@ -770,6 +770,13 @@ def test_service_startup_recovers_prior_android_shop_workers_as_needs_human(
         job_type="android_shop_collection", input_data={}, progress_total=2
     )
     jobs.claim(running.id)
+    legacy_queued = jobs.create(
+        job_type="shop_collection", input_data={}, progress_total=3
+    )
+    legacy_running = jobs.create(
+        job_type="shop_collection", input_data={}, progress_total=4
+    )
+    jobs.claim(legacy_running.id)
     unrelated = jobs.create(job_type="radar_collection", input_data={})
 
     service = ShopCollectionService(
@@ -778,7 +785,7 @@ def test_service_startup_recovers_prior_android_shop_workers_as_needs_human(
         submitter=_capturing_submitter([]),
     )
 
-    for job_id in (queued.id, running.id):
+    for job_id in (queued.id, running.id, legacy_queued.id, legacy_running.id):
         recovered = jobs.get(job_id)
         assert recovered.state is JobState.needs_human
         assert recovered.current_stage == "worker_restart_required"
@@ -786,6 +793,60 @@ def test_service_startup_recovers_prior_android_shop_workers_as_needs_human(
         assert any("worker restart" in log.message.casefold() for log in recovered.logs)
     assert jobs.get(unrelated.id).state is JobState.queued
     service.close()
+
+
+def test_app_startup_classifies_expired_shop_workers_before_generic_lease_recovery(
+    tmp_path: Path,
+) -> None:
+    """Generic lease recovery must not erase the physical-worker restart reason."""
+    runtime_dir = tmp_path / "runtime"
+    database_path = runtime_dir / "workbench.sqlite3"
+    seed_database = Database(database_path)
+    seed_jobs = JobService(seed_database, runtime_dir=runtime_dir)
+    current_shop = seed_jobs.create(
+        job_type="android_shop_collection",
+        input_data={},
+        progress_total=1,
+        current_stage="device_pending",
+    )
+    legacy_shop = seed_jobs.create(
+        job_type="shop_collection",
+        input_data={},
+        progress_total=1,
+        current_stage="device_pending",
+    )
+    non_shop = seed_jobs.create(
+        job_type="radar_collection",
+        input_data={},
+        current_stage="radar_running",
+    )
+    for job in (current_shop, legacy_shop, non_shop):
+        seed_jobs.claim(job.id, lease_seconds=-1)
+    seed_database.close()
+
+    app = create_app(
+        Settings(runtime_dir=runtime_dir, database_path=database_path)
+    )
+    try:
+        for job_id in (current_shop.id, legacy_shop.id):
+            recovered = app.state.job_service.get(job_id)
+            assert recovered.state is JobState.needs_human
+            assert recovered.current_stage == "worker_restart_required"
+            assert recovered.error_category == "worker_restart_required"
+            assert any(
+                "worker restart" in log.message.casefold() for log in recovered.logs
+            )
+
+        generic = app.state.job_service.get(non_shop.id)
+        assert generic.state is JobState.needs_human
+        assert generic.current_stage == "radar_running"
+        assert generic.error_category is None
+        assert generic.logs[-1].message == (
+            "Running lease expired; human recovery required."
+        )
+    finally:
+        app.state.shop_service.close()
+        app.state.database.close()
 
 
 def test_closed_service_rejects_enqueue_before_creating_a_job(tmp_path: Path) -> None:

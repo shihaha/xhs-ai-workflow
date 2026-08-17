@@ -13,7 +13,10 @@ from backend.app.db import Database
 from backend.app.features.radar.api import router as radar_router
 from backend.app.features.radar.service import RadarService
 from backend.app.features.shops.api import router as shops_router
-from backend.app.features.shops.service import ShopCollectionService
+from backend.app.features.shops.service import (
+    ANDROID_SHOP_JOB_TYPES,
+    ShopCollectionService,
+)
 from backend.app.settings import Settings
 from backend.app.services.jobs import JobService
 
@@ -50,7 +53,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.database, runtime_dir=app.state.settings.runtime_dir
         )
         app.state.radar_service = RadarService(app.state.database)
-        app.state.job_service.recover_expired_running()
+        app.state.job_service.recover_expired_running(
+            worker_job_types=ANDROID_SHOP_JOB_TYPES
+        )
     except (OSError, SQLAlchemyError):
         app.state.database = None
         app.state.job_service = None

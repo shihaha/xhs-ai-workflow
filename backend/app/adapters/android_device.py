@@ -1366,7 +1366,7 @@ class AndroidDeviceAdapter:
         ) or "expected_product_not_discovered"
         missing_items = [
             MissingCollectionItem(
-                reference=f"expected_product:{observed + index + 1}",
+                reference=f"expected_product:{identity_observed + index + 1}",
                 reason=missing_reason,
                 raw_evidence={
                     "selector_profile_version": self.selector_profile_version,
