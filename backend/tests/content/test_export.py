@@ -7,10 +7,11 @@ import pytest
 import httpx
 
 from backend.app.features.content.export import UnsafeContentPath, deterministic_zip
-from backend.app.features.content.schemas import ContentItemCreate, MaterialCreate, ReviewCreate
+from backend.app.features.content.schemas import ContentItemCreate, ExportCreate, MaterialCreate, ReviewCreate
 from backend.app.features.content.service import ContentStateError, ContentValidationError
 from backend.app.main import create_app
 from backend.app.settings import Settings
+from backend.tests.content.test_hardening import PNG_1X1
 from backend.tests.content.test_workflow import FakeModel, create_product, seed_database, seeded_service
 
 
@@ -19,13 +20,14 @@ def _item_with_material(tmp_path: Path):
     product_id = create_product(service, opportunity_id)
     source = tmp_path / "materials" / "approved.png"
     source.parent.mkdir()
-    source.write_bytes(b"real-image-bytes")
+    source.write_bytes(PNG_1X1)
     material = service.add_material(product_id, MaterialCreate(
-        logical_name="approved.png", path="materials/approved.png", media_type="image/png"
+        logical_name="approved.png", path="materials/approved.png", media_type="image/png", kind="output_image"
     ))
     item = service.create_content_item(ContentItemCreate(
         product_id=product_id, opportunity_id=opportunity_id,
-        template_key="list-v1", evidence_ids=[evidence_id], material_ids=[material.id],
+        template_key="list-v1", evidence_ids=[evidence_id],
+        image_material_ids=[material.id], cover_material_id=material.id,
         research_facts=[{"fact": "真实事实", "evidence_ids": [evidence_id]}],
     ))
     return service, item, source
@@ -34,17 +36,18 @@ def _item_with_material(tmp_path: Path):
 def test_export_is_blocked_before_approved_current_revision(tmp_path: Path) -> None:
     service, item, _ = _item_with_material(tmp_path)
     with pytest.raises(ContentStateError):
-        service.export_package(item.id)
+        service.export_package(item.id, ExportCreate(expected_revision_id=item.current_revision.id))
 
 
 def test_deterministic_zip_contains_manifest_sources_reviews_and_material_hashes(tmp_path: Path) -> None:
     service, item, _ = _item_with_material(tmp_path)
     service.review(item.id, ReviewCreate(
-        decision="approve", actor="operator", note="人工核对通过"
+        decision="approve", actor="operator", note="人工核对通过", expected_revision_id=item.current_revision.id,
+        visual_checks=[{"material_id": item.image_material_ids[0], "passed": True, "observation": "图文清晰一致"}],
     ))
-    first = service.export_package(item.id)
+    first = service.export_package(item.id, ExportCreate(expected_revision_id=item.current_revision.id))
     first_bytes = (tmp_path / first.path).read_bytes()
-    second = service.export_package(item.id)
+    second = service.export_package(item.id, ExportCreate(expected_revision_id=item.current_revision.id))
     second_bytes = (tmp_path / second.path).read_bytes()
 
     assert first.id == second.id
@@ -58,27 +61,34 @@ def test_deterministic_zip_contains_manifest_sources_reviews_and_material_hashes
         assert "content/final.md" in names
         assert "sources/evidence.json" in names
         assert "reviews/history.json" in names
-        assert any(name.startswith("materials/") for name in names)
+        assert any(name.startswith("images/") for name in names)
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["automatic_publish"] is False
         assert manifest["materials"][0]["version"] == 1
-        assert manifest["materials"][0]["sha256"] == sha256(b"real-image-bytes").hexdigest()
+        assert manifest["materials"][0]["sha256"] == sha256(PNG_1X1).hexdigest()
+        assert manifest["images"]["count"] == 1
         for entry in manifest["entries"]:
             assert sha256(archive.read(entry["path"])).hexdigest() == entry["sha256"]
 
 
 def test_changed_or_symlinked_material_is_rejected_at_export(tmp_path: Path) -> None:
     service, item, source = _item_with_material(tmp_path)
-    service.review(item.id, ReviewCreate(decision="approve", actor="operator", note="ok"))
+    service.review(item.id, ReviewCreate(
+        decision="approve", actor="operator", note="ok", expected_revision_id=item.current_revision.id,
+        visual_checks=[{"material_id": item.image_material_ids[0], "passed": True, "observation": "清晰"}],
+    ))
     stored_path = service.get_product(item.product_id).materials[0].path
     (tmp_path / stored_path).write_bytes(b"tampered")
     with pytest.raises(ContentValidationError):
-        service.export_package(item.id)
+        service.export_package(item.id, ExportCreate(expected_revision_id=item.current_revision.id))
 
 
 def test_export_output_parent_symlink_is_rejected(tmp_path: Path) -> None:
     service, item, _ = _item_with_material(tmp_path)
-    service.review(item.id, ReviewCreate(decision="approve", actor="operator", note="ok"))
+    service.review(item.id, ReviewCreate(
+        decision="approve", actor="operator", note="ok", expected_revision_id=item.current_revision.id,
+        visual_checks=[{"material_id": item.image_material_ids[0], "passed": True, "observation": "清晰"}],
+    ))
     outside = tmp_path.parent / "outside-packages"
     outside.mkdir(exist_ok=True)
     parent = tmp_path / "content-packages"
@@ -87,7 +97,7 @@ def test_export_output_parent_symlink_is_rejected(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("directory symlink creation unavailable")
     with pytest.raises(ContentValidationError):
-        service.export_package(item.id)
+        service.export_package(item.id, ExportCreate(expected_revision_id=item.current_revision.id))
     assert list(outside.iterdir()) == []
 
 
@@ -109,6 +119,8 @@ async def test_http_fresh_database_runs_controlled_adapter_e2e(tmp_path: Path) -
     source = tmp_path / "incoming" / "facts.md"
     source.parent.mkdir()
     source.write_text("approved source", encoding="utf-8")
+    image_source = tmp_path / "incoming" / "cover.png"
+    image_source.write_bytes(PNG_1X1)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -121,17 +133,27 @@ async def test_http_fresh_database_runs_controlled_adapter_e2e(tmp_path: Path) -
             "logical_name": "facts.md", "path": "incoming/facts.md", "media_type": "text/markdown",
         })
         assert material.status_code == 201
+        image = await client.post(f"/api/v1/products/{product_id}/materials", json={
+            "logical_name": "cover.png", "path": "incoming/cover.png",
+            "media_type": "image/png", "kind": "output_image",
+        })
+        assert image.status_code == 201
         item = await client.post("/api/v1/content-items", json={
             "product_id": product_id, "opportunity_id": opportunity_id,
             "template_key": "list-v1", "evidence_ids": [evidence_id],
             "material_ids": [material.json()["id"]],
+            "image_material_ids": [image.json()["id"]], "cover_material_id": image.json()["id"],
             "research_facts": [{"fact": "persisted fact", "evidence_ids": [evidence_id]}],
         })
         assert item.status_code == 201 and item.json()["status"] == "review"
         approved = await client.post(f"/api/v1/content-items/{item.json()['id']}/reviews", json={
             "decision": "approve", "actor": "operator", "note": "checked",
+            "expected_revision_id": item.json()["current_revision"]["id"],
+            "visual_checks": [{"material_id": image.json()["id"], "passed": True, "observation": "清晰一致"}],
         })
-        package = await client.post(f"/api/v1/content-items/{item.json()['id']}/export")
+        package = await client.post(f"/api/v1/content-items/{item.json()['id']}/export", json={
+            "expected_revision_id": item.json()["current_revision"]["id"]
+        })
         listing = await client.get("/api/v1/content-packages")
     assert approved.json()["status"] == "approved"
     assert package.status_code == 201 and package.json()["status"] == "ready"
@@ -148,9 +170,15 @@ async def test_http_unconfigured_model_never_claims_a_draft(tmp_path: Path) -> N
         product = await client.post("/api/v1/products", json={
             "name": "No model", "target_user": "operator", "opportunity_id": opportunity_id,
         })
+        cover = tmp_path / "cover.png"
+        cover.write_bytes(PNG_1X1)
+        image = await client.post(f"/api/v1/products/{product.json()['id']}/materials", json={
+            "logical_name": "cover.png", "path": "cover.png", "media_type": "image/png", "kind": "output_image",
+        })
         response = await client.post("/api/v1/content-items", json={
             "product_id": product.json()["id"], "opportunity_id": opportunity_id,
             "template_key": "list-v1", "evidence_ids": [evidence_id],
+            "image_material_ids": [image.json()["id"]], "cover_material_id": image.json()["id"],
             "research_facts": [{"fact": "persisted fact", "evidence_ids": [evidence_id]}],
         })
         listing = await client.get("/api/v1/content-items")

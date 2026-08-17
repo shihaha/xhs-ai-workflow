@@ -26,6 +26,9 @@ class FakeModel:
         self.output: dict[str, object] | None = None
 
     def generate_structured(self, request: object, schema: object) -> ModelResult:
+        import json
+        prompt = json.loads(request.user_prompt)
+        image_ids = prompt["ordered_image_material_ids"]
         output = self.output if self.output is not None else {
                 "title": "一份有来源的清单",
                 "body": "这是基于已保存证据生成的正文。",
@@ -33,6 +36,15 @@ class FakeModel:
                     {"claim": "存在这个需求", "evidence_ids": [self.evidence_id]}
                 ],
                 "source_evidence_ids": [self.evidence_id],
+                "image_plan": [
+                    {
+                        "page_number": index + 1, "material_id": material_id,
+                        "role": "cover" if index == 0 else "page",
+                        "headline": "封面" if index == 0 else f"第{index + 1}页",
+                        "visual_direction": "文字清晰并与正文一致",
+                    }
+                    for index, material_id in enumerate(image_ids)
+                ],
             }
         return ModelResult(
             model=self.model,
@@ -65,7 +77,14 @@ def seed_database(database: Database) -> tuple[str, str]:
             account_user_ids_json=["account-a"], status="succeeded",
             prompt_version="analysis-v1", provider="controlled_fake", model="fake",
             input_digest="a" * 64, evidence_ids_json=[evidence_id],
-            output_json={"claims": [], "product_clusters": [], "opportunities": []},
+            output_json={
+                "claims": [{"claim": "真实需求", "evidence_ids": [evidence_id]}],
+                "product_clusters": [],
+                "opportunities": [{
+                    "title": "资料产品机会", "status": "升温", "summary": "真实证据支持",
+                    "evidence_ids": [evidence_id], "next_action": "制作一篇待审核内容",
+                }],
+            },
             usage_json={}, attempts_json=[], created_at=now,
         )
         opportunity = OpportunityRecord(
@@ -89,6 +108,17 @@ def create_product(service: ContentService, opportunity_id: str) -> str:
     return service.create_product(
         ProductCreate(name="测试产品", target_user="需要清单的人", opportunity_id=opportunity_id)
     ).id
+
+
+def add_output_image(service: ContentService, product_id: str, tmp_path: Path, name: str = "cover.png"):
+    import base64
+    payload = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+    path = tmp_path / "incoming" / name
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(payload)
+    return service.add_material(product_id, MaterialCreate(
+        logical_name=name, path=f"incoming/{name}", media_type="image/png", kind="output_image"
+    ))
 
 
 def test_material_versions_are_hashed_by_system_and_old_versions_remain(tmp_path: Path) -> None:
@@ -156,10 +186,12 @@ def test_source_linked_research_and_model_revision_are_persisted(tmp_path: Path)
     material_id = service.add_material(product_id, MaterialCreate(
         logical_name="facts.md", path="materials/facts.md", media_type="text/markdown"
     )).id
+    image = add_output_image(service, product_id, tmp_path)
 
     item = service.create_content_item(ContentItemCreate(
         product_id=product_id, opportunity_id=opportunity_id,
         template_key="list-v1", evidence_ids=[evidence_id], material_ids=[material_id],
+        image_material_ids=[image.id], cover_material_id=image.id,
         research_facts=[{"fact": "用户需要清单", "evidence_ids": [evidence_id]}],
     ))
 
@@ -173,10 +205,12 @@ def test_source_linked_research_and_model_revision_are_persisted(tmp_path: Path)
 def test_unknown_or_cross_opportunity_citation_rejects_whole_draft(tmp_path: Path) -> None:
     service, opportunity_id, _ = seeded_service(tmp_path)
     product_id = create_product(service, opportunity_id)
+    image = add_output_image(service, product_id, tmp_path)
     with pytest.raises(ContentValidationError):
         service.create_content_item(ContentItemCreate(
             product_id=product_id, opportunity_id=opportunity_id,
             template_key="list-v1", evidence_ids=["rank-item:999999"],
+            image_material_ids=[image.id], cover_material_id=image.id,
             research_facts=[{"fact": "伪造事实", "evidence_ids": ["rank-item:999999"]}],
         ))
     assert service.list_content_items() == []

@@ -67,6 +67,72 @@ class Database:
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
+        self._migrate_content_schema()
+
+    def _migrate_content_schema(self) -> None:
+        inspector = inspect(self.engine)
+        if "content_products" not in inspector.get_table_names():
+            return
+        required = {
+            "content_product_materials": {"kind"},
+            "content_items": {"image_material_ids_json", "cover_material_id"},
+            "content_revisions": {"image_plan_json"},
+            "content_reviews": {"visual_checks_json"},
+            "content_packages": {"error_detail"},
+        }
+        constraints_ok = {
+            item.get("name") for item in inspector.get_check_constraints("content_items")
+        } >= {"ck_content_item_status"} and {
+            item.get("name") for item in inspector.get_check_constraints("content_product_materials")
+        } >= {"ck_material_version_positive", "ck_material_size_positive", "ck_material_sha_format", "ck_material_kind"} and {
+            item.get("name") for item in inspector.get_check_constraints("content_packages")
+        } >= {"ck_package_status", "ck_package_size_nonnegative", "ck_package_sha_format"}
+        indexes_ok = {
+            item.get("name") for item in inspector.get_indexes("content_reviews")
+        } >= {"uq_review_terminal_revision"}
+        columns_ok = all(
+            names.issubset({column["name"] for column in inspector.get_columns(table)})
+            for table, names in required.items()
+        )
+        if not (columns_ok and constraints_ok and indexes_ok):
+            tables = [
+                "content_packages", "content_reviews", "content_revisions", "content_items",
+                "content_product_materials", "content_products",
+            ]
+            with self.engine.begin() as connection:
+                populated = any(
+                    connection.scalar(text(f"SELECT COUNT(*) FROM {table}"))
+                    for table in tables if table in inspector.get_table_names()
+                )
+                if populated:
+                    raise SchemaMigrationError(
+                        "Legacy or malformed Task 8 schema contains records and requires isolated manual migration."
+                    )
+                connection.execute(text("PRAGMA foreign_keys=OFF"))
+                for table in tables:
+                    connection.execute(text(f"DROP TABLE IF EXISTS {table}"))
+                connection.execute(text("PRAGMA foreign_keys=ON"))
+            Base.metadata.create_all(self.engine)
+            inspector = inspect(self.engine)
+        final_columns_ok = all(
+            names.issubset({column["name"] for column in inspector.get_columns(table)})
+            for table, names in required.items()
+        )
+        if not final_columns_ok:
+            raise SchemaMigrationError("Task 8 schema validation failed.")
+        with self.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE content_packages SET status='failed', "
+                    "error_detail='worker_restart_required' WHERE status='building'"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT OR IGNORE INTO workbench_schema_migrations (name, applied_at) "
+                    "VALUES ('task8_content_v2', CURRENT_TIMESTAMP)"
+                )
+            )
 
     def _migrate_artifact_provenance(self) -> None:
         columns = {

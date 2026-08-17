@@ -9,7 +9,7 @@ import os
 from pathlib import Path, PurePosixPath
 import stat
 import zipfile
-from uuid import uuid4
+import unicodedata
 
 
 MAX_MATERIAL_BYTES = 50 * 1024 * 1024
@@ -79,18 +79,35 @@ def write_contained_atomic(root: Path, relative: str, payload: bytes) -> None:
                 current.mkdir()
                 current.resolve(strict=True).relative_to(resolved_root)
         target = root.joinpath(*posix.parts)
-        if target.exists() and (
-            target.is_symlink() or (hasattr(target, "is_junction") and target.is_junction())
-            or not target.is_file()
-        ):
-            raise UnsafeContentPath("Output target must be a regular file or absent.")
+        if target.exists():
+            raise UnsafeContentPath("Output target must be absent; existing artifacts are never overwritten.")
         target.resolve(strict=False).relative_to(resolved_root)
-        temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
-        temporary.write_bytes(payload)
-        if temporary.is_symlink() or not temporary.is_file():
-            raise UnsafeContentPath("Temporary output is not a regular file.")
-        temporary.resolve(strict=True).relative_to(resolved_root)
-        temporary.replace(target)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        descriptor = os.open(target, flags, 0o600)
+        opened = os.fstat(descriptor)
+        resolved_after_open = target.resolve(strict=True)
+        resolved_after_open.relative_to(resolved_root)
+        path_stat = target.stat()
+        if (
+            not stat.S_ISREG(opened.st_mode) or _identity(opened) != _identity(path_stat)
+            or target.is_symlink()
+        ):
+            raise UnsafeContentPath("Opened output identity is not the verified runtime file.")
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise OSError("short output write")
+            written += count
+        os.fsync(descriptor)
+        final_handle = os.fstat(descriptor)
+        if final_handle.st_size != len(payload) or final_handle.st_dev != opened.st_dev or final_handle.st_ino != opened.st_ino:
+            raise UnsafeContentPath("Output handle identity changed while writing.")
+        os.close(descriptor)
+        descriptor = None
         written = read_contained_regular(root, posix.as_posix(), limit=max(len(payload), 1))
         if written != payload:
             raise UnsafeContentPath("Output verification failed.")
@@ -99,15 +116,21 @@ def write_contained_atomic(root: Path, relative: str, payload: bytes) -> None:
     except (OSError, ValueError, TypeError) as error:
         raise UnsafeContentPath("Output path is unavailable or escapes the runtime directory.") from error
     finally:
-        if "temporary" in locals():
-            temporary.unlink(missing_ok=True)
+        if "descriptor" in locals() and descriptor is not None:
+            os.close(descriptor)
 
 
 def deterministic_zip(entries: dict[str, bytes], manifest: dict[str, object]) -> bytes:
+    if len(entries) > 127 or sum(len(value) for value in entries.values()) > 250 * 1024 * 1024:
+        raise UnsafeContentPath("ZIP entry count or uncompressed size limit exceeded.")
     normalized: dict[str, bytes] = {}
     for name, value in entries.items():
+        name = unicodedata.normalize("NFC", name)
         path = PurePosixPath(name)
-        if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        if path.is_absolute() or not path.parts or any(
+            part in {"", ".", ".."} or ":" in part or "\\" in part
+            or any(ord(char) < 32 for char in part) for part in path.parts
+        ):
             raise UnsafeContentPath("ZIP entry path is unsafe.")
         canonical = path.as_posix()
         if canonical in normalized or canonical.casefold() in {item.casefold() for item in normalized}:
@@ -128,7 +151,13 @@ def deterministic_zip(entries: dict[str, bytes], manifest: dict[str, object]) ->
             info.external_attr = 0o100644 << 16
             info.flag_bits = 0x800
             archive.writestr(info, normalized[name])
-    return target.getvalue()
+    payload = target.getvalue()
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        total_compressed = sum(max(info.compress_size, 1) for info in archive.infolist())
+        total_uncompressed = sum(info.file_size for info in archive.infolist())
+        if total_uncompressed > 250 * 1024 * 1024 or total_uncompressed / max(total_compressed, 1) > 500:
+            raise UnsafeContentPath("ZIP compression ratio limit exceeded.")
+    return payload
 
 
 def entry_manifest(entries: dict[str, bytes]) -> list[dict[str, object]]:

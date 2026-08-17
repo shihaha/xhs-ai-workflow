@@ -4,10 +4,11 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from backend.app.features.content.schemas import (
     ContentItemCreate, ContentItemRead, ContentPackageRead, MaterialCreate, MaterialRead,
-    ProductCreate, ProductRead, ReviewCreate,
+    ExportCreate, ProductCreate, ProductRead, RegenerateCreate, ReviewCreate,
 )
 from backend.app.features.content.service import (
-    ContentNotFound, ContentService, ContentStateError, ContentValidationError,
+    ContentModelFailure, ContentModelUnavailable, ContentNotFound, ContentService,
+    ContentStateError, ContentValidationError,
 )
 
 
@@ -22,6 +23,10 @@ def _service(request: Request) -> ContentService:
 
 
 def _translate(error: Exception) -> HTTPException:
+    if isinstance(error, ContentModelUnavailable):
+        return HTTPException(status_code=503, detail=str(error))
+    if isinstance(error, ContentModelFailure):
+        return HTTPException(status_code=502, detail=str(error))
     if isinstance(error, ContentNotFound):
         return HTTPException(status_code=404, detail=str(error))
     if isinstance(error, ContentStateError):
@@ -33,7 +38,7 @@ def _translate(error: Exception) -> HTTPException:
 def create_product(payload: ProductCreate, request: Request) -> ProductRead:
     try:
         return _service(request).create_product(payload)
-    except (ContentNotFound, ContentValidationError, ContentStateError) as error:
+    except (ContentNotFound, ContentValidationError, ContentStateError, ContentModelUnavailable, ContentModelFailure) as error:
         raise _translate(error) from error
 
 
@@ -46,7 +51,7 @@ def list_products(request: Request) -> list[ProductRead]:
 def get_product(product_id: str, request: Request) -> ProductRead:
     try:
         return _service(request).get_product(product_id)
-    except ContentNotFound as error:
+    except (ContentNotFound, ContentStateError) as error:
         raise _translate(error) from error
 
 
@@ -54,7 +59,7 @@ def get_product(product_id: str, request: Request) -> ProductRead:
 def add_material(product_id: str, payload: MaterialCreate, request: Request) -> MaterialRead:
     try:
         return _service(request).add_material(product_id, payload)
-    except (ContentNotFound, ContentValidationError) as error:
+    except (ContentNotFound, ContentValidationError, ContentStateError) as error:
         raise _translate(error) from error
 
 
@@ -65,7 +70,7 @@ def create_content_item(payload: ContentItemCreate, request: Request) -> Content
         raise HTTPException(status_code=503, detail="Model provider is not configured.")
     try:
         return service.create_content_item(payload)
-    except (ContentNotFound, ContentValidationError, ContentStateError) as error:
+    except (ContentNotFound, ContentValidationError, ContentStateError, ContentModelUnavailable, ContentModelFailure) as error:
         raise _translate(error) from error
 
 
@@ -91,17 +96,17 @@ def review(item_id: str, payload: ReviewCreate, request: Request) -> ContentItem
 
 
 @router.post("/content-items/{item_id}/regenerate", response_model=ContentItemRead)
-def regenerate(item_id: str, request: Request) -> ContentItemRead:
+def regenerate(item_id: str, payload: RegenerateCreate, request: Request) -> ContentItemRead:
     try:
-        return _service(request).regenerate(item_id)
-    except (ContentNotFound, ContentValidationError, ContentStateError) as error:
+        return _service(request).regenerate(item_id, payload)
+    except (ContentNotFound, ContentValidationError, ContentStateError, ContentModelUnavailable, ContentModelFailure) as error:
         raise _translate(error) from error
 
 
 @router.post("/content-items/{item_id}/export", response_model=ContentPackageRead, status_code=201)
-def export(item_id: str, request: Request) -> ContentPackageRead:
+def export(item_id: str, payload: ExportCreate, request: Request) -> ContentPackageRead:
     try:
-        return _service(request).export_package(item_id)
+        return _service(request).export_package(item_id, payload)
     except (ContentNotFound, ContentValidationError, ContentStateError) as error:
         raise _translate(error) from error
 
@@ -115,5 +120,5 @@ def list_packages(request: Request) -> list[ContentPackageRead]:
 def get_package(package_id: str, request: Request) -> ContentPackageRead:
     try:
         return _service(request).get_package(package_id)
-    except ContentNotFound as error:
+    except (ContentNotFound, ContentStateError) as error:
         raise _translate(error) from error
