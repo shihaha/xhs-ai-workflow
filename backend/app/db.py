@@ -3,7 +3,8 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
+import unicodedata
+from uuid import UUID, uuid4
 
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -18,6 +19,55 @@ class Base(DeclarativeBase):
 
 class SchemaMigrationError(SQLAlchemyError):
     """Raised when a migration marker contradicts the physical SQLite schema."""
+
+
+_WINDOWS_RESERVED_STEMS = {
+    "con", "prn", "aux", "nul", "conin$", "conout$", "clock$",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+    "com¹", "com²", "com³", "lpt¹", "lpt²", "lpt³",
+}
+
+
+def is_canonical_uuid_text(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except (ValueError, AttributeError):
+        return False
+
+
+def canonical_artifact_path_key(value: object) -> str | None:
+    """Return one Windows-equivalent key only for a canonical managed path."""
+
+    if not isinstance(value, str) or not value or unicodedata.normalize("NFC", value) != value:
+        return None
+    if value.startswith("/") or "\\" in value or ":" in value:
+        return None
+    parts = value.split("/")
+    if not parts:
+        return None
+    canonical_parts: list[str] = []
+    for part in parts:
+        if (
+            not part
+            or part in {".", ".."}
+            or part.strip() != part
+            or part.endswith((".", " "))
+            or any(
+                ord(char) < 32
+                or 127 <= ord(char) <= 159
+                or char in '<>:"/\\|?*'
+                for char in part
+            )
+        ):
+            return None
+        stem = part.split(".", 1)[0].casefold()
+        if stem in _WINDOWS_RESERVED_STEMS:
+            return None
+        canonical_parts.append(unicodedata.normalize("NFC", part.casefold()))
+    return "/".join(canonical_parts)
 
 
 class Database:
@@ -70,11 +120,41 @@ class Database:
             RankItemRecord,
             RankSnapshotRecord,
         )
+        quarantine_marker_present = self._migration_marker_exists(
+            "task8_artifact_quarantine_v1"
+        )
+        if quarantine_marker_present:
+            self._require_artifact_quarantine_schema()
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
         self._migrate_content_schema()
-        self._migrate_artifact_quarantine()
+        self._migrate_artifact_quarantine(
+            marker_present=quarantine_marker_present
+        )
+
+    def _migration_marker_exists(self, name: str) -> bool:
+        inspector = inspect(self.engine)
+        if "workbench_schema_migrations" not in inspector.get_table_names():
+            return False
+        with self.engine.connect() as connection:
+            return connection.scalar(
+                text(
+                    "SELECT 1 FROM workbench_schema_migrations WHERE name=:name"
+                ),
+                {"name": name},
+            ) is not None
+
+    def _require_artifact_quarantine_schema(self) -> None:
+        with self.engine.connect() as connection:
+            if (
+                not _artifact_quarantine_schema_valid(inspect(connection))
+                or not _artifact_quarantine_triggers_valid(connection)
+                or not _artifact_quarantine_data_valid(connection)
+            ):
+                raise SchemaMigrationError(
+                    "Task 8 artifact cleanup schema validation failed."
+                )
 
     def _migrate_content_schema(self) -> None:
         inspector = inspect(self.engine)
@@ -110,9 +190,14 @@ class Database:
                 )
             )
 
-    def _migrate_artifact_quarantine(self) -> None:
+    def _migrate_artifact_quarantine(self, *, marker_present: bool) -> None:
         """Install and validate durable cleanup facts, then recover interrupted builds."""
         from backend.app.features.content.models import ArtifactCleanupRecord
+
+        if marker_present:
+            self._require_artifact_quarantine_schema()
+            self._recover_stranded_content_packages()
+            return
 
         with self.engine.begin() as connection:
             connection.execute(
@@ -129,13 +214,37 @@ class Database:
                 connection.execute(
                     text("ALTER TABLE content_packages ADD COLUMN build_token VARCHAR(36)")
                 )
-            if "artifact_gc_queue" not in inspect(connection).get_table_names():
+            tables = set(inspect(connection).get_table_names())
+            if "artifact_gc_queue" not in tables:
+                ArtifactCleanupRecord.__table__.create(connection)
+            elif not _artifact_quarantine_table_valid(inspect(connection)):
+                row_count = connection.scalar(
+                    text("SELECT COUNT(*) FROM artifact_gc_queue")
+                )
+                if row_count:
+                    raise SchemaMigrationError(
+                        "Legacy artifact cleanup records require isolated manual migration."
+                    )
+                ArtifactCleanupRecord.__table__.drop(connection)
                 ArtifactCleanupRecord.__table__.create(connection)
 
+            _create_artifact_quarantine_triggers(connection)
+
             inspector = inspect(connection)
-            if not _artifact_quarantine_schema_valid(inspector):
+            if (
+                not _artifact_quarantine_schema_valid(inspector)
+                or not _artifact_quarantine_triggers_valid(connection)
+                or not _artifact_quarantine_data_valid(connection)
+            ):
                 raise SchemaMigrationError("Task 8 artifact cleanup schema validation failed.")
 
+        self._recover_stranded_content_packages(write_marker=True)
+        self._require_artifact_quarantine_schema()
+
+    def _recover_stranded_content_packages(self, *, write_marker: bool = False) -> None:
+        from backend.app.features.content.models import ArtifactCleanupRecord
+
+        with self.engine.begin() as connection:
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             stranded = connection.execute(
                 text(
@@ -144,9 +253,17 @@ class Database:
                 )
             ).mappings().all()
             for package in stranded:
+                path_key = canonical_artifact_path_key(package["path"])
+                if (
+                    not is_canonical_uuid_text(package["id"])
+                    or path_key is None
+                ):
+                    raise SchemaMigrationError(
+                        "Interrupted package identity requires isolated manual migration."
+                    )
                 connection.execute(
                     sqlite_insert(ArtifactCleanupRecord).on_conflict_do_nothing(
-                        index_elements=["owner_type", "owner_id", "relative_path"],
+                        index_elements=["owner_type", "owner_id", "path_key"],
                         index_where=text(
                             "state IN ('pending','claimed','quarantined','needs_human')"
                         ),
@@ -156,6 +273,7 @@ class Database:
                         "owner_type": "content_package",
                         "owner_id": package["id"],
                         "relative_path": package["path"],
+                        "path_key": path_key,
                         "expected_sha256": package["sha256"],
                         "expected_size_bytes": package["size_bytes"],
                         "state": "pending",
@@ -177,15 +295,13 @@ class Database:
                     "error_detail='worker_restart_required' WHERE status='building'"
                 )
             )
-            connection.execute(
-                text(
-                    "INSERT OR IGNORE INTO workbench_schema_migrations (name, applied_at) "
-                    "VALUES ('task8_artifact_quarantine_v1', CURRENT_TIMESTAMP)"
+            if write_marker:
+                connection.execute(
+                    text(
+                        "INSERT INTO workbench_schema_migrations (name, applied_at) "
+                        "VALUES ('task8_artifact_quarantine_v1', CURRENT_TIMESTAMP)"
+                    )
                 )
-            )
-
-        if not _artifact_quarantine_schema_valid(inspect(self.engine)):
-            raise SchemaMigrationError("Task 8 artifact cleanup schema validation failed.")
 
     def _migrate_artifact_provenance(self) -> None:
         columns = {
@@ -370,6 +486,13 @@ class Database:
 
 
 def _configure_sqlite(connection: object, _: object) -> None:
+    connection.create_function(  # type: ignore[union-attr]
+        "artifact_path_key", 1, canonical_artifact_path_key, deterministic=True
+    )
+    connection.create_function(  # type: ignore[union-attr]
+        "is_canonical_uuid", 1, lambda value: int(is_canonical_uuid_text(value)),
+        deterministic=True,
+    )
     cursor = connection.cursor()  # type: ignore[union-attr]
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
@@ -550,11 +673,32 @@ def _compact_sql(value: object) -> str:
 def _artifact_quarantine_schema_valid(inspector: object) -> bool:
     """Validate the physical cleanup contract instead of trusting a marker."""
 
+    if not _artifact_quarantine_table_valid(inspector):
+        return False
+    try:
+        package_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("content_packages")
+        }
+        build_token = package_columns.get("build_token")
+        return bool(
+            build_token is not None
+            and build_token.get("nullable") is True
+            and str(build_token.get("type") or "").upper() == "VARCHAR(36)"
+        )
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+
+
+def _artifact_quarantine_table_valid(inspector: object) -> bool:
+    """Validate every physical queue column, CHECK and open-row identity index."""
+
     required_columns = {
         "id",
         "owner_type",
         "owner_id",
         "relative_path",
+        "path_key",
         "expected_sha256",
         "expected_size_bytes",
         "state",
@@ -574,6 +718,7 @@ def _artifact_quarantine_schema_valid(inspector: object) -> bool:
         "owner_type",
         "owner_id",
         "relative_path",
+        "path_key",
         "expected_sha256",
         "expected_size_bytes",
         "state",
@@ -588,6 +733,7 @@ def _artifact_quarantine_schema_valid(inspector: object) -> bool:
         "owner_type": "VARCHAR(32)",
         "owner_id": "VARCHAR(36)",
         "relative_path": "TEXT",
+        "path_key": "TEXT",
         "expected_sha256": "VARCHAR(64)",
         "expected_size_bytes": "INTEGER",
         "state": "VARCHAR(20)",
@@ -608,9 +754,11 @@ def _artifact_quarantine_schema_valid(inspector: object) -> bool:
         "ck_artifact_gc_size": "expected_size_bytes>=0",
         "ck_artifact_gc_sha_format": "length(expected_sha256)=64andexpected_sha256notglob'*[^0-9a-f]*'",
         "ck_artifact_gc_attempts": "attempt_count>=0",
+        "ck_artifact_gc_uuid_identity": "is_canonical_uuid(id)=1andis_canonical_uuid(owner_id)=1and(lease_tokenisnulloris_canonical_uuid(lease_token)=1)",
+        "ck_artifact_gc_lease_state": "((state='claimed'andlease_tokenisnotnullandlease_expires_atisnotnull)or(state!='claimed'andlease_tokenisnullandlease_expires_atisnull))",
         "ck_artifact_gc_timestamps": "datetime(not_before)isnotnullanddatetime(created_at)isnotnullanddatetime(updated_at)isnotnulland(lease_expires_atisnullordatetime(lease_expires_at)isnotnull)and(completed_atisnullordatetime(completed_at)isnotnull)",
-        "ck_artifact_gc_relative_path": "length(trim(relative_path))>0andsubstr(relative_path,1,1)notin('/','\\')andinstr(relative_path,':')=0andinstr(relative_path,'\\')=0",
-        "ck_artifact_gc_quarantine_path": "quarantine_pathisnullor(length(trim(quarantine_path))>0andsubstr(quarantine_path,1,1)notin('/','\\')andinstr(quarantine_path,':')=0andinstr(quarantine_path,'\\')=0)",
+        "ck_artifact_gc_relative_path": "artifact_path_key(relative_path)isnotnullandpath_key=artifact_path_key(relative_path)",
+        "ck_artifact_gc_quarantine_path": "quarantine_pathisnullorartifact_path_key(quarantine_path)isnotnull",
     }
     try:
         tables = set(inspector.get_table_names())
@@ -634,17 +782,6 @@ def _artifact_quarantine_schema_valid(inspector: object) -> bool:
             for name, column in columns.items()
         } != expected_types:
             return False
-        package_columns = {
-            column["name"]: column
-            for column in inspector.get_columns("content_packages")
-        }
-        build_token = package_columns.get("build_token")
-        if (
-            build_token is None
-            or build_token.get("nullable") is not True
-            or str(build_token.get("type") or "").upper() != "VARCHAR(36)"
-        ):
-            return False
         checks = {
             item.get("name"): _compact_sql(item.get("sqltext"))
             for item in inspector.get_check_constraints("artifact_gc_queue")
@@ -661,12 +798,93 @@ def _artifact_quarantine_schema_valid(inspector: object) -> bool:
         }
         if indexes != {
             "uq_artifact_gc_open_owner": (
-                ("owner_type", "owner_id", "relative_path"),
+                ("owner_type", "owner_id", "path_key"),
                 True,
                 "statein('pending','claimed','quarantined','needs_human')",
             )
         }:
             return False
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+    return True
+
+
+_BUILD_TOKEN_INSERT_TRIGGER = """
+CREATE TRIGGER ck_content_packages_build_token_insert
+BEFORE INSERT ON content_packages
+WHEN NEW.build_token IS NOT NULL AND is_canonical_uuid(NEW.build_token) != 1
+BEGIN
+    SELECT RAISE(ABORT, 'content_packages.build_token must be a canonical UUID');
+END
+"""
+
+_BUILD_TOKEN_UPDATE_TRIGGER = """
+CREATE TRIGGER ck_content_packages_build_token_update
+BEFORE UPDATE OF build_token ON content_packages
+WHEN NEW.build_token IS NOT NULL AND is_canonical_uuid(NEW.build_token) != 1
+BEGIN
+    SELECT RAISE(ABORT, 'content_packages.build_token must be a canonical UUID');
+END
+"""
+
+
+def _create_artifact_quarantine_triggers(connection: Connection) -> None:
+    connection.execute(text("DROP TRIGGER IF EXISTS ck_content_packages_build_token_insert"))
+    connection.execute(text("DROP TRIGGER IF EXISTS ck_content_packages_build_token_update"))
+    connection.execute(text(_BUILD_TOKEN_INSERT_TRIGGER))
+    connection.execute(text(_BUILD_TOKEN_UPDATE_TRIGGER))
+
+
+def _artifact_quarantine_triggers_valid(connection: Connection) -> bool:
+    rows = connection.execute(
+        text(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+            "AND name IN ('ck_content_packages_build_token_insert', "
+            "'ck_content_packages_build_token_update')"
+        )
+    ).mappings().all()
+    actual = {row["name"]: _compact_sql(row["sql"]) for row in rows}
+    return actual == {
+        "ck_content_packages_build_token_insert": _compact_sql(
+            _BUILD_TOKEN_INSERT_TRIGGER
+        ),
+        "ck_content_packages_build_token_update": _compact_sql(
+            _BUILD_TOKEN_UPDATE_TRIGGER
+        ),
+    }
+
+
+def _artifact_quarantine_data_valid(connection: Connection) -> bool:
+    try:
+        build_tokens = connection.execute(
+            text("SELECT build_token FROM content_packages WHERE build_token IS NOT NULL")
+        ).scalars()
+        if any(not is_canonical_uuid_text(token) for token in build_tokens):
+            return False
+        rows = connection.execute(
+            text(
+                "SELECT id, owner_id, relative_path, path_key, quarantine_path, "
+                "state, lease_token, lease_expires_at FROM artifact_gc_queue"
+            )
+        ).mappings()
+        for row in rows:
+            expected_key = canonical_artifact_path_key(row["relative_path"])
+            lease_complete = (
+                is_canonical_uuid_text(row["lease_token"])
+                and row["lease_expires_at"] is not None
+            )
+            if (
+                not is_canonical_uuid_text(row["id"])
+                or not is_canonical_uuid_text(row["owner_id"])
+                or expected_key is None
+                or row["path_key"] != expected_key
+                or (
+                    row["quarantine_path"] is not None
+                    and canonical_artifact_path_key(row["quarantine_path"]) is None
+                )
+                or ((row["state"] == "claimed") != lease_complete)
+            ):
+                return False
     except (KeyError, TypeError, AttributeError, SQLAlchemyError):
         return False
     return True

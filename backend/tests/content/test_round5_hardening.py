@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from backend.app.db import Database
+from backend.app.db import Database, SchemaMigrationError
 from backend.app.features.content.models import (
     ContentItemRecord,
     ContentPackageRecord,
@@ -191,6 +191,12 @@ def test_startup_preserves_artifact_for_noncanonical_database_identity(
         )
     database_path = service.database.database_path
     service.database.close()
+
+    if package_id is not None:
+        with pytest.raises(SchemaMigrationError, match="manual migration"):
+            Database(database_path, runtime_dir=tmp_path)
+        assert changed_artifact.read_bytes() == original
+        return
 
     reopened = Database(database_path, runtime_dir=tmp_path)
     try:

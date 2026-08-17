@@ -395,3 +395,65 @@ Compilation and diff checks exited 0; Git emitted only the repository's Windows
 LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
 remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
 is still blocked until redesign Tasks 2—5 and an independent clean review finish.
+
+## Approved quarantine redesign — Task 1 fix round 1/5
+
+The first independent review found two Important gaps: a present migration marker
+could still be followed by `create_all`/`ALTER` repair, and open cleanup identity
+was based on raw path text without durable Windows-equivalent identity or strict
+UUID/lease relationships.
+
+Observed RED before production changes:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_schema.py -q
+25 failed, 5 passed in 2.99s
+
+python -m pytest backend/tests/content/test_artifact_cleanup_schema.py::test_cleanup_read_is_strict_and_has_no_mutation_defaults -q
+1 failed in 0.35s
+```
+
+Implemented findings:
+
+- Startup reads `task8_artifact_quarantine_v1` before `Base.metadata.create_all`.
+  When the marker exists, missing queue/build-token columns, CHECKs, triggers or the
+  exact partial index make the database unavailable; no DDL repair is attempted.
+- Marker-absent baseline and empty half-migrations remain retry-safe. DDL and startup
+  recovery complete before the marker is written; unsafe populated legacy cleanup
+  rows fail closed for isolated manual migration.
+- Cleanup rows persist `path_key`, derived from an NFC-normalized, Windows-casefolded
+  canonical relative path. Absolute paths, backslashes, colon paths, empty/dot/
+  whitespace segments, trailing dot/space, controls, reserved device stems and
+  non-NFC spellings are rejected by both Pydantic and SQLite CHECKs.
+- Open-row uniqueness now uses `(owner_type, owner_id, path_key)` so case-equivalent
+  Windows paths cannot create separate live cleanup identities.
+- Cleanup IDs, owner IDs and lease tokens must be canonical UUIDs. A `claimed` row
+  must have exactly one canonical token and expiry; every non-claimed row must have
+  neither. Strict read validation mirrors the physical contract.
+- Canonical `content_packages.build_token` is enforced for direct inserts and updates
+  by physically validated SQLite triggers, including legacy tables where SQLite
+  cannot add a column CHECK in place.
+- Historical interrupted package rows with noncanonical owner/path identity retain
+  their files and fail startup for manual migration rather than being silently
+  normalized or assigned a false cleanup owner.
+
+Final fix-round verification:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_schema.py backend/tests/content/test_content_schema_migration.py -q
+34 passed in 2.58s
+
+python -m pytest backend/tests/content -q
+126 passed in 12.55s
+
+python -m pytest backend/tests -q
+439 passed, 1 skipped in 25.13s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only Windows LF/CRLF notices.
+Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android remains
+`not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8 remains
+blocked pending redesign Tasks 2—5 and independent clean review.

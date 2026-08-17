@@ -222,6 +222,16 @@ class ArtifactCleanupRecord(Base):
         ),
         CheckConstraint("attempt_count >= 0", name="ck_artifact_gc_attempts"),
         CheckConstraint(
+            "is_canonical_uuid(id) = 1 AND is_canonical_uuid(owner_id) = 1 "
+            "AND (lease_token IS NULL OR is_canonical_uuid(lease_token) = 1)",
+            name="ck_artifact_gc_uuid_identity",
+        ),
+        CheckConstraint(
+            "((state = 'claimed' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL) "
+            "OR (state != 'claimed' AND lease_token IS NULL AND lease_expires_at IS NULL))",
+            name="ck_artifact_gc_lease_state",
+        ),
+        CheckConstraint(
             "datetime(not_before) IS NOT NULL AND datetime(created_at) IS NOT NULL "
             "AND datetime(updated_at) IS NOT NULL "
             "AND (lease_expires_at IS NULL OR datetime(lease_expires_at) IS NOT NULL) "
@@ -229,21 +239,19 @@ class ArtifactCleanupRecord(Base):
             name="ck_artifact_gc_timestamps",
         ),
         CheckConstraint(
-            "length(trim(relative_path)) > 0 AND substr(relative_path, 1, 1) NOT IN ('/','\\') "
-            "AND instr(relative_path, ':') = 0 AND instr(relative_path, '\\') = 0",
+            "artifact_path_key(relative_path) IS NOT NULL "
+            "AND path_key = artifact_path_key(relative_path)",
             name="ck_artifact_gc_relative_path",
         ),
         CheckConstraint(
-            "quarantine_path IS NULL OR (length(trim(quarantine_path)) > 0 "
-            "AND substr(quarantine_path, 1, 1) NOT IN ('/','\\') "
-            "AND instr(quarantine_path, ':') = 0 AND instr(quarantine_path, '\\') = 0)",
+            "quarantine_path IS NULL OR artifact_path_key(quarantine_path) IS NOT NULL",
             name="ck_artifact_gc_quarantine_path",
         ),
         Index(
             "uq_artifact_gc_open_owner",
             "owner_type",
             "owner_id",
-            "relative_path",
+            "path_key",
             unique=True,
             sqlite_where=text(
                 "state IN ('pending','claimed','quarantined','needs_human')"
@@ -255,6 +263,7 @@ class ArtifactCleanupRecord(Base):
     owner_type: Mapped[str] = mapped_column(String(32), nullable=False)
     owner_id: Mapped[str] = mapped_column(String(36), nullable=False)
     relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    path_key: Mapped[str] = mapped_column(Text, nullable=False)
     expected_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     expected_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     state: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")

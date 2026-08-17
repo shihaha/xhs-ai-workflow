@@ -9,6 +9,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.app.db import canonical_artifact_path_key, is_canonical_uuid_text
+
 
 _EVIDENCE = re.compile(r"^(?:artifact|rank-item):([1-9][0-9]*)$", re.ASCII)
 _MAX_SQLITE_ID = 9_223_372_036_854_775_807
@@ -247,22 +249,57 @@ class ContentPackageRead(StrictModel):
 
 
 class ArtifactCleanupRead(StrictModel):
-    id: str
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str = Field(min_length=36, max_length=36)
     owner_type: Literal["material", "content_package"]
-    owner_id: str
-    relative_path: str
-    expected_sha256: str
-    expected_size_bytes: int
+    owner_id: str = Field(min_length=36, max_length=36)
+    relative_path: str = Field(min_length=1, max_length=1000)
+    path_key: str = Field(min_length=1, max_length=1000)
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_size_bytes: int = Field(ge=0)
     state: Literal[
         "pending", "claimed", "quarantined", "deleted", "needs_human", "cancelled"
     ]
-    reason: str
+    reason: str = Field(min_length=1, max_length=64)
     not_before: datetime
     lease_token: str | None
     lease_expires_at: datetime | None
     quarantine_path: str | None
-    attempt_count: int
+    attempt_count: int = Field(ge=0)
     last_error_category: str | None
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+
+    @field_validator("id", "owner_id")
+    @classmethod
+    def canonical_identity(cls, value: str) -> str:
+        if not is_canonical_uuid_text(value):
+            raise ValueError("cleanup identities must be canonical UUIDs")
+        return value
+
+    @field_validator("lease_token")
+    @classmethod
+    def canonical_lease(cls, value: str | None) -> str | None:
+        if value is not None and not is_canonical_uuid_text(value):
+            raise ValueError("lease_token must be a canonical UUID")
+        return value
+
+    @model_validator(mode="after")
+    def canonical_paths_and_lease_state(self) -> "ArtifactCleanupRead":
+        expected_key = canonical_artifact_path_key(self.relative_path)
+        if expected_key is None or self.path_key != expected_key:
+            raise ValueError("relative_path and path_key must be one canonical identity")
+        if (
+            self.quarantine_path is not None
+            and canonical_artifact_path_key(self.quarantine_path) is None
+        ):
+            raise ValueError("quarantine_path must be a canonical managed path")
+        if self.state == "claimed":
+            lease_valid = self.lease_token is not None and self.lease_expires_at is not None
+        else:
+            lease_valid = self.lease_token is None and self.lease_expires_at is None
+        if not lease_valid:
+            raise ValueError("only claimed cleanup records may hold a complete lease")
+        return self

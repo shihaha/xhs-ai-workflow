@@ -16,15 +16,16 @@ from backend.app.features.content.schemas import ExportCreate
 from backend.tests.content.test_hardening import _approval, _image_item
 
 
-def _cleanup_values(*, state: str = "pending", owner_id: str | None = None) -> dict[str, object]:
-    return {
+def _cleanup_values(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
         "id": str(uuid4()),
         "owner_type": "content_package",
-        "owner_id": owner_id or str(uuid4()),
+        "owner_id": str(uuid4()),
         "relative_path": "content-packages/item/package.zip",
+        "path_key": "content-packages/item/package.zip",
         "expected_sha256": "a" * 64,
         "expected_size_bytes": 12,
-        "state": state,
+        "state": "pending",
         "reason": "worker_restart_required",
         "not_before": datetime(2026, 8, 18),
         "lease_token": None,
@@ -36,6 +37,8 @@ def _cleanup_values(*, state: str = "pending", owner_id: str | None = None) -> d
         "updated_at": datetime(2026, 8, 18),
         "completed_at": None,
     }
+    values.update(overrides)
+    return values
 
 
 def _insert_cleanup(database: Database, **overrides: object) -> object:
@@ -57,6 +60,17 @@ def test_fresh_schema_has_cleanup_queue_build_token_and_migration_marker(tmp_pat
             column["name"] for column in inspection.get_columns("content_packages")
         }
         assert "build_token" in package_columns
+        cleanup_columns = {
+            column["name"] for column in inspection.get_columns("artifact_gc_queue")
+        }
+        assert "path_key" in cleanup_columns
+        cleanup_index = {
+            item["name"]: tuple(item["column_names"])
+            for item in inspection.get_indexes("artifact_gc_queue")
+        }
+        assert cleanup_index["uq_artifact_gc_open_owner"] == (
+            "owner_type", "owner_id", "path_key"
+        )
         with database.engine.connect() as connection:
             assert connection.scalar(
                 text(
@@ -118,6 +132,118 @@ def test_cleanup_timestamps_are_physically_constrained(tmp_path: Path) -> None:
         database.close()
 
 
+@pytest.mark.parametrize(
+    "invalid_path",
+    [
+        "/absolute/file.zip",
+        "C:/absolute/file.zip",
+        "folder\\file.zip",
+        "folder//file.zip",
+        "folder/./file.zip",
+        "folder/../file.zip",
+        "folder/   /file.zip",
+        "folder./file.zip",
+        "folder /file.zip",
+        "folder/CON.txt",
+        "folder/bad\x1f.zip",
+        "folder/e\u0301.zip",
+    ],
+)
+def test_cleanup_paths_are_canonical_in_database(
+    tmp_path: Path, invalid_path: str
+) -> None:
+    database = Database(tmp_path / f"invalid-{uuid4()}.sqlite3", runtime_dir=tmp_path)
+    try:
+        with pytest.raises(IntegrityError):
+            _insert_cleanup(
+                database,
+                relative_path=invalid_path,
+                path_key=invalid_path.casefold(),
+            )
+        with pytest.raises(IntegrityError):
+            _insert_cleanup(database, quarantine_path=invalid_path)
+    finally:
+        database.close()
+
+
+def test_windows_equivalent_paths_share_one_open_identity(tmp_path: Path) -> None:
+    database = Database(tmp_path / "path-key.sqlite3", runtime_dir=tmp_path)
+    try:
+        owner_id = str(uuid4())
+        first = _insert_cleanup(
+            database,
+            owner_id=owner_id,
+            relative_path="Content-Packages/Item/File.ZIP",
+            path_key="content-packages/item/file.zip",
+        )
+        with pytest.raises(IntegrityError):
+            _insert_cleanup(
+                database,
+                owner_id=owner_id,
+                relative_path="content-packages/item/file.zip",
+                path_key="content-packages/item/file.zip",
+            )
+        assert first.path_key == "content-packages/item/file.zip"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"id": "NOT-A-UUID"},
+        {"owner_id": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"},
+        {"lease_token": str(uuid4()), "lease_expires_at": datetime(2026, 8, 19)},
+        {"state": "claimed"},
+        {
+            "state": "claimed",
+            "lease_token": "not-a-uuid",
+            "lease_expires_at": datetime(2026, 8, 19),
+        },
+    ],
+)
+def test_cleanup_identity_and_lease_state_are_physically_constrained(
+    tmp_path: Path, overrides: dict[str, object]
+) -> None:
+    database = Database(tmp_path / f"identity-{uuid4()}.sqlite3", runtime_dir=tmp_path)
+    try:
+        with pytest.raises(IntegrityError):
+            _insert_cleanup(database, **overrides)
+    finally:
+        database.close()
+
+
+def test_claimed_cleanup_accepts_one_complete_canonical_lease(tmp_path: Path) -> None:
+    database = Database(tmp_path / "valid-lease.sqlite3", runtime_dir=tmp_path)
+    try:
+        record = _insert_cleanup(
+            database,
+            state="claimed",
+            lease_token=str(uuid4()),
+            lease_expires_at=datetime(2026, 8, 19),
+        )
+        assert record.state == "claimed"
+    finally:
+        database.close()
+
+
+def test_build_token_is_canonical_uuid_on_direct_write(tmp_path: Path) -> None:
+    service, item, image = _image_item(tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    package = service.export_package(
+        item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+    )
+    try:
+        with pytest.raises(IntegrityError):
+            with service.database.engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE content_packages SET build_token='NOT-A-UUID' WHERE id=:id"),
+                    {"id": package.id},
+                )
+    finally:
+        service.database.close()
+
+
 def test_cleanup_read_is_strict_and_has_no_mutation_defaults() -> None:
     values = _cleanup_values()
     read = content_schemas.ArtifactCleanupRead.model_validate(values)
@@ -128,6 +254,18 @@ def test_cleanup_read_is_strict_and_has_no_mutation_defaults() -> None:
     incomplete.pop("lease_token")
     with pytest.raises(ValidationError):
         content_schemas.ArtifactCleanupRead.model_validate(incomplete)
+    with pytest.raises(ValidationError):
+        content_schemas.ArtifactCleanupRead.model_validate(
+            {**values, "relative_path": "Folder/File.zip", "path_key": "WRONG"}
+        )
+    with pytest.raises(ValidationError):
+        content_schemas.ArtifactCleanupRead.model_validate(
+            {**values, "lease_expires_at": datetime(2026, 8, 19)}
+        )
+    with pytest.raises(ValidationError):
+        content_schemas.ArtifactCleanupRead.model_validate(
+            {**values, "quarantine_path": "artifacts-quarantine/../victim.zip"}
+        )
 
 
 def test_legacy_building_package_is_failed_and_enqueued_without_deleting_file(
@@ -200,6 +338,71 @@ def test_marker_does_not_hide_malformed_cleanup_index(tmp_path: Path) -> None:
         )
     with pytest.raises(SchemaMigrationError, match="artifact cleanup"):
         Database(path, runtime_dir=tmp_path)
+    with sqlite3.connect(path) as connection:
+        index = next(
+            row for row in connection.execute("PRAGMA index_list(artifact_gc_queue)")
+            if row[1] == "uq_artifact_gc_open_owner"
+        )
+        assert index[2] == 0
+
+
+def test_marker_present_missing_cleanup_table_fails_without_repair(tmp_path: Path) -> None:
+    path = tmp_path / "marker-missing-table.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE artifact_gc_queue")
+    with pytest.raises(SchemaMigrationError, match="artifact cleanup"):
+        Database(path, runtime_dir=tmp_path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='artifact_gc_queue'"
+        ).fetchone()[0] == 0
+
+
+def test_marker_present_missing_cleanup_constraints_fails_without_repair(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "marker-missing-constraints.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE artifact_gc_queue")
+        connection.execute(
+            "CREATE TABLE artifact_gc_queue ("
+            "id VARCHAR(36) NOT NULL PRIMARY KEY, owner_type VARCHAR(32) NOT NULL, "
+            "owner_id VARCHAR(36) NOT NULL, relative_path TEXT NOT NULL, "
+            "path_key TEXT NOT NULL, expected_sha256 VARCHAR(64) NOT NULL, "
+            "expected_size_bytes INTEGER NOT NULL, state VARCHAR(20) NOT NULL, "
+            "reason VARCHAR(64) NOT NULL, not_before DATETIME NOT NULL, "
+            "lease_token VARCHAR(36), lease_expires_at DATETIME, quarantine_path TEXT, "
+            "attempt_count INTEGER NOT NULL, last_error_category VARCHAR(64), "
+            "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, completed_at DATETIME)"
+        )
+    with pytest.raises(SchemaMigrationError, match="artifact cleanup"):
+        Database(path, runtime_dir=tmp_path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
+            "AND name='uq_artifact_gc_open_owner'"
+        ).fetchone()[0] == 0
+
+
+def test_marker_present_missing_build_token_fails_without_repair(tmp_path: Path) -> None:
+    path = tmp_path / "marker-missing-token.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER ck_content_packages_build_token_insert")
+        connection.execute("DROP TRIGGER ck_content_packages_build_token_update")
+        connection.execute("ALTER TABLE content_packages DROP COLUMN build_token")
+    with pytest.raises(SchemaMigrationError, match="artifact cleanup"):
+        Database(path, runtime_dir=tmp_path)
+    with sqlite3.connect(path) as connection:
+        assert "build_token" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(content_packages)")
+        }
 
 
 def test_half_migration_without_marker_is_retry_safe(tmp_path: Path) -> None:
