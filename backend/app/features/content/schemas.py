@@ -244,3 +244,25 @@ class ContentPackageRead(StrictModel):
     sha256: str
     size_bytes: int
     created_at: datetime
+
+
+class ArtifactCleanupRead(StrictModel):
+    id: str
+    owner_type: Literal["material", "content_package"]
+    owner_id: str
+    relative_path: str
+    expected_sha256: str
+    expected_size_bytes: int
+    state: Literal[
+        "pending", "claimed", "quarantined", "deleted", "needs_human", "cancelled"
+    ]
+    reason: str
+    not_before: datetime
+    lease_token: str | None
+    lease_expires_at: datetime | None
+    quarantine_path: str | None
+    attempt_count: int
+    last_error_category: str | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None

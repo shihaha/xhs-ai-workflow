@@ -1,12 +1,12 @@
 """SQLite database lifecycle for durable local workbench facts."""
 
 import json
-from pathlib import Path, PurePosixPath
-import re
-import unicodedata
-from uuid import UUID
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -43,6 +43,7 @@ class Database:
         """Create schema without creating any business records."""
         from backend.app.features.analysis.models import AnalysisRecord, OpportunityRecord
         from backend.app.features.content.models import (
+            ArtifactCleanupRecord,
             ContentItemRecord,
             ContentPackageRecord,
             ContentReviewRecord,
@@ -56,6 +57,7 @@ class Database:
         _ = (
             AnalysisRecord,
             OpportunityRecord,
+            ArtifactCleanupRecord,
             ContentItemRecord,
             ContentPackageRecord,
             ContentReviewRecord,
@@ -72,6 +74,7 @@ class Database:
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
         self._migrate_content_schema()
+        self._migrate_artifact_quarantine()
 
     def _migrate_content_schema(self) -> None:
         inspector = inspect(self.engine)
@@ -100,37 +103,74 @@ class Database:
         if not _content_schema_valid(inspector):
             raise SchemaMigrationError("Task 8 schema validation failed.")
         with self.engine.begin() as connection:
-            stranded_packages = connection.execute(
+            connection.execute(
                 text(
-                    "SELECT id, content_item_id, path FROM content_packages "
+                    "INSERT OR IGNORE INTO workbench_schema_migrations (name, applied_at) "
+                    "VALUES ('task8_content_v2', CURRENT_TIMESTAMP)"
+                )
+            )
+
+    def _migrate_artifact_quarantine(self) -> None:
+        """Install and validate durable cleanup facts, then recover interrupted builds."""
+        from backend.app.features.content.models import ArtifactCleanupRecord
+
+        with self.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS workbench_schema_migrations ("
+                    "name VARCHAR(200) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL)"
+                )
+            )
+            package_columns = {
+                column["name"]: column
+                for column in inspect(connection).get_columns("content_packages")
+            }
+            if "build_token" not in package_columns:
+                connection.execute(
+                    text("ALTER TABLE content_packages ADD COLUMN build_token VARCHAR(36)")
+                )
+            if "artifact_gc_queue" not in inspect(connection).get_table_names():
+                ArtifactCleanupRecord.__table__.create(connection)
+
+            inspector = inspect(connection)
+            if not _artifact_quarantine_schema_valid(inspector):
+                raise SchemaMigrationError("Task 8 artifact cleanup schema validation failed.")
+
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            stranded = connection.execute(
+                text(
+                    "SELECT id, path, sha256, size_bytes FROM content_packages "
                     "WHERE status='building'"
                 )
             ).mappings().all()
-            if self.runtime_dir is not None:
-                from backend.app.features.content.export import (
-                    remove_contained_regular,
-                    windows_artifact_reference,
-                    windows_artifact_references_conflict,
+            for package in stranded:
+                connection.execute(
+                    sqlite_insert(ArtifactCleanupRecord).on_conflict_do_nothing(
+                        index_elements=["owner_type", "owner_id", "relative_path"],
+                        index_where=text(
+                            "state IN ('pending','claimed','quarantined','needs_human')"
+                        ),
+                    ),
+                    {
+                        "id": str(uuid4()),
+                        "owner_type": "content_package",
+                        "owner_id": package["id"],
+                        "relative_path": package["path"],
+                        "expected_sha256": package["sha256"],
+                        "expected_size_bytes": package["size_bytes"],
+                        "state": "pending",
+                        "reason": "worker_restart_required",
+                        "not_before": now,
+                        "lease_token": None,
+                        "lease_expires_at": None,
+                        "quarantine_path": None,
+                        "attempt_count": 0,
+                        "last_error_category": None,
+                        "created_at": now,
+                        "updated_at": now,
+                        "completed_at": None,
+                    },
                 )
-
-                material_paths = list(
-                    connection.execute(
-                        text("SELECT path FROM content_product_materials")
-                    ).scalars().all()
-                )
-                package_references = connection.execute(
-                    text("SELECT id, path FROM content_packages")
-                ).mappings().all()
-                for package in stranded_packages:
-                    if _building_package_owns_artifact(
-                        package,
-                        runtime_dir=self.runtime_dir,
-                        material_paths=material_paths,
-                        package_references=package_references,
-                        reference_resolver=windows_artifact_reference,
-                        reference_conflicts=windows_artifact_references_conflict,
-                    ):
-                        remove_contained_regular(self.runtime_dir, package["path"])
             connection.execute(
                 text(
                     "UPDATE content_packages SET status='failed', "
@@ -140,9 +180,12 @@ class Database:
             connection.execute(
                 text(
                     "INSERT OR IGNORE INTO workbench_schema_migrations (name, applied_at) "
-                    "VALUES ('task8_content_v2', CURRENT_TIMESTAMP)"
+                    "VALUES ('task8_artifact_quarantine_v1', CURRENT_TIMESTAMP)"
                 )
             )
+
+        if not _artifact_quarantine_schema_valid(inspect(self.engine)):
+            raise SchemaMigrationError("Task 8 artifact cleanup schema validation failed.")
 
     def _migrate_artifact_provenance(self) -> None:
         columns = {
@@ -504,51 +547,126 @@ def _compact_sql(value: object) -> str:
     return "".join(compact)
 
 
-_PACKAGE_FILENAME = re.compile(r"^(?P<id>[0-9a-f-]{36})(?:-[0-9a-f]{32})?\.zip$")
+def _artifact_quarantine_schema_valid(inspector: object) -> bool:
+    """Validate the physical cleanup contract instead of trusting a marker."""
 
-
-def _building_package_owns_artifact(
-    package: object,
-    *,
-    runtime_dir: Path,
-    material_paths: list[object],
-    package_references: list[object],
-    reference_resolver: object,
-    reference_conflicts: object,
-) -> bool:
-    """Prove a stranded path is exclusively the artifact reserved by this package."""
-
+    required_columns = {
+        "id",
+        "owner_type",
+        "owner_id",
+        "relative_path",
+        "expected_sha256",
+        "expected_size_bytes",
+        "state",
+        "reason",
+        "not_before",
+        "lease_token",
+        "lease_expires_at",
+        "quarantine_path",
+        "attempt_count",
+        "last_error_category",
+        "created_at",
+        "updated_at",
+        "completed_at",
+    }
+    required_not_null = {
+        "id",
+        "owner_type",
+        "owner_id",
+        "relative_path",
+        "expected_sha256",
+        "expected_size_bytes",
+        "state",
+        "reason",
+        "not_before",
+        "attempt_count",
+        "created_at",
+        "updated_at",
+    }
+    expected_types = {
+        "id": "VARCHAR(36)",
+        "owner_type": "VARCHAR(32)",
+        "owner_id": "VARCHAR(36)",
+        "relative_path": "TEXT",
+        "expected_sha256": "VARCHAR(64)",
+        "expected_size_bytes": "INTEGER",
+        "state": "VARCHAR(20)",
+        "reason": "VARCHAR(64)",
+        "not_before": "DATETIME",
+        "lease_token": "VARCHAR(36)",
+        "lease_expires_at": "DATETIME",
+        "quarantine_path": "TEXT",
+        "attempt_count": "INTEGER",
+        "last_error_category": "VARCHAR(64)",
+        "created_at": "DATETIME",
+        "updated_at": "DATETIME",
+        "completed_at": "DATETIME",
+    }
+    expected_checks = {
+        "ck_artifact_gc_owner_type": "owner_typein('material','content_package')",
+        "ck_artifact_gc_state": "statein('pending','claimed','quarantined','deleted','needs_human','cancelled')",
+        "ck_artifact_gc_size": "expected_size_bytes>=0",
+        "ck_artifact_gc_sha_format": "length(expected_sha256)=64andexpected_sha256notglob'*[^0-9a-f]*'",
+        "ck_artifact_gc_attempts": "attempt_count>=0",
+        "ck_artifact_gc_timestamps": "datetime(not_before)isnotnullanddatetime(created_at)isnotnullanddatetime(updated_at)isnotnulland(lease_expires_atisnullordatetime(lease_expires_at)isnotnull)and(completed_atisnullordatetime(completed_at)isnotnull)",
+        "ck_artifact_gc_relative_path": "length(trim(relative_path))>0andsubstr(relative_path,1,1)notin('/','\\')andinstr(relative_path,':')=0andinstr(relative_path,'\\')=0",
+        "ck_artifact_gc_quarantine_path": "quarantine_pathisnullor(length(trim(quarantine_path))>0andsubstr(quarantine_path,1,1)notin('/','\\')andinstr(quarantine_path,':')=0andinstr(quarantine_path,'\\')=0)",
+    }
     try:
-        package_id = package["id"]  # type: ignore[index]
-        content_item_id = package["content_item_id"]  # type: ignore[index]
-        relative_path = package["path"]  # type: ignore[index]
-        if not all(isinstance(value, str) and value for value in (package_id, content_item_id, relative_path)):
+        tables = set(inspector.get_table_names())
+        if "artifact_gc_queue" not in tables or "content_packages" not in tables:
             return False
-        if str(UUID(package_id)) != package_id or str(UUID(content_item_id)) != content_item_id:
+        columns = {
+            column["name"]: column
+            for column in inspector.get_columns("artifact_gc_queue")
+        }
+        if set(columns) != required_columns:
             return False
-        path = PurePosixPath(relative_path)
-        if path.as_posix() != relative_path or unicodedata.normalize("NFC", relative_path) != relative_path:
+        if any(columns[name].get("nullable") is not False for name in required_not_null):
             return False
-        if path.parts[:2] != ("content-packages", content_item_id) or len(path.parts) != 3:
+        if any(
+            columns[name].get("nullable") is not True
+            for name in required_columns - required_not_null
+        ):
             return False
-        match = _PACKAGE_FILENAME.fullmatch(path.name)
-        if match is None or match.group("id") != package_id:
+        if {
+            name: str(column.get("type") or "").upper()
+            for name, column in columns.items()
+        } != expected_types:
             return False
-        resolver = reference_resolver  # keep the injectable boundary narrow for tests
-        owned = resolver(runtime_dir, relative_path)  # type: ignore[operator]
-        if owned is None or owned[1] is None:
+        package_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("content_packages")
+        }
+        build_token = package_columns.get("build_token")
+        if (
+            build_token is None
+            or build_token.get("nullable") is not True
+            or str(build_token.get("type") or "").upper() != "VARCHAR(36)"
+        ):
             return False
-        for material_path in material_paths:
-            if isinstance(material_path, str) and reference_conflicts(owned, resolver(runtime_dir, material_path)):  # type: ignore[operator]
-                return False
-        owners = 0
-        for reference in package_references:
-            reference_id = reference["id"]  # type: ignore[index]
-            reference_path = reference["path"]  # type: ignore[index]
-            if isinstance(reference_path, str) and reference_conflicts(owned, resolver(runtime_dir, reference_path)):  # type: ignore[operator]
-                owners += 1
-                if reference_id != package_id:
-                    return False
-        return owners == 1
-    except (KeyError, TypeError, ValueError, AttributeError):
+        checks = {
+            item.get("name"): _compact_sql(item.get("sqltext"))
+            for item in inspector.get_check_constraints("artifact_gc_queue")
+        }
+        if checks != expected_checks:
+            return False
+        indexes = {
+            item.get("name"): (
+                tuple(item.get("column_names") or ()),
+                bool(item.get("unique")),
+                _compact_sql((item.get("dialect_options") or {}).get("sqlite_where")),
+            )
+            for item in inspector.get_indexes("artifact_gc_queue")
+        }
+        if indexes != {
+            "uq_artifact_gc_open_owner": (
+                ("owner_type", "owner_id", "relative_path"),
+                True,
+                "statein('pending','claimed','quarantined','needs_human')",
+            )
+        }:
+            return False
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
         return False
+    return True

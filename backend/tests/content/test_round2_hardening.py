@@ -13,7 +13,11 @@ from sqlalchemy import text
 
 from backend.app.db import Database, SchemaMigrationError
 from backend.app.features.analysis.models import AnalysisRecord, OpportunityRecord
-from backend.app.features.content.models import ContentPackageRecord, ProductRecord
+from backend.app.features.content.models import (
+    ArtifactCleanupRecord,
+    ContentPackageRecord,
+    ProductRecord,
+)
 from backend.app.features.content.schemas import ExportCreate, MaterialCreate, RegenerateCreate, ReviewCreate
 from backend.app.features.content.service import ContentStateError, ContentValidationError
 from backend.tests.content.test_hardening import PNG_1X1, _approval, _image_item
@@ -141,7 +145,7 @@ def test_package_read_uses_package_limit_not_material_file_limit(tmp_path: Path)
     assert service.get_package(package.id).availability == "available"
 
 
-def test_startup_recovery_removes_safe_contained_building_artifact(tmp_path: Path) -> None:
+def test_startup_recovery_retains_building_artifact_and_enqueues_cleanup(tmp_path: Path) -> None:
     service, item, image = _image_item(tmp_path)
     approved = service.review(item.id, _approval(item, image))
     package = service.export_package(item.id, ExportCreate(expected_revision_id=approved.current_revision.id))
@@ -153,10 +157,18 @@ def test_startup_recovery_removes_safe_contained_building_artifact(tmp_path: Pat
     database_path = service.database.database_path
     service.database.close()
     reopened = Database(database_path, runtime_dir=tmp_path)
-    assert not target.exists()
-    with reopened.session() as session:
-        assert session.get(ContentPackageRecord, package.id).status == "failed"
-    reopened.close()
+    try:
+        assert target.exists()
+        with reopened.session() as session:
+            assert session.get(ContentPackageRecord, package.id).status == "failed"
+            cleanup = session.query(ArtifactCleanupRecord).filter_by(
+                owner_type="content_package",
+                owner_id=package.id,
+                relative_path=package.path,
+            ).one()
+            assert cleanup.state == "pending"
+    finally:
+        reopened.close()
 
 
 def test_export_includes_visual_checks_and_complete_image_plan(tmp_path: Path) -> None:

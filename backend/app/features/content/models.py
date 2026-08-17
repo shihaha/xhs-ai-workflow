@@ -199,5 +199,72 @@ class ContentPackageRecord(Base):
     path: Mapped[str] = mapped_column(Text, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    build_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ArtifactCleanupRecord(Base):
+    __tablename__ = "artifact_gc_queue"
+    __table_args__ = (
+        CheckConstraint(
+            "owner_type IN ('material','content_package')",
+            name="ck_artifact_gc_owner_type",
+        ),
+        CheckConstraint(
+            "state IN ('pending','claimed','quarantined','deleted','needs_human','cancelled')",
+            name="ck_artifact_gc_state",
+        ),
+        CheckConstraint("expected_size_bytes >= 0", name="ck_artifact_gc_size"),
+        CheckConstraint(
+            "length(expected_sha256) = 64 AND expected_sha256 NOT GLOB '*[^0-9a-f]*'",
+            name="ck_artifact_gc_sha_format",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_artifact_gc_attempts"),
+        CheckConstraint(
+            "datetime(not_before) IS NOT NULL AND datetime(created_at) IS NOT NULL "
+            "AND datetime(updated_at) IS NOT NULL "
+            "AND (lease_expires_at IS NULL OR datetime(lease_expires_at) IS NOT NULL) "
+            "AND (completed_at IS NULL OR datetime(completed_at) IS NOT NULL)",
+            name="ck_artifact_gc_timestamps",
+        ),
+        CheckConstraint(
+            "length(trim(relative_path)) > 0 AND substr(relative_path, 1, 1) NOT IN ('/','\\') "
+            "AND instr(relative_path, ':') = 0 AND instr(relative_path, '\\') = 0",
+            name="ck_artifact_gc_relative_path",
+        ),
+        CheckConstraint(
+            "quarantine_path IS NULL OR (length(trim(quarantine_path)) > 0 "
+            "AND substr(quarantine_path, 1, 1) NOT IN ('/','\\') "
+            "AND instr(quarantine_path, ':') = 0 AND instr(quarantine_path, '\\') = 0)",
+            name="ck_artifact_gc_quarantine_path",
+        ),
+        Index(
+            "uq_artifact_gc_open_owner",
+            "owner_type",
+            "owner_id",
+            "relative_path",
+            unique=True,
+            sqlite_where=text(
+                "state IN ('pending','claimed','quarantined','needs_human')"
+            ),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    not_before: Mapped[datetime] = mapped_column(nullable=False)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    quarantine_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(nullable=True)

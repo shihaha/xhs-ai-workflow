@@ -343,3 +343,55 @@ LF/CRLF notices.
 Live Bailian and Android-device validation remain `not_run` because no live key or
 device was supplied. This round makes no live-provider, real-device or seven-day UAT
 claim.
+
+## Approved quarantine redesign — Task 1: durable schema and startup recovery
+
+The approved replacement for request/startup-time deletion began with a durable
+database boundary. The initial focused run was observed RED before production
+changes:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_schema.py -q
+8 failed in 1.01s
+```
+
+The failures covered the absent cleanup table, package builder token, strict read
+schema, migration marker, physical constraints and enqueue-only startup recovery.
+A separate timestamp-constraint probe was also observed RED (`1 failed in 0.39s`)
+before the database CHECK was added.
+
+Implemented in this task:
+
+- Added `artifact_gc_queue` with strict owner/state/size/hash/path/timestamp/attempt
+  CHECK constraints and one partial unique index for open owner/path facts.
+- Added nullable `content_packages.build_token` for the exact builder CAS completed
+  by later redesign tasks.
+- Added `task8_artifact_quarantine_v1`, which is retry-safe when physical DDL exists
+  without the marker and validates columns, types, nullability, named CHECKs and the
+  exact partial index before trusting the database.
+- Startup now changes interrupted `building` packages to `failed` and atomically
+  enqueues a `pending` cleanup fact. It never opens, moves or deletes the artifact.
+- Replaced the two old startup-deletion regression expectations with the approved
+  retain-and-enqueue contract; configured runtime and database-parent files are both
+  retained.
+
+Final Task-1 verification:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_schema.py backend/tests/content/test_content_schema_migration.py -q
+11 passed in 1.18s
+
+python -m pytest backend/tests/content -q
+103 passed in 10.70s
+
+python -m pytest backend/tests -q
+416 passed, 1 skipped in 23.68s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only the repository's Windows
+LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
+remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
+is still blocked until redesign Tasks 2—5 and an independent clean review finish.

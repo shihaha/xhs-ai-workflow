@@ -10,13 +10,15 @@ from backend.app.features.content.export import (
     deterministic_zip,
     remove_contained_regular,
 )
-from backend.app.features.content.models import ContentPackageRecord
+from backend.app.features.content.models import ArtifactCleanupRecord, ContentPackageRecord
 from backend.app.features.content.schemas import ExportCreate
 from backend.app.features.content.service import ContentValidationError, _validate_material_bytes
 from backend.tests.content.test_hardening import _approval, _image_item
 
 
-def test_startup_cleanup_uses_configured_runtime_not_database_parent(tmp_path: Path) -> None:
+def test_startup_recovery_retains_configured_runtime_and_database_parent_files(
+    tmp_path: Path,
+) -> None:
     database_dir = tmp_path / "database"
     runtime_dir = tmp_path / "runtime"
     database_dir.mkdir()
@@ -39,10 +41,19 @@ def test_startup_cleanup_uses_configured_runtime_not_database_parent(tmp_path: P
         )
 
     reopened = Database(database_path, runtime_dir=runtime_dir)
-    reopened.close()
-
-    assert not (runtime_dir / package.path).exists()
-    assert unrelated.read_bytes() == b"unrelated"
+    try:
+        assert (runtime_dir / package.path).exists()
+        assert unrelated.read_bytes() == b"unrelated"
+        with reopened.session() as session:
+            assert session.get(ContentPackageRecord, package.id).status == "failed"
+            cleanup = session.query(ArtifactCleanupRecord).filter_by(
+                owner_type="content_package",
+                owner_id=package.id,
+                relative_path=package.path,
+            ).one()
+            assert cleanup.state == "pending"
+    finally:
+        reopened.close()
 
 
 def test_remove_contained_regular_is_handle_bound_during_parent_swap(
