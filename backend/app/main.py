@@ -9,7 +9,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from backend.app.api.health import router as health_router
 from backend.app.api.jobs import router as jobs_router
 from backend.app.adapters.android_device import AndroidDeviceAdapter
+from backend.app.adapters.bailian import BailianModelAdapter
 from backend.app.db import Database
+from backend.app.features.analysis.api import router as analysis_router
+from backend.app.features.analysis.service import AnalysisService
 from backend.app.features.radar.api import router as radar_router
 from backend.app.features.radar.service import RadarService
 from backend.app.features.shops.api import router as shops_router
@@ -44,6 +47,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.radar_service = None
     app.state.android_adapter = None
     app.state.shop_service = None
+    app.state.analysis_service = None
+    app.state.bailian_adapter = BailianModelAdapter(
+        api_key=app.state.settings.bailian_api_key,
+        base_url=app.state.settings.bailian_base_url,
+        model=app.state.settings.bailian_text_model,
+        max_attempts=app.state.settings.bailian_max_attempts,
+        timeout_seconds=app.state.settings.bailian_timeout_seconds,
+    )
     app.state.database_error = None
     try:
         if database_path.is_dir():
@@ -53,6 +64,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.database, runtime_dir=app.state.settings.runtime_dir
         )
         app.state.radar_service = RadarService(app.state.database)
+        app.state.analysis_service = AnalysisService(
+            app.state.database, app.state.bailian_adapter
+        )
         app.state.job_service.recover_expired_running(
             worker_job_types=ANDROID_SHOP_JOB_TYPES
         )
@@ -60,6 +74,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.database = None
         app.state.job_service = None
         app.state.radar_service = None
+        app.state.analysis_service = None
         app.state.database_error = "SQLite database is unavailable."
     app.state.android_adapter = AndroidDeviceAdapter(
         runtime_dir=app.state.settings.runtime_dir,
@@ -75,6 +90,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(jobs_router)
     app.include_router(radar_router)
     app.include_router(shops_router)
+    app.include_router(analysis_router)
 
     @app.exception_handler(SQLAlchemyError)
     async def database_failure(request: Request, _: SQLAlchemyError) -> JSONResponse:

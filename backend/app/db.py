@@ -30,10 +30,13 @@ class Database:
 
     def initialize(self) -> None:
         """Create schema without creating any business records."""
+        from backend.app.features.analysis.models import AnalysisRecord, OpportunityRecord
         from backend.app.features.radar.models import RankItemRecord, RankSnapshotRecord
         from backend.app.models.jobs import JobArtifactRecord, JobLogRecord, JobRecord
 
         _ = (
+            AnalysisRecord,
+            OpportunityRecord,
             JobArtifactRecord,
             JobLogRecord,
             JobRecord,

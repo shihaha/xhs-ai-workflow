@@ -29,6 +29,10 @@ class Settings(BaseSettings):
         validation_alias="BAILIAN_API_KEY",
         repr=False,
     )
+    bailian_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    bailian_text_model: str = "deepseek-v4-flash"
+    bailian_max_attempts: int = Field(default=3, ge=1, le=10)
+    bailian_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
 
     @model_validator(mode="after")
     def prepare_runtime_dir(self) -> "Settings":
