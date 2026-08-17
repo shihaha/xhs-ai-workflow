@@ -21,8 +21,8 @@ from backend.app.features.analysis.models import OpportunityRecord
 from backend.app.features.radar.models import RankItemRecord
 from backend.app.models.jobs import JobArtifactRecord
 from backend.app.features.content.export import (
-    UnsafeContentPath, deterministic_zip, entry_manifest, read_contained_regular,
-    write_contained_atomic,
+    MAX_PACKAGE_BYTES, UnsafeContentPath, deterministic_zip, entry_manifest,
+    read_contained_regular, remove_contained_regular, write_contained_atomic,
 )
 from backend.app.features.content.models import (
     ContentItemRecord, ContentPackageRecord, ContentReviewRecord, ContentRevisionRecord,
@@ -33,6 +33,7 @@ from backend.app.features.content.schemas import (
     ExportCreate, MaterialCreate, MaterialRead, ProductCreate, ProductRead,
     RegenerateCreate, ReviewCreate, ReviewRead,
     RevisionRead,
+    windows_name_key,
 )
 from backend.app.features.content.templates import TEMPLATE_SEEDS
 
@@ -111,14 +112,16 @@ class ContentService:
             ).one()
             if count >= 100 or int(aggregate) + len(data) > 200 * 1024 * 1024:
                 raise ContentValidationError("Product material count or aggregate size limit exceeded.")
+            logical_key = windows_name_key(payload.logical_name)
             version = int(session.scalar(
                 select(func.coalesce(func.max(ProductMaterialRecord.version), 0)).where(
                     ProductMaterialRecord.product_id == product_id,
-                    ProductMaterialRecord.logical_name == payload.logical_name,
+                    ProductMaterialRecord.logical_key == logical_key,
                 )
             )) + 1
             record = ProductMaterialRecord(
                 product_id=product_id, logical_name=payload.logical_name, version=version,
+                logical_key=logical_key,
                 path="pending",
                 sha256=sha256(data).hexdigest(), size_bytes=len(data),
                 media_type=detected, kind=payload.kind, created_at=_now(),
@@ -275,20 +278,33 @@ class ContentService:
                 ).values(status="rejected", updated_at=_now()))
                 session.commit()
             raise
+        try:
+            with self.database.session() as session:
+                record = _load_item(session, item_id)
+                self._validate_item_trust(record, session=session)
+                if record.status != "draft" or record.current_revision_id != prior.id:
+                    raise ContentStateError("Content item changed during regeneration.")
+                revision = self._revision(record.id, number, output, model_meta)
+                session.add(revision)
+                session.flush()
+                record.current_revision_id = revision.id
+                record.status = "review"
+                record.updated_at = _now()
+                session.commit()
+                session.expire_all()
+                return _item_read(_load_item(session, item_id))
+        except Exception:
+            self._restore_rejected_reservation(item_id, payload_request.expected_revision_id)
+            raise
+
+    def _restore_rejected_reservation(self, item_id: str, revision_id: str) -> None:
         with self.database.session() as session:
-            record = _load_item(session, item_id)
-            self._validate_item_trust(record, session=session)
-            if record.status != "draft" or record.current_revision_id != prior.id:
-                raise ContentStateError("Content item changed during regeneration.")
-            revision = self._revision(record.id, number, output, model_meta)
-            session.add(revision)
-            session.flush()
-            record.current_revision_id = revision.id
-            record.status = "review"
-            record.updated_at = _now()
+            session.execute(update(ContentItemRecord).where(
+                ContentItemRecord.id == item_id,
+                ContentItemRecord.status == "draft",
+                ContentItemRecord.current_revision_id == revision_id,
+            ).values(status="rejected", updated_at=_now()))
             session.commit()
-            session.expire_all()
-            return _item_read(_load_item(session, item_id))
 
     def export_package(self, item_id: str, payload: ExportCreate) -> ContentPackageRead:
         with self.database.session() as session:
@@ -312,14 +328,24 @@ class ContentService:
                     return projected
                 if existing.status == "building":
                     raise ContentStateError("This revision package is already building.")
-                existing.status = "building"
-                existing.error_detail = None
-                existing.sha256 = "0" * 64
-                existing.size_bytes = 0
-                existing.path = f"content-packages/{item.id}/{existing.id}-{uuid4().hex}.zip"
+                old_path = existing.path
+                previous_status = existing.status
+                replacement_path = f"content-packages/{item.id}/{existing.id}-{uuid4().hex}.zip"
+                won = session.execute(update(ContentPackageRecord).where(
+                    ContentPackageRecord.id == existing.id,
+                    ContentPackageRecord.status == previous_status,
+                    ContentPackageRecord.path == old_path,
+                ).values(
+                    status="building", error_detail=None, sha256="0" * 64,
+                    size_bytes=0, path=replacement_path,
+                )).rowcount
+                if won != 1:
+                    session.rollback()
+                    raise ContentStateError("This revision package was concurrently reserved.")
                 session.commit()
                 package_id = existing.id
-                package_path = existing.path
+                package_path = replacement_path
+                remove_contained_regular(self.runtime_dir, old_path)
             else:
                 package_id_value = str(uuid4())
                 package = ContentPackageRecord(
@@ -432,7 +458,7 @@ class ContentService:
             availability = "failed"
         else:
             try:
-                payload = read_contained_regular(self.runtime_dir, record.path)
+                payload = read_contained_regular(self.runtime_dir, record.path, limit=MAX_PACKAGE_BYTES)
             except UnsafeContentPath:
                 candidate = self.runtime_dir.joinpath(*__import__("pathlib").PurePosixPath(record.path).parts)
                 availability = "corrupt" if candidate.exists() else "missing"
@@ -655,6 +681,7 @@ class ContentService:
     def _package_entries(self, item: ContentItemRecord, revision: ContentRevisionRecord, product: ProductRecord, materials: list[ProductMaterialRecord]) -> dict[str, bytes]:
         entries: dict[str, bytes] = {
             "content/final.md": f"# {revision.title}\n\n{revision.body}\n".encode("utf-8"),
+            "content/image-plan.json": _json_bytes(list(revision.image_plan_json)),
             "sources/evidence.json": _json_bytes({
                 "opportunity_id": item.opportunity_id,
                 "evidence_ids": list(revision.source_evidence_ids_json),
@@ -664,6 +691,7 @@ class ContentService:
             "reviews/history.json": _json_bytes([
                 {"id": review.id, "revision_id": review.revision_id, "decision": review.decision,
                  "actor": review.actor, "note": review.note, "created_at": review.created_at.isoformat()}
+                 | {"visual_checks": list(review.visual_checks_json)}
                 for review in item.reviews
             ]),
             "product/product.json": _json_bytes({
@@ -787,27 +815,32 @@ def _json_bytes(value: object) -> bytes:
 def _validate_material_bytes(payload: bytes, *, declared: str, kind: str) -> str:
     if not payload:
         raise ContentValidationError("Material files must not be empty.")
-    detected: str | None = None
-    if _valid_png(payload):
-        detected = "image/png"
-    elif _valid_jpeg(payload):
-        detected = "image/jpeg"
-    elif _valid_webp(payload):
-        detected = "image/webp"
-    else:
+    supported_images = {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}
+    supported_text = {"text/plain", "text/markdown", "application/json"}
+    detected: str | None
+    if declared in supported_images:
+        from io import BytesIO
+        from PIL import Image, UnidentifiedImageError
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                actual_format = image.format
+                image.verify()
+            with Image.open(BytesIO(payload)) as image:
+                image.load()
+                if image.width < 1 or image.height < 1 or image.width * image.height > 100_000_000:
+                    raise ValueError("unsafe image dimensions")
+        except (UnidentifiedImageError, OSError, ValueError, SyntaxError, Image.DecompressionBombError) as error:
+            raise ContentValidationError("Image material cannot be fully decoded.") from error
+        detected = next((media for media, image_format in supported_images.items() if image_format == actual_format), None)
+    elif declared in supported_text:
         try:
             payload.decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            detected = None
-        else:
-            detected = {
-                ".md": "text/markdown",
-                ".json": "application/json",
-            }.get("", "text/plain")
-            if declared in {"text/plain", "text/markdown", "application/json"}:
-                detected = declared
-    supported = {"image/png", "image/jpeg", "image/webp", "text/plain", "text/markdown", "application/json"}
-    if detected is None or declared not in supported or detected != declared:
+        except UnicodeDecodeError as error:
+            raise ContentValidationError("Text material is not valid UTF-8.") from error
+        detected = declared
+    else:
+        detected = None
+    if detected is None or detected != declared:
         raise ContentValidationError("Declared media type does not match supported file bytes.")
     if kind == "output_image" and not detected.startswith("image/"):
         raise ContentValidationError("output_image materials must contain a supported image.")

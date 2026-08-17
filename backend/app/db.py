@@ -73,28 +73,7 @@ class Database:
         inspector = inspect(self.engine)
         if "content_products" not in inspector.get_table_names():
             return
-        required = {
-            "content_product_materials": {"kind"},
-            "content_items": {"image_material_ids_json", "cover_material_id"},
-            "content_revisions": {"image_plan_json"},
-            "content_reviews": {"visual_checks_json"},
-            "content_packages": {"error_detail"},
-        }
-        constraints_ok = {
-            item.get("name") for item in inspector.get_check_constraints("content_items")
-        } >= {"ck_content_item_status"} and {
-            item.get("name") for item in inspector.get_check_constraints("content_product_materials")
-        } >= {"ck_material_version_positive", "ck_material_size_positive", "ck_material_sha_format", "ck_material_kind"} and {
-            item.get("name") for item in inspector.get_check_constraints("content_packages")
-        } >= {"ck_package_status", "ck_package_size_nonnegative", "ck_package_sha_format"}
-        indexes_ok = {
-            item.get("name") for item in inspector.get_indexes("content_reviews")
-        } >= {"uq_review_terminal_revision"}
-        columns_ok = all(
-            names.issubset({column["name"] for column in inspector.get_columns(table)})
-            for table, names in required.items()
-        )
-        if not (columns_ok and constraints_ok and indexes_ok):
+        if not _content_schema_valid(inspector):
             tables = [
                 "content_packages", "content_reviews", "content_revisions", "content_items",
                 "content_product_materials", "content_products",
@@ -114,13 +93,17 @@ class Database:
                 connection.execute(text("PRAGMA foreign_keys=ON"))
             Base.metadata.create_all(self.engine)
             inspector = inspect(self.engine)
-        final_columns_ok = all(
-            names.issubset({column["name"] for column in inspector.get_columns(table)})
-            for table, names in required.items()
-        )
-        if not final_columns_ok:
+        if not _content_schema_valid(inspector):
             raise SchemaMigrationError("Task 8 schema validation failed.")
         with self.engine.begin() as connection:
+            from backend.app.features.content.export import remove_contained_regular
+
+            stranded_paths = connection.execute(
+                text("SELECT path FROM content_packages WHERE status='building'")
+            ).scalars().all()
+            for relative_path in stranded_paths:
+                if isinstance(relative_path, str):
+                    remove_contained_regular(self.database_path.parent, relative_path)
             connection.execute(
                 text(
                     "UPDATE content_packages SET status='failed', "
@@ -330,3 +313,95 @@ def _is_exact_empty_json_array_default(value: object) -> bool:
     while expression.startswith("(") and expression.endswith(")"):
         expression = expression[1:-1].strip()
     return expression == "'[]'"
+
+
+def _content_schema_valid(inspector: object) -> bool:
+    required_columns = {
+        "content_products": {"id", "opportunity_id", "name", "target_user", "created_at"},
+        "content_product_materials": {"id", "product_id", "logical_name", "logical_key", "version", "path", "sha256", "size_bytes", "media_type", "kind", "created_at"},
+        "content_items": {"id", "product_id", "opportunity_id", "template_key", "status", "evidence_ids_json", "material_ids_json", "image_material_ids_json", "cover_material_id", "research_facts_json", "current_revision_id", "created_at", "updated_at"},
+        "content_revisions": {"id", "content_item_id", "number", "title", "body", "claims_json", "source_evidence_ids_json", "image_plan_json", "model_provider", "model_name", "prompt_version", "usage_json", "attempts_json", "created_at"},
+        "content_reviews": {"id", "content_item_id", "revision_id", "decision", "actor", "note", "visual_checks_json", "created_at"},
+        "content_packages": {"id", "content_item_id", "revision_id", "status", "path", "sha256", "size_bytes", "created_at", "error_detail"},
+    }
+    try:
+        tables = set(inspector.get_table_names())
+        if not set(required_columns).issubset(tables):
+            return False
+        for table, required in required_columns.items():
+            columns = {item["name"]: item for item in inspector.get_columns(table)}
+            if not required.issubset(columns):
+                return False
+            for name in required - {"current_revision_id", "error_detail"}:
+                if columns[name].get("nullable") is not False:
+                    return False
+
+        required_checks = {
+            "content_product_materials": {
+                "ck_material_version_positive": ("version>0",),
+                "ck_material_size_positive": ("size_bytes>0",),
+                "ck_material_sha_format": ("length(sha256)=64", "glob"),
+                "ck_material_kind": ("source", "output_image"),
+            },
+            "content_items": {
+                "ck_content_item_status": ("research", "draft", "review", "rejected", "approved", "exported"),
+            },
+            "content_revisions": {"ck_revision_number_positive": ("number>0",)},
+            "content_reviews": {"ck_review_decision": ("approve", "reject", "regenerate")},
+            "content_packages": {
+                "ck_package_status": ("building", "ready", "failed"),
+                "ck_package_size_nonnegative": ("size_bytes>=0",),
+                "ck_package_sha_format": ("length(sha256)=64", "glob"),
+            },
+        }
+        for table, expected in required_checks.items():
+            actual = {item.get("name"): _compact_sql(item.get("sqltext")) for item in inspector.get_check_constraints(table)}
+            for name, fragments in expected.items():
+                sql = actual.get(name, "")
+                if any(_compact_sql(fragment) not in sql for fragment in fragments):
+                    return False
+
+        required_fks = {
+            "content_products": {(('opportunity_id',), "opportunities", ('id',))},
+            "content_product_materials": {(('product_id',), "content_products", ('id',))},
+            "content_items": {
+                (('product_id',), "content_products", ('id',)),
+                (('opportunity_id',), "opportunities", ('id',)),
+                (('current_revision_id', 'id'), "content_revisions", ('id', 'content_item_id')),
+            },
+            "content_revisions": {(('content_item_id',), "content_items", ('id',))},
+            "content_reviews": {(('revision_id', 'content_item_id'), "content_revisions", ('id', 'content_item_id'))},
+            "content_packages": {(('revision_id', 'content_item_id'), "content_revisions", ('id', 'content_item_id'))},
+        }
+        for table, expected in required_fks.items():
+            actual = {
+                (tuple(item.get("constrained_columns") or ()), item.get("referred_table"), tuple(item.get("referred_columns") or ()))
+                for item in inspector.get_foreign_keys(table)
+            }
+            if not expected.issubset(actual):
+                return False
+
+        required_unique = {
+            "content_product_materials": {("product_id", "logical_key", "version")},
+            "content_revisions": {("content_item_id", "number"), ("id", "content_item_id")},
+            "content_packages": {("revision_id",)},
+        }
+        for table, expected in required_unique.items():
+            actual = {tuple(item.get("column_names") or ()) for item in inspector.get_unique_constraints(table)}
+            if not expected.issubset(actual):
+                return False
+
+        index = next((item for item in inspector.get_indexes("content_reviews") if item.get("name") == "uq_review_terminal_revision"), None)
+        if index is None or bool(index.get("unique")) is not True or tuple(index.get("column_names") or ()) != ("revision_id",):
+            return False
+        where = _compact_sql((index.get("dialect_options") or {}).get("sqlite_where"))
+        if where != "decisionin(approve,reject)":
+            return False
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+    return True
+
+
+def _compact_sql(value: object) -> str:
+    rendered = "" if value is None else str(value)
+    return "".join(rendered.lower().split()).replace('"', "").replace("'", "")

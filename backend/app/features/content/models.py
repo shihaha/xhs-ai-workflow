@@ -38,7 +38,7 @@ class ProductRecord(Base):
 class ProductMaterialRecord(Base):
     __tablename__ = "content_product_materials"
     __table_args__ = (
-        UniqueConstraint("product_id", "logical_name", "version", name="uq_material_version"),
+        UniqueConstraint("product_id", "logical_key", "version", name="uq_material_version"),
         CheckConstraint("version > 0", name="ck_material_version_positive"),
         CheckConstraint("size_bytes > 0", name="ck_material_size_positive"),
         CheckConstraint(
@@ -53,6 +53,7 @@ class ProductMaterialRecord(Base):
         ForeignKey("content_products.id", ondelete="CASCADE"), nullable=False, index=True
     )
     logical_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    logical_key: Mapped[str] = mapped_column(String(200), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     path: Mapped[str] = mapped_column(Text, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)

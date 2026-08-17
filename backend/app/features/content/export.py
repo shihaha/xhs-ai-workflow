@@ -13,6 +13,7 @@ import unicodedata
 
 
 MAX_MATERIAL_BYTES = 50 * 1024 * 1024
+MAX_PACKAGE_BYTES = 250 * 1024 * 1024
 
 
 class UnsafeContentPath(ValueError):
@@ -120,8 +121,23 @@ def write_contained_atomic(root: Path, relative: str, payload: bytes) -> None:
             os.close(descriptor)
 
 
+def remove_contained_regular(root: Path, relative: str, *, limit: int = MAX_PACKAGE_BYTES) -> bool:
+    try:
+        read_contained_regular(root, relative, limit=limit)
+        posix = PurePosixPath(relative)
+        candidate = root.joinpath(*posix.parts)
+        resolved_root = root.resolve(strict=True)
+        candidate.resolve(strict=True).relative_to(resolved_root)
+        if candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()):
+            return False
+        candidate.unlink()
+        return True
+    except (UnsafeContentPath, OSError, ValueError, TypeError):
+        return False
+
+
 def deterministic_zip(entries: dict[str, bytes], manifest: dict[str, object]) -> bytes:
-    if len(entries) > 127 or sum(len(value) for value in entries.values()) > 250 * 1024 * 1024:
+    if len(entries) > 127 or sum(len(value) for value in entries.values()) > MAX_PACKAGE_BYTES:
         raise UnsafeContentPath("ZIP entry count or uncompressed size limit exceeded.")
     normalized: dict[str, bytes] = {}
     for name, value in entries.items():
@@ -155,7 +171,7 @@ def deterministic_zip(entries: dict[str, bytes], manifest: dict[str, object]) ->
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         total_compressed = sum(max(info.compress_size, 1) for info in archive.infolist())
         total_uncompressed = sum(info.file_size for info in archive.infolist())
-        if total_uncompressed > 250 * 1024 * 1024 or total_uncompressed / max(total_compressed, 1) > 500:
+        if total_uncompressed > MAX_PACKAGE_BYTES or total_uncompressed / max(total_compressed, 1) > 500:
             raise UnsafeContentPath("ZIP compression ratio limit exceeded.")
     return payload
 

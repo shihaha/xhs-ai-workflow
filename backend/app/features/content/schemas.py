@@ -35,6 +35,10 @@ def _strip_nonblank(value: str) -> str:
     return normalized
 
 
+def windows_name_key(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()
+
+
 class ProductCreate(StrictModel):
     name: str = Field(min_length=1, max_length=300)
     target_user: str = Field(min_length=1, max_length=4000)
@@ -54,10 +58,17 @@ class MaterialCreate(StrictModel):
     def safe_logical_name(cls, value: str) -> str:
         value = unicodedata.normalize("NFC", value)
         stem = value.split(".", 1)[0].casefold()
-        reserved = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+        reserved = {
+            "con", "prn", "aux", "nul", "conin$", "conout$", "clock$",
+            *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10)),
+            "com¹", "com²", "com³", "lpt¹", "lpt²", "lpt³",
+        }
         if (
             value in {".", ".."} or value.strip() != value or value.endswith((".", " "))
-            or stem in reserved or any(ord(char) < 32 or char in '<>:"/\\|?*' for char in value)
+            or stem in reserved or any(
+                ord(char) < 32 or 127 <= ord(char) <= 159 or char in '<>:"/\\|?*'
+                for char in value
+            )
         ):
             raise ValueError("logical_name must be a safe single filename")
         return value
