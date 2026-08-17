@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import stat
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -96,18 +98,14 @@ class AnalysisService:
         )
         try:
             model_result = self.model_adapter.generate_structured(request, AnalysisOutput)
-            output = AnalysisOutput.model_validate(model_result.output)
-            _validate_grounding(output, allowed=set(payload.evidence_ids))
-            if output.opportunities and not eligible:
-                raise ValueError("Opportunity output requires complete deep verification.")
         except ModelAdapterError as error:
             return self._persist_failure(
                 payload,
                 digest=digest,
                 status="failed",
-                error_category=error.category,
+                error_category=_safe_model_category(error.category),
                 error_detail="Model adapter reported a safe failure.",
-                attempts=error.attempts,
+                attempts=_safe_model_attempts(error.attempts),
             )
         except TimeoutError:
             return self._persist_failure(
@@ -117,6 +115,12 @@ class AnalysisService:
                 error_category="model_timeout",
                 error_detail="Model adapter timed out.",
             )
+
+        try:
+            output = AnalysisOutput.model_validate(model_result.output)
+            _validate_grounding(output, allowed=set(payload.evidence_ids))
+            if output.opportunities and not eligible:
+                raise ValueError("Opportunity output requires complete deep verification.")
         except (ValidationError, ValueError) as error:
             return self._persist_failure(
                 payload,
@@ -348,19 +352,20 @@ class AnalysisService:
         if (
             job.type not in ANDROID_SHOP_JOB_TYPES
             or artifact.kind != "shop_collection_result"
+            or artifact.producer != "android_shop_worker_v1"
             or JobState(job.state) is not JobState.succeeded
         ):
             return None
         expected_path = Path("evidence") / "shops" / job.id / "result.json"
         if artifact.path != expected_path.as_posix():
             return None
-        result_path = _contained_regular_file(self.runtime_dir, expected_path)
-        if result_path is None:
-            return None
         try:
-            with result_path.open("rb") as result_stream:
-                raw_result = result_stream.read(MAX_TRUSTED_RESULT_BYTES + 1)
-            if len(raw_result) > MAX_TRUSTED_RESULT_BYTES:
+            raw_result = _read_contained_regular_file(
+                self.runtime_dir,
+                expected_path,
+                limit=MAX_TRUSTED_RESULT_BYTES,
+            )
+            if raw_result is None:
                 return None
             file_result = json.loads(raw_result.decode("utf-8", errors="strict"))
             metadata_result = artifact.metadata_json.get("result")
@@ -469,6 +474,15 @@ def _eligible_for_opportunity(
             or rejected_count != len(rejected_items)
         ):
             return False
+        rejected_references = [
+            item.get("reference") if isinstance(item, dict) else None
+            for item in rejected_items
+        ]
+        if (
+            any(not isinstance(reference, str) or not reference.strip() for reference in rejected_references)
+            or len(set(rejected_references)) != len(rejected_references)
+        ):
+            return False
         duplicate_rows = sum(
             isinstance(item, dict) and item.get("reason") == "duplicate_source_url"
             for item in rejected_items
@@ -492,7 +506,9 @@ def _eligible_for_opportunity(
     return covered_accounts == set(required_accounts)
 
 
-def _contained_regular_file(root: Path, relative_path: Path) -> Path | None:
+def _read_contained_regular_file(
+    root: Path, relative_path: Path, *, limit: int
+) -> bytes | None:
     try:
         resolved_root = root.resolve(strict=True)
         candidate = root.joinpath(*relative_path.parts)
@@ -503,12 +519,83 @@ def _contained_regular_file(root: Path, relative_path: Path) -> Path | None:
                 hasattr(current, "is_junction") and current.is_junction()
             ):
                 return None
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(resolved_root)
-        mode = resolved.stat().st_mode
-    except (OSError, ValueError):
+        pre_resolved = candidate.resolve(strict=True)
+        pre_resolved.relative_to(resolved_root)
+        pre_stat = candidate.stat()
+        if not stat.S_ISREG(pre_stat.st_mode) or pre_stat.st_size > limit:
+            return None
+        with candidate.open("rb") as stream:
+            opened_stat = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or _file_identity(opened_stat) != _file_identity(pre_stat)
+                or opened_stat.st_size > limit
+            ):
+                return None
+            payload = stream.read(limit + 1)
+            if len(payload) > limit:
+                return None
+            final_handle_stat = os.fstat(stream.fileno())
+            if _file_identity(final_handle_stat) != _file_identity(opened_stat):
+                return None
+        post_resolved = candidate.resolve(strict=True)
+        post_resolved.relative_to(resolved_root)
+        post_stat = candidate.stat()
+        if (
+            post_resolved != pre_resolved
+            or _file_identity(post_stat) != _file_identity(opened_stat)
+        ):
+            return None
+    except (OSError, ValueError, TypeError):
         return None
-    return resolved if stat.S_ISREG(mode) else None
+    return payload
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+
+
+_SAFE_MODEL_CATEGORIES = {
+    "model_unconfigured",
+    "model_authentication_failed",
+    "model_retry_exhausted",
+    "model_request_failed",
+    "model_output_invalid",
+    "model_transport_failed",
+    "model_timeout",
+}
+_SAFE_ATTEMPT_CATEGORIES = re.compile(
+    r"^(?:timeout|network|authentication|response_received|http_(?:408|429|5[0-9]{2}))$",
+    re.ASCII,
+)
+
+
+def _safe_model_category(value: object) -> str:
+    return value if isinstance(value, str) and value in _SAFE_MODEL_CATEGORIES else "model_request_failed"
+
+
+def _safe_model_attempts(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    safe: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        attempt = item.get("attempt")
+        category = item.get("category")
+        if (
+            isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or not 1 <= attempt <= 1000
+            or not isinstance(category, str)
+            or len(category) > 32
+            or _SAFE_ATTEMPT_CATEGORIES.fullmatch(category) is None
+        ):
+            continue
+        safe.append({"attempt": attempt, "category": category})
+        if len(safe) == 20:
+            break
+    return safe
 
 
 def _validate_grounding(output: AnalysisOutput, *, allowed: set[str]) -> None:

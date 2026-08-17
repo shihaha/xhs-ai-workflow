@@ -33,6 +33,7 @@ class JobLog:
 @dataclass(frozen=True)
 class JobArtifact:
     kind: str
+    producer: str
     path: str
     metadata: dict[str, Any]
 
@@ -276,6 +277,7 @@ class JobService:
                     JobArtifactRecord(
                         job_id=job_id,
                         kind=kind,
+                        producer="android_shop_worker_v1",
                         path=final_relative.as_posix(),
                         metadata_json=metadata,
                         created_at=now,
@@ -310,6 +312,7 @@ class JobService:
             artifact = JobArtifactRecord(
                 job_id=record.id,
                 kind=kind,
+                producer="external",
                 path=relative_path.as_posix(),
                 metadata_json=metadata,
                 created_at=_utc_now(),
@@ -318,7 +321,10 @@ class JobService:
             record.updated_at = _utc_now()
             session.commit()
             return JobArtifact(
-                kind=artifact.kind, path=artifact.path, metadata=artifact.metadata_json
+                kind=artifact.kind,
+                producer=artifact.producer,
+                path=artifact.path,
+                metadata=artifact.metadata_json,
             )
 
     def recover_expired_running(
@@ -455,7 +461,10 @@ def _as_job(record: JobRecord) -> Job:
         logs=[JobLog(level=log.level, message=log.message) for log in record.logs],
         artifacts=[
             JobArtifact(
-                kind=artifact.kind, path=artifact.path, metadata=dict(artifact.metadata_json)
+                kind=artifact.kind,
+                producer=artifact.producer,
+                path=artifact.path,
+                metadata=dict(artifact.metadata_json),
             )
             for artifact in record.artifacts
         ],

@@ -167,3 +167,70 @@ def test_broken_legacy_analysis_schema_fails_during_startup(tmp_path: Path) -> N
 
     assert app.state.database is None
     assert app.state.database_error == "SQLite database is unavailable."
+
+
+@pytest.mark.parametrize("scope_column", ["missing", "nullable_without_default"])
+def test_migration_marker_never_overrides_broken_target_schema(
+    tmp_path: Path, scope_column: str
+) -> None:
+    runtime = tmp_path / scope_column
+    runtime.mkdir()
+    database_path = runtime / "db.sqlite3"
+    _create_f0_schema(database_path)
+    connection = sqlite3.connect(database_path)
+    if scope_column == "nullable_without_default":
+        connection.execute("ALTER TABLE analyses ADD COLUMN account_user_ids_json JSON")
+    connection.execute(
+        "CREATE TABLE workbench_schema_migrations (name VARCHAR(200) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO workbench_schema_migrations VALUES ('task7_trusted_grounding_v2','2026-08-17')"
+    )
+    connection.commit()
+    connection.close()
+
+    app = create_app(Settings(runtime_dir=runtime, database_path=database_path))
+
+    assert app.state.database is None
+    assert app.state.database_error == "SQLite database is unavailable."
+
+
+def test_legacy_artifact_provenance_is_migrated_as_external(tmp_path: Path) -> None:
+    runtime = tmp_path / "legacy-artifact"
+    runtime.mkdir()
+    database_path = runtime / "db.sqlite3"
+    _create_f0_schema(database_path)
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        CREATE TABLE jobs (
+          id VARCHAR(36) PRIMARY KEY, type VARCHAR(100) NOT NULL, input_data JSON NOT NULL,
+          state VARCHAR(32) NOT NULL, progress_current INTEGER NOT NULL,
+          progress_total INTEGER, current_stage VARCHAR(255), error_category VARCHAR(100),
+          retry_count INTEGER NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+          started_at DATETIME, completed_at DATETIME, lease_expires_at DATETIME
+        );
+        CREATE TABLE job_artifacts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, job_id VARCHAR(36) NOT NULL REFERENCES jobs(id),
+          kind VARCHAR(100) NOT NULL, path TEXT NOT NULL, metadata_json JSON NOT NULL,
+          created_at DATETIME NOT NULL
+        );
+        INSERT INTO jobs VALUES (
+          'legacy-job','android_shop_collection','{}','succeeded',1,1,'shop_complete',NULL,0,
+          '2026-08-17 12:00:00','2026-08-17 12:00:00',NULL,NULL,NULL
+        );
+        INSERT INTO job_artifacts (job_id,kind,path,metadata_json,created_at) VALUES (
+          'legacy-job','shop_collection_result','evidence/shops/legacy-job/result.json','{}','2026-08-17 12:00:00'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(database_path)
+    with database.session() as session:
+        row = session.execute(
+            __import__("sqlalchemy").text("SELECT producer FROM job_artifacts WHERE id=1")
+        ).one()
+    assert row[0] == "external"
+    database.close()

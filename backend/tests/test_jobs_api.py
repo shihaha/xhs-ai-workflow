@@ -78,6 +78,7 @@ async def test_job_progress_logs_and_evidence_survive_a_new_app_instance(
     assert persisted["artifacts"] == [
         {
             "kind": "raw_response",
+            "producer": "external",
             "path": "evidence/response-001.json",
             "metadata": {"source_url": "https://example.test/search?q=tea"},
         }

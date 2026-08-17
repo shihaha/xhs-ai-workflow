@@ -18,7 +18,9 @@ class AnalysisRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     analysis_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     account_user_id: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
-    account_user_ids_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    account_user_ids_json: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(100), nullable=False)
     provider: Mapped[str] = mapped_column(String(100), nullable=False)

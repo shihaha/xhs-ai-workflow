@@ -42,6 +42,7 @@ class JobLogRead(BaseModel):
 
 class JobArtifactRead(BaseModel):
     kind: str
+    producer: str
     path: str
     metadata: dict[str, Any]
 

@@ -23,6 +23,8 @@ from backend.app.services.jobs import (
 
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
+_RESERVED_JOB_TYPES = {"android_shop_collection", "shop_collection"}
+_RESERVED_ARTIFACT_KINDS = {"shop_collection_result"}
 
 
 def _service(request: Request) -> JobService:
@@ -34,6 +36,8 @@ def _service(request: Request) -> JobService:
 
 @router.post("", response_model=JobRead, status_code=status.HTTP_201_CREATED)
 def create_job(payload: JobCreate, request: Request) -> JobRead:
+    if payload.type in _RESERVED_JOB_TYPES:
+        raise HTTPException(status_code=422, detail="Reserved worker job type.")
     return _job_read(
         _service(request).create(
             job_type=payload.type,
@@ -95,6 +99,8 @@ def append_log(job_id: str, payload: JobLogCreate, request: Request) -> JobLogRe
 def attach_artifact(
     job_id: str, payload: JobArtifactCreate, request: Request
 ) -> JobArtifactRead:
+    if payload.kind in _RESERVED_ARTIFACT_KINDS:
+        raise HTTPException(status_code=422, detail="Reserved worker artifact kind.")
     try:
         artifact = _service(request).attach_artifact(
             job_id, kind=payload.kind, path=payload.path, metadata=payload.metadata
@@ -104,7 +110,10 @@ def attach_artifact(
     except InvalidArtifactPath as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return JobArtifactRead(
-        kind=artifact.kind, path=artifact.path, metadata=artifact.metadata
+        kind=artifact.kind,
+        producer=artifact.producer,
+        path=artifact.path,
+        metadata=artifact.metadata,
     )
 
 

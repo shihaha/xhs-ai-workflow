@@ -132,6 +132,7 @@ def _complete_artifact(
         artifact = JobArtifactRecord(
             job_id=job.id,
             kind="shop_collection_result",
+            producer="android_shop_worker_v1",
             path=relative_path,
             metadata_json={"result": result},
             created_at=now,
@@ -437,9 +438,6 @@ async def test_public_jobs_api_forgery_is_never_opportunity_eligible(
             bailian_api_key="configured-for-stub",
         )
     )
-    forged_path = runtime / "unrelated.json"
-    forged_path.write_text("{}", encoding="utf-8")
-
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -451,45 +449,7 @@ async def test_public_jobs_api_forgery_is_never_opportunity_eligible(
                 "progress_total": 1,
             },
         )
-        job_id = created.json()["id"]
-        assert (await client.post(f"/api/v1/jobs/{job_id}/claim")).status_code == 200
-        assert (
-            await client.post(
-                f"/api/v1/jobs/{job_id}/transition",
-                json={"state": "succeeded", "progress_current": 1, "progress_total": 1},
-            )
-        ).status_code == 200
-        result = _shop_result(job_id)
-        attached = await client.post(
-            f"/api/v1/jobs/{job_id}/artifacts",
-            json={
-                "kind": "shop_collection_result",
-                "path": "unrelated.json",
-                "metadata": {"result": result},
-            },
-        )
-        assert attached.status_code == 201
-        evidence = await client.get(
-            "/api/v1/analysis-evidence", params={"account_user_id": "account-a"}
-        )
-        forged_id = evidence.json()[0]["evidence_id"]
-        assert evidence.json()[0]["eligible_for_opportunity"] is False
-
-        model = StubModel(_output(forged_id, status="已验证"))
-        app.state.bailian_adapter = model
-        app.state.analysis_service.model_adapter = model
-        analysis = await client.post(
-            "/api/v1/analyses",
-            json={
-                "analysis_type": "account_opportunity",
-                "account_user_ids": ["account-a"],
-                "evidence_ids": [forged_id],
-            },
-        )
-
-    assert analysis.status_code == 201
-    assert analysis.json()["status"] == "needs_human"
-    assert model.calls == 0
+    assert created.status_code == 422
 
 
 def _replace_result(
@@ -593,3 +553,129 @@ def test_untrusted_result_file_is_bounded_and_never_crashes_discovery_or_create(
     assert created.status == "needs_human"
     assert model.calls == 0
     database.close()
+
+
+def test_external_artifact_provenance_is_never_trusted(tmp_path: Path) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    with database.session() as session:
+        artifact = session.get(JobArtifactRecord, int(evidence_id.split(":")[1]))
+        assert artifact is not None
+        artifact.producer = "external"
+        session.commit()
+    model = StubModel(_output(evidence_id, status="已验证"))
+
+    created = AnalysisService(database, model, runtime_dir=tmp_path).create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+
+    assert created.status == "needs_human"
+    assert model.calls == 0
+    database.close()
+
+
+def test_duplicate_rejected_references_break_collection_conservation(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    with database.session() as session:
+        artifact = session.get(JobArtifactRecord, int(evidence_id.split(":")[1]))
+        assert artifact is not None
+        result = deepcopy(artifact.metadata_json["result"])
+    duplicate = {
+        "reference": "same-card",
+        "reason": "duplicate_source_url",
+        "raw_evidence": {"source_url": "https://www.xiaohongshu.com/goods/p1"},
+    }
+    result["rejected_items"] = [duplicate, deepcopy(duplicate)]
+    result["rejected_count"] = 2
+    result["duplicate_observation_count"] = 2
+    result["raw_observation_count"] = 3
+    _replace_result(database, tmp_path, evidence_id, result)
+    model = StubModel(_output(evidence_id))
+
+    created = AnalysisService(database, model, runtime_dir=tmp_path).create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+
+    assert created.status == "needs_human"
+    assert model.calls == 0
+    database.close()
+
+
+def test_open_handle_identity_rejects_atomic_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    with database.session() as session:
+        artifact = session.get(JobArtifactRecord, int(evidence_id.split(":")[1]))
+        assert artifact is not None
+        target = tmp_path / artifact.path
+        replacement_result = deepcopy(artifact.metadata_json["result"])
+        replacement_result["detail"] = "replacement"
+        artifact.metadata_json = {"result": replacement_result}
+        session.commit()
+    replacement = target.with_name("replacement.json")
+    replacement.write_text(
+        __import__("json").dumps(replacement_result, ensure_ascii=False), encoding="utf-8"
+    )
+    original_open = Path.open
+    swapped = False
+
+    def swapping_open(path: Path, *args: object, **kwargs: object):
+        nonlocal swapped
+        if path == target and not swapped:
+            swapped = True
+            replacement.replace(target)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", swapping_open)
+    service = AnalysisService(database, StubModel(_output(evidence_id)), runtime_dir=tmp_path)
+
+    discovered = service.list_evidence(account_user_id="account-a")
+
+    assert swapped is True
+    assert discovered[0].eligible_for_opportunity is False
+    database.close()
+
+
+@pytest.mark.anyio
+async def test_public_jobs_api_rejects_reserved_worker_types_and_artifact_kind(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "reserved-api"
+    app = create_app(Settings(runtime_dir=runtime, database_path=runtime / "db.sqlite3"))
+    evidence_file = runtime / "external.json"
+    evidence_file.write_text("{}", encoding="utf-8")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        reserved_job = await client.post(
+            "/api/v1/jobs",
+            json={"type": "android_shop_collection", "input": {}},
+        )
+        generic_job = await client.post(
+            "/api/v1/jobs", json={"type": "manual_note", "input": {}}
+        )
+        reserved_artifact = await client.post(
+            f"/api/v1/jobs/{generic_job.json()['id']}/artifacts",
+            json={
+                "kind": "shop_collection_result",
+                "path": "external.json",
+                "metadata": {},
+            },
+        )
+
+    assert reserved_job.status_code == 422
+    assert generic_job.status_code == 201
+    assert reserved_artifact.status_code == 422

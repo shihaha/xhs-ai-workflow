@@ -4,11 +4,16 @@ import json
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
 class Base(DeclarativeBase):
     """Base class for all persisted workbench records."""
+
+
+class SchemaMigrationError(SQLAlchemyError):
+    """Raised when a migration marker contradicts the physical SQLite schema."""
 
 
 class Database:
@@ -45,11 +50,40 @@ class Database:
             RankSnapshotRecord,
         )
         Base.metadata.create_all(self.engine)
+        self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
+
+    def _migrate_artifact_provenance(self) -> None:
+        columns = {
+            column["name"]: column
+            for column in inspect(self.engine).get_columns("job_artifacts")
+        }
+        if "producer" not in columns:
+            with self.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "ALTER TABLE job_artifacts ADD COLUMN producer VARCHAR(64) "
+                        "NOT NULL DEFAULT 'external'"
+                    )
+                )
+            columns = {
+                column["name"]: column
+                for column in inspect(self.engine).get_columns("job_artifacts")
+            }
+        producer = columns.get("producer")
+        if (
+            producer is None
+            or producer.get("nullable") is not False
+            or "external" not in str(producer.get("default") or "")
+        ):
+            raise SchemaMigrationError("job_artifacts.producer schema is invalid")
 
     def _migrate_analysis_scope(self) -> None:
         """Upgrade the pre-scope Task 7 schema and quarantine its success claims."""
-        columns = {column["name"] for column in inspect(self.engine).get_columns("analyses")}
+        columns = {
+            column["name"]: column
+            for column in inspect(self.engine).get_columns("analyses")
+        }
         with self.engine.begin() as connection:
             connection.execute(
                 text(
@@ -64,6 +98,7 @@ class Database:
                 )
             )
             if already_applied:
+                self._validate_analysis_scope_schema(columns)
                 return
             added_scope_column = "account_user_ids_json" not in columns
             if added_scope_column:
@@ -118,6 +153,43 @@ class Database:
                     "VALUES ('task7_trusted_grounding_v2', CURRENT_TIMESTAMP)"
                 )
             )
+        refreshed = {
+            column["name"]: column
+            for column in inspect(self.engine).get_columns("analyses")
+        }
+        self._validate_analysis_scope_schema(refreshed)
+
+    @staticmethod
+    def _validate_analysis_scope_schema(columns: dict[str, object]) -> None:
+        required_columns = {
+            "id",
+            "analysis_type",
+            "account_user_id",
+            "account_user_ids_json",
+            "status",
+            "prompt_version",
+            "provider",
+            "model",
+            "input_digest",
+            "evidence_ids_json",
+            "output_json",
+            "usage_json",
+            "duration_ms",
+            "attempts_json",
+            "error_category",
+            "error_detail",
+            "created_at",
+        }
+        if not required_columns.issubset(columns):
+            raise SchemaMigrationError("analyses schema is missing required columns")
+        account_scope = columns.get("account_user_ids_json")
+        if (
+            account_scope is None
+            or account_scope.get("nullable") is not False  # type: ignore[union-attr]
+            or "[]" not in str(account_scope.get("default") or "")  # type: ignore[union-attr]
+            or "JSON" not in str(account_scope.get("type") or "").upper()  # type: ignore[union-attr]
+        ):
+            raise SchemaMigrationError("analyses.account_user_ids_json schema is invalid")
 
     def session(self) -> Session:
         return self.sessions()

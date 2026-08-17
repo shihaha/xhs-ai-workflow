@@ -250,6 +250,110 @@ async def test_protocol_adapter_reporting_unconfigured_returns_503(tmp_path: Pat
     assert response.status_code == 503
 
 
+def test_adapter_programming_value_error_is_not_misclassified_as_grounding(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "programming.sqlite3")
+    evidence_id = _rank_evidence(database)
+    service = AnalysisService(
+        database,
+        _FailingProvider(ValueError("adapter implementation bug")),
+        runtime_dir=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="implementation bug"):
+        service.create(
+            AnalysisCreate(
+                analysis_type="account_report",
+                account_user_id="account-a",
+                evidence_ids=[evidence_id],
+            )
+        )
+    assert service.list() == []
+    database.close()
+
+
+def test_shared_error_metadata_is_projected_to_safe_bounded_fields(tmp_path: Path) -> None:
+    database = Database(tmp_path / "safe-error.sqlite3")
+    evidence_id = _rank_evidence(database)
+    secret = "Bearer top-secret-token"
+    error = ModelAdapterError(
+        secret,
+        category=secret,
+        attempts=[
+            {
+                "attempt": 1,
+                "category": "network",
+                "authorization": secret,
+                "headers": {"Authorization": secret},
+                "body": secret,
+                "token": secret,
+            },
+            {"attempt": -1, "category": secret, "body": secret},
+        ] * 50,
+    )
+    service = AnalysisService(
+        database, _FailingProvider(error), runtime_dir=tmp_path
+    )
+
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_report",
+            account_user_id="account-a",
+            evidence_ids=[evidence_id],
+        )
+    )
+    serialized = json.dumps(created.model_dump(mode="json"), ensure_ascii=False)
+
+    assert created.error_category == "model_request_failed"
+    assert created.attempts == [{"attempt": 1, "category": "network"}] * 20
+    assert secret not in serialized
+    database.close()
+
+
+@pytest.mark.anyio
+async def test_shared_error_secret_never_reaches_api_or_database_response(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "safe-api"
+    app = create_app(
+        Settings(
+            runtime_dir=runtime,
+            database_path=runtime / "db.sqlite3",
+            bailian_api_key="configured",
+        )
+    )
+    evidence_id = _rank_evidence(app.state.database)
+    secret = "Bearer api-secret-token"
+    adapter = _FailingProvider(
+        ModelAdapterError(
+            secret,
+            category=secret,
+            attempts=[
+                {"attempt": 1, "category": "network", "authorization": secret}
+            ],
+        )
+    )
+    app.state.bailian_adapter = adapter
+    app.state.analysis_service.model_adapter = adapter
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v1/analyses",
+            json={
+                "analysis_type": "account_report",
+                "account_user_id": "account-a",
+                "evidence_ids": [evidence_id],
+            },
+        )
+        listing = await client.get("/api/v1/analyses")
+
+    assert response.status_code == 201
+    assert secret not in response.text
+    assert secret not in listing.text
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"

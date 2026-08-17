@@ -64,6 +64,9 @@ class JobArtifactRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), nullable=False, index=True)
     kind: Mapped[str] = mapped_column(String(100), nullable=False)
+    producer: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="external", server_default="external"
+    )
     path: Mapped[str] = mapped_column(Text, nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
