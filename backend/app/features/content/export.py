@@ -20,6 +20,53 @@ class UnsafeContentPath(ValueError):
     pass
 
 
+ArtifactReference = tuple[str, tuple[int, int] | None]
+
+
+def windows_artifact_reference(root: Path, relative: str) -> ArtifactReference | None:
+    """Return a Windows-equivalent absolute key plus physical file identity.
+
+    Untrusted, missing, linked or out-of-runtime paths intentionally have no
+    identity and therefore can never authorize deletion.
+    """
+    posix = PurePosixPath(relative)
+    if (
+        posix.is_absolute() or not posix.parts
+        or any(part in {"", ".", ".."} or ":" in part or "\\" in part for part in posix.parts)
+    ):
+        return None
+    try:
+        resolved_root = root.resolve(strict=True)
+        candidate = root.joinpath(*posix.parts)
+        current = root
+        for part in posix.parts:
+            current = current / part
+            if current.is_symlink() or (hasattr(current, "is_junction") and current.is_junction()):
+                return None
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(resolved_root)
+        absolute_key = unicodedata.normalize("NFC", str(resolved)).casefold()
+        try:
+            metadata = candidate.stat()
+        except FileNotFoundError:
+            return absolute_key, None
+        if not stat.S_ISREG(metadata.st_mode):
+            return absolute_key, None
+        return absolute_key, (metadata.st_dev, metadata.st_ino)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def windows_artifact_references_conflict(
+    left: ArtifactReference | None,
+    right: ArtifactReference | None,
+) -> bool:
+    return left is not None and right is not None and (
+        left[0] == right[0]
+        or (left[1] is not None and right[1] is not None and left[1] == right[1])
+    )
+
+
 def read_contained_regular(root: Path, relative: str, *, limit: int = MAX_MATERIAL_BYTES) -> bytes:
     posix = PurePosixPath(relative)
     if (

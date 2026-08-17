@@ -257,3 +257,89 @@ git diff --check
 ```
 
 Compilation and diff checks exited 0; Git emitted only the repository's Windows LF/CRLF notices. Live Bailian and Android-device validation remain `not_run` because no live key or device was supplied; this round makes no live-provider or real-device claim.
+
+## Fix round 5: canonical artifact ownership and reservation finalization
+
+The final Critical and two Important review groups were captured in
+`test_round5_hardening.py` before production changes.
+
+Initial RED:
+
+```text
+python -m pytest backend/tests/content/test_round5_hardening.py -q
+8 failed, 3 passed in 2.26s
+```
+
+The corrected generic-failure probe was also mutation-checked by temporarily
+removing the two cleanup calls, then restoring them:
+
+```text
+python -m pytest <generic-failure-test> <post-create-path-test> -q
+2 failed in 0.58s
+2 passed in 0.52s
+```
+
+An item-state CAS-loss probe then exposed that the builder's own newly-failed row
+prevented cleanup of its unreferenced bytes:
+
+```text
+python -m pytest backend/tests/content/test_round5_hardening.py -q -k 'finalizer and item'
+1 failed in 0.49s
+```
+
+The failure finalizer now reports whether this builder won its exact reservation
+CAS. Only in that case is its own failed row excluded from the subsequent
+ownership proof; any other material/package owner still forces preservation.
+
+Implemented review findings:
+
+- Startup cleanup now requires canonical lower-case UUID text for both package and
+  content-item identities, an exact NFC-normalized package path shape, a trusted
+  contained regular artifact, and exclusive ownership under Windows-equivalent
+  absolute path keys or physical file identity. Case/NFC-equivalent material paths
+  and package paths in every status preserve the artifact while stranded builders
+  are still marked failed; links, junctions and abnormal identities never authorize
+  deletion.
+- Material creation cleanup now covers generic SQLAlchemy failures and post-create
+  path-validation failures. A fresh independent connection first proves the new
+  material row was not persisted and that no material/package owns an equivalent
+  file. Ambiguous commit acknowledgement, lookup failure or an existing owner keeps
+  the artifact; cleanup remains handle-bound and the originating exception remains
+  the request failure.
+- Package finalization now conditionally updates the exact package ID, item ID,
+  revision ID, `building` status and reserved path, together with a current-revision
+  item CAS in one transaction. Path/status/other-builder takeover cannot become
+  `ready` or mark the item exported. A lost reservation safely removes only a newly
+  built unreferenced artifact and preserves any artifact claimed by another owner.
+- Round-3/4 runtime-root, handle-bound deletion, schema-literal, image-limit and ZIP
+  safety invariants remain covered. The two previously approved Minor findings
+  remain deferred unchanged.
+
+Round-5 GREEN and verification:
+
+```text
+python -m pytest backend/tests/content/test_round5_hardening.py -q
+14 passed in 2.81s
+
+python -m pytest backend/tests/content/test_round4_hardening.py -q
+7 passed in 1.36s
+
+python -m pytest backend/tests/content/test_round3_hardening.py -q
+18 passed in 0.90s
+
+python -m pytest backend/tests/content -q
+94 passed in 9.47s
+
+python -m pytest backend/tests -q
+407 passed, 1 skipped in 21.53s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only the repository's Windows
+LF/CRLF notices.
+
+Live Bailian and Android-device validation remain `not_run` because no live key or
+device was supplied. This round makes no live-provider, real-device or seven-day UAT
+claim.

@@ -3,6 +3,8 @@
 import json
 from pathlib import Path, PurePosixPath
 import re
+import unicodedata
+from uuid import UUID
 
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Connection
@@ -105,24 +107,28 @@ class Database:
                 )
             ).mappings().all()
             if self.runtime_dir is not None:
-                from backend.app.features.content.export import remove_contained_regular
+                from backend.app.features.content.export import (
+                    remove_contained_regular,
+                    windows_artifact_reference,
+                    windows_artifact_references_conflict,
+                )
 
-                material_paths = set(
+                material_paths = list(
                     connection.execute(
                         text("SELECT path FROM content_product_materials")
                     ).scalars().all()
                 )
-                package_path_owners: dict[str, set[str]] = {}
-                for package_id, relative_path in connection.execute(
+                package_references = connection.execute(
                     text("SELECT id, path FROM content_packages")
-                ):
-                    if isinstance(relative_path, str):
-                        package_path_owners.setdefault(relative_path, set()).add(package_id)
+                ).mappings().all()
                 for package in stranded_packages:
                     if _building_package_owns_artifact(
                         package,
+                        runtime_dir=self.runtime_dir,
                         material_paths=material_paths,
-                        package_path_owners=package_path_owners,
+                        package_references=package_references,
+                        reference_resolver=windows_artifact_reference,
+                        reference_conflicts=windows_artifact_references_conflict,
                     ):
                         remove_contained_regular(self.runtime_dir, package["path"])
             connection.execute(
@@ -504,8 +510,11 @@ _PACKAGE_FILENAME = re.compile(r"^(?P<id>[0-9a-f-]{36})(?:-[0-9a-f]{32})?\.zip$"
 def _building_package_owns_artifact(
     package: object,
     *,
-    material_paths: set[object],
-    package_path_owners: dict[str, set[str]],
+    runtime_dir: Path,
+    material_paths: list[object],
+    package_references: list[object],
+    reference_resolver: object,
+    reference_conflicts: object,
 ) -> bool:
     """Prove a stranded path is exclusively the artifact reserved by this package."""
 
@@ -515,14 +524,31 @@ def _building_package_owns_artifact(
         relative_path = package["path"]  # type: ignore[index]
         if not all(isinstance(value, str) and value for value in (package_id, content_item_id, relative_path)):
             return False
-        if relative_path in material_paths:
-            return False
-        if package_path_owners.get(relative_path) != {package_id}:
+        if str(UUID(package_id)) != package_id or str(UUID(content_item_id)) != content_item_id:
             return False
         path = PurePosixPath(relative_path)
+        if path.as_posix() != relative_path or unicodedata.normalize("NFC", relative_path) != relative_path:
+            return False
         if path.parts[:2] != ("content-packages", content_item_id) or len(path.parts) != 3:
             return False
         match = _PACKAGE_FILENAME.fullmatch(path.name)
-        return match is not None and match.group("id") == package_id
-    except (KeyError, TypeError, ValueError):
+        if match is None or match.group("id") != package_id:
+            return False
+        resolver = reference_resolver  # keep the injectable boundary narrow for tests
+        owned = resolver(runtime_dir, relative_path)  # type: ignore[operator]
+        if owned is None or owned[1] is None:
+            return False
+        for material_path in material_paths:
+            if isinstance(material_path, str) and reference_conflicts(owned, resolver(runtime_dir, material_path)):  # type: ignore[operator]
+                return False
+        owners = 0
+        for reference in package_references:
+            reference_id = reference["id"]  # type: ignore[index]
+            reference_path = reference["path"]  # type: ignore[index]
+            if isinstance(reference_path, str) and reference_conflicts(owned, resolver(runtime_dir, reference_path)):  # type: ignore[operator]
+                owners += 1
+                if reference_id != package_id:
+                    return False
+        return owners == 1
+    except (KeyError, TypeError, ValueError, AttributeError):
         return False

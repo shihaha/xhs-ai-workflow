@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from backend.app.adapters.contracts import ModelAdapter, ModelAdapterError, StructuredModelRequest
@@ -23,6 +23,7 @@ from backend.app.models.jobs import JobArtifactRecord
 from backend.app.features.content.export import (
     MAX_PACKAGE_BYTES, UnsafeContentPath, deterministic_zip, entry_manifest,
     read_contained_regular, remove_contained_regular, write_contained_atomic,
+    windows_artifact_reference, windows_artifact_references_conflict,
 )
 from backend.app.features.content.models import (
     ContentItemRecord, ContentPackageRecord, ContentReviewRecord, ContentRevisionRecord,
@@ -135,14 +136,45 @@ class ContentService:
                 write_contained_atomic(self.runtime_dir, record.path, data)
                 session.commit()
             except UnsafeContentPath as error:
+                session.rollback()
+                self._cleanup_unpersisted_material(record.id, managed_path)
                 raise ContentValidationError(str(error)) from error
             except IntegrityError as error:
-                if managed_path is not None:
-                    remove_contained_regular(self.runtime_dir, managed_path)
+                session.rollback()
+                self._cleanup_unpersisted_material(record.id, managed_path)
                 raise ContentStateError("Concurrent material version conflict; retry the request.") from error
             except Exception:
+                session.rollback()
+                self._cleanup_unpersisted_material(record.id, managed_path)
                 raise
             return self._material_read(record)
+
+    def _cleanup_unpersisted_material(self, material_id: str, managed_path: str) -> None:
+        """Delete only when a fresh connection proves no database row owns the file."""
+        try:
+            with self.database.engine.connect() as connection:
+                persisted = connection.exec_driver_sql(
+                    "SELECT path FROM content_product_materials WHERE id=?", (material_id,)
+                ).scalar_one_or_none()
+                if persisted is not None:
+                    return
+                references = connection.exec_driver_sql(
+                    "SELECT path FROM content_product_materials UNION ALL SELECT path FROM content_packages"
+                ).scalars().all()
+            candidate = windows_artifact_reference(self.runtime_dir, managed_path)
+            if candidate is None:
+                return
+            if any(
+                isinstance(path, str)
+                and windows_artifact_references_conflict(
+                    candidate, windows_artifact_reference(self.runtime_dir, path)
+                )
+                for path in references
+            ):
+                return
+        except (SQLAlchemyError, OSError, ValueError, TypeError):
+            return
+        remove_contained_regular(self.runtime_dir, managed_path)
 
     def create_content_item(self, payload: ContentItemCreate) -> ContentItemRead:
         with self.database.session() as session:
@@ -360,7 +392,7 @@ class ContentService:
                 package_path = package.path
         try:
             if old_path_to_remove is not None:
-                remove_contained_regular(self.runtime_dir, old_path_to_remove)
+                self._cleanup_unreferenced_artifact(old_path_to_remove)
             with self.database.session() as session:
                 item = _load_item(session, item_id)
                 self._validate_item_trust(item, session=session)
@@ -420,39 +452,84 @@ class ContentService:
             archive = deterministic_zip(entries, manifest)
             write_contained_atomic(self.runtime_dir, package_path, archive)
             with self.database.session() as session:
-                package = session.get(ContentPackageRecord, package_id)
-                item_record = _load_item(session, item_id)
-                self._validate_item_trust(item_record, session=session)
-                if (
-                    package is None or package.status != "building"
-                    or item_record.current_revision_id != payload.expected_revision_id
-                    or item_record.status not in {"approved", "exported"}
-                ):
+                current_item = _load_item(session, item_id)
+                self._validate_item_trust(current_item, session=session)
+                package_won = session.execute(update(ContentPackageRecord).where(
+                    ContentPackageRecord.id == package_id,
+                    ContentPackageRecord.content_item_id == item_id,
+                    ContentPackageRecord.revision_id == payload.expected_revision_id,
+                    ContentPackageRecord.status == "building",
+                    ContentPackageRecord.path == package_path,
+                ).values(
+                    status="ready", sha256=sha256(archive).hexdigest(),
+                    size_bytes=len(archive), error_detail=None,
+                )).rowcount
+                item_won = session.execute(update(ContentItemRecord).where(
+                    ContentItemRecord.id == item_id,
+                    ContentItemRecord.current_revision_id == payload.expected_revision_id,
+                    ContentItemRecord.status.in_(("approved", "exported")),
+                ).values(status="exported", updated_at=_now())).rowcount
+                if package_won != 1 or item_won != 1:
+                    session.rollback()
                     raise ContentStateError("Package or content state changed before finalization.")
-                package.status = "ready"
-                package.sha256 = sha256(archive).hexdigest()
-                package.size_bytes = len(archive)
-                item_record.status = "exported"
-                item_record.updated_at = _now()
                 session.commit()
+                package = session.get(ContentPackageRecord, package_id)
+                if package is None:
+                    raise ContentStateError("Package disappeared after finalization.")
                 return self._package_read(package)
         except UnsafeContentPath as error:
-            self._fail_package_reservation(package_id, package_path)
+            failed_by_builder = self._fail_package_reservation(package_id, package_path)
+            self._cleanup_unreferenced_artifact(
+                package_path, ignored_package_id=package_id if failed_by_builder else None
+            )
             raise ContentValidationError(
                 "Package build failed; no ready artifact was recorded."
             ) from error
         except Exception:
-            self._fail_package_reservation(package_id, package_path)
+            failed_by_builder = self._fail_package_reservation(package_id, package_path)
+            self._cleanup_unreferenced_artifact(
+                package_path, ignored_package_id=package_id if failed_by_builder else None
+            )
             raise
 
-    def _fail_package_reservation(self, package_id: str, package_path: str) -> None:
+    def _fail_package_reservation(self, package_id: str, package_path: str) -> bool:
         with self.database.session() as session:
-            session.execute(update(ContentPackageRecord).where(
+            won = session.execute(update(ContentPackageRecord).where(
                 ContentPackageRecord.id == package_id,
                 ContentPackageRecord.status == "building",
                 ContentPackageRecord.path == package_path,
-            ).values(status="failed", error_detail="package_build_failed"))
+            ).values(status="failed", error_detail="package_build_failed")).rowcount
             session.commit()
+            return won == 1
+
+    def _cleanup_unreferenced_artifact(
+        self, relative_path: str, *, ignored_package_id: str | None = None
+    ) -> None:
+        """Remove an artifact only if no material or package owns an equivalent file."""
+        try:
+            candidate = windows_artifact_reference(self.runtime_dir, relative_path)
+            if candidate is None:
+                return
+            with self.database.engine.connect() as connection:
+                references = list(connection.exec_driver_sql(
+                    "SELECT NULL AS id, path FROM content_product_materials"
+                ).mappings().all())
+                references.extend(connection.exec_driver_sql(
+                    "SELECT id, path FROM content_packages"
+                ).mappings().all())
+            if any(
+                reference["id"] != ignored_package_id
+                and isinstance(reference["path"], str)
+                and windows_artifact_references_conflict(
+                    candidate,
+                    windows_artifact_reference(self.runtime_dir, reference["path"]),
+                )
+                for reference in references
+            ):
+                return
+        except (SQLAlchemyError, OSError, ValueError, TypeError):
+            return
+        remove_contained_regular(self.runtime_dir, relative_path)
 
     def list_packages(self) -> list[ContentPackageRead]:
         with self.database.session() as session:
