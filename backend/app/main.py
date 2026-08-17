@@ -13,6 +13,8 @@ from backend.app.adapters.bailian import BailianModelAdapter
 from backend.app.db import Database
 from backend.app.features.analysis.api import router as analysis_router
 from backend.app.features.analysis.service import AnalysisService
+from backend.app.features.content.api import router as content_router
+from backend.app.features.content.service import ContentService
 from backend.app.features.radar.api import router as radar_router
 from backend.app.features.radar.service import RadarService
 from backend.app.features.shops.api import router as shops_router
@@ -48,6 +50,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.android_adapter = None
     app.state.shop_service = None
     app.state.analysis_service = None
+    app.state.content_service = None
     app.state.bailian_adapter = BailianModelAdapter(
         api_key=app.state.settings.bailian_api_key,
         base_url=app.state.settings.bailian_base_url,
@@ -69,6 +72,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.bailian_adapter,
             runtime_dir=app.state.settings.runtime_dir,
         )
+        app.state.content_service = ContentService(
+            app.state.database,
+            app.state.bailian_adapter,
+            runtime_dir=app.state.settings.runtime_dir,
+        )
         app.state.job_service.recover_expired_running(
             worker_job_types=ANDROID_SHOP_JOB_TYPES
         )
@@ -77,6 +85,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.job_service = None
         app.state.radar_service = None
         app.state.analysis_service = None
+        app.state.content_service = None
         app.state.database_error = "SQLite database is unavailable."
     app.state.android_adapter = AndroidDeviceAdapter(
         runtime_dir=app.state.settings.runtime_dir,
@@ -93,6 +102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(radar_router)
     app.include_router(shops_router)
     app.include_router(analysis_router)
+    app.include_router(content_router)
 
     @app.exception_handler(SQLAlchemyError)
     async def database_failure(request: Request, _: SQLAlchemyError) -> JSONResponse:
