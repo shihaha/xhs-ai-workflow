@@ -166,7 +166,10 @@ def _adapter(
     device: _FakeU2Device,
     *,
     jobs: JobService | None = None,
+    **adapter_options: Any,
 ) -> AndroidDeviceAdapter:
+    adapter_options.setdefault("profile_settle_seconds", 0)
+    adapter_options.setdefault("sleep", lambda _: None)
     return AndroidDeviceAdapter(
         runtime_dir=tmp_path / "runtime",
         job_service=jobs,
@@ -174,6 +177,7 @@ def _adapter(
         u2_connector=lambda _: device,
         executable_resolver=lambda _: "C:/Android/platform-tools/adb.exe",
         max_shop_screens=2,
+        **adapter_options,
     )
 
 
@@ -236,6 +240,41 @@ def test_collection_reports_changed_profile_selector_instead_of_empty_success(
     assert result.items == []
     assert result.observed_count == 0
     assert len(result.missing_items) == 1
+
+
+def test_collection_waits_for_delayed_shop_hierarchy_before_selector_ruling(
+    tmp_path: Path,
+) -> None:
+    """A bounded delayed UI dump must reach the shop instead of becoming a false layout change."""
+
+    class DelayedShopDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__()
+            self.shop_dumps = 0
+
+        def dump_hierarchy(self, *, compressed: bool = False) -> str:
+            if self.screen == "shop":
+                self.shop_dumps += 1
+                if self.shop_dumps == 1:
+                    return PROFILE_XML
+            return super().dump_hierarchy(compressed=compressed)
+
+    device = DelayedShopDevice()
+
+    result = _adapter(
+        tmp_path,
+        device,
+        transition_poll_interval=0,
+    ).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert device.shop_dumps >= 2
 
 
 def test_collection_reports_device_disconnect_during_profile_transition(
@@ -364,6 +403,8 @@ def test_collection_uses_the_requested_device_when_multiple_are_connected(
         adb_client_factory=MultipleClient,
         u2_connector=lambda serial: connected_serials.append(serial) or device,
         executable_resolver=lambda _: "C:/Android/platform-tools/adb.exe",
+        profile_settle_seconds=0,
+        sleep=lambda _: None,
     )
 
     result = adapter.collect_shop(
@@ -383,6 +424,57 @@ def test_return_to_shop_captures_each_bounded_back_transition(tmp_path: Path) ->
     device = _FakeU2Device(back_screens=["detail", "shop"])
 
     result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert [action for action in device.actions if action[0] == "press"] == [
+        ("press", "back"),
+        ("press", "back"),
+    ]
+
+
+def test_return_to_shop_waits_past_stale_detail_before_another_back(
+    tmp_path: Path,
+) -> None:
+    """A delayed shop render after the second Back must not cause an unsafe third Back."""
+
+    class DelayedReturnDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__(back_screens=[])
+            self.back_count = 0
+            self.return_dumps = 0
+
+        def press(self, key: str) -> None:
+            self.actions.append(("press", key))
+            self.back_count += 1
+            if self.back_count == 1:
+                self.screen = "detail"
+            elif self.back_count == 2:
+                self.return_dumps = 0
+                self.screen = "returning"
+                self.screens["returning"] = DETAIL_XML
+            else:
+                self.screen = "initial"
+
+        def dump_hierarchy(self, *, compressed: bool = False) -> str:
+            if self.screen == "returning":
+                self.return_dumps += 1
+                if self.return_dumps >= 2:
+                    self.screen = "shop"
+            return super().dump_hierarchy(compressed=compressed)
+
+    device = DelayedReturnDevice()
+
+    result = _adapter(
+        tmp_path,
+        device,
+        transition_poll_interval=0,
+    ).collect_shop(
         CollectionRequest(
             capability="shop_products",
             parameters={"account_user_id": "account-1"},

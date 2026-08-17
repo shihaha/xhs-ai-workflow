@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import re
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -77,6 +78,7 @@ class AndroidSelectorProfile:
     shop_markers: tuple[str, ...]
     detail_markers: tuple[str, ...]
     end_markers: tuple[str, ...]
+    profile_activity_markers: tuple[str, ...]
     shop_activity_markers: tuple[str, ...]
     detail_activity_markers: tuple[str, ...]
 
@@ -93,6 +95,7 @@ ANDROID_SELECTOR_PROFILES: dict[str, AndroidSelectorProfile] = {
         shop_markers=("到手价", "已售", "没有更多商品了"),
         detail_markers=("立即购买", "加入购物车"),
         end_markers=("没有更多商品了",),
+        profile_activity_markers=("NewOtherUser",),
         shop_activity_markers=("ShopDetail",),
         detail_activity_markers=("GoodsDetail",),
     )
@@ -219,6 +222,12 @@ class AndroidDeviceAdapter:
         u2_connector: Callable[[str], Any] | None = None,
         executable_resolver: Callable[[str], str | None] = which,
         max_shop_screens: int = 10,
+        profile_settle_seconds: float = 1,
+        selector_timeout_seconds: float = 5,
+        transition_timeout_seconds: float = 8,
+        transition_poll_interval: float = 0.25,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if selector_profile_version not in ANDROID_SELECTOR_PROFILES:
             raise ValueError(f"Unknown Android selector profile: {selector_profile_version}")
@@ -232,6 +241,12 @@ class AndroidDeviceAdapter:
         self._u2_connector = u2_connector or _default_u2_connect
         self._executable_resolver = executable_resolver
         self.max_shop_screens = max(1, max_shop_screens)
+        self.profile_settle_seconds = max(profile_settle_seconds, 0)
+        self.selector_timeout_seconds = max(selector_timeout_seconds, 0)
+        self.transition_timeout_seconds = max(transition_timeout_seconds, 0)
+        self.transition_poll_interval = max(transition_poll_interval, 0)
+        self._sleep = sleep
+        self._monotonic = monotonic
 
     def health(self) -> DeviceHealth:
         return self._connect(self.device_id).health
@@ -315,17 +330,28 @@ class AndroidDeviceAdapter:
         transitions: list[dict[str, Any]] = []
         sequence = 0
 
-        def capture(name: str) -> _ScreenEvidence:
+        def capture(
+            name: str, ready: Callable[[str], bool] | None = None
+        ) -> _ScreenEvidence:
             nonlocal sequence
             sequence += 1
-            evidence = self._capture_transition(device, job_id, name, sequence)
+            evidence = self._capture_transition(
+                device, job_id, name, sequence, ready=ready
+            )
             artifact_paths.extend(evidence.artifacts)
             transitions.append(evidence.raw())
             return evidence
 
         try:
             self._open_profile(device, account_user_id)
-            profile_screen = capture("account_profile")
+            self._sleep(self.profile_settle_seconds)
+            profile_screen = capture(
+                "account_profile",
+                ready=lambda hierarchy: (
+                    self._blocked_reason(hierarchy) is not None
+                    or self._is_profile_activity(device)
+                ),
+            )
             cancelled = self._cancelled_result(
                 request, job_id, items, rejected_items, artifact_paths, transitions
             )
@@ -342,7 +368,11 @@ class AndroidDeviceAdapter:
                     artifacts=artifact_paths,
                     transitions=transitions,
                 )
-            if not _click_first(device, self.profile.shop_entry):
+            if not _click_first(
+                device,
+                self.profile.shop_entry,
+                timeout_seconds=self.selector_timeout_seconds,
+            ):
                 return self._result(
                     request=request,
                     status="needs_human",
@@ -353,7 +383,13 @@ class AndroidDeviceAdapter:
                     transitions=transitions,
                 )
 
-            shop_screen = capture("shop_page")
+            shop_screen = capture(
+                "shop_page",
+                ready=lambda hierarchy: (
+                    self._blocked_reason(hierarchy) is not None
+                    or self._is_shop_hierarchy(hierarchy)
+                ),
+            )
             cancelled = self._cancelled_result(
                 request, job_id, items, rejected_items, artifact_paths, transitions
             )
@@ -407,7 +443,13 @@ class AndroidDeviceAdapter:
                         continue
                     seen_titles.add(product.title)
                     device.click(product.center_x, product.center_y)
-                    detail_screen = capture(f"product_{len(seen_titles)}_detail")
+                    detail_screen = capture(
+                        f"product_{len(seen_titles)}_detail",
+                        ready=lambda hierarchy: (
+                            self._blocked_reason(hierarchy) is not None
+                            or self._is_detail_hierarchy(hierarchy)
+                        ),
+                    )
                     cancelled = self._cancelled_result(
                         request,
                         job_id,
@@ -447,7 +489,11 @@ class AndroidDeviceAdapter:
                             artifacts=artifact_paths,
                             transitions=transitions,
                         )
-                    if not _click_first(device, self.profile.share_product):
+                    if not _click_first(
+                        device,
+                        self.profile.share_product,
+                        timeout_seconds=self.selector_timeout_seconds,
+                    ):
                         rejected_items.append(
                             _rejected_product(
                                 product, "selector_changed", detail_screen.raw()
@@ -462,7 +508,13 @@ class AndroidDeviceAdapter:
                             artifacts=artifact_paths,
                             transitions=transitions,
                         )
-                    share_screen = capture(f"product_{len(seen_titles)}_share")
+                    share_screen = capture(
+                        f"product_{len(seen_titles)}_share",
+                        ready=lambda hierarchy: (
+                            self._blocked_reason(hierarchy) is not None
+                            or self._is_share_hierarchy(hierarchy)
+                        ),
+                    )
                     cancelled = self._cancelled_result(
                         request,
                         job_id,
@@ -488,7 +540,11 @@ class AndroidDeviceAdapter:
                             transitions=transitions,
                         )
                     link: str | None = None
-                    if _click_first(device, self.profile.copy_link):
+                    if _click_first(
+                        device,
+                        self.profile.copy_link,
+                        timeout_seconds=self.selector_timeout_seconds,
+                    ):
                         link = _canonical_product_url(_read_clipboard(device))
                     product_evidence = {
                         "title": product.title,
@@ -532,9 +588,21 @@ class AndroidDeviceAdapter:
 
                     returned_to_shop = False
                     for back_attempt in range(1, 6):
+                        if self._is_shop_activity(device):
+                            returned_to_shop = True
+                            break
                         device.press("back")
                         shop_screen = capture(
-                            f"product_{len(seen_titles)}_shop_return_{back_attempt}"
+                            f"product_{len(seen_titles)}_shop_return_{back_attempt}",
+                            ready=lambda hierarchy, allow_detail=back_attempt == 1: (
+                                self._blocked_reason(hierarchy) is not None
+                                or self._is_shop(device, hierarchy)
+                                or (
+                                    allow_detail
+                                    and self._is_detail_hierarchy(hierarchy)
+                                    and not self._is_share_hierarchy(hierarchy)
+                                )
+                            ),
                         )
                         cancelled = self._cancelled_result(
                             request,
@@ -575,8 +643,16 @@ class AndroidDeviceAdapter:
                     break
                 if expected is not None and len(items) + len(rejected_items) >= expected:
                     break
+                previous_hierarchy = shop_screen.hierarchy
                 device.swipe(360, 1300, 360, 500, 0.6)
-                shop_screen = capture(f"shop_scroll_{screen_index + 1}")
+                shop_screen = capture(
+                    f"shop_scroll_{screen_index + 1}",
+                    ready=lambda hierarchy: (
+                        self._blocked_reason(hierarchy) is not None
+                        or self._is_end(hierarchy)
+                        or hierarchy != previous_hierarchy
+                    ),
+                )
                 cancelled = self._cancelled_result(
                     request,
                     job_id,
@@ -778,11 +854,27 @@ class AndroidDeviceAdapter:
         return raw_job_id
 
     def _capture_transition(
-        self, device: Any, job_id: str | None, transition: str, sequence: int
+        self,
+        device: Any,
+        job_id: str | None,
+        transition: str,
+        sequence: int,
+        *,
+        ready: Callable[[str], bool] | None = None,
     ) -> _ScreenEvidence:
         try:
+            deadline = self._monotonic() + self.transition_timeout_seconds
+            while True:
+                hierarchy = device.dump_hierarchy(compressed=False)
+                if (
+                    ready is None
+                    or ready(hierarchy)
+                    or self._is_cancelled(job_id)
+                    or self._monotonic() >= deadline
+                ):
+                    break
+                self._sleep(self.transition_poll_interval)
             screenshot = _screenshot_bytes(device)
-            hierarchy = device.dump_hierarchy(compressed=False)
         except Exception as error:
             if _is_disconnect_error(error):
                 raise _DeviceDisconnected(str(error)) from error
@@ -847,15 +939,33 @@ class AndroidDeviceAdapter:
         return None
 
     def _is_shop(self, device: Any, hierarchy: str) -> bool:
+        return self._is_shop_activity(device) or self._is_shop_hierarchy(hierarchy)
+
+    def _is_shop_activity(self, device: Any) -> bool:
         activity = str(device.app_current().get("activity") or "")
-        return any(marker in activity for marker in self.profile.shop_activity_markers) or any(
-            marker in hierarchy for marker in self.profile.shop_markers
+        return any(marker in activity for marker in self.profile.shop_activity_markers)
+
+    def _is_profile_activity(self, device: Any) -> bool:
+        activity = str(device.app_current().get("activity") or "")
+        return any(
+            marker in activity for marker in self.profile.profile_activity_markers
         )
 
     def _is_detail(self, device: Any, hierarchy: str) -> bool:
         activity = str(device.app_current().get("activity") or "")
-        return any(marker in activity for marker in self.profile.detail_activity_markers) or any(
-            marker in hierarchy for marker in self.profile.detail_markers
+        return any(
+            marker in activity for marker in self.profile.detail_activity_markers
+        ) or self._is_detail_hierarchy(hierarchy)
+
+    def _is_shop_hierarchy(self, hierarchy: str) -> bool:
+        return any(marker in hierarchy for marker in self.profile.shop_markers)
+
+    def _is_detail_hierarchy(self, hierarchy: str) -> bool:
+        return any(marker in hierarchy for marker in self.profile.detail_markers)
+
+    def _is_share_hierarchy(self, hierarchy: str) -> bool:
+        return any(
+            selector.value in hierarchy for selector in self.profile.copy_link
         )
 
     def _is_end(self, hierarchy: str) -> bool:
@@ -1020,11 +1130,20 @@ def _device_record(device: Any) -> dict[str, str]:
     return {"device_id": serial, "state": state}
 
 
-def _click_first(device: Any, selectors: tuple[SelectorQuery, ...]) -> bool:
+def _click_first(
+    device: Any,
+    selectors: tuple[SelectorQuery, ...],
+    *,
+    timeout_seconds: float,
+) -> bool:
     for selector in selectors:
         ui_object = device(**{selector.attribute: selector.value})
         exists_value = getattr(ui_object, "exists", False)
-        exists = exists_value(timeout=0.2) if callable(exists_value) else bool(exists_value)
+        exists = (
+            exists_value(timeout=timeout_seconds)
+            if callable(exists_value)
+            else bool(exists_value)
+        )
         if exists:
             ui_object.click()
             return True
