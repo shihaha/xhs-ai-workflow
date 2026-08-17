@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 from hashlib import sha256
 import io
 import json
@@ -11,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import zipfile
 import unicodedata
-from typing import Callable, Literal
+from typing import Callable, Iterator, Literal
 
 
 MAX_MATERIAL_BYTES = 50 * 1024 * 1024
@@ -289,6 +290,140 @@ def remove_contained_regular(
             os.close(descriptor)
 
 
+@contextmanager
+def open_contained_delete_handle(
+    root: Path,
+    relative: str,
+    *,
+    limit: int = MAX_PACKAGE_BYTES,
+    expected_identity: tuple[int, int, int, int] | None = None,
+) -> Iterator[int | None]:
+    """Yield one identity-bound Windows deletion handle, or ``None`` fail-closed."""
+
+    descriptor: int | None = None
+    try:
+        inspection = inspect_contained_artifact(root, relative)
+        if (
+            os.name != "nt"
+            or inspection.status != "trusted"
+            or inspection.path is None
+            or inspection.identity is None
+            or inspection.size_bytes is None
+            or inspection.size_bytes > limit
+            or (
+                expected_identity is not None
+                and inspection.identity != expected_identity
+            )
+        ):
+            yield None
+            return
+        descriptor = _open_delete_handle(inspection.path)
+        opened = os.fstat(descriptor)
+        after = inspect_contained_artifact(root, relative)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _identity(opened) != inspection.identity
+            or after.status != "trusted"
+            or after.identity != inspection.identity
+        ):
+            yield None
+            return
+        yield descriptor
+    except (OSError, OverflowError, ValueError, TypeError):
+        yield None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def rename_contained_regular_to_directory(
+    root: Path,
+    source_relative: str,
+    target_relative: str,
+    *,
+    expected_identity: tuple[int, int, int, int],
+) -> ArtifactPathInspection:
+    """Retry one transient handle acquisition without ever falling back to paths."""
+
+    moved = ArtifactPathInspection("ambiguous", absolute_key="not_attempted")
+    for _attempt in range(2):
+        moved = _rename_contained_regular_to_directory_once(
+            root,
+            source_relative,
+            target_relative,
+            expected_identity=expected_identity,
+        )
+        if moved.status == "trusted":
+            return moved
+        source = inspect_contained_artifact(root, source_relative)
+        target = inspect_contained_artifact(root, target_relative)
+        if (
+            source.status != "trusted"
+            or source.identity != expected_identity
+            or target.status != "missing"
+        ):
+            return moved
+    return moved
+
+
+def _rename_contained_regular_to_directory_once(
+    root: Path,
+    source_relative: str,
+    target_relative: str,
+    *,
+    expected_identity: tuple[int, int, int, int],
+) -> ArtifactPathInspection:
+    """Rename by source and target-directory handles; never resolve a late target path."""
+
+    source = inspect_contained_artifact(root, source_relative)
+    target_posix = PurePosixPath(target_relative)
+    if (
+        os.name != "nt"
+        or source.status != "trusted"
+        or source.path is None
+        or source.identity != expected_identity
+        or target_posix.is_absolute()
+        or len(target_posix.parts) < 2
+    ):
+        return ArtifactPathInspection("ambiguous", absolute_key="precondition")
+    target_parent = root.joinpath(*target_posix.parts[:-1])
+    descriptor: int | None = None
+    directory_handle: int | None = None
+    try:
+        target_parent.resolve(strict=True).relative_to(root.resolve(strict=True))
+        if target_parent.is_symlink() or (
+            hasattr(target_parent, "is_junction") and target_parent.is_junction()
+        ):
+            return ArtifactPathInspection("ambiguous", absolute_key="target_link")
+        descriptor = _open_delete_handle(source.path)
+        opened = os.fstat(descriptor)
+        if _identity(opened) != expected_identity:
+            return ArtifactPathInspection("ambiguous", absolute_key="source_handle_identity")
+        directory_handle = _open_directory_handle(target_parent)
+        if not _directory_handle_matches_path(directory_handle, target_parent, root):
+            return ArtifactPathInspection("ambiguous", absolute_key="directory_handle_identity")
+        if not _rename_open_file(
+            descriptor, 0, _windows_extended_path(target_parent / target_posix.name)
+        ):
+            return ArtifactPathInspection(
+                "ambiguous", absolute_key=f"rename_failed_{_windows_last_error()}"
+            )
+        moved_handle = os.fstat(descriptor)
+        if _identity(moved_handle) != expected_identity:
+            return ArtifactPathInspection("ambiguous", absolute_key="post_handle_identity")
+    except (OSError, OverflowError, ValueError, TypeError):
+        return ArtifactPathInspection("ambiguous", absolute_key="exception")
+    finally:
+        if directory_handle is not None:
+            _close_windows_handle(directory_handle)
+        if descriptor is not None:
+            os.close(descriptor)
+    moved = inspect_contained_artifact(root, target_relative)
+    if moved.status != "trusted" or moved.identity != expected_identity:
+        return ArtifactPathInspection("ambiguous", absolute_key="post_path_identity")
+    return moved
+
+
 def _open_delete_handle(path: Path) -> int:
     import ctypes
     import msvcrt
@@ -305,7 +440,7 @@ def _open_delete_handle(path: Path) -> int:
     open_existing = 3
     open_reparse_point = 0x00200000
     handle = create_file(
-        str(path), delete_access | 0x80000000, share_all, None,
+        _windows_extended_path(path), delete_access | 0x80000000, share_all, None,
         open_existing, open_reparse_point, None,
     )
     invalid_handle = wintypes.HANDLE(-1).value
@@ -316,6 +451,153 @@ def _open_delete_handle(path: Path) -> int:
     except Exception:
         ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
         raise
+
+
+def _open_directory_handle(path: Path) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    read_attributes_and_list = 0x00000080 | 0x00000001
+    share_read_write = 0x00000001 | 0x00000002
+    open_existing = 3
+    backup_semantics = 0x02000000
+    open_reparse_point = 0x00200000
+    handle = create_file(
+        _windows_extended_path(path), read_attributes_and_list, share_read_write, None, open_existing,
+        backup_semantics | open_reparse_point, None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise OSError(ctypes.get_last_error(), "Unable to open quarantine directory.")
+    return int(handle)
+
+
+def _directory_handle_matches_path(handle: int, path: Path, root: Path) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    get_attributes = ctypes.WinDLL(
+        "kernel32", use_last_error=True
+    ).GetFileInformationByHandle
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    information = ByHandleFileInformation()
+    get_attributes.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation),
+    )
+    get_attributes.restype = wintypes.BOOL
+    if not get_attributes(handle, ctypes.byref(information)):
+        return False
+    directory_attribute = 0x00000010
+    reparse_attribute = 0x00000400
+    if (
+        not information.file_attributes & directory_attribute
+        or information.file_attributes & reparse_attribute
+    ):
+        return False
+    get_final_path = ctypes.WinDLL(
+        "kernel32", use_last_error=True
+    ).GetFinalPathNameByHandleW
+    get_final_path.argtypes = (
+        wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+    )
+    get_final_path.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_final_path(handle, buffer, len(buffer), 0)
+    if not length or length >= len(buffer):
+        return False
+    rendered = buffer.value
+    if rendered.startswith("\\\\?\\UNC\\"):
+        rendered = "\\\\" + rendered[8:]
+    elif rendered.startswith("\\\\?\\"):
+        rendered = rendered[4:]
+    try:
+        final = Path(rendered).resolve(strict=True)
+        final.relative_to(root.resolve(strict=True))
+        return unicodedata.normalize("NFC", str(final)).casefold() == unicodedata.normalize(
+            "NFC", str(path.resolve(strict=True))
+        ).casefold()
+    except (OSError, ValueError):
+        return False
+
+
+def _rename_open_file(
+    descriptor: int, directory_handle: int, target_name: str
+) -> bool:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    encoded_length = len(target_name.encode("utf-16-le"))
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", ctypes.c_ubyte),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * (len(target_name) + 1)),
+        ]
+
+    information = FileRenameInfo(
+        False, directory_handle, encoded_length, target_name
+    )
+    set_information = ctypes.WinDLL(
+        "kernel32", use_last_error=True
+    ).SetFileInformationByHandle
+    set_information.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+    )
+    set_information.restype = wintypes.BOOL
+    return bool(
+        set_information(
+            msvcrt.get_osfhandle(descriptor), 3,
+            ctypes.byref(information),
+            FileRenameInfo.file_name.offset + encoded_length + ctypes.sizeof(wintypes.WCHAR),
+        )
+    )
+
+
+def _close_windows_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    close = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    close(handle)
+
+
+def _windows_extended_path(path: Path) -> str:
+    rendered = str(path.resolve(strict=False))
+    if rendered.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + rendered[2:]
+    if rendered.startswith("\\\\?\\"):
+        return rendered
+    return "\\\\?\\" + rendered
+
+
+def _windows_last_error() -> int:
+    import ctypes
+
+    return ctypes.get_last_error()
 
 
 def _delete_open_file(descriptor: int) -> bool:

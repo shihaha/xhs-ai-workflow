@@ -206,7 +206,7 @@ Define `ArtifactCleanupCandidate` as a frozen dataclass containing the seven fie
 
 - [ ] **Step 4: Implement fail-closed ownership proof and quarantine rename**
 
-Add a single helper in `export.py` that returns `trusted`, `ambiguous`, or `missing` rather than treating `None` as “no conflict.” `process_one()` must keep the database lease while proving ownership, but it must never hold a SQLite write transaction across hashing or file I/O. It rechecks the lease and all reference facts immediately before and after an atomic same-volume rename. Any changed fact moves the row to `needs_human`; it never guesses and never follows a link or junction.
+Add a single helper in `export.py` that returns `trusted`, `ambiguous`, or `missing` rather than treating `None` as “no conflict.” `process_one()` must keep the database lease while proving ownership. Hashing, large reads, rename, and waits must remain outside SQLite write transactions. The sole bounded exception is final deletion: after opening and verifying the identity-bound delete handle, a short `BEGIN IMMEDIATE` transaction revalidates the lease and complete reference snapshot, performs only the handle-bound disposition, writes the `deleted` CAS, and commits immediately so a new reference writer cannot pass between authorization and deletion. It rechecks the lease and all reference facts immediately before and after an atomic same-volume rename. Any changed fact moves the row to `needs_human`; it never guesses and never follows a link or junction.
 
 - [ ] **Step 5: Implement delayed final deletion**
 

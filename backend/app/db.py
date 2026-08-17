@@ -123,14 +123,22 @@ class Database:
         quarantine_marker_present = self._migration_marker_exists(
             "task8_artifact_quarantine_v1"
         )
+        quarantine_identity_marker_present = self._migration_marker_exists(
+            "task8_artifact_quarantine_identity_v1"
+        )
         if quarantine_marker_present:
-            self._require_artifact_quarantine_schema()
+            self._require_artifact_quarantine_schema(
+                require_identity=quarantine_identity_marker_present
+            )
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
         self._migrate_content_schema()
         self._migrate_artifact_quarantine(
             marker_present=quarantine_marker_present
+        )
+        self._migrate_artifact_quarantine_identity(
+            marker_present=quarantine_identity_marker_present
         )
 
     def _migration_marker_exists(self, name: str) -> bool:
@@ -145,12 +153,20 @@ class Database:
                 {"name": name},
             ) is not None
 
-    def _require_artifact_quarantine_schema(self) -> None:
+    def _require_artifact_quarantine_schema(
+        self, *, require_identity: bool = True
+    ) -> None:
         with self.engine.connect() as connection:
             if (
-                not _artifact_quarantine_schema_valid(inspect(connection))
-                or not _artifact_quarantine_triggers_valid(connection)
-                or not _artifact_quarantine_data_valid(connection)
+                not _artifact_quarantine_schema_valid(
+                    inspect(connection), require_identity=require_identity
+                )
+                or not _artifact_quarantine_triggers_valid(
+                    connection, require_identity=require_identity
+                )
+                or not _artifact_quarantine_data_valid(
+                    connection, require_identity=require_identity
+                )
             ):
                 raise SchemaMigrationError(
                     "Task 8 artifact cleanup schema validation failed."
@@ -195,7 +211,7 @@ class Database:
         from backend.app.features.content.models import ArtifactCleanupRecord
 
         if marker_present:
-            self._require_artifact_quarantine_schema()
+            self._require_artifact_quarantine_schema(require_identity=False)
             self._recover_stranded_content_packages()
             return
 
@@ -217,7 +233,9 @@ class Database:
             tables = set(inspect(connection).get_table_names())
             if "artifact_gc_queue" not in tables:
                 ArtifactCleanupRecord.__table__.create(connection)
-            elif not _artifact_quarantine_table_valid(inspect(connection)):
+            elif not _artifact_quarantine_table_valid(
+                inspect(connection), require_identity=False
+            ):
                 row_count = connection.scalar(
                     text("SELECT COUNT(*) FROM artifact_gc_queue")
                 )
@@ -232,14 +250,70 @@ class Database:
 
             inspector = inspect(connection)
             if (
-                not _artifact_quarantine_schema_valid(inspector)
-                or not _artifact_quarantine_triggers_valid(connection)
-                or not _artifact_quarantine_data_valid(connection)
+                not _artifact_quarantine_schema_valid(
+                    inspector, require_identity=False
+                )
+                or not _artifact_quarantine_triggers_valid(
+                    connection, require_identity=False
+                )
+                or not _artifact_quarantine_data_valid(
+                    connection, require_identity=False
+                )
             ):
                 raise SchemaMigrationError("Task 8 artifact cleanup schema validation failed.")
 
         self._recover_stranded_content_packages(write_marker=True)
-        self._require_artifact_quarantine_schema()
+        self._require_artifact_quarantine_schema(require_identity=False)
+
+    def _migrate_artifact_quarantine_identity(self, *, marker_present: bool) -> None:
+        """Add durable quarantine identity without trusting a partial migration."""
+
+        if marker_present:
+            self._require_artifact_quarantine_schema(require_identity=True)
+            return
+        identity_columns = (
+            "quarantine_volume_id",
+            "quarantine_file_id",
+            "quarantine_size_bytes",
+            "quarantine_mtime_ns",
+        )
+        with self.engine.begin() as connection:
+            columns = {
+                column["name"]
+                for column in inspect(connection).get_columns("artifact_gc_queue")
+            }
+            present = {name for name in identity_columns if name in columns}
+            if present and present != set(identity_columns):
+                raise SchemaMigrationError(
+                    "Partial artifact cleanup identity migration requires manual recovery."
+                )
+            for name in identity_columns:
+                if name not in columns:
+                    connection.execute(
+                        text(f"ALTER TABLE artifact_gc_queue ADD COLUMN {name} INTEGER")
+                    )
+            _create_artifact_quarantine_identity_triggers(connection)
+            if (
+                not _artifact_quarantine_schema_valid(
+                    inspect(connection), require_identity=True
+                )
+                or not _artifact_quarantine_triggers_valid(
+                    connection, require_identity=True
+                )
+                or not _artifact_quarantine_data_valid(
+                    connection, require_identity=True
+                )
+            ):
+                raise SchemaMigrationError(
+                    "Task 8 artifact cleanup identity schema validation failed."
+                )
+            connection.execute(
+                text(
+                    "INSERT INTO workbench_schema_migrations (name, applied_at) "
+                    "VALUES ('task8_artifact_quarantine_identity_v1', CURRENT_TIMESTAMP)"
+                )
+            )
+        self._require_artifact_quarantine_schema(require_identity=True)
 
     def _recover_stranded_content_packages(self, *, write_marker: bool = False) -> None:
         from backend.app.features.content.models import ArtifactCleanupRecord
@@ -670,10 +744,14 @@ def _compact_sql(value: object) -> str:
     return "".join(compact)
 
 
-def _artifact_quarantine_schema_valid(inspector: object) -> bool:
+def _artifact_quarantine_schema_valid(
+    inspector: object, *, require_identity: bool = True
+) -> bool:
     """Validate the physical cleanup contract instead of trusting a marker."""
 
-    if not _artifact_quarantine_table_valid(inspector):
+    if not _artifact_quarantine_table_valid(
+        inspector, require_identity=require_identity
+    ):
         return False
     try:
         package_columns = {
@@ -690,10 +768,12 @@ def _artifact_quarantine_schema_valid(inspector: object) -> bool:
         return False
 
 
-def _artifact_quarantine_table_valid(inspector: object) -> bool:
+def _artifact_quarantine_table_valid(
+    inspector: object, *, require_identity: bool = True
+) -> bool:
     """Validate every physical queue column, CHECK and open-row identity index."""
 
-    required_columns = {
+    base_columns = {
         "id",
         "owner_type",
         "owner_id",
@@ -712,6 +792,12 @@ def _artifact_quarantine_table_valid(inspector: object) -> bool:
         "created_at",
         "updated_at",
         "completed_at",
+    }
+    identity_columns = {
+        "quarantine_volume_id",
+        "quarantine_file_id",
+        "quarantine_size_bytes",
+        "quarantine_mtime_ns",
     }
     required_not_null = {
         "id",
@@ -747,8 +833,12 @@ def _artifact_quarantine_table_valid(inspector: object) -> bool:
         "created_at": "DATETIME",
         "updated_at": "DATETIME",
         "completed_at": "DATETIME",
+        "quarantine_volume_id": "INTEGER",
+        "quarantine_file_id": "INTEGER",
+        "quarantine_size_bytes": "INTEGER",
+        "quarantine_mtime_ns": "INTEGER",
     }
-    expected_checks = {
+    legacy_checks = {
         "ck_artifact_gc_owner_type": "owner_typein('material','content_package')",
         "ck_artifact_gc_state": "statein('pending','claimed','quarantined','deleted','needs_human','cancelled')",
         "ck_artifact_gc_size": "expected_size_bytes>=0",
@@ -760,6 +850,13 @@ def _artifact_quarantine_table_valid(inspector: object) -> bool:
         "ck_artifact_gc_relative_path": "artifact_path_key(relative_path)isnotnullandpath_key=artifact_path_key(relative_path)",
         "ck_artifact_gc_quarantine_path": "quarantine_pathisnullorartifact_path_key(quarantine_path)isnotnull",
     }
+    hardened_checks = {
+        **legacy_checks,
+        "ck_artifact_gc_size": "expected_size_bytes>=0andexpected_size_bytes<=262144000",
+        "ck_artifact_gc_relative_path": "artifact_path_key(relative_path)isnotnullandlength(relative_path)<=1000andpath_key=artifact_path_key(relative_path)",
+        "ck_artifact_gc_quarantine_path": "quarantine_pathisnullor(length(quarantine_path)<=1000andartifact_path_key(quarantine_path)isnotnull)",
+        "ck_artifact_gc_quarantine_identity": "((quarantine_pathisnullandquarantine_volume_idisnullandquarantine_file_idisnullandquarantine_size_bytesisnullandquarantine_mtime_nsisnull)or(quarantine_pathisnotnullandquarantine_volume_idisnotnullandquarantine_file_idisnotnullandquarantine_size_bytesisnotnullandquarantine_mtime_nsisnotnullandquarantine_volume_id>=0andquarantine_file_id>=0andquarantine_size_bytes>=0andquarantine_size_bytes<=262144000andquarantine_mtime_ns>=0))and(state!='quarantined'orquarantine_pathisnotnull)",
+    }
     try:
         tables = set(inspector.get_table_names())
         if "artifact_gc_queue" not in tables or "content_packages" not in tables:
@@ -768,25 +865,30 @@ def _artifact_quarantine_table_valid(inspector: object) -> bool:
             column["name"]: column
             for column in inspector.get_columns("artifact_gc_queue")
         }
-        if set(columns) != required_columns:
+        has_identity = set(columns) == base_columns | identity_columns
+        if set(columns) != base_columns and not has_identity:
+            return False
+        if require_identity and not has_identity:
             return False
         if any(columns[name].get("nullable") is not False for name in required_not_null):
             return False
         if any(
             columns[name].get("nullable") is not True
-            for name in required_columns - required_not_null
+            for name in set(columns) - required_not_null
         ):
             return False
         if {
             name: str(column.get("type") or "").upper()
             for name, column in columns.items()
-        } != expected_types:
+        } != {name: expected_types[name] for name in columns}:
             return False
         checks = {
             item.get("name"): _compact_sql(item.get("sqltext"))
             for item in inspector.get_check_constraints("artifact_gc_queue")
         }
-        if checks != expected_checks:
+        if checks != hardened_checks and not (has_identity and checks == legacy_checks):
+            return False
+        if not has_identity and checks != legacy_checks:
             return False
         indexes = {
             item.get("name"): (
@@ -827,6 +929,42 @@ BEGIN
 END
 """
 
+_CLEANUP_IDENTITY_WHEN = """
+length(NEW.relative_path) > 1000
+OR NEW.expected_size_bytes < 0 OR NEW.expected_size_bytes > 262144000
+OR (NEW.quarantine_path IS NULL AND (
+    NEW.quarantine_volume_id IS NOT NULL OR NEW.quarantine_file_id IS NOT NULL
+    OR NEW.quarantine_size_bytes IS NOT NULL OR NEW.quarantine_mtime_ns IS NOT NULL
+))
+OR (NEW.quarantine_path IS NOT NULL AND (
+    length(NEW.quarantine_path) > 1000
+    OR NEW.quarantine_volume_id IS NULL OR NEW.quarantine_file_id IS NULL
+    OR NEW.quarantine_size_bytes IS NULL OR NEW.quarantine_mtime_ns IS NULL
+    OR NEW.quarantine_volume_id < 0 OR NEW.quarantine_file_id < 0
+    OR NEW.quarantine_size_bytes < 0 OR NEW.quarantine_size_bytes > 262144000
+    OR NEW.quarantine_mtime_ns < 0
+))
+OR (NEW.state = 'quarantined' AND NEW.quarantine_path IS NULL)
+"""
+
+_CLEANUP_IDENTITY_INSERT_TRIGGER = f"""
+CREATE TRIGGER ck_artifact_gc_identity_insert
+BEFORE INSERT ON artifact_gc_queue
+WHEN {_CLEANUP_IDENTITY_WHEN}
+BEGIN
+    SELECT RAISE(ABORT, 'artifact cleanup identity is invalid');
+END
+"""
+
+_CLEANUP_IDENTITY_UPDATE_TRIGGER = f"""
+CREATE TRIGGER ck_artifact_gc_identity_update
+BEFORE UPDATE ON artifact_gc_queue
+WHEN {_CLEANUP_IDENTITY_WHEN}
+BEGIN
+    SELECT RAISE(ABORT, 'artifact cleanup identity is invalid');
+END
+"""
+
 
 def _create_artifact_quarantine_triggers(connection: Connection) -> None:
     connection.execute(text("DROP TRIGGER IF EXISTS ck_content_packages_build_token_insert"))
@@ -835,16 +973,33 @@ def _create_artifact_quarantine_triggers(connection: Connection) -> None:
     connection.execute(text(_BUILD_TOKEN_UPDATE_TRIGGER))
 
 
-def _artifact_quarantine_triggers_valid(connection: Connection) -> bool:
+def _create_artifact_quarantine_identity_triggers(connection: Connection) -> None:
+    connection.execute(text("DROP TRIGGER IF EXISTS ck_artifact_gc_identity_insert"))
+    connection.execute(text("DROP TRIGGER IF EXISTS ck_artifact_gc_identity_update"))
+    connection.execute(text(_CLEANUP_IDENTITY_INSERT_TRIGGER))
+    connection.execute(text(_CLEANUP_IDENTITY_UPDATE_TRIGGER))
+
+
+def _artifact_quarantine_triggers_valid(
+    connection: Connection, *, require_identity: bool = True
+) -> bool:
+    names = [
+        "ck_content_packages_build_token_insert",
+        "ck_content_packages_build_token_update",
+    ]
+    if require_identity:
+        names.extend(
+            ["ck_artifact_gc_identity_insert", "ck_artifact_gc_identity_update"]
+        )
+    placeholders = ",".join(f"'{name}'" for name in names)
     rows = connection.execute(
         text(
             "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
-            "AND name IN ('ck_content_packages_build_token_insert', "
-            "'ck_content_packages_build_token_update')"
+            f"AND name IN ({placeholders})"
         )
     ).mappings().all()
     actual = {row["name"]: _compact_sql(row["sql"]) for row in rows}
-    return actual == {
+    expected = {
         "ck_content_packages_build_token_insert": _compact_sql(
             _BUILD_TOKEN_INSERT_TRIGGER
         ),
@@ -852,19 +1007,38 @@ def _artifact_quarantine_triggers_valid(connection: Connection) -> bool:
             _BUILD_TOKEN_UPDATE_TRIGGER
         ),
     }
+    if require_identity:
+        expected.update(
+            {
+                "ck_artifact_gc_identity_insert": _compact_sql(
+                    _CLEANUP_IDENTITY_INSERT_TRIGGER
+                ),
+                "ck_artifact_gc_identity_update": _compact_sql(
+                    _CLEANUP_IDENTITY_UPDATE_TRIGGER
+                ),
+            }
+        )
+    return actual == expected
 
 
-def _artifact_quarantine_data_valid(connection: Connection) -> bool:
+def _artifact_quarantine_data_valid(
+    connection: Connection, *, require_identity: bool = True
+) -> bool:
     try:
         build_tokens = connection.execute(
             text("SELECT build_token FROM content_packages WHERE build_token IS NOT NULL")
         ).scalars()
         if any(not is_canonical_uuid_text(token) for token in build_tokens):
             return False
+        identity_sql = (
+            ", quarantine_volume_id, quarantine_file_id, quarantine_size_bytes, "
+            "quarantine_mtime_ns" if require_identity else ""
+        )
         rows = connection.execute(
             text(
                 "SELECT id, owner_id, relative_path, path_key, quarantine_path, "
-                "state, lease_token, lease_expires_at FROM artifact_gc_queue"
+                "expected_size_bytes, state, lease_token, lease_expires_at"
+                f"{identity_sql} FROM artifact_gc_queue"
             )
         ).mappings()
         for row in rows:
@@ -878,6 +1052,8 @@ def _artifact_quarantine_data_valid(connection: Connection) -> bool:
                 or not is_canonical_uuid_text(row["owner_id"])
                 or expected_key is None
                 or row["path_key"] != expected_key
+                or len(row["relative_path"]) > 1000
+                or not 0 <= row["expected_size_bytes"] <= 262144000
                 or (
                     row["quarantine_path"] is not None
                     and canonical_artifact_path_key(row["quarantine_path"]) is None
@@ -885,6 +1061,25 @@ def _artifact_quarantine_data_valid(connection: Connection) -> bool:
                 or ((row["state"] == "claimed") != lease_complete)
             ):
                 return False
+            if require_identity:
+                identity = (
+                    row["quarantine_volume_id"], row["quarantine_file_id"],
+                    row["quarantine_size_bytes"], row["quarantine_mtime_ns"],
+                )
+                if (
+                    (row["quarantine_path"] is None)
+                    != all(value is None for value in identity)
+                    or (
+                        row["quarantine_path"] is not None
+                        and (
+                            len(row["quarantine_path"]) > 1000
+                            or any(value is None or value < 0 for value in identity)
+                            or row["quarantine_size_bytes"] > 262144000
+                        )
+                    )
+                    or (row["state"] == "quarantined" and row["quarantine_path"] is None)
+                ):
+                    return False
     except (KeyError, TypeError, AttributeError, SQLAlchemyError):
         return False
     return True

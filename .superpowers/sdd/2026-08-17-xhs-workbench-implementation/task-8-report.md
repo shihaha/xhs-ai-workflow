@@ -517,3 +517,71 @@ Bailian remains
 `not_run: BAILIAN_API_KEY unavailable`, Android remains
 `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8 remains
 blocked until redesign Tasks 3—5 and an independent clean review finish.
+
+## Approved quarantine redesign — Task 2 fix round 1/5
+
+The independent review's one Critical, five Important and one Minor groups were
+captured before the production fixes. The first combined schema/service run was
+observed RED:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_schema.py backend/tests/content/test_artifact_cleanup_service.py -q
+32 failed, 31 passed
+```
+
+The RED cases covered a reference inserted after final-delete authorization,
+same-byte replacement with a new physical identity, expired-lease missing paths,
+candidate/schema bounds, a grace period incorrectly anchored before the move, and
+a target-parent swap during quarantine rename. A commit-fault recovery case and a
+select/update expired-lease race were retained as explicit regressions.
+
+Implemented review findings:
+
+- Final deletion now opens and verifies the exact Windows file handle first, then
+  enters one short SQLite `BEGIN IMMEDIATE` boundary. Inside that boundary it
+  revalidates cleanup ID/state/token/expiry and persisted quarantine identity,
+  compares a complete material/package/open-cleanup reference snapshot, performs
+  only the identity-bound handle disposition, writes the exact `deleted` CAS and
+  commits immediately. A concurrent reference writer is blocked; after release it
+  observes `deleted` and does not create a stale reference.
+- Hashing, bounded content reads, rename and waits remain outside write
+  transactions. If handle deletion succeeds but commit acknowledgement fails, the
+  durable row remains recoverable; after lease expiry, the missing artifact is
+  finalized only after another no-reference proof.
+- Quarantine volume ID, file ID, size and mtime-nanoseconds are persisted and
+  physically validated by the model, migration, strict schema and SQLite triggers.
+  A same-byte new inode is retained as `needs_human`.
+- Same-volume quarantine uses a verified source handle while holding a verified
+  non-reparse target-directory handle that denies delete sharing. The Windows
+  `FILE_RENAME_INFO` operation uses the locked absolute target and a correctly
+  terminated buffer; a parent-swap attempt cannot redirect bytes outside runtime.
+- Missing branches first prove an owned, unexpired lease. Every terminal transition
+  is an expiry-aware token CAS, and expired-lease recovery uses one conditional
+  update matching the originally selected state/token/expiry so a new claim wins.
+- Candidate, Pydantic and SQLite contracts share the 1000-character path bound and
+  independent 250 MiB hard size cap. Validation occurs before enqueue, and bounded
+  processing failures cannot leave a poisoned owned claim.
+- The 24-hour grace deadline is calculated from a fresh clock after successful move
+  and post-move identity/reference verification. The plan and design now document
+  final handle disposition as the sole bounded file-I/O/write-transaction exception.
+
+Final fix-round verification:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py backend/tests/content/test_round3_hardening.py backend/tests/content/test_round5_hardening.py -q
+63 passed in 5.93s
+
+python -m pytest backend/tests/content -q
+159 passed in 15.73s
+
+python -m pytest backend/tests -q
+472 passed, 1 skipped in 29.45s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only the repository's Windows
+LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
+remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
+remains blocked pending redesign Tasks 3—5 and independent review.

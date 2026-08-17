@@ -6,12 +6,15 @@ from datetime import datetime, timedelta
 from hashlib import sha256
 import os
 from pathlib import Path
+from threading import Event
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.dml import Update
 
 from backend.app.db import Database
 from backend.app.features.content.cleanup import (
@@ -151,6 +154,50 @@ def test_recover_expired_lease_returns_it_to_pending(cleanup_environment) -> Non
     assert recovered.attempt_count == 1
 
 
+def test_recover_expired_lease_does_not_overwrite_a_new_claim(
+    cleanup_environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    record = service.enqueue(_candidate(runtime, clock))
+    assert service.claim_due(limit=1) == [record.id]
+    clock.advance(timedelta(minutes=6))
+    replacement_token = str(uuid4())
+    replacement_expiry = clock.now() + timedelta(minutes=5)
+    real_execute = Session.execute
+    replaced = False
+
+    def replace_before_recovery_update(session: Session, statement, *args, **kwargs):
+        nonlocal replaced
+        if (
+            not replaced
+            and isinstance(statement, Update)
+            and statement.table.name == "artifact_gc_queue"
+        ):
+            replaced = True
+            with database.engine.connect() as connection:
+                connection.execute(
+                    update(ArtifactCleanupRecord)
+                    .where(ArtifactCleanupRecord.id == record.id)
+                    .values(
+                        state="claimed",
+                        lease_token=replacement_token,
+                        lease_expires_at=replacement_expiry,
+                    )
+                )
+                connection.commit()
+        return real_execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "execute", replace_before_recovery_update)
+
+    assert service.recover_expired_leases() == 0
+    current = service.get_record(record.id)
+    assert current is not None
+    assert current.state == "claimed"
+    assert current.lease_token == replacement_token
+    assert current.lease_expires_at == replacement_expiry
+    assert current.attempt_count == 0
+
+
 def test_ambiguous_link_is_needs_human_and_retained(cleanup_environment) -> None:
     _, runtime, clock, service, _ = cleanup_environment
     outside = runtime.parent / "outside.bin"
@@ -259,7 +306,9 @@ def test_run_due_once_processes_only_claimed_batch(cleanup_environment) -> None:
     later = service.enqueue(later_candidate)
 
     assert service.run_due_once(limit=10) == 1
-    assert service.get_record(due.id).state == "quarantined"  # type: ignore[union-attr]
+    due_record = service.get_record(due.id)
+    assert due_record is not None
+    assert due_record.state == "quarantined", due_record
     assert service.get_record(later.id).state == "pending"  # type: ignore[union-attr]
 
 
@@ -282,24 +331,28 @@ def test_database_has_no_write_transaction_during_hash_or_move(
     import backend.app.features.content.cleanup as cleanup_module
 
     real_read = cleanup_module.read_contained_regular
-    real_replace = cleanup_module.os.replace
+    real_rename = cleanup_module.rename_contained_regular_to_directory
 
     def assert_no_write_then_read(*args, **kwargs):
         with database.engine.connect() as connection:
             assert connection.exec_driver_sql("PRAGMA data_version").scalar_one() >= 1
         return real_read(*args, **kwargs)
 
-    def assert_no_write_then_replace(*args, **kwargs):
+    def assert_no_write_then_rename(*args, **kwargs):
         with database.engine.begin() as connection:
             connection.exec_driver_sql(
                 "INSERT INTO workbench_schema_migrations(name, applied_at) "
                 "VALUES (?, CURRENT_TIMESTAMP)",
                 (f"io-probe-{uuid4()}",),
             )
-        return real_replace(*args, **kwargs)
+        return real_rename(*args, **kwargs)
 
     monkeypatch.setattr(cleanup_module, "read_contained_regular", assert_no_write_then_read)
-    monkeypatch.setattr(cleanup_module.os, "replace", assert_no_write_then_replace)
+    monkeypatch.setattr(
+        cleanup_module,
+        "rename_contained_regular_to_directory",
+        assert_no_write_then_rename,
+    )
 
     assert service.process_one(record.id).state == "quarantined"
 
@@ -323,15 +376,15 @@ def test_move_commit_failure_is_needs_human_with_quarantine_retained(
     record = service.enqueue(_candidate(runtime, clock))
     import backend.app.features.content.cleanup as cleanup_module
 
-    real_replace = cleanup_module.os.replace
+    real_rename = cleanup_module.rename_contained_regular_to_directory
     real_commit = Session.commit
     moved = False
     failed_once = False
 
     def record_move(*args, **kwargs):
         nonlocal moved
-        result = real_replace(*args, **kwargs)
-        moved = True
+        result = real_rename(*args, **kwargs)
+        moved = result.status == "trusted"
         return result
 
     def fail_first_post_move_commit(session: Session) -> None:
@@ -341,7 +394,9 @@ def test_move_commit_failure_is_needs_human_with_quarantine_retained(
             raise SQLAlchemyError("forced ambiguous quarantine commit")
         real_commit(session)
 
-    monkeypatch.setattr(cleanup_module.os, "replace", record_move)
+    monkeypatch.setattr(
+        cleanup_module, "rename_contained_regular_to_directory", record_move
+    )
     monkeypatch.setattr(Session, "commit", fail_first_post_move_commit)
 
     result = service.process_one(record.id)
@@ -361,10 +416,10 @@ def test_reference_created_during_move_blocks_finalization_and_retains_quarantin
     record = service.enqueue(candidate)
     import backend.app.features.content.cleanup as cleanup_module
 
-    real_replace = cleanup_module.os.replace
+    real_rename = cleanup_module.rename_contained_regular_to_directory
 
     def move_then_reference(*args, **kwargs):
-        result = real_replace(*args, **kwargs)
+        result = real_rename(*args, **kwargs)
         _insert_material_reference(
             database,
             material_id=str(uuid4()),
@@ -375,7 +430,9 @@ def test_reference_created_during_move_blocks_finalization_and_retains_quarantin
         )
         return result
 
-    monkeypatch.setattr(cleanup_module.os, "replace", move_then_reference)
+    monkeypatch.setattr(
+        cleanup_module, "rename_contained_regular_to_directory", move_then_reference
+    )
 
     result = service.process_one(record.id)
 
@@ -561,3 +618,230 @@ def test_reference_created_after_delete_handle_open_blocks_deletion(
     assert result.state == "needs_human"
     assert result.last_error_category == "live_reference"
     assert (runtime / quarantined.quarantine_path).exists()
+
+
+def test_reference_created_after_authorization_cannot_race_final_delete(
+    cleanup_environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    record = service.enqueue(_candidate(runtime, clock))
+    quarantined = service.process_one(record.id)
+    assert quarantined.quarantine_path is not None
+    clock.advance(timedelta(hours=24))
+    import backend.app.features.content.export as export_module
+
+    real_delete = export_module._delete_open_file
+    writer_started = Event()
+    writer_finished = Event()
+    observed_states: list[str] = []
+    writer_future = None
+
+    def insert_only_if_cleanup_is_open() -> None:
+        try:
+            with database.engine.connect() as connection:
+                connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                writer_started.set()
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                state = connection.execute(
+                    select(ArtifactCleanupRecord.state).where(
+                        ArtifactCleanupRecord.id == record.id
+                    )
+                ).scalar_one()
+                observed_states.append(state)
+                if state != "deleted":
+                    connection.execute(
+                        text(
+                            "INSERT INTO content_product_materials "
+                            "(id,product_id,logical_name,logical_key,version,path,sha256,"
+                            "size_bytes,media_type,kind,created_at) VALUES "
+                            "(:id,:product_id,'material.bin','material.bin',1,:path,:sha256,"
+                            ":size_bytes,'application/octet-stream','source',:created_at)"
+                        ),
+                        {
+                            "id": str(uuid4()),
+                            "product_id": str(uuid4()),
+                            "path": record.relative_path,
+                            "sha256": record.expected_sha256,
+                            "size_bytes": record.expected_size_bytes,
+                            "created_at": clock.now().isoformat(sep=" "),
+                        },
+                    )
+                connection.commit()
+        finally:
+            writer_finished.set()
+
+    def insert_after_authorization(descriptor: int) -> bool:
+        nonlocal writer_future
+        writer_future = pool.submit(insert_only_if_cleanup_is_open)
+        assert writer_started.wait(1)
+        assert not writer_finished.wait(0.1)
+        return real_delete(descriptor)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(export_module, "_delete_open_file", insert_after_authorization)
+
+        result = service.process_one(record.id)
+        assert writer_future is not None
+        writer_future.result(timeout=5)
+
+    assert observed_states == ["deleted"]
+    assert result.state == "deleted"
+    assert not (runtime / quarantined.quarantine_path).exists()
+    with database.engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM content_product_materials")
+        ).scalar_one() == 0
+
+
+def test_final_delete_commit_fault_recovers_from_missing_file(
+    cleanup_environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime, clock, service, _ = cleanup_environment
+    record = service.enqueue(_candidate(runtime, clock))
+    quarantined = service.process_one(record.id)
+    assert quarantined.quarantine_path is not None
+    target = runtime / quarantined.quarantine_path
+    clock.advance(timedelta(hours=24))
+    real_commit = Connection.commit
+    failed = False
+
+    def fail_first_commit(connection: Connection) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise SQLAlchemyError("injected final commit fault")
+        real_commit(connection)
+
+    with monkeypatch.context() as context:
+        context.setattr(Connection, "commit", fail_first_commit)
+        ambiguous = service.process_one(record.id)
+
+    assert failed is True
+    assert ambiguous.state == "claimed"
+    assert not target.exists()
+    clock.advance(timedelta(minutes=6))
+    assert service.recover_expired_leases() == 1
+
+    recovered = service.process_one(record.id)
+
+    assert recovered.state == "deleted"
+    assert recovered.last_error_category == "already_missing"
+
+
+def test_same_bytes_replaced_in_quarantine_are_not_deleted(cleanup_environment) -> None:
+    _, runtime, clock, service, _ = cleanup_environment
+    payload = b"same bytes, new file identity"
+    record = service.enqueue(_candidate(runtime, clock, payload=payload))
+    quarantined = service.process_one(record.id)
+    assert quarantined.quarantine_path is not None
+    target = runtime / quarantined.quarantine_path
+    target.unlink()
+    target.write_bytes(payload)
+    clock.advance(timedelta(hours=24))
+
+    result = service.process_one(record.id)
+
+    assert result.state == "needs_human"
+    assert result.last_error_category == "quarantine_identity_changed"
+    assert target.read_bytes() == payload
+
+
+def test_missing_branch_cannot_finalize_with_expired_lease(cleanup_environment) -> None:
+    _, runtime, clock, service, _ = cleanup_environment
+    candidate = _candidate(runtime, clock)
+    record = service.enqueue(candidate)
+    (runtime / candidate.relative_path).unlink()
+    assert service.claim_due(limit=1) == [record.id]
+    clock.advance(timedelta(minutes=6))
+
+    result = service.process_one(record.id)
+
+    assert result.state == "claimed"
+    assert result.completed_at is None
+
+
+def test_candidate_rejects_oversize_and_overlong_path_before_database(
+    cleanup_environment,
+) -> None:
+    _, runtime, clock, service, _ = cleanup_environment
+    with pytest.raises(ValueError):
+        ArtifactCleanupCandidate(
+            owner_type="material",
+            owner_id=str(uuid4()),
+            relative_path="a/" + "x" * 999,
+            expected_sha256="a" * 64,
+            expected_size_bytes=1,
+            reason="invalid",
+            not_before=clock.now(),
+        )
+    with pytest.raises(ValueError):
+        ArtifactCleanupCandidate(
+            owner_type="material",
+            owner_id=str(uuid4()),
+            relative_path="a/file.bin",
+            expected_sha256="a" * 64,
+            expected_size_bytes=250 * 1024 * 1024 + 1,
+            reason="invalid",
+            not_before=clock.now(),
+        )
+    assert service.list_records() == []
+
+
+def test_grace_deadline_starts_after_successful_move_verification(
+    cleanup_environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime, clock, service, _ = cleanup_environment
+    record = service.enqueue(_candidate(runtime, clock))
+    import backend.app.features.content.cleanup as cleanup_module
+
+    real_rename = cleanup_module.rename_contained_regular_to_directory
+
+    def slow_move(*args, **kwargs):
+        result = real_rename(*args, **kwargs)
+        clock.advance(timedelta(minutes=1))
+        return result
+
+    monkeypatch.setattr(
+        cleanup_module, "rename_contained_regular_to_directory", slow_move
+    )
+
+    result = service.process_one(record.id)
+
+    assert result.state == "quarantined"
+    assert result.not_before == clock.now() + timedelta(hours=24)
+
+
+def test_target_parent_swap_never_moves_artifact_outside_runtime(
+    cleanup_environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime, clock, service, _ = cleanup_environment
+    payload = b"must stay in runtime"
+    record = service.enqueue(_candidate(runtime, clock, payload=payload))
+    outside = runtime.parent / "outside-quarantine"
+    outside.mkdir()
+    import backend.app.features.content.export as export_module
+
+    real_rename = export_module._rename_open_file
+    swap_attempted = False
+
+    def swap_target_parent(descriptor: int, root_handle: int, target_name: str) -> bool:
+        nonlocal swap_attempted
+        swap_attempted = True
+        target_parent = runtime / "artifacts-quarantine" / record.id
+        displaced = target_parent.with_name(target_parent.name + "-original")
+        try:
+            target_parent.rename(displaced)
+        except OSError:
+            return real_rename(descriptor, root_handle, target_name)
+        target_parent.symlink_to(outside, target_is_directory=True)
+        return real_rename(descriptor, root_handle, target_name)
+
+    monkeypatch.setattr(export_module, "_rename_open_file", swap_target_parent)
+
+    result = service.process_one(record.id)
+
+    assert result.state == "quarantined"
+    assert swap_attempted is True
+    assert not (outside / "material.bin").exists()
+    retained = list(runtime.rglob("material.bin"))
+    assert retained and retained[0].read_bytes() == payload

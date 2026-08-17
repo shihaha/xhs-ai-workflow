@@ -31,6 +31,10 @@ def _cleanup_values(**overrides: object) -> dict[str, object]:
         "lease_token": None,
         "lease_expires_at": None,
         "quarantine_path": None,
+        "quarantine_volume_id": None,
+        "quarantine_file_id": None,
+        "quarantine_size_bytes": None,
+        "quarantine_mtime_ns": None,
         "attempt_count": 0,
         "last_error_category": None,
         "created_at": datetime(2026, 8, 18),
@@ -64,6 +68,10 @@ def test_fresh_schema_has_cleanup_queue_build_token_and_migration_marker(tmp_pat
             column["name"] for column in inspection.get_columns("artifact_gc_queue")
         }
         assert "path_key" in cleanup_columns
+        assert {
+            "quarantine_volume_id", "quarantine_file_id",
+            "quarantine_size_bytes", "quarantine_mtime_ns",
+        } <= cleanup_columns
         cleanup_index = {
             item["name"]: tuple(item["column_names"])
             for item in inspection.get_indexes("artifact_gc_queue")
@@ -128,6 +136,47 @@ def test_cleanup_timestamps_are_physically_constrained(tmp_path: Path) -> None:
                     ),
                     values,
                 )
+    finally:
+        database.close()
+
+
+def test_cleanup_size_and_path_lengths_are_physically_bounded(tmp_path: Path) -> None:
+    database = Database(tmp_path / "cleanup-bounds.sqlite3", runtime_dir=tmp_path)
+    try:
+        with pytest.raises(IntegrityError):
+            _insert_cleanup(database, expected_size_bytes=250 * 1024 * 1024 + 1)
+        long_path = "a/" + "x" * 999
+        with pytest.raises(IntegrityError):
+            _insert_cleanup(
+                database,
+                relative_path=long_path,
+                path_key=long_path,
+            )
+    finally:
+        database.close()
+
+
+def test_quarantine_identity_is_all_or_none_and_required_for_quarantined_state(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "quarantine-identity.sqlite3", runtime_dir=tmp_path)
+    try:
+        with pytest.raises(IntegrityError):
+            _insert_cleanup(
+                database,
+                state="quarantined",
+                quarantine_path="artifacts-quarantine/id/file.zip",
+            )
+        record = _insert_cleanup(
+            database,
+            state="quarantined",
+            quarantine_path="artifacts-quarantine/id/file.zip",
+            quarantine_volume_id=12,
+            quarantine_file_id=34,
+            quarantine_size_bytes=12,
+            quarantine_mtime_ns=56,
+        )
+        assert record.quarantine_file_id == 34
     finally:
         database.close()
 

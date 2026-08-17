@@ -257,7 +257,7 @@ class ArtifactCleanupRead(StrictModel):
     relative_path: str = Field(min_length=1, max_length=1000)
     path_key: str = Field(min_length=1, max_length=1000)
     expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    expected_size_bytes: int = Field(ge=0)
+    expected_size_bytes: int = Field(ge=0, le=250 * 1024 * 1024)
     state: Literal[
         "pending", "claimed", "quarantined", "deleted", "needs_human", "cancelled"
     ]
@@ -265,7 +265,11 @@ class ArtifactCleanupRead(StrictModel):
     not_before: datetime
     lease_token: str | None
     lease_expires_at: datetime | None
-    quarantine_path: str | None
+    quarantine_path: str | None = Field(max_length=1000)
+    quarantine_volume_id: int | None = Field(ge=0)
+    quarantine_file_id: int | None = Field(ge=0)
+    quarantine_size_bytes: int | None = Field(ge=0, le=250 * 1024 * 1024)
+    quarantine_mtime_ns: int | None = Field(ge=0)
     attempt_count: int = Field(ge=0)
     last_error_category: str | None
     created_at: datetime
@@ -296,6 +300,18 @@ class ArtifactCleanupRead(StrictModel):
             and canonical_artifact_path_key(self.quarantine_path) is None
         ):
             raise ValueError("quarantine_path must be a canonical managed path")
+        identity = (
+            self.quarantine_volume_id,
+            self.quarantine_file_id,
+            self.quarantine_size_bytes,
+            self.quarantine_mtime_ns,
+        )
+        if (self.quarantine_path is None) != all(value is None for value in identity):
+            raise ValueError("quarantine path and physical identity must be all-or-none")
+        if self.quarantine_path is not None and any(value is None for value in identity):
+            raise ValueError("quarantine physical identity must be complete")
+        if self.state == "quarantined" and self.quarantine_path is None:
+            raise ValueError("quarantined cleanup requires physical identity")
         if self.state == "claimed":
             lease_valid = self.lease_token is not None and self.lease_expires_at is not None
         else:

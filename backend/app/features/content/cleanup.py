@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
-import os
 from pathlib import Path, PurePosixPath
 import stat
 from threading import Lock
@@ -15,13 +14,17 @@ from uuid import uuid4
 from sqlalchemy import select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
+from pydantic import ValidationError
 
 from backend.app.db import Database, canonical_artifact_path_key, is_canonical_uuid_text
+from backend.app.features.content import export as content_export
 from backend.app.features.content.export import (
     ArtifactPathInspection,
+    MAX_PACKAGE_BYTES,
     inspect_contained_artifact,
+    open_contained_delete_handle,
     read_contained_regular,
-    remove_contained_regular,
+    rename_contained_regular_to_directory,
     windows_artifact_references_conflict,
 )
 from backend.app.features.content.models import (
@@ -57,6 +60,22 @@ class ArtifactCleanupCandidate:
     reason: str
     not_before: datetime
 
+    def __post_init__(self) -> None:
+        path_key = canonical_artifact_path_key(self.relative_path)
+        if (
+            self.owner_type not in {"material", "content_package"}
+            or not is_canonical_uuid_text(self.owner_id)
+            or path_key is None
+            or len(self.relative_path) > 1000
+            or len(self.expected_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.expected_sha256)
+            or not 0 <= self.expected_size_bytes <= MAX_PACKAGE_BYTES
+            or not self.reason.strip()
+            or len(self.reason) > 64
+        ):
+            raise ValueError("Artifact cleanup candidate is not canonical.")
+        _naive_utc(self.not_before)
+
 
 class ArtifactCleanupService:
     """Move unreferenced artifacts to quarantine and delete them after a grace period."""
@@ -84,9 +103,10 @@ class ArtifactCleanupService:
             candidate.owner_type not in {"material", "content_package"}
             or not is_canonical_uuid_text(candidate.owner_id)
             or path_key is None
+            or len(candidate.relative_path) > 1000
             or len(candidate.expected_sha256) != 64
             or any(char not in "0123456789abcdef" for char in candidate.expected_sha256)
-            or candidate.expected_size_bytes < 0
+            or not 0 <= candidate.expected_size_bytes <= MAX_PACKAGE_BYTES
             or not candidate.reason.strip()
             or len(candidate.reason) > 64
         ):
@@ -107,6 +127,10 @@ class ArtifactCleanupService:
             "lease_token": None,
             "lease_expires_at": None,
             "quarantine_path": None,
+            "quarantine_volume_id": None,
+            "quarantine_file_id": None,
+            "quarantine_size_bytes": None,
+            "quarantine_mtime_ns": None,
             "attempt_count": 0,
             "last_error_category": None,
             "created_at": now,
@@ -180,9 +204,12 @@ class ArtifactCleanupService:
             claimed = self._load_claimed(cleanup_id, token)
             if claimed is None:
                 return self.get_record(cleanup_id) or record
-            if claimed.quarantine_path is None:
-                return self._quarantine(claimed, token, now)
-            return self._delete_quarantined(claimed, token, now)
+            try:
+                if claimed.quarantine_path is None:
+                    return self._quarantine(claimed, token, now)
+                return self._delete_quarantined(claimed, token, now)
+            except (OSError, OverflowError, ValidationError, ValueError):
+                return self._needs_human(cleanup_id, token, "cleanup_processing_error")
         finally:
             with self._lease_lock:
                 self._owned_leases.pop(cleanup_id, None)
@@ -191,26 +218,46 @@ class ArtifactCleanupService:
         now = _naive_utc(self.clock())
         with self.database.session() as session:
             expired = list(
-                session.scalars(
-                    select(ArtifactCleanupRecord).where(
+                session.execute(
+                    select(
+                        ArtifactCleanupRecord.id,
+                        ArtifactCleanupRecord.lease_token,
+                        ArtifactCleanupRecord.lease_expires_at,
+                        ArtifactCleanupRecord.quarantine_path,
+                    ).where(
                         ArtifactCleanupRecord.state == "claimed",
                         ArtifactCleanupRecord.lease_expires_at < now,
                     )
                 )
             )
+            recovered_ids: list[str] = []
             for record in expired:
-                record.state = "quarantined" if record.quarantine_path else "pending"
-                record.lease_token = None
-                record.lease_expires_at = None
-                record.attempt_count += 1
-                record.last_error_category = "lease_expired"
-                record.updated_at = now
+                result = session.execute(
+                    update(ArtifactCleanupRecord)
+                    .where(
+                        ArtifactCleanupRecord.id == record.id,
+                        ArtifactCleanupRecord.state == "claimed",
+                        ArtifactCleanupRecord.lease_token == record.lease_token,
+                        ArtifactCleanupRecord.lease_expires_at == record.lease_expires_at,
+                        ArtifactCleanupRecord.lease_expires_at < now,
+                    )
+                    .values(
+                        state="quarantined" if record.quarantine_path else "pending",
+                        lease_token=None,
+                        lease_expires_at=None,
+                        attempt_count=ArtifactCleanupRecord.attempt_count + 1,
+                        last_error_category="lease_expired",
+                        updated_at=now,
+                    )
+                )
+                if result.rowcount == 1:
+                    recovered_ids.append(record.id)
             session.commit()
-        if expired:
+        if recovered_ids:
             with self._lease_lock:
-                for record in expired:
-                    self._owned_leases.pop(record.id, None)
-        return len(expired)
+                for cleanup_id in recovered_ids:
+                    self._owned_leases.pop(cleanup_id, None)
+        return len(recovered_ids)
 
     def run_due_once(self, *, limit: int = 10) -> int:
         cleanup_ids = self.claim_due(limit=limit)
@@ -303,6 +350,8 @@ class ArtifactCleanupService:
                 else "ambiguous_path"
             )
             return self._needs_human(record.id, token, category)
+        if not self._lease_owned(record.id, token):
+            return self.get_record(record.id) or record
         reference_issue = self._reference_issue(record, inspection)
         if reference_issue is not None:
             return self._needs_human(record.id, token, reference_issue)
@@ -322,13 +371,16 @@ class ArtifactCleanupService:
             or not self._lease_owned(record.id, token)
         ):
             return self._needs_human(record.id, token, "identity_changed_before_move")
-        try:
-            if second.path.stat().st_dev != target.parent.stat().st_dev:
-                return self._needs_human(record.id, token, "cross_volume_quarantine")
-            os.replace(second.path, target)
-        except OSError:
-            return self._needs_human(record.id, token, "quarantine_move_failed")
-
+        moved = rename_contained_regular_to_directory(
+            self.runtime_dir,
+            record.relative_path,
+            quarantine_relative,
+            expected_identity=second.identity,
+        )
+        if moved.status != "trusted":
+            return self._needs_human(
+                record.id, token, f"quarantine_move_{moved.absolute_key or 'failed'}"
+            )
         moved = self._verified_file(quarantine_relative, record)
         post_reference_issue = self._reference_issue(record, moved)
         if (
@@ -339,6 +391,9 @@ class ArtifactCleanupService:
         ):
             category = post_reference_issue or "quarantine_move_outcome_ambiguous"
             return self._needs_human(record.id, token, category)
+        if moved.identity is None:
+            return self._needs_human(record.id, token, "quarantine_identity_missing")
+        quarantined_at = _naive_utc(self.clock())
         try:
             with self.database.session() as session:
                 result = session.execute(
@@ -347,15 +402,20 @@ class ArtifactCleanupService:
                         ArtifactCleanupRecord.id == record.id,
                         ArtifactCleanupRecord.state == "claimed",
                         ArtifactCleanupRecord.lease_token == token,
+                        ArtifactCleanupRecord.lease_expires_at >= quarantined_at,
                     )
                     .values(
                         state="quarantined",
                         quarantine_path=quarantine_relative,
-                        not_before=now + self.grace_period,
+                        quarantine_volume_id=moved.identity[0],
+                        quarantine_file_id=moved.identity[1],
+                        quarantine_size_bytes=moved.identity[2],
+                        quarantine_mtime_ns=moved.identity[3],
+                        not_before=quarantined_at + self.grace_period,
                         lease_token=None,
                         lease_expires_at=None,
                         last_error_category=None,
-                        updated_at=now,
+                        updated_at=quarantined_at,
                     )
                 )
                 session.commit()
@@ -370,6 +430,8 @@ class ArtifactCleanupService:
     ) -> ArtifactCleanupRead:
         if record.quarantine_path is None:
             return self._needs_human(record.id, token, "missing_quarantine_identity")
+        if not self._lease_owned(record.id, token):
+            return self.get_record(record.id) or record
         original = inspect_contained_artifact(self.runtime_dir, record.relative_path)
         if original.status != "missing":
             return self._needs_human(record.id, token, "original_path_reappeared")
@@ -384,45 +446,122 @@ class ArtifactCleanupService:
                 else "ambiguous_quarantine_path"
             )
             return self._needs_human(record.id, token, category)
-        reference_issue = self._reference_issue(record, inspection)
+        persisted_identity = (
+            record.quarantine_volume_id,
+            record.quarantine_file_id,
+            record.quarantine_size_bytes,
+            record.quarantine_mtime_ns,
+        )
+        if inspection.status == "trusted" and inspection.identity != persisted_identity:
+            return self._needs_human(
+                record.id, token, "quarantine_identity_changed"
+            )
+        reference_snapshot = self._reference_snapshot(record.id)
+        if reference_snapshot is None:
+            return self._needs_human(record.id, token, "reference_check_failed")
+        reference_issue = self._reference_issue_from_snapshot(
+            record, inspection, reference_snapshot
+        )
         if reference_issue is not None:
             return self._needs_human(record.id, token, reference_issue)
         if inspection.status == "missing":
             return self._mark_deleted(record.id, token, now, "already_missing")
         if inspection.identity is None or not self._lease_owned(record.id, token):
             return self.get_record(record.id) or record
+        expected_identity = inspection.identity
+        deleted_on_disk = False
         authorization_issue: str | None = None
-
-        def authorize_delete() -> bool:
-            nonlocal authorization_issue
-            if inspect_contained_artifact(
-                self.runtime_dir, record.relative_path
-            ).status != "missing":
-                authorization_issue = "original_path_reappeared"
-                return False
-            authorization_issue = self._reference_issue(record, inspection)
-            if authorization_issue is not None:
-                return False
-            if not self._lease_owned(record.id, token):
-                authorization_issue = "lease_lost"
-                return False
-            return True
-
-        deleted = remove_contained_regular(
+        with open_contained_delete_handle(
             self.runtime_dir,
             record.quarantine_path,
             limit=max(record.expected_size_bytes, 1),
-            expected_identity=inspection.identity,
-            authorize_delete=authorize_delete,
-        )
-        after = inspect_contained_artifact(self.runtime_dir, record.quarantine_path)
-        if deleted and after.status == "missing":
-            return self._mark_deleted(record.id, token, now, None)
-        if not deleted and after.status == "missing":
-            return self._mark_deleted(record.id, token, now, "delete_outcome_ambiguous")
-        return self._needs_human(
-            record.id, token, authorization_issue or "delete_failed"
-        )
+            expected_identity=expected_identity,
+        ) as descriptor:
+            if descriptor is None:
+                return self._needs_human(record.id, token, "delete_handle_failed")
+            if inspect_contained_artifact(
+                self.runtime_dir, record.relative_path
+            ).status != "missing":
+                return self._needs_human(
+                    record.id, token, "original_path_reappeared"
+                )
+            connection = self.database.engine.connect()
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                delete_time = _naive_utc(self.clock())
+                current = connection.execute(
+                    select(
+                        ArtifactCleanupRecord.id,
+                        ArtifactCleanupRecord.quarantine_path,
+                        ArtifactCleanupRecord.quarantine_volume_id,
+                        ArtifactCleanupRecord.quarantine_file_id,
+                        ArtifactCleanupRecord.quarantine_size_bytes,
+                        ArtifactCleanupRecord.quarantine_mtime_ns,
+                    ).where(
+                        ArtifactCleanupRecord.id == record.id,
+                        ArtifactCleanupRecord.state == "claimed",
+                        ArtifactCleanupRecord.lease_token == token,
+                        ArtifactCleanupRecord.lease_expires_at >= delete_time,
+                    )
+                ).first()
+                if current is None or (
+                    current.quarantine_path,
+                    current.quarantine_volume_id,
+                    current.quarantine_file_id,
+                    current.quarantine_size_bytes,
+                    current.quarantine_mtime_ns,
+                ) != (record.quarantine_path, *expected_identity):
+                    authorization_issue = "lease_or_identity_changed"
+                    connection.rollback()
+                else:
+                    locked_snapshot = self._reference_snapshot(
+                        record.id, executor=connection
+                    )
+                    if locked_snapshot is None or locked_snapshot != reference_snapshot:
+                        authorization_issue = "reference_set_changed"
+                        connection.rollback()
+                    elif not content_export._delete_open_file(descriptor):
+                        authorization_issue = "delete_failed"
+                        connection.rollback()
+                    else:
+                        deleted_on_disk = True
+                        result = connection.execute(
+                            update(ArtifactCleanupRecord)
+                            .where(
+                                ArtifactCleanupRecord.id == record.id,
+                                ArtifactCleanupRecord.state == "claimed",
+                                ArtifactCleanupRecord.lease_token == token,
+                                ArtifactCleanupRecord.lease_expires_at >= delete_time,
+                            )
+                            .values(
+                                state="deleted",
+                                lease_token=None,
+                                lease_expires_at=None,
+                                last_error_category=None,
+                                updated_at=delete_time,
+                                completed_at=delete_time,
+                            )
+                        )
+                        if result.rowcount != 1:
+                            raise RuntimeError("Final cleanup lease CAS failed.")
+                        connection.commit()
+            except (SQLAlchemyError, RuntimeError):
+                try:
+                    connection.rollback()
+                except SQLAlchemyError:
+                    pass
+            finally:
+                connection.close()
+
+        if deleted_on_disk:
+            return self.get_record(record.id) or record
+        if authorization_issue == "reference_set_changed":
+            refreshed_snapshot = self._reference_snapshot(record.id)
+            if refreshed_snapshot is not None:
+                authorization_issue = self._reference_issue_from_snapshot(
+                    record, inspection, refreshed_snapshot
+                ) or authorization_issue
+        return self._needs_human(record.id, token, authorization_issue or "delete_failed")
 
     def _verified_file(
         self, relative_path: str, record: ArtifactCleanupRead
@@ -457,72 +596,96 @@ class ArtifactCleanupService:
     def _reference_issue(
         self, record: ArtifactCleanupRead, artifact: ArtifactPathInspection
     ) -> str | None:
-        try:
-            with self.database.session() as session:
-                materials = list(
-                    session.execute(
-                        select(
-                            ProductMaterialRecord.id,
-                            ProductMaterialRecord.path,
-                        )
-                    )
-                )
-                packages = list(
-                    session.execute(
-                        select(
-                            ContentPackageRecord.id,
-                            ContentPackageRecord.path,
-                            ContentPackageRecord.status,
-                            ContentPackageRecord.sha256,
-                            ContentPackageRecord.size_bytes,
-                        )
-                    )
-                )
-                cleanups = list(
-                    session.execute(
-                        select(
-                            ArtifactCleanupRecord.id,
-                            ArtifactCleanupRecord.relative_path,
-                            ArtifactCleanupRecord.path_key,
-                            ArtifactCleanupRecord.quarantine_path,
-                            ArtifactCleanupRecord.state,
-                        ).where(
-                            ArtifactCleanupRecord.id != record.id,
-                            ArtifactCleanupRecord.state.in_(OPEN_STATES),
-                        )
-                    )
-                )
-        except SQLAlchemyError:
+        snapshot = self._reference_snapshot(record.id)
+        if snapshot is None:
             return "reference_check_failed"
+        return self._reference_issue_from_snapshot(record, artifact, snapshot)
+
+    def _reference_snapshot(self, cleanup_id: str, *, executor=None):
+        try:
+            if executor is None:
+                with self.database.engine.connect() as connection:
+                    return self._reference_snapshot(cleanup_id, executor=connection)
+            materials = tuple(
+                tuple(row)
+                for row in executor.execute(
+                    select(
+                        ProductMaterialRecord.id,
+                        ProductMaterialRecord.path,
+                    )
+                    .order_by(ProductMaterialRecord.id)
+                )
+            )
+            packages = tuple(
+                tuple(row)
+                for row in executor.execute(
+                    select(
+                        ContentPackageRecord.id,
+                        ContentPackageRecord.path,
+                        ContentPackageRecord.status,
+                        ContentPackageRecord.sha256,
+                        ContentPackageRecord.size_bytes,
+                    )
+                    .order_by(ContentPackageRecord.id)
+                )
+            )
+            cleanups = tuple(
+                tuple(row)
+                for row in executor.execute(
+                    select(
+                        ArtifactCleanupRecord.id,
+                        ArtifactCleanupRecord.relative_path,
+                        ArtifactCleanupRecord.path_key,
+                        ArtifactCleanupRecord.quarantine_path,
+                        ArtifactCleanupRecord.state,
+                    )
+                    .where(
+                        ArtifactCleanupRecord.id != cleanup_id,
+                        ArtifactCleanupRecord.state.in_(OPEN_STATES),
+                    )
+                    .order_by(ArtifactCleanupRecord.id)
+                )
+            )
+            return materials, packages, cleanups
+        except SQLAlchemyError:
+            return None
+
+    def _reference_issue_from_snapshot(
+        self,
+        record: ArtifactCleanupRead,
+        artifact: ArtifactPathInspection,
+        snapshot,
+    ) -> str | None:
+        materials, packages, cleanups = snapshot
 
         references: list[tuple[str, str]] = []
-        for material in materials:
-            if record.owner_type == "material" and material.id == record.owner_id:
+        for material_id, material_path in materials:
+            if record.owner_type == "material" and material_id == record.owner_id:
                 return "live_reference" if (
-                    canonical_artifact_path_key(material.path) == record.path_key
+                    canonical_artifact_path_key(material_path) == record.path_key
                 ) else "owner_identity_mismatch"
-            references.append(("material", material.path))
-        for package in packages:
-            package_key = canonical_artifact_path_key(package.path)
+            references.append(("material", material_path))
+        for package_id, package_path, package_status, package_sha, package_size in packages:
+            package_key = canonical_artifact_path_key(package_path)
             exact_failed_owner = (
                 record.owner_type == "content_package"
-                and package.id == record.owner_id
-                and package.status == "failed"
+                and package_id == record.owner_id
+                and package_status == "failed"
                 and package_key == record.path_key
-                and package.sha256 == record.expected_sha256
-                and package.size_bytes == record.expected_size_bytes
+                and package_sha == record.expected_sha256
+                and package_size == record.expected_size_bytes
             )
             if exact_failed_owner:
                 continue
-            if record.owner_type == "content_package" and package.id == record.owner_id:
+            if record.owner_type == "content_package" and package_id == record.owner_id:
                 return "owner_identity_mismatch"
-            references.append(("package", package.path))
-        for cleanup in cleanups:
-            if cleanup.path_key == record.path_key:
+            references.append(("package", package_path))
+        for _, cleanup_path, cleanup_key, quarantine_path, _ in cleanups:
+            if cleanup_key == record.path_key:
                 return "other_cleanup_reference"
-            references.append(("cleanup", cleanup.relative_path))
-            if cleanup.quarantine_path is not None:
-                references.append(("cleanup", cleanup.quarantine_path))
+            references.append(("cleanup", cleanup_path))
+            if quarantine_path is not None:
+                references.append(("cleanup", quarantine_path))
 
         for _kind, relative_path in references:
             reference_key = canonical_artifact_path_key(relative_path)
@@ -583,6 +746,7 @@ class ArtifactCleanupService:
                         ArtifactCleanupRecord.id == cleanup_id,
                         ArtifactCleanupRecord.state == "claimed",
                         ArtifactCleanupRecord.lease_token == token,
+                        ArtifactCleanupRecord.lease_expires_at >= now,
                     )
                     .values(
                         state="needs_human",
@@ -614,6 +778,7 @@ class ArtifactCleanupService:
                     ArtifactCleanupRecord.id == cleanup_id,
                     ArtifactCleanupRecord.state == "claimed",
                     ArtifactCleanupRecord.lease_token == token,
+                    ArtifactCleanupRecord.lease_expires_at >= now,
                 )
                 .values(
                     state="deleted",
@@ -647,6 +812,10 @@ def _read(record: ArtifactCleanupRecord) -> ArtifactCleanupRead:
             "lease_token": record.lease_token,
             "lease_expires_at": record.lease_expires_at,
             "quarantine_path": record.quarantine_path,
+            "quarantine_volume_id": record.quarantine_volume_id,
+            "quarantine_file_id": record.quarantine_file_id,
+            "quarantine_size_bytes": record.quarantine_size_bytes,
+            "quarantine_mtime_ns": record.quarantine_mtime_ns,
             "attempt_count": record.attempt_count,
             "last_error_category": record.last_error_category,
             "created_at": record.created_at,

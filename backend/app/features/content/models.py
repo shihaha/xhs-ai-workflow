@@ -215,7 +215,10 @@ class ArtifactCleanupRecord(Base):
             "state IN ('pending','claimed','quarantined','deleted','needs_human','cancelled')",
             name="ck_artifact_gc_state",
         ),
-        CheckConstraint("expected_size_bytes >= 0", name="ck_artifact_gc_size"),
+        CheckConstraint(
+            "expected_size_bytes >= 0 AND expected_size_bytes <= 262144000",
+            name="ck_artifact_gc_size",
+        ),
         CheckConstraint(
             "length(expected_sha256) = 64 AND expected_sha256 NOT GLOB '*[^0-9a-f]*'",
             name="ck_artifact_gc_sha_format",
@@ -240,12 +243,26 @@ class ArtifactCleanupRecord(Base):
         ),
         CheckConstraint(
             "artifact_path_key(relative_path) IS NOT NULL "
+            "AND length(relative_path) <= 1000 "
             "AND path_key = artifact_path_key(relative_path)",
             name="ck_artifact_gc_relative_path",
         ),
         CheckConstraint(
-            "quarantine_path IS NULL OR artifact_path_key(quarantine_path) IS NOT NULL",
+            "quarantine_path IS NULL OR (length(quarantine_path) <= 1000 "
+            "AND artifact_path_key(quarantine_path) IS NOT NULL)",
             name="ck_artifact_gc_quarantine_path",
+        ),
+        CheckConstraint(
+            "((quarantine_path IS NULL AND quarantine_volume_id IS NULL "
+            "AND quarantine_file_id IS NULL AND quarantine_size_bytes IS NULL "
+            "AND quarantine_mtime_ns IS NULL) OR "
+            "(quarantine_path IS NOT NULL AND quarantine_volume_id IS NOT NULL "
+            "AND quarantine_file_id IS NOT NULL AND quarantine_size_bytes IS NOT NULL "
+            "AND quarantine_mtime_ns IS NOT NULL AND quarantine_volume_id >= 0 "
+            "AND quarantine_file_id >= 0 AND quarantine_size_bytes >= 0 "
+            "AND quarantine_size_bytes <= 262144000 AND quarantine_mtime_ns >= 0)) "
+            "AND (state != 'quarantined' OR quarantine_path IS NOT NULL)",
+            name="ck_artifact_gc_quarantine_identity",
         ),
         Index(
             "uq_artifact_gc_open_owner",
@@ -272,6 +289,10 @@ class ArtifactCleanupRecord(Base):
     lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
     quarantine_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quarantine_volume_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quarantine_file_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quarantine_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quarantine_mtime_ns: Mapped[int | None] = mapped_column(Integer, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
