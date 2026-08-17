@@ -342,6 +342,21 @@ class ArtifactCleanupService:
             self.runtime_dir, quarantine_relative
         )
         if quarantine_existing.status != "missing":
+            if (
+                quarantine_existing.status == "trusted"
+                and inspection.status == "missing"
+                and self._lease_owned(record.id, token)
+            ):
+                recovered = self._verified_file(quarantine_relative, record)
+                if recovered.status == "trusted" and recovered.identity is not None:
+                    reference_issue = self._reference_issue(record, recovered)
+                    return self._mark_moved_needs_human(
+                        record.id,
+                        token,
+                        reference_issue or "quarantine_move_recovered",
+                        quarantine_relative,
+                        recovered.identity,
+                    )
             return self._needs_human(record.id, token, "quarantine_target_ambiguous")
         if inspection.status == "ambiguous":
             category = (
@@ -371,28 +386,43 @@ class ArtifactCleanupService:
             or not self._lease_owned(record.id, token)
         ):
             return self._needs_human(record.id, token, "identity_changed_before_move")
-        moved = rename_contained_regular_to_directory(
+        rename_result = rename_contained_regular_to_directory(
             self.runtime_dir,
             record.relative_path,
             quarantine_relative,
             expected_identity=second.identity,
         )
-        if moved.status != "trusted":
+        if rename_result.status != "trusted":
             return self._needs_human(
-                record.id, token, f"quarantine_move_{moved.absolute_key or 'failed'}"
+                record.id,
+                token,
+                f"quarantine_move_{rename_result.absolute_key or 'failed'}",
             )
+        moved_identity = rename_result.identity or second.identity
         moved = self._verified_file(quarantine_relative, record)
         post_reference_issue = self._reference_issue(record, moved)
         if (
             moved.status != "trusted"
-            or moved.identity != second.identity
+            or moved.identity != moved_identity
             or post_reference_issue is not None
             or not self._lease_owned(record.id, token)
         ):
             category = post_reference_issue or "quarantine_move_outcome_ambiguous"
-            return self._needs_human(record.id, token, category)
+            return self._mark_moved_needs_human(
+                record.id,
+                token,
+                category,
+                quarantine_relative,
+                moved_identity,
+            )
         if moved.identity is None:
-            return self._needs_human(record.id, token, "quarantine_identity_missing")
+            return self._mark_moved_needs_human(
+                record.id,
+                token,
+                "quarantine_identity_missing",
+                quarantine_relative,
+                moved_identity,
+            )
         quarantined_at = _naive_utc(self.clock())
         try:
             with self.database.session() as session:
@@ -420,10 +450,107 @@ class ArtifactCleanupService:
                 )
                 session.commit()
                 if result.rowcount != 1:
-                    return self.get_record(record.id) or record
+                    latest = self.get_record(record.id)
+                    if self._moved_fact_matches(
+                        latest,
+                        quarantine_relative,
+                        moved_identity,
+                        states={"quarantined"},
+                    ):
+                        return latest  # type: ignore[return-value]
+                    return self._mark_moved_needs_human(
+                        record.id,
+                        token,
+                        "quarantine_commit_ambiguous",
+                        quarantine_relative,
+                        moved_identity,
+                    )
         except SQLAlchemyError:
-            return self._needs_human(record.id, token, "quarantine_commit_ambiguous")
+            latest = self.get_record(record.id)
+            if self._moved_fact_matches(
+                latest,
+                quarantine_relative,
+                moved_identity,
+                states={"quarantined"},
+            ):
+                return latest  # type: ignore[return-value]
+            return self._mark_moved_needs_human(
+                record.id,
+                token,
+                "quarantine_commit_ambiguous",
+                quarantine_relative,
+                moved_identity,
+            )
         return self.get_record(record.id) or record
+
+    def _mark_moved_needs_human(
+        self,
+        cleanup_id: str,
+        token: str,
+        category: str,
+        quarantine_path: str,
+        identity: tuple[int, int, int, int],
+    ) -> ArtifactCleanupRead:
+        fresh_now = _naive_utc(self.clock())
+        try:
+            with self.database.session() as session:
+                result = session.execute(
+                    update(ArtifactCleanupRecord)
+                    .where(
+                        ArtifactCleanupRecord.id == cleanup_id,
+                        ArtifactCleanupRecord.state == "claimed",
+                        ArtifactCleanupRecord.lease_token == token,
+                        ArtifactCleanupRecord.lease_expires_at > fresh_now,
+                    )
+                    .values(
+                        state="needs_human",
+                        quarantine_path=quarantine_path,
+                        quarantine_volume_id=identity[0],
+                        quarantine_file_id=identity[1],
+                        quarantine_size_bytes=identity[2],
+                        quarantine_mtime_ns=identity[3],
+                        lease_token=None,
+                        lease_expires_at=None,
+                        last_error_category=category[:64],
+                        updated_at=fresh_now,
+                    )
+                )
+                session.commit()
+                if result.rowcount != 1:
+                    latest = self.get_record(cleanup_id)
+                    if latest is None:
+                        raise RuntimeError("Cleanup record disappeared.")
+                    return latest
+        except SQLAlchemyError:
+            pass
+        latest = self.get_record(cleanup_id)
+        if latest is None:
+            raise RuntimeError("Cleanup record disappeared.")
+        if self._moved_fact_matches(
+            latest, quarantine_path, identity, states={"needs_human"}
+        ) and latest.last_error_category == category[:64]:
+            return latest
+        return latest
+
+    @staticmethod
+    def _moved_fact_matches(
+        record: ArtifactCleanupRead | None,
+        quarantine_path: str,
+        identity: tuple[int, int, int, int],
+        *,
+        states: set[str],
+    ) -> bool:
+        return record is not None and (
+            record.state in states
+            and record.quarantine_path == quarantine_path
+            and (
+                record.quarantine_volume_id,
+                record.quarantine_file_id,
+                record.quarantine_size_bytes,
+                record.quarantine_mtime_ns,
+            )
+            == identity
+        )
 
     def _delete_quarantined(
         self, record: ArtifactCleanupRead, token: str, now: datetime

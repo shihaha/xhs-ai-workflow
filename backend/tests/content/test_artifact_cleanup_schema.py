@@ -260,6 +260,98 @@ def test_material_and_package_writes_cannot_reference_quarantine_path(
         service.database.close()
 
 
+def test_cleanup_insert_and_update_cannot_capture_existing_references(
+    tmp_path: Path,
+) -> None:
+    service, item, image = _image_item(tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    package = service.export_package(
+        item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+    )
+    material_alias = "Reserved/Cafe\u0301.txt."
+    material_quarantine = "reserved/Café.txt"
+    try:
+        with service.database.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE content_product_materials SET path=:path WHERE id=:id"
+                ),
+                {"path": material_alias, "id": image.id},
+            )
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            _insert_cleanup(
+                service.database,
+                state="deleted",
+                quarantine_path=material_quarantine,
+                quarantine_volume_id=1,
+                quarantine_file_id=2,
+                quarantine_size_bytes=12,
+                quarantine_mtime_ns=3,
+            )
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            _insert_cleanup(
+                service.database,
+                state="needs_human",
+                quarantine_path=package.path.upper(),
+                quarantine_volume_id=4,
+                quarantine_file_id=5,
+                quarantine_size_bytes=package.size_bytes,
+                quarantine_mtime_ns=6,
+            )
+
+        pending = _insert_cleanup(service.database)
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with service.database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE artifact_gc_queue SET state='needs_human', "
+                        "quarantine_path=:path, quarantine_volume_id=7, "
+                        "quarantine_file_id=8, quarantine_size_bytes=:size, "
+                        "quarantine_mtime_ns=9 WHERE id=:id"
+                    ),
+                    {
+                        "path": package.path.swapcase(),
+                        "size": package.size_bytes,
+                        "id": pending.id,
+                    },
+                )
+
+        pending_with_path = _insert_cleanup(
+            service.database,
+            state="pending",
+            quarantine_path=material_quarantine,
+            quarantine_volume_id=10,
+            quarantine_file_id=11,
+            quarantine_size_bytes=12,
+            quarantine_mtime_ns=13,
+        )
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with service.database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE artifact_gc_queue SET state='deleted' WHERE id=:id"
+                    ),
+                    {"id": pending_with_path.id},
+                )
+    finally:
+        service.database.close()
+
+
+def test_reference_guard_marker_detects_missing_reverse_trigger(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "missing-reverse-trigger.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DROP TRIGGER IF EXISTS ck_gc_cleanup_reference_update"
+        )
+
+    with pytest.raises(SchemaMigrationError, match="reference guard"):
+        Database(path, runtime_dir=tmp_path)
+
+
 def test_content_service_rejects_existing_package_that_is_quarantined(
     tmp_path: Path,
 ) -> None:
@@ -269,6 +361,10 @@ def test_content_service_rejects_existing_package_that_is_quarantined(
         item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
     )
     try:
+        with service.database.engine.begin() as connection:
+            connection.execute(
+                text("DROP TRIGGER ck_gc_cleanup_reference_insert")
+            )
         _insert_cleanup(
             service.database,
             state="deleted",
@@ -330,6 +426,22 @@ def test_reference_guard_migration_fails_closed_on_historical_conflict(
     package = service.export_package(
         item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
     )
+    with service.database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "DELETE FROM workbench_schema_migrations "
+                "WHERE name='task8_artifact_quarantine_reference_guard_v1'"
+            )
+        )
+        for name in (
+            "ck_gc_material_path_insert",
+            "ck_gc_material_path_update",
+            "ck_gc_package_path_insert",
+            "ck_gc_package_path_update",
+            "ck_gc_cleanup_reference_insert",
+            "ck_gc_cleanup_reference_update",
+        ):
+            connection.execute(text(f"DROP TRIGGER {name}"))
     _insert_cleanup(
         service.database,
         state="deleted",
@@ -340,18 +452,6 @@ def test_reference_guard_migration_fails_closed_on_historical_conflict(
         quarantine_mtime_ns=3,
     )
     service.database.close()
-    with sqlite3.connect(path) as connection:
-        connection.execute(
-            "DELETE FROM workbench_schema_migrations "
-            "WHERE name='task8_artifact_quarantine_reference_guard_v1'"
-        )
-        for name in (
-            "ck_gc_material_path_insert",
-            "ck_gc_material_path_update",
-            "ck_gc_package_path_insert",
-            "ck_gc_package_path_update",
-        ):
-            connection.execute(f"DROP TRIGGER {name}")
 
     with pytest.raises(SchemaMigrationError, match="Historical quarantine"):
         Database(path, runtime_dir=tmp_path)

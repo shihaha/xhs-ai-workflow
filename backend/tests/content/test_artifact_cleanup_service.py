@@ -424,8 +424,71 @@ def test_move_commit_failure_is_needs_human_with_quarantine_retained(
 
     assert result.state == "needs_human"
     assert result.last_error_category == "quarantine_commit_ambiguous"
+    assert result.quarantine_path == (
+        f"artifacts-quarantine/{record.id}/material.bin"
+    )
+    assert result.quarantine_volume_id is not None
+    assert result.quarantine_file_id is not None
     assert not (runtime / record.relative_path).exists()
     retained = runtime / "artifacts-quarantine" / record.id / "material.bin"
+    assert retained.exists()
+    restarted = ArtifactCleanupService(
+        service.database, runtime_dir=runtime, clock=clock.now
+    )
+    persisted = restarted.get_record(record.id)
+    assert persisted is not None
+    assert persisted.quarantine_path == result.quarantine_path
+    assert persisted.quarantine_file_id == result.quarantine_file_id
+
+
+def test_unproven_moved_fact_stays_claimed_then_recovers_from_quarantine(
+    cleanup_environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime, clock, service, _ = cleanup_environment
+    record = service.enqueue(_candidate(runtime, clock))
+    import backend.app.features.content.cleanup as cleanup_module
+
+    real_rename = cleanup_module.rename_contained_regular_to_directory
+    real_commit = Session.commit
+    moved = False
+    post_move_failures = 0
+
+    def record_move(*args, **kwargs):
+        nonlocal moved
+        result = real_rename(*args, **kwargs)
+        moved = result.status == "trusted"
+        return result
+
+    def fail_two_post_move_commits(session: Session) -> None:
+        nonlocal post_move_failures
+        if moved and post_move_failures < 2:
+            post_move_failures += 1
+            raise SQLAlchemyError("forced unproven moved fact")
+        real_commit(session)
+
+    monkeypatch.setattr(
+        cleanup_module, "rename_contained_regular_to_directory", record_move
+    )
+    monkeypatch.setattr(Session, "commit", fail_two_post_move_commits)
+
+    uncertain = service.process_one(record.id)
+
+    assert post_move_failures == 2
+    assert uncertain.state == "claimed"
+    assert uncertain.quarantine_path is None
+    retained = runtime / "artifacts-quarantine" / record.id / "material.bin"
+    assert retained.exists()
+    clock.advance(timedelta(minutes=6))
+    assert service.recover_expired_leases() == 1
+
+    recovered = service.process_one(record.id)
+
+    assert recovered.state == "needs_human"
+    assert recovered.last_error_category == "quarantine_move_recovered"
+    assert recovered.quarantine_path == (
+        f"artifacts-quarantine/{record.id}/material.bin"
+    )
+    assert recovered.quarantine_file_id is not None
     assert retained.exists()
 
 
@@ -459,6 +522,11 @@ def test_reference_created_during_move_blocks_finalization_and_retains_quarantin
 
     assert result.state == "needs_human"
     assert result.last_error_category == "live_reference"
+    assert result.quarantine_path == (
+        f"artifacts-quarantine/{record.id}/material.bin"
+    )
+    assert result.quarantine_volume_id is not None
+    assert result.quarantine_file_id is not None
     assert (runtime / "artifacts-quarantine" / record.id / "material.bin").exists()
 
 

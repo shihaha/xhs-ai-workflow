@@ -655,3 +655,55 @@ Compilation and diff checks exited 0; Git emitted only the repository's Windows
 LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
 remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
 remains blocked pending redesign Tasks 3—5 and independent review.
+
+## Approved quarantine redesign — Task 2 fix round 3/5
+
+The two Important review groups were first reproduced as focused failures:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_schema.py -q -k "cleanup_insert_and_update or missing_reverse"
+2 failed, 39 deselected
+
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py -q -k "move_commit_failure or reference_created_during_move"
+2 failed, 33 deselected
+
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py -q -k "unproven_moved_fact"
+1 failed, 35 deselected
+```
+
+Implemented review findings:
+
+- Added physically validated reverse cleanup guards for direct queue INSERT and
+  quarantine-path/state UPDATE. A protected cleanup record cannot capture any
+  Windows-equivalent material or package path, including case, NFC and trailing
+  dot/space variants. The reference-guard marker now requires all six exact
+  triggers; missing, weak, or historically conflicting installations fail closed.
+- Added an expiry-aware moved-file `needs_human` CAS that persists quarantine path,
+  volume/file identity, size, mtime, category and fresh update time while clearing
+  the lease. Confirmed moves that fail post-move identity, reference, lease or
+  commit checks retain the file with these durable facts.
+- Ambiguous commit acknowledgement is verified read-only. If the moved fact cannot
+  be proven durable, the record remains claimed rather than reporting success; an
+  expired-lease retry recognizes the deterministic quarantine target and records
+  the recovered path and identity for service reads after restart.
+
+Final fix-round verification:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py backend/tests/content/test_artifact_cleanup_schema.py backend/tests/content/test_round3_hardening.py backend/tests/content/test_round5_hardening.py -q
+109 passed in 10.68s
+
+python -m pytest backend/tests/content -q
+171 passed in 18.57s
+
+python -m pytest backend/tests -q
+484 passed, 1 skipped in 33.66s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only the repository's Windows
+LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
+remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
+remains blocked pending redesign Tasks 3—5 and independent review.

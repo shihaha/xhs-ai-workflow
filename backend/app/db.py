@@ -1072,11 +1072,44 @@ _PACKAGE_PATH_UPDATE_TRIGGER = _reference_guard_trigger(
     "ck_gc_package_path_update", "content_packages", "UPDATE OF path"
 )
 
+_CLEANUP_CAPTURES_REFERENCE_WHEN = """
+NEW.quarantine_path IS NOT NULL
+AND NEW.state IN ('claimed','quarantined','deleted','needs_human')
+AND EXISTS (
+    SELECT 1 FROM (
+        SELECT path FROM content_product_materials
+        UNION ALL SELECT path FROM content_packages
+    ) AS reference
+    WHERE windows_artifact_path_key(reference.path)
+          = windows_artifact_path_key(NEW.quarantine_path)
+)
+"""
+
+_CLEANUP_REFERENCE_INSERT_TRIGGER = f"""
+CREATE TRIGGER ck_gc_cleanup_reference_insert
+BEFORE INSERT ON artifact_gc_queue
+WHEN {_CLEANUP_CAPTURES_REFERENCE_WHEN}
+BEGIN
+    SELECT RAISE(ABORT, 'quarantine path conflicts with an existing artifact reference');
+END
+"""
+
+_CLEANUP_REFERENCE_UPDATE_TRIGGER = f"""
+CREATE TRIGGER ck_gc_cleanup_reference_update
+BEFORE UPDATE OF quarantine_path, state ON artifact_gc_queue
+WHEN {_CLEANUP_CAPTURES_REFERENCE_WHEN}
+BEGIN
+    SELECT RAISE(ABORT, 'quarantine path conflicts with an existing artifact reference');
+END
+"""
+
 _REFERENCE_GUARD_TRIGGERS = {
     "ck_gc_material_path_insert": _MATERIAL_PATH_INSERT_TRIGGER,
     "ck_gc_material_path_update": _MATERIAL_PATH_UPDATE_TRIGGER,
     "ck_gc_package_path_insert": _PACKAGE_PATH_INSERT_TRIGGER,
     "ck_gc_package_path_update": _PACKAGE_PATH_UPDATE_TRIGGER,
+    "ck_gc_cleanup_reference_insert": _CLEANUP_REFERENCE_INSERT_TRIGGER,
+    "ck_gc_cleanup_reference_update": _CLEANUP_REFERENCE_UPDATE_TRIGGER,
 }
 
 
