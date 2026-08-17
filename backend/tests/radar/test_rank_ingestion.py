@@ -1,9 +1,15 @@
+import json
 from pathlib import Path
+from typing import Any
 
 from backend.app.adapters.qianfan_playwright import QianfanPlaywrightAdapter
+from backend.app.adapters.contracts import CollectionRequest, CollectionResult
+from backend.app.adapters.registry import AdapterRegistry
 from backend.app.db import Database
 from backend.app.features.radar.models import RankItemInput, RankSnapshotInput
 from backend.app.features.radar.service import RadarService
+from backend.app.models.jobs import JobState
+from backend.app.services.jobs import JobService
 
 
 BOARDS = ("阅读榜", "引流榜", "热卖榜", "成交榜")
@@ -103,6 +109,44 @@ def test_snapshot_deduplication_is_stable_and_uses_lowest_rank_evidence(
     assert second.items[0].raw_evidence == {"rank": 2}
 
 
+def test_fallback_dedupe_keeps_distinct_notes_from_one_user(tmp_path: Path) -> None:
+    """Using user_id as fallback identity must not collapse different notes by one account."""
+    first = RankItemInput(
+        rank_no=3,
+        title="第一篇",
+        author_name="账号甲",
+        user_id="same-user",
+        publish_date="2026-08-17 09:00",
+        source_url="https://ark.xiaohongshu.com/api/rank",
+        raw_evidence={"noteTitle": "第一篇", "rank": 3},
+    )
+    first_duplicate = first.model_copy(update={"rank_no": 8})
+    second = RankItemInput(
+        rank_no=4,
+        title="第二篇",
+        author_name="账号甲",
+        user_id="same-user",
+        publish_date="2026-08-17 10:00",
+        source_url="https://ark.xiaohongshu.com/api/rank",
+        raw_evidence={"noteTitle": "第二篇", "rank": 4},
+    )
+    service = RadarService(Database(tmp_path / "radar.sqlite3"))
+
+    snapshot = service.ingest_snapshot(
+        _snapshot(
+            "成交榜",
+            "优秀内容",
+            items=[first_duplicate, second, first],
+        )
+    )
+
+    assert snapshot.deduplicated_count == 2
+    assert [(item.rank_no, item.title) for item in snapshot.items] == [
+        (3, "第一篇"),
+        (4, "第二篇"),
+    ]
+
+
 class _FakeLocator:
     def __init__(self, count: int) -> None:
         self._count = count
@@ -112,13 +156,31 @@ class _FakeLocator:
 
 
 class _FakeResponse:
-    def __init__(self, url: str, status: int, body: dict[str, object]) -> None:
+    def __init__(
+        self,
+        url: str,
+        status: int,
+        body: dict[str, object] | None = None,
+        *,
+        raw_text: str | None = None,
+        json_error: Exception | None = None,
+    ) -> None:
         self.url = url
         self.status = status
         self._body = body
+        self._raw_text = raw_text
+        self._json_error = json_error
 
     def json(self) -> dict[str, object]:
+        if self._json_error is not None:
+            raise self._json_error
+        assert self._body is not None
         return self._body
+
+    def text(self) -> str:
+        if self._raw_text is None:
+            raise RuntimeError("text not configured")
+        return self._raw_text
 
 
 class _FakePage:
@@ -135,6 +197,10 @@ class _FakePage:
         self.selectors = selectors
         self.responses = responses or []
         self.visited: list[str] = []
+        self.removed_listeners: list[tuple[str, object]] = []
+        self.closed = False
+        self.goto_error: Exception | None = None
+        self.locator_error: Exception | None = None
         self._response_handler: object | None = None
 
     def on(self, event: str, handler: object) -> None:
@@ -143,15 +209,29 @@ class _FakePage:
 
     def goto(self, url: str, *, wait_until: str) -> None:
         self.visited.append(url)
+        if self.goto_error is not None:
+            raise self.goto_error
+        self.emit_responses()
+
+    def emit_responses(self) -> None:
         if callable(self._response_handler):
             for response in self.responses:
                 self._response_handler(response)
+            self.responses.clear()
 
     def content(self) -> str:
         return self.html
 
     def locator(self, selector: str) -> _FakeLocator:
+        if self.locator_error is not None:
+            raise self.locator_error
         return _FakeLocator(self.selectors.get(selector, 0))
+
+    def remove_listener(self, event: str, handler: object) -> None:
+        self.removed_listeners.append((event, handler))
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_controlled_adapter_returns_needs_human_with_raw_page_on_login() -> None:
@@ -162,7 +242,9 @@ def test_controlled_adapter_returns_needs_human_with_raw_page_on_login() -> None
         selectors={"input[type='password']": 1},
     )
 
-    outcome = QianfanPlaywrightAdapter(page_factory=lambda: page).capture_visible_page()
+    outcome = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, timeout_seconds=0
+    ).capture_visible_page()
 
     assert outcome.status == "needs_human"
     assert outcome.reason == "login_required"
@@ -178,7 +260,9 @@ def test_controlled_adapter_returns_needs_human_when_expected_layout_is_absent()
         selectors={"input[type='password']": 0, ".note-rank table": 0},
     )
 
-    outcome = QianfanPlaywrightAdapter(page_factory=lambda: page).capture_visible_page()
+    outcome = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, timeout_seconds=0
+    ).capture_visible_page()
 
     assert outcome.status == "needs_human"
     assert outcome.reason == "layout_changed"
@@ -219,3 +303,222 @@ def test_controlled_adapter_captures_raw_page_and_response_without_writes() -> N
             }
         ],
     }
+    assert len(page.removed_listeners) == 1
+
+
+def test_malformed_response_preserves_raw_body_and_parse_error() -> None:
+    """A JSON parse failure must not replace the actual provider response evidence."""
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<section class='note-rank'><table></table></section>",
+        selectors={"input[type='password']": 0, ".note-rank table": 1},
+        responses=[
+            _FakeResponse(
+                "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
+                502,
+                raw_text="<html>bad gateway</html>",
+                json_error=ValueError("not json"),
+            )
+        ],
+    )
+
+    outcome = QianfanPlaywrightAdapter(page_factory=lambda: page).capture_visible_page()
+
+    response = outcome.raw_evidence["responses"][0]
+    assert response["raw_text"] == "<html>bad gateway</html>"
+    assert response["capture_error"] == "ValueError"
+
+
+def test_capture_waits_for_delayed_ranking_response_and_cleans_listener() -> None:
+    """A response arriving within the bounded wait must be captured before deciding layout changed."""
+    response_body = {"data": {"dataList": [{"rank": 1, "userId": "delayed"}]}}
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<main>loading</main>",
+        selectors={"input[type='password']": 0, ".note-rank table": 0},
+        responses=[
+            _FakeResponse(
+                "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
+                200,
+                response_body,
+            )
+        ],
+    )
+    page.responses_to_delay = page.responses
+    page.responses = []
+
+    def release_response(_: float) -> None:
+        page.responses = page.responses_to_delay
+        page.emit_responses()
+
+    outcome = QianfanPlaywrightAdapter(
+        page_factory=lambda: page,
+        timeout_seconds=1,
+        poll_interval=0.01,
+        sleep=release_response,
+    ).capture_visible_page()
+
+    assert outcome.status == "captured"
+    assert outcome.raw_evidence["responses"][0]["body"] == response_body
+    assert len(page.removed_listeners) == 1
+
+
+def test_navigation_failure_is_needs_human_with_evidence_and_owned_page_cleanup() -> None:
+    """A browser timeout must leave factual evidence and close only a page the adapter owns."""
+    page = _FakePage(
+        url="about:blank",
+        html="<main>not loaded</main>",
+        selectors={},
+    )
+    page.goto_error = TimeoutError("navigation timed out")
+
+    outcome = QianfanPlaywrightAdapter(
+        page_factory=lambda: page,
+        timeout_seconds=0,
+        owns_page=True,
+    ).capture_visible_page()
+
+    assert outcome.status == "needs_human"
+    assert outcome.reason == "navigation_failed"
+    assert outcome.raw_evidence["capture_errors"] == [
+        {"stage": "navigation", "type": "TimeoutError", "message": "navigation timed out"}
+    ]
+    assert len(page.removed_listeners) == 1
+    assert page.closed is True
+
+
+def test_locator_failure_is_needs_human_with_layout_error_evidence() -> None:
+    """A selector API failure must be an observed layout problem, not an uncaught crash."""
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<main>unknown</main>",
+        selectors={},
+    )
+    page.locator_error = RuntimeError("locator unavailable")
+
+    outcome = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, timeout_seconds=0
+    ).capture_visible_page()
+
+    assert outcome.status == "needs_human"
+    assert outcome.reason == "layout_changed"
+    assert outcome.raw_evidence["capture_errors"] == [
+        {"stage": "layout", "type": "RuntimeError", "message": "locator unavailable"}
+    ]
+
+
+def test_collect_rankings_never_claims_empty_success_without_a_ranking_response() -> None:
+    """A visible table without parseable response rows cannot truthfully become 0/0 success."""
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<section class='note-rank'><table></table></section>",
+        selectors={"input[type='password']": 0, ".note-rank table": 1},
+    )
+    adapter = QianfanPlaywrightAdapter(page_factory=lambda: page, timeout_seconds=0)
+
+    result = adapter.collect_rankings(CollectionRequest(capability="rankings"))
+
+    assert result.status == "needs_human"
+    assert result.complete is False
+    assert result.missing_items[0].reason == "response_not_observed"
+
+
+def test_collect_rankings_returns_contract_and_attaches_raw_job_evidence(
+    tmp_path: Path,
+) -> None:
+    """The selectable collector boundary must return normalized items and durable raw evidence."""
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3")
+    jobs = JobService(database, runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    response_body: dict[str, Any] = {
+        "data": {
+            "dataList": [
+                {
+                    "rank": 1,
+                    "noteId": "note-a",
+                    "userId": "account-a",
+                    "userNickname": "账号甲",
+                }
+            ]
+        }
+    }
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<section class='note-rank'><table></table></section>",
+        selectors={"input[type='password']": 0, ".note-rank table": 1},
+        responses=[
+            _FakeResponse(
+                "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
+                200,
+                response_body,
+            )
+        ],
+    )
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, job_service=jobs, runtime_dir=runtime_dir
+    )
+    registry = AdapterRegistry()
+    registry.register(
+        name="qianfan-playwright",
+        adapter=adapter,
+        capabilities={"rankings"},
+        priority=10,
+    )
+
+    selected = registry.resolve("rankings")
+    result = selected.collect_rankings(
+        CollectionRequest(
+            capability="rankings", parameters={"job_id": job.id}, expected_count=1
+        )
+    )
+
+    assert isinstance(result, CollectionResult)
+    assert result.status == "succeeded"
+    assert result.complete is True
+    assert result.items[0].id == "note-a"
+    persisted_job = jobs.get(job.id)
+    assert len(persisted_job.artifacts) == 1
+    artifact = persisted_job.artifacts[0]
+    assert artifact.kind == "qianfan_raw_capture"
+    assert (runtime_dir / artifact.path).is_file()
+    assert result.evidence_artifacts == [artifact.path]
+    persisted_evidence = json.loads(
+        (runtime_dir / artifact.path).read_text(encoding="utf-8")
+    )
+    assert persisted_evidence["raw_evidence"]["responses"][0]["body"] == response_body
+    assert response_body["data"]["dataList"][0] == result.items[0].raw_evidence["item"]
+
+
+def test_collect_rankings_maps_login_to_needs_human_job_and_contract(
+    tmp_path: Path,
+) -> None:
+    """A login wall must agree across collection result, durable job state and evidence artifact."""
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3")
+    jobs = JobService(database, runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/login",
+        html="<form>登录</form>",
+        selectors={"input[type='password']": 1},
+    )
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: page,
+        job_service=jobs,
+        runtime_dir=runtime_dir,
+        timeout_seconds=0,
+    )
+
+    result = adapter.collect_rankings(
+        CollectionRequest(capability="rankings", parameters={"job_id": job.id})
+    )
+
+    assert result.status == "needs_human"
+    assert result.complete is False
+    assert result.missing_items[0].reason == "login_required"
+    persisted_job = jobs.get(job.id)
+    assert persisted_job.state is JobState.needs_human
+    assert len(persisted_job.artifacts) == 1

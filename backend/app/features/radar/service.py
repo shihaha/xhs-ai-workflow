@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from datetime import date
 from hashlib import sha256
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -21,7 +22,7 @@ from backend.app.features.radar.models import (
     RankSnapshotRead,
     RankSnapshotRecord,
 )
-from backend.app.features.radar.scoring import score_account
+from backend.app.features.radar.scoring import has_recognized_evidence, score_account
 
 
 class RadarService:
@@ -66,7 +67,13 @@ class RadarService:
             session.refresh(record)
             return _snapshot_read(record)
 
-    def list_snapshots(self, *, source_date: str | date | None = None) -> list[RankSnapshotRead]:
+    def list_snapshots(
+        self,
+        *,
+        source_date: str | date | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[RankSnapshotRead]:
         statement = select(RankSnapshotRecord).options(selectinload(RankSnapshotRecord.items))
         if source_date is not None:
             value = source_date.isoformat() if isinstance(source_date, date) else source_date
@@ -75,12 +82,12 @@ class RadarService:
             RankSnapshotRecord.source_date.desc(),
             RankSnapshotRecord.board,
             RankSnapshotRecord.dimension,
-        )
+        ).limit(limit).offset(offset)
         with self.database.session() as session:
             return [_snapshot_read(record) for record in session.scalars(statement).all()]
 
-    def list_accounts(self) -> list[AccountRead]:
-        return self._scored_accounts()
+    def list_accounts(self, *, limit: int = 100, offset: int = 0) -> list[AccountRead]:
+        return self._scored_accounts()[offset : offset + limit]
 
     def list_candidates(self, *, source_date: date, limit: int) -> list[AccountRead]:
         target = source_date.isoformat()
@@ -96,6 +103,8 @@ class RadarService:
         by_user: dict[str, list[tuple[RankSnapshotRecord, RankItemRecord]]] = {}
         eligible_users: set[str] = set()
         for snapshot in snapshots:
+            if eligible_date is not None and snapshot.source_date > eligible_date:
+                continue
             for item in snapshot.items:
                 if not item.user_id:
                     continue
@@ -121,7 +130,13 @@ class RadarService:
                     "read_range": item.read_range,
                 }
                 for snapshot, item in evidence_rows
-                if item.gmv_range is not None
+                if has_recognized_evidence(
+                    {
+                        "gmv_range": item.gmv_range,
+                        "pay_rate_range": item.pay_rate_range,
+                        "read_range": item.read_range,
+                    }
+                )
             ]
             if not score_rows:
                 continue
@@ -141,10 +156,37 @@ class RadarService:
 def _stable_key(item: RankItemInput) -> str:
     if item.note_id:
         return f"note:{item.note_id}"
-    if item.user_id:
-        return f"user:{item.user_id}"
-    payload = json.dumps(item.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+    content_url = _canonical_content_url(str(item.source_url))
+    if content_url is not None:
+        return f"url:{content_url}"
+    payload = json.dumps(
+        {
+            "user_id": item.user_id,
+            "title": item.title,
+            "publish_date": item.publish_date,
+            "raw_evidence": item.raw_evidence,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     return f"raw:{sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _canonical_content_url(source_url: str) -> str | None:
+    parts = urlsplit(source_url)
+    path_segments = [segment.lower() for segment in parts.path.split("/") if segment]
+    has_note_identity = (
+        "explore" in path_segments
+        and path_segments.index("explore") + 1 < len(path_segments)
+    ) or (
+        "item" in path_segments
+        and path_segments.index("item") + 1 < len(path_segments)
+    )
+    if not has_note_identity:
+        return None
+    return urlunsplit(
+        (parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), "", "")
+    )
 
 
 def _deduplicate(items: Iterable[RankItemInput]) -> list[tuple[str, RankItemInput]]:

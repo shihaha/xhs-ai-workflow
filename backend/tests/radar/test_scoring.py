@@ -1,3 +1,8 @@
+import json
+from pathlib import Path
+
+import pytest
+
 from backend.app.features.radar.scoring import (
     GMV_BUCKET_SCORES,
     PAY_BUCKET_SCORES,
@@ -91,3 +96,18 @@ def test_score_caps_credibility_and_only_boosts_positive_sub_thousand_fans() -> 
         "nboard": 12,
     }
     assert score_account(items, fans=1000).accessibility == 1.0
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    json.loads(
+        (Path(__file__).parent / "fixtures" / "tutorial_scoring_cases.json").read_text(
+            encoding="utf-8"
+        )
+    ),
+    ids=lambda fixture: fixture["name"],
+)
+def test_committed_tutorial_scoring_parity_fixtures(fixture: dict[str, object]) -> None:
+    """The reviewable static fixture output must stay equal to the tutorial scorer."""
+    result = score_account(fixture["items"], fans=fixture["fans"])
+    assert result.model_dump() == fixture["expected"]

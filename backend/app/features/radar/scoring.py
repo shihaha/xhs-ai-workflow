@@ -76,3 +76,12 @@ def score_account(items: Sequence[Mapping[str, Any]], fans: int) -> AccountScore
         nday=day_count,
         nboard=board_count,
     )
+
+
+def has_recognized_evidence(item: Mapping[str, Any]) -> bool:
+    """Return whether at least one tutorial metric can contribute to evidence."""
+    return (
+        item.get("gmv_range") in GMV_BUCKET_SCORES
+        or item.get("pay_rate_range") in PAY_BUCKET_SCORES
+        or item.get("read_range") in READ_BUCKET_SCORES
+    )

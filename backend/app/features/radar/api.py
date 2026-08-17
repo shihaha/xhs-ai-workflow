@@ -27,14 +27,23 @@ def ingest_rank_snapshot(payload: RankSnapshotInput, request: Request) -> RankSn
 
 @router.get("/rank-snapshots", response_model=list[RankSnapshotRead])
 def list_rank_snapshots(
-    request: Request, source_date: date | None = None
+    request: Request,
+    source_date: date | None = None,
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
 ) -> list[RankSnapshotRead]:
-    return _service(request).list_snapshots(source_date=source_date)
+    return _service(request).list_snapshots(
+        source_date=source_date, limit=limit, offset=offset
+    )
 
 
 @router.get("/accounts", response_model=list[AccountRead])
-def list_accounts(request: Request) -> list[AccountRead]:
-    return _service(request).list_accounts()
+def list_accounts(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[AccountRead]:
+    return _service(request).list_accounts(limit=limit, offset=offset)
 
 
 @router.get("/candidates", response_model=list[AccountRead])

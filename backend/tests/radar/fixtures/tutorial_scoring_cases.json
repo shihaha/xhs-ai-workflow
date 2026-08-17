@@ -1,0 +1,109 @@
+[
+  {
+    "name": "mixed-single-row-low-fans",
+    "fans": 250,
+    "items": [
+      {
+        "source_date": "2026-08-17",
+        "board": "成交榜",
+        "gmv_range": "￥1000-5000",
+        "pay_rate_range": "15%-25%",
+        "read_range": "3万-5万"
+      }
+    ],
+    "expected": {
+      "score": 0.71,
+      "evidence": 0.45,
+      "credibility": 1.09,
+      "accessibility": 1.45,
+      "fans": 250,
+      "gmv": "￥1000-5000",
+      "pay": "15%-25%",
+      "read": "3万-5万",
+      "nday": 1,
+      "nboard": 1
+    }
+  },
+  {
+    "name": "read-only-evidence",
+    "fans": 1000,
+    "items": [
+      {
+        "source_date": "2026-08-17",
+        "board": "阅读榜",
+        "gmv_range": null,
+        "pay_rate_range": null,
+        "read_range": "10万以上"
+      }
+    ],
+    "expected": {
+      "score": 0.16,
+      "evidence": 0.15,
+      "credibility": 1.09,
+      "accessibility": 1.0,
+      "fans": 1000,
+      "gmv": "—",
+      "pay": "—",
+      "read": "10万以上",
+      "nday": 1,
+      "nboard": 1
+    }
+  },
+  {
+    "name": "pay-only-low-fans",
+    "fans": 500,
+    "items": [
+      {
+        "source_date": "2026-08-17",
+        "board": "引流榜",
+        "gmv_range": null,
+        "pay_rate_range": "70%-90%",
+        "read_range": null
+      }
+    ],
+    "expected": {
+      "score": 0.49,
+      "evidence": 0.35,
+      "credibility": 1.09,
+      "accessibility": 1.3,
+      "fans": 500,
+      "gmv": "—",
+      "pay": "70%-90%",
+      "read": "—",
+      "nday": 1,
+      "nboard": 1
+    }
+  },
+  {
+    "name": "two-day-two-board-maximum-evidence",
+    "fans": 200,
+    "items": [
+      {
+        "source_date": "2026-08-16",
+        "board": "成交榜",
+        "gmv_range": "1万-5万",
+        "pay_rate_range": "70%-90%",
+        "read_range": "10万以上"
+      },
+      {
+        "source_date": "2026-08-17",
+        "board": "热卖榜",
+        "gmv_range": "1万-5万",
+        "pay_rate_range": "70%-90%",
+        "read_range": "10万以上"
+      }
+    ],
+    "expected": {
+      "score": 1.74,
+      "evidence": 1.0,
+      "credibility": 1.18,
+      "accessibility": 1.48,
+      "fans": 200,
+      "gmv": "1万-5万",
+      "pay": "70%-90%",
+      "read": "10万以上",
+      "nday": 2,
+      "nboard": 2
+    }
+  }
+]
