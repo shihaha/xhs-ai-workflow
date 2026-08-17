@@ -30,10 +30,11 @@ def health(request: Request) -> dict[str, object]:
     settings: Settings = request.app.state.settings
     database_path = settings.database_path
     assert database_path is not None
+    database_error = request.app.state.database_error
 
     checks = {
         "database": {
-            "healthy": _is_writable_database_path(database_path),
+            "healthy": database_error is None and _is_writable_database_path(database_path),
             "path": str(database_path),
         },
         "adb": {

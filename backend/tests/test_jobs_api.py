@@ -22,6 +22,9 @@ async def test_job_progress_logs_and_evidence_survive_a_new_app_instance(
         runtime_dir=runtime_dir,
         database_path=runtime_dir / "workbench.sqlite3",
     )
+    evidence_file = runtime_dir / "evidence" / "response-001.json"
+    evidence_file.parent.mkdir()
+    evidence_file.write_text('{"result": "tea"}', encoding="utf-8")
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app(settings)),

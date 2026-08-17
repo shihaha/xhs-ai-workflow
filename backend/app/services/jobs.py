@@ -2,9 +2,10 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import case, select, update
 from sqlalchemy.orm import selectinload
 
 from backend.app.db import Database
@@ -17,6 +18,10 @@ class JobNotFound(Exception):
 
 class InvalidJobTransition(Exception):
     """Raised when an attempted job-state edge is not allowed."""
+
+
+class InvalidArtifactPath(Exception):
+    """Raised when evidence does not point to an existing runtime file."""
 
 
 @dataclass(frozen=True)
@@ -71,8 +76,9 @@ _TERMINAL_STATES = {JobState.succeeded, JobState.failed, JobState.cancelled}
 class JobService:
     """Persist state-machine operations in the configured SQLite database."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, *, runtime_dir: Path | None = None) -> None:
         self.database = database
+        self.runtime_dir = (runtime_dir or database.database_path.parent).resolve()
 
     def create(
         self,
@@ -114,20 +120,39 @@ class JobService:
             return [_as_job(record) for record in records]
 
     def claim(self, job_id: str, *, lease_seconds: int = 300) -> Job:
+        now = _utc_now()
         with self.database.session() as session:
-            record = self._record(session, job_id)
-            current_state = JobState(record.state)
-            if current_state not in {JobState.queued, JobState.needs_human}:
-                raise InvalidJobTransition(f"Cannot claim a {current_state.value} job.")
-            now = _utc_now()
-            if current_state is JobState.needs_human:
-                record.retry_count += 1
-            record.state = JobState.running
-            record.started_at = record.started_at or now
-            record.lease_expires_at = now + timedelta(seconds=lease_seconds)
-            record.updated_at = now
+            result = session.execute(
+                update(JobRecord)
+                .where(
+                    JobRecord.id == job_id,
+                    JobRecord.state.in_((JobState.queued.value, JobState.needs_human.value)),
+                )
+                .values(
+                    state=JobState.running.value,
+                    retry_count=case(
+                        (
+                            JobRecord.state == JobState.needs_human.value,
+                            JobRecord.retry_count + 1,
+                        ),
+                        else_=JobRecord.retry_count,
+                    ),
+                    started_at=case(
+                        (JobRecord.started_at.is_(None), now), else_=JobRecord.started_at
+                    ),
+                    lease_expires_at=now + timedelta(seconds=lease_seconds),
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                try:
+                    record = self._record(session, job_id)
+                except JobNotFound:
+                    raise
+                raise InvalidJobTransition(f"Cannot claim a {JobState(record.state).value} job.")
             session.commit()
-            return _as_job(record)
+            return _as_job(self._record(session, job_id))
 
     def transition(
         self,
@@ -157,7 +182,12 @@ class JobService:
             if error_category is not None:
                 record.error_category = error_category
             record.updated_at = now
-            if state in _TERMINAL_STATES:
+            if state is JobState.running:
+                if current_state is JobState.needs_human:
+                    record.retry_count += 1
+                record.started_at = record.started_at or now
+                record.lease_expires_at = now + timedelta(seconds=300)
+            elif state in _TERMINAL_STATES:
                 record.completed_at = now
                 record.lease_expires_at = None
             elif state is JobState.needs_human:
@@ -179,12 +209,13 @@ class JobService:
     def attach_artifact(
         self, job_id: str, *, kind: str, path: str, metadata: dict[str, Any]
     ) -> JobArtifact:
+        relative_path = self._validated_artifact_path(path)
         with self.database.session() as session:
             record = self._record(session, job_id)
             artifact = JobArtifactRecord(
                 job_id=record.id,
                 kind=kind,
-                path=path,
+                path=relative_path.as_posix(),
                 metadata_json=metadata,
                 created_at=_utc_now(),
             )
@@ -231,6 +262,19 @@ class JobService:
         if record is None:
             raise JobNotFound(f"Job {job_id} does not exist.")
         return record
+
+    def _validated_artifact_path(self, path: str) -> Path:
+        candidate = Path(path)
+        if candidate.is_absolute():
+            raise InvalidArtifactPath("Artifact path must be relative to runtime storage.")
+        resolved = (self.runtime_dir / candidate).resolve()
+        try:
+            relative_path = resolved.relative_to(self.runtime_dir)
+        except ValueError as error:
+            raise InvalidArtifactPath("Artifact path escapes runtime storage.") from error
+        if not resolved.is_file():
+            raise InvalidArtifactPath("Artifact file does not exist.")
+        return relative_path
 
 
 def _as_job(record: JobRecord) -> Job:

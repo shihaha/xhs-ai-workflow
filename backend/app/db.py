@@ -22,7 +22,11 @@ class Database:
         )
         event.listen(self.engine, "connect", _configure_sqlite)
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
-        self.initialize()
+        try:
+            self.initialize()
+        except Exception:
+            self.close()
+            raise
 
     def initialize(self) -> None:
         """Create schema without creating any business records."""
@@ -33,6 +37,10 @@ class Database:
 
     def session(self) -> Session:
         return self.sessions()
+
+    def close(self) -> None:
+        """Release pooled SQLite handles before an app instance is replaced."""
+        self.engine.dispose()
 
 
 def _configure_sqlite(connection: object, _: object) -> None:

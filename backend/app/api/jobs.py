@@ -13,7 +13,13 @@ from backend.app.schemas.jobs import (
     JobRead,
     JobTransition,
 )
-from backend.app.services.jobs import InvalidJobTransition, Job, JobNotFound, JobService
+from backend.app.services.jobs import (
+    InvalidArtifactPath,
+    InvalidJobTransition,
+    Job,
+    JobNotFound,
+    JobService,
+)
 
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
@@ -95,6 +101,8 @@ def attach_artifact(
         )
     except JobNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except InvalidArtifactPath as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     return JobArtifactRead(
         kind=artifact.kind, path=artifact.path, metadata=artifact.metadata
     )
