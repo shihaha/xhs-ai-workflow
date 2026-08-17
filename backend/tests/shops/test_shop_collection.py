@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event, Timer
 from typing import Any
 
 import httpx
@@ -49,6 +52,14 @@ DETAIL_XML = """<?xml version="1.0" encoding="UTF-8"?>
 </hierarchy>"""
 SHARE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <hierarchy><node content-desc="复制链接" bounds="[120,1300][360,1500]" /></hierarchy>"""
+SAME_TITLE_SHOP_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="同名商品完整标题" bounds="[20,120][600,180]" />
+  <node content-desc="到手价¥19.90已售100+" bounds="[20,225][600,280]" />
+  <node text="同名商品完整标题" bounds="[20,420][600,480]" />
+  <node content-desc="到手价¥29.90已售200+" bounds="[20,525][600,580]" />
+  <node text="没有更多商品了" bounds="[0,1400][720,1500]" />
+</hierarchy>"""
 
 
 class _FakeAdbDevice:
@@ -83,11 +94,15 @@ class _FakeU2Device:
         on_open_url: Callable[[], None] | None = None,
         on_selector: Callable[[tuple[str, str]], None] | None = None,
         back_screens: list[str] | None = None,
+        shop_xml: str = SHOP_XML,
+        links_by_y: dict[int, str] | None = None,
+        clipboard_before: str = "",
+        clipboard_after: list[str] | None = None,
     ) -> None:
         self.screen = "initial"
         self.screens = {
             "profile": profile_xml,
-            "shop": SHOP_XML,
+            "shop": shop_xml,
             "detail": DETAIL_XML,
             "share": SHARE_XML,
         }
@@ -96,6 +111,13 @@ class _FakeU2Device:
         self.on_open_url = on_open_url
         self.on_selector = on_selector
         self.back_screens = list(back_screens or ["shop"])
+        self.links_by_y = dict(links_by_y or {})
+        self._clipboard_before = clipboard_before
+        self._clipboard_after = (
+            list(clipboard_after) if clipboard_after is not None else None
+        )
+        self._copy_clicked = False
+        self.clipboard_reads = 0
         self.actions: list[tuple[object, ...]] = []
 
     def app_current(self) -> dict[str, object]:
@@ -140,6 +162,8 @@ class _FakeU2Device:
             self.actions.append(("selector", *key))
             if target is not None:
                 self.screen = target
+            if key == ("description", "复制链接"):
+                self._copy_clicked = True
             if self.on_selector is not None:
                 self.on_selector(key)
 
@@ -147,6 +171,8 @@ class _FakeU2Device:
 
     def click(self, x: int, y: int) -> None:
         self.actions.append(("click", x, y))
+        self.link = self.links_by_y.get(y, self.link)
+        self._copy_clicked = False
         self.screen = "detail"
 
     def press(self, key: str) -> None:
@@ -158,7 +184,14 @@ class _FakeU2Device:
 
     @property
     def clipboard(self) -> str:
-        return self.link
+        self.clipboard_reads += 1
+        if not self._copy_clicked:
+            return self._clipboard_before
+        if self._clipboard_after is None:
+            return self.link
+        if len(self._clipboard_after) > 1:
+            return self._clipboard_after.pop(0)
+        return self._clipboard_after[0]
 
 
 def _adapter(
@@ -169,6 +202,7 @@ def _adapter(
     **adapter_options: Any,
 ) -> AndroidDeviceAdapter:
     adapter_options.setdefault("profile_settle_seconds", 0)
+    adapter_options.setdefault("selector_timeout_seconds", 0)
     adapter_options.setdefault("sleep", lambda _: None)
     return AndroidDeviceAdapter(
         runtime_dir=tmp_path / "runtime",
@@ -362,6 +396,160 @@ def test_collection_stops_immediately_when_cancelled_on_share_transition(
     assert ("press", "back") not in device.actions
 
 
+def test_collection_stops_after_copy_cancellation_before_accepting_clipboard(
+    tmp_path: Path,
+) -> None:
+    """Accepting a freshly copied URL or pressing Back after cancellation is a race."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="shop_collection", input_data={}, progress_total=1)
+    jobs.claim(job.id)
+
+    def cancel_on_copy(selector: tuple[str, str]) -> None:
+        if selector == ("description", "复制链接"):
+            jobs.transition(job.id, JobState.cancelled)
+
+    device = _FakeU2Device(on_selector=cancel_on_copy)
+
+    result = _adapter(tmp_path, device, jobs=jobs).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1", "job_id": job.id},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.detail == "cancelled"
+    assert result.items == []
+    assert ("press", "back") not in device.actions
+
+
+def test_collection_rechecks_cancellation_immediately_before_back(
+    tmp_path: Path,
+) -> None:
+    """A state change during the return check must prevent the pending Back action."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="shop_collection", input_data={}, progress_total=1)
+    jobs.claim(job.id)
+
+    class CancelBeforeBackDevice(_FakeU2Device):
+        def app_current(self) -> dict[str, object]:
+            if (
+                self.screen == "share"
+                and self._copy_clicked
+                and jobs.get(job.id).state is JobState.running
+            ):
+                jobs.transition(job.id, JobState.cancelled)
+            return super().app_current()
+
+    device = CancelBeforeBackDevice()
+    result = _adapter(tmp_path, device, jobs=jobs).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1", "job_id": job.id},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.detail == "cancelled"
+    assert ("press", "back") not in device.actions
+
+
+def test_collection_reports_cancellation_during_selector_wait(
+    tmp_path: Path,
+) -> None:
+    """A selector wait must poll cancellation instead of returning a layout diagnosis."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="shop_collection", input_data={}, progress_total=1)
+    jobs.claim(job.id)
+
+    class CancellingExists:
+        def __call__(self, *, timeout: float) -> bool:
+            _ = timeout
+            jobs.transition(job.id, JobState.cancelled)
+            return False
+
+    class CancellingSelectorDevice(_FakeU2Device):
+        def __call__(self, **query: str) -> _FakeUiObject:
+            if next(iter(query.items())) == ("text", "店铺"):
+                candidate = _FakeUiObject(False, lambda: None)
+                candidate.exists = CancellingExists()  # type: ignore[assignment]
+                return candidate
+            return super().__call__(**query)
+
+    device = CancellingSelectorDevice()
+    result = _adapter(tmp_path, device, jobs=jobs).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1", "job_id": job.id},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.detail == "cancelled"
+    assert not any(action[0] == "click" for action in device.actions)
+
+
+def test_collection_waits_for_a_changed_clipboard_product_url(tmp_path: Path) -> None:
+    """Reading once would preserve the stale pre-Copy link instead of the delayed new one."""
+    stale = "https://xhslink.com/stale-product"
+    current = "https://xhslink.com/current-product"
+    device = _FakeU2Device(
+        link=current,
+        clipboard_before=stale,
+        clipboard_after=[stale, stale, current],
+    )
+
+    result = _adapter(
+        tmp_path,
+        device,
+        clipboard_timeout_seconds=0.1,
+        transition_poll_interval=0,
+    ).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert str(result.items[0].source_url) == current
+    assert device.clipboard_reads >= 4
+
+
+def test_collection_rejects_an_unchanged_valid_clipboard_url(tmp_path: Path) -> None:
+    """A valid URL already present before Copy is stale evidence, not this card's result."""
+    stale = "https://xhslink.com/stale-product"
+    device = _FakeU2Device(
+        link=stale,
+        clipboard_before=stale,
+        clipboard_after=[stale],
+    )
+
+    result = _adapter(
+        tmp_path,
+        device,
+        clipboard_timeout_seconds=0,
+    ).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert result.succeeded_count == 0
+    assert result.observed_count == 1
+    assert result.rejected_items[0].reason == "stale_clipboard"
+
+
 def test_partial_shop_collection_reports_explicit_expected_discovered_and_missing(
     tmp_path: Path,
 ) -> None:
@@ -385,6 +573,53 @@ def test_partial_shop_collection_reports_explicit_expected_discovered_and_missin
     assert result.missing_items[0].reason == "expected_product_not_discovered"
     assert result.complete is False
     assert str(result.items[0].source_url) == "https://xhslink.com/product-a"
+
+
+def test_same_title_cards_with_distinct_urls_are_both_accounted(tmp_path: Path) -> None:
+    """Title equality cannot silently discard a different card and canonical URL."""
+    device = _FakeU2Device(
+        shop_xml=SAME_TITLE_SHOP_XML,
+        links_by_y={150: "https://xhslink.com/product-a", 450: "https://xhslink.com/product-b"},
+    )
+
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=2,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.observed_count == 2
+    assert {str(item.source_url) for item in result.items} == {
+        "https://xhslink.com/product-a",
+        "https://xhslink.com/product-b",
+    }
+
+
+def test_duplicate_url_card_is_an_explicit_rejected_observation(tmp_path: Path) -> None:
+    """A second card resolving to the same URL must remain visible as rejected evidence."""
+    duplicate = "https://xhslink.com/product-a"
+    device = _FakeU2Device(
+        shop_xml=SAME_TITLE_SHOP_XML,
+        links_by_y={150: duplicate, 450: duplicate},
+    )
+
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=2,
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert result.succeeded_count == 1
+    assert result.observed_count == 2
+    assert len(result.rejected_items) == 1
+    assert result.rejected_items[0].reason == "duplicate_source_url"
+    assert result.rejected_items[0].raw_evidence["source_url"] == duplicate
 
 
 def test_collection_uses_the_requested_device_when_multiple_are_connected(
@@ -417,6 +652,138 @@ def test_collection_uses_the_requested_device_when_multiple_are_connected(
 
     assert result.status == "succeeded"
     assert connected_serials == ["phone-2"]
+
+
+def test_concurrent_collection_on_same_serial_reports_device_busy(
+    tmp_path: Path,
+) -> None:
+    """Two workers navigating one serial concurrently would corrupt both evidence trails."""
+    entered = Event()
+    release = Event()
+
+    class BlockingDevice(_FakeU2Device):
+        def open_url(self, url: str) -> None:
+            entered.set()
+            release.wait(timeout=1)
+            super().open_url(url)
+
+    device = BlockingDevice()
+    adapter = _adapter(tmp_path, device)
+    request = CollectionRequest(
+        capability="shop_products",
+        parameters={"account_user_id": "account-1"},
+        expected_count=1,
+    )
+
+    timer = Timer(0.3, release.set)
+    timer.start()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(adapter.collect_shop, request)
+            assert entered.wait(timeout=1)
+            started_at = time.monotonic()
+            second = adapter.collect_shop(request)
+            elapsed = time.monotonic() - started_at
+            release.set()
+            first_result = first.result(timeout=2)
+    finally:
+        release.set()
+        timer.cancel()
+
+    assert first_result.status == "succeeded"
+    assert second.status == "needs_human"
+    assert second.detail == "device_busy"
+    assert elapsed < 0.2
+
+
+def test_concurrent_collection_on_different_serials_can_both_navigate(
+    tmp_path: Path,
+) -> None:
+    """Replacing per-serial reservations with one global lock would block another phone."""
+    release = Event()
+    entered = {"phone-1": Event(), "phone-2": Event()}
+
+    class MultipleClient:
+        def device_list(self) -> list[_FakeAdbDevice]:
+            return [_FakeAdbDevice("phone-1"), _FakeAdbDevice("phone-2")]
+
+    class ParallelDevice(_FakeU2Device):
+        def __init__(self, serial: str) -> None:
+            super().__init__()
+            self.serial = serial
+
+        def open_url(self, url: str) -> None:
+            entered[self.serial].set()
+            release.wait(timeout=1)
+            super().open_url(url)
+
+    devices = {serial: ParallelDevice(serial) for serial in entered}
+    adapter = AndroidDeviceAdapter(
+        runtime_dir=tmp_path / "runtime",
+        adb_client_factory=MultipleClient,
+        u2_connector=lambda serial: devices[serial],
+        executable_resolver=lambda _: "C:/Android/platform-tools/adb.exe",
+        profile_settle_seconds=0,
+        selector_timeout_seconds=0,
+        sleep=lambda _: None,
+    )
+
+    def collect(serial: str) -> CollectionResult:
+        return adapter.collect_shop(
+            CollectionRequest(
+                capability="shop_products",
+                parameters={"account_user_id": "account-1", "device_id": serial},
+                expected_count=1,
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(collect, "phone-1")
+        second = executor.submit(collect, "phone-2")
+        assert entered["phone-1"].wait(timeout=1)
+        assert entered["phone-2"].wait(timeout=1)
+        release.set()
+        results = [first.result(timeout=2), second.result(timeout=2)]
+
+    assert [result.status for result in results] == ["succeeded", "succeeded"]
+
+
+def test_device_reservation_is_released_when_navigation_raises(tmp_path: Path) -> None:
+    """A failed worker must not leave the serial permanently busy."""
+    healthy = _FakeU2Device()
+    connection_count = 0
+
+    class RaisingDevice(_FakeU2Device):
+        def open_url(self, url: str) -> None:
+            _ = url
+            raise RuntimeError("unexpected navigation failure")
+
+    def connect(_: str) -> _FakeU2Device:
+        nonlocal connection_count
+        connection_count += 1
+        return RaisingDevice() if connection_count == 1 else healthy
+
+    adapter = AndroidDeviceAdapter(
+        runtime_dir=tmp_path / "runtime",
+        adb_client_factory=_FakeAdbClient,
+        u2_connector=connect,
+        executable_resolver=lambda _: "C:/Android/platform-tools/adb.exe",
+        profile_settle_seconds=0,
+        selector_timeout_seconds=0,
+        sleep=lambda _: None,
+    )
+    request = CollectionRequest(
+        capability="shop_products",
+        parameters={"account_user_id": "account-1"},
+        expected_count=1,
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected navigation failure"):
+        adapter.collect_shop(request)
+    retried = adapter.collect_shop(request)
+
+    assert retried.status == "succeeded"
+    assert retried.detail is None
 
 
 def test_return_to_shop_captures_each_bounded_back_transition(tmp_path: Path) -> None:
@@ -568,7 +935,7 @@ def anyio_backend() -> str:
 async def test_device_and_shop_collection_apis_return_database_backed_counts(
     tmp_path: Path,
 ) -> None:
-    """The public API must expose device facts and an exact completed 1/1 durable job."""
+    """The public API queues work and the job preserves URL counts pending deep evidence."""
     runtime_dir = tmp_path / "runtime"
     app = create_app(
         Settings(
@@ -598,13 +965,26 @@ async def test_device_and_shop_collection_apis_return_database_backed_counts(
 
     assert devices.status_code == 200
     assert devices.json()[0]["detail"] == "ready"
-    assert collected.status_code == 201
+    assert collected.status_code == 202
     payload = collected.json()
-    assert payload["status"] == "succeeded"
-    assert payload["expected_count"] == 1
-    assert payload["discovered_count"] == 1
-    assert payload["succeeded_count"] == 1
-    assert payload["missing_count"] == 0
-    assert payload["complete"] is True
-    assert app.state.job_service.get(payload["job_id"]).state is JobState.succeeded
+    assert payload["status"] == "queued"
+    for _ in range(100):
+        job = app.state.job_service.get(payload["job_id"])
+        if job.state not in {JobState.queued, JobState.running}:
+            break
+        time.sleep(0.01)
+    assert job.state is JobState.needs_human
+    assert job.error_category == "product_evidence_verification_pending"
+    persisted = next(
+        artifact.metadata["result"]
+        for artifact in job.artifacts
+        if artifact.kind == "shop_collection_result"
+    )
+    assert persisted["expected_count"] == 1
+    assert persisted["discovered_count"] == 1
+    assert persisted["succeeded_count"] == 1
+    assert persisted["missing_count"] == 0
+    assert persisted["rejected_count"] == 0
+    assert persisted["complete"] is False
     assert adapter.requests[0].parameters["job_id"] == payload["job_id"]
+    app.state.shop_service.close()

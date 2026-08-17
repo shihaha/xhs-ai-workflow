@@ -23,6 +23,9 @@ async def _lifespan(app: FastAPI):
     try:
         yield
     finally:
+        shop_service: ShopCollectionService | None = app.state.shop_service
+        if shop_service is not None:
+            shop_service.close()
         database: Database | None = app.state.database
         if database is not None:
             database.close()

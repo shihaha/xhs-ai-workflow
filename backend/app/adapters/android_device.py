@@ -12,6 +12,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from shutil import which
+from threading import Lock
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
@@ -34,6 +35,8 @@ _PRICE_SOLD = re.compile(r"^(?:到手价)?(¥[\d.]+)已售([\d.万+]+)")
 _IMAGE_SCREENSHOT_KIND = "android_screenshot"
 _HIERARCHY_KIND = "android_ui_hierarchy"
 _ZERO_WIDTH = "\u200b\u200c\u200d\ufeff"
+_DEVICE_RESERVATIONS_GUARD = Lock()
+_DEVICE_RESERVATIONS: dict[str, Lock] = {}
 _BAD_TITLE_PREFIXES = (
     "限时立减",
     "立减",
@@ -226,6 +229,7 @@ class AndroidDeviceAdapter:
         selector_timeout_seconds: float = 5,
         transition_timeout_seconds: float = 8,
         transition_poll_interval: float = 0.25,
+        clipboard_timeout_seconds: float = 5,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -245,13 +249,20 @@ class AndroidDeviceAdapter:
         self.selector_timeout_seconds = max(selector_timeout_seconds, 0)
         self.transition_timeout_seconds = max(transition_timeout_seconds, 0)
         self.transition_poll_interval = max(transition_poll_interval, 0)
+        self.clipboard_timeout_seconds = max(clipboard_timeout_seconds, 0)
         self._sleep = sleep
         self._monotonic = monotonic
 
     def health(self) -> DeviceHealth:
         return self._connect(self.device_id).health
 
-    def collect_shop(self, request: CollectionRequest) -> CollectionResult:
+    def collect_shop(
+        self,
+        request: CollectionRequest,
+        *,
+        _connected: _ConnectedDevice | None = None,
+        _reservation_held: bool = False,
+    ) -> CollectionResult:
         expected = request.expected_count
         job_id = self._validated_job_id(request)
         requested_profile = request.parameters.get(
@@ -306,7 +317,7 @@ class AndroidDeviceAdapter:
                 transitions=[],
             )
 
-        connected = self._connect(selected_device_id)
+        connected = _connected or self._connect(selected_device_id)
         if connected.device is None:
             status: Literal["needs_human", "failed"] = (
                 "needs_human"
@@ -322,6 +333,31 @@ class AndroidDeviceAdapter:
                 artifacts=[],
                 transitions=[{"device_health": connected.health.model_dump(mode="json")}],
             )
+
+        if not _reservation_held:
+            serial = connected.health.device_id
+            assert serial is not None
+            reservation = _device_reservation(serial)
+            if not reservation.acquire(blocking=False):
+                return self._result(
+                    request=request,
+                    status="needs_human",
+                    detail="device_busy",
+                    items=[],
+                    rejected_items=[],
+                    artifacts=[],
+                    transitions=[
+                        {"device_health": connected.health.model_dump(mode="json")}
+                    ],
+                )
+            try:
+                return self.collect_shop(
+                    request,
+                    _connected=connected,
+                    _reservation_held=True,
+                )
+            finally:
+                reservation.release()
 
         device = connected.device
         items: list[CollectionItem] = []
@@ -344,7 +380,19 @@ class AndroidDeviceAdapter:
 
         try:
             self._open_profile(device, account_user_id)
-            self._sleep(self.profile_settle_seconds)
+            if self._wait_for_duration_or_cancellation(
+                job_id, self.profile_settle_seconds
+            ):
+                cancelled = self._cancelled_result(
+                    request,
+                    job_id,
+                    items,
+                    rejected_items,
+                    artifact_paths,
+                    transitions,
+                )
+                assert cancelled is not None
+                return cancelled
             profile_screen = capture(
                 "account_profile",
                 ready=lambda hierarchy: (
@@ -368,11 +416,27 @@ class AndroidDeviceAdapter:
                     artifacts=artifact_paths,
                     transitions=transitions,
                 )
-            if not _click_first(
-                device,
-                self.profile.shop_entry,
-                timeout_seconds=self.selector_timeout_seconds,
-            ):
+            click_outcome = self._click_selector(
+                device, self.profile.shop_entry, job_id
+            )
+            if click_outcome == "cancelled":
+                return self._cancelled_result(
+                    request,
+                    job_id,
+                    items,
+                    rejected_items,
+                    artifact_paths,
+                    transitions,
+                ) or self._result(
+                    request=request,
+                    status="failed",
+                    detail="cancelled",
+                    items=items,
+                    rejected_items=rejected_items,
+                    artifacts=artifact_paths,
+                    transitions=transitions,
+                )
+            if click_outcome != "clicked":
                 return self._result(
                     request=request,
                     status="needs_human",
@@ -407,8 +471,9 @@ class AndroidDeviceAdapter:
                     transitions=transitions,
                 )
 
-            seen_titles: set[str] = set()
+            visited_card_positions: set[tuple[str, int, int]] = set()
             seen_urls: set[str] = set()
+            observation_count = 0
             for screen_index in range(self.max_shop_screens):
                 cancelled = self._cancelled_result(
                     request, job_id, items, rejected_items, artifact_paths, transitions
@@ -438,13 +503,36 @@ class AndroidDeviceAdapter:
                         transitions=transitions,
                     )
 
+                screen_fingerprint = sha256(
+                    shop_screen.hierarchy.encode("utf-8")
+                ).hexdigest()
                 for product in products:
-                    if product.title in seen_titles:
+                    traversal_key = (
+                        screen_fingerprint,
+                        product.center_x,
+                        product.center_y,
+                    )
+                    if traversal_key in visited_card_positions:
                         continue
-                    seen_titles.add(product.title)
+                    visited_card_positions.add(traversal_key)
+                    observation_count += 1
+                    observation_reference = (
+                        f"shop_card:{screen_index + 1}:{product.center_x}:"
+                        f"{product.center_y}:{observation_count}"
+                    )
+                    cancelled = self._cancelled_result(
+                        request,
+                        job_id,
+                        items,
+                        rejected_items,
+                        artifact_paths,
+                        transitions,
+                    )
+                    if cancelled is not None:
+                        return cancelled
                     device.click(product.center_x, product.center_y)
                     detail_screen = capture(
-                        f"product_{len(seen_titles)}_detail",
+                        f"product_{observation_count}_detail",
                         ready=lambda hierarchy: (
                             self._blocked_reason(hierarchy) is not None
                             or self._is_detail_hierarchy(hierarchy)
@@ -463,7 +551,12 @@ class AndroidDeviceAdapter:
                     blocked = self._blocked_reason(detail_screen.hierarchy)
                     if blocked is not None:
                         rejected_items.append(
-                            _rejected_product(product, blocked, detail_screen.raw())
+                            _rejected_product(
+                                product,
+                                blocked,
+                                detail_screen.raw(),
+                                reference=observation_reference,
+                            )
                         )
                         return self._result(
                             request=request,
@@ -477,7 +570,10 @@ class AndroidDeviceAdapter:
                     if not self._is_detail(device, detail_screen.hierarchy):
                         rejected_items.append(
                             _rejected_product(
-                                product, "selector_changed", detail_screen.raw()
+                                product,
+                                "selector_changed",
+                                detail_screen.raw(),
+                                reference=observation_reference,
                             )
                         )
                         return self._result(
@@ -489,14 +585,33 @@ class AndroidDeviceAdapter:
                             artifacts=artifact_paths,
                             transitions=transitions,
                         )
-                    if not _click_first(
-                        device,
-                        self.profile.share_product,
-                        timeout_seconds=self.selector_timeout_seconds,
-                    ):
+                    click_outcome = self._click_selector(
+                        device, self.profile.share_product, job_id
+                    )
+                    if click_outcome == "cancelled":
+                        return self._cancelled_result(
+                            request,
+                            job_id,
+                            items,
+                            rejected_items,
+                            artifact_paths,
+                            transitions,
+                        ) or self._result(
+                            request=request,
+                            status="failed",
+                            detail="cancelled",
+                            items=items,
+                            rejected_items=rejected_items,
+                            artifacts=artifact_paths,
+                            transitions=transitions,
+                        )
+                    if click_outcome != "clicked":
                         rejected_items.append(
                             _rejected_product(
-                                product, "selector_changed", detail_screen.raw()
+                                product,
+                                "selector_changed",
+                                detail_screen.raw(),
+                                reference=observation_reference,
                             )
                         )
                         return self._result(
@@ -509,7 +624,7 @@ class AndroidDeviceAdapter:
                             transitions=transitions,
                         )
                     share_screen = capture(
-                        f"product_{len(seen_titles)}_share",
+                        f"product_{observation_count}_share",
                         ready=lambda hierarchy: (
                             self._blocked_reason(hierarchy) is not None
                             or self._is_share_hierarchy(hierarchy)
@@ -528,7 +643,12 @@ class AndroidDeviceAdapter:
                     blocked = self._blocked_reason(share_screen.hierarchy)
                     if blocked is not None:
                         rejected_items.append(
-                            _rejected_product(product, blocked, share_screen.raw())
+                            _rejected_product(
+                                product,
+                                blocked,
+                                share_screen.raw(),
+                                reference=observation_reference,
+                            )
                         )
                         return self._result(
                             request=request,
@@ -539,13 +659,49 @@ class AndroidDeviceAdapter:
                             artifacts=artifact_paths,
                             transitions=transitions,
                         )
+                    cancelled = self._cancelled_result(
+                        request,
+                        job_id,
+                        items,
+                        rejected_items,
+                        artifact_paths,
+                        transitions,
+                    )
+                    if cancelled is not None:
+                        return cancelled
+                    previous_clipboard = _read_clipboard(device)
+                    click_outcome = self._click_selector(
+                        device, self.profile.copy_link, job_id
+                    )
+                    if click_outcome == "cancelled":
+                        cancelled = self._cancelled_result(
+                            request,
+                            job_id,
+                            items,
+                            rejected_items,
+                            artifact_paths,
+                            transitions,
+                        )
+                        assert cancelled is not None
+                        return cancelled
                     link: str | None = None
-                    if _click_first(
-                        device,
-                        self.profile.copy_link,
-                        timeout_seconds=self.selector_timeout_seconds,
-                    ):
-                        link = _canonical_product_url(_read_clipboard(device))
+                    link_failure = "product_link_unavailable"
+                    if click_outcome == "clicked":
+                        link, link_failure = self._fresh_clipboard_product_url(
+                            device,
+                            previous_clipboard=previous_clipboard,
+                            job_id=job_id,
+                        )
+                    cancelled = self._cancelled_result(
+                        request,
+                        job_id,
+                        items,
+                        rejected_items,
+                        artifact_paths,
+                        transitions,
+                    )
+                    if cancelled is not None:
+                        return cancelled
                     product_evidence = {
                         "title": product.title,
                         "price": product.price,
@@ -558,14 +714,20 @@ class AndroidDeviceAdapter:
                     if link is None:
                         rejected_items.append(
                             _rejected_product(
-                                product, "product_link_unavailable", product_evidence
+                                product,
+                                link_failure,
+                                product_evidence,
+                                reference=observation_reference,
                             )
                         )
                     elif link in seen_urls:
                         product_evidence["source_url"] = link
                         rejected_items.append(
                             _rejected_product(
-                                product, "duplicate_source_url", product_evidence
+                                product,
+                                "duplicate_source_url",
+                                product_evidence,
+                                reference=observation_reference,
                             )
                         )
                     else:
@@ -588,12 +750,32 @@ class AndroidDeviceAdapter:
 
                     returned_to_shop = False
                     for back_attempt in range(1, 6):
+                        cancelled = self._cancelled_result(
+                            request,
+                            job_id,
+                            items,
+                            rejected_items,
+                            artifact_paths,
+                            transitions,
+                        )
+                        if cancelled is not None:
+                            return cancelled
                         if self._is_shop_activity(device):
                             returned_to_shop = True
                             break
+                        cancelled = self._cancelled_result(
+                            request,
+                            job_id,
+                            items,
+                            rejected_items,
+                            artifact_paths,
+                            transitions,
+                        )
+                        if cancelled is not None:
+                            return cancelled
                         device.press("back")
                         shop_screen = capture(
-                            f"product_{len(seen_titles)}_shop_return_{back_attempt}",
+                            f"product_{observation_count}_shop_return_{back_attempt}",
                             ready=lambda hierarchy, allow_detail=back_attempt == 1: (
                                 self._blocked_reason(hierarchy) is not None
                                 or self._is_shop(device, hierarchy)
@@ -643,6 +825,16 @@ class AndroidDeviceAdapter:
                     break
                 if expected is not None and len(items) + len(rejected_items) >= expected:
                     break
+                cancelled = self._cancelled_result(
+                    request,
+                    job_id,
+                    items,
+                    rejected_items,
+                    artifact_paths,
+                    transitions,
+                )
+                if cancelled is not None:
+                    return cancelled
                 previous_hierarchy = shop_screen.hierarchy
                 device.swipe(360, 1300, 360, 500, 0.6)
                 shop_screen = capture(
@@ -685,6 +877,11 @@ class AndroidDeviceAdapter:
                 transitions=transitions,
             )
 
+        cancelled = self._cancelled_result(
+            request, job_id, items, rejected_items, artifact_paths, transitions
+        )
+        if cancelled is not None:
+            return cancelled
         if expected is None:
             return self._result(
                 request=request,
@@ -864,8 +1061,8 @@ class AndroidDeviceAdapter:
     ) -> _ScreenEvidence:
         try:
             deadline = self._monotonic() + self.transition_timeout_seconds
+            hierarchy = device.dump_hierarchy(compressed=False)
             while True:
-                hierarchy = device.dump_hierarchy(compressed=False)
                 if (
                     ready is None
                     or ready(hierarchy)
@@ -874,6 +1071,9 @@ class AndroidDeviceAdapter:
                 ):
                     break
                 self._sleep(self.transition_poll_interval)
+                if self._is_cancelled(job_id):
+                    break
+                hierarchy = device.dump_hierarchy(compressed=False)
             screenshot = _screenshot_bytes(device)
         except Exception as error:
             if _is_disconnect_error(error):
@@ -970,6 +1170,69 @@ class AndroidDeviceAdapter:
 
     def _is_end(self, hierarchy: str) -> bool:
         return any(marker in hierarchy for marker in self.profile.end_markers)
+
+    def _click_selector(
+        self,
+        device: Any,
+        selectors: tuple[SelectorQuery, ...],
+        job_id: str | None,
+    ) -> Literal["clicked", "not_found", "cancelled"]:
+        return _click_first(
+            device,
+            selectors,
+            timeout_seconds=self.selector_timeout_seconds,
+            poll_interval=self.transition_poll_interval,
+            sleep=self._sleep,
+            monotonic=self._monotonic,
+            is_cancelled=lambda: self._is_cancelled(job_id),
+        )
+
+    def _fresh_clipboard_product_url(
+        self,
+        device: Any,
+        *,
+        previous_clipboard: Any,
+        job_id: str | None,
+    ) -> tuple[str | None, str]:
+        previous_url = _canonical_product_url(previous_clipboard)
+        deadline = self._monotonic() + self.clipboard_timeout_seconds
+        first_attempt = True
+        saw_stale_valid_url = False
+        while first_attempt or self._monotonic() < deadline:
+            first_attempt = False
+            if self._is_cancelled(job_id):
+                return None, "cancelled"
+            current_url = _canonical_product_url(_read_clipboard(device))
+            if self._is_cancelled(job_id):
+                return None, "cancelled"
+            if current_url is not None and current_url != previous_url:
+                return current_url, ""
+            if current_url is not None and current_url == previous_url:
+                saw_stale_valid_url = True
+            if self._monotonic() >= deadline:
+                break
+            self._sleep(
+                min(
+                    self.transition_poll_interval,
+                    max(deadline - self._monotonic(), 0),
+                )
+            )
+        return (
+            None,
+            "stale_clipboard" if saw_stale_valid_url else "product_link_unavailable",
+        )
+
+    def _wait_for_duration_or_cancellation(
+        self, job_id: str | None, duration: float
+    ) -> bool:
+        deadline = self._monotonic() + max(duration, 0)
+        while self._monotonic() < deadline:
+            if self._is_cancelled(job_id):
+                return True
+            remaining = max(deadline - self._monotonic(), 0)
+            interval = self.transition_poll_interval or remaining
+            self._sleep(min(interval, remaining))
+        return self._is_cancelled(job_id)
 
     @staticmethod
     def _open_profile(device: Any, account_user_id: str) -> None:
@@ -1121,6 +1384,11 @@ def _select_device(devices: list[Any], selected_id: str | None) -> Any | None:
     return devices[0] if len(devices) == 1 else None
 
 
+def _device_reservation(serial: str) -> Lock:
+    with _DEVICE_RESERVATIONS_GUARD:
+        return _DEVICE_RESERVATIONS.setdefault(serial, Lock())
+
+
 def _device_record(device: Any) -> dict[str, str]:
     serial = str(getattr(device, "serial", ""))
     try:
@@ -1135,19 +1403,37 @@ def _click_first(
     selectors: tuple[SelectorQuery, ...],
     *,
     timeout_seconds: float,
-) -> bool:
-    for selector in selectors:
-        ui_object = device(**{selector.attribute: selector.value})
-        exists_value = getattr(ui_object, "exists", False)
-        exists = (
-            exists_value(timeout=timeout_seconds)
-            if callable(exists_value)
-            else bool(exists_value)
-        )
-        if exists:
-            ui_object.click()
-            return True
-    return False
+    poll_interval: float,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+    is_cancelled: Callable[[], bool],
+) -> Literal["clicked", "not_found", "cancelled"]:
+    deadline = monotonic() + max(timeout_seconds, 0)
+    first_attempt = True
+    while first_attempt or monotonic() < deadline:
+        first_attempt = False
+        if is_cancelled():
+            return "cancelled"
+        for selector in selectors:
+            ui_object = device(**{selector.attribute: selector.value})
+            exists_value = getattr(ui_object, "exists", False)
+            remaining = max(deadline - monotonic(), 0)
+            exists = (
+                exists_value(timeout=min(max(poll_interval, 0), remaining))
+                if callable(exists_value)
+                else bool(exists_value)
+            )
+            if is_cancelled():
+                return "cancelled"
+            if exists:
+                if is_cancelled():
+                    return "cancelled"
+                ui_object.click()
+                return "clicked"
+        if monotonic() >= deadline:
+            break
+        sleep(min(max(poll_interval, 0), max(deadline - monotonic(), 0)))
+    return "not_found"
 
 
 def _read_clipboard(device: Any) -> Any:
@@ -1191,16 +1477,20 @@ def _canonical_product_url(value: Any) -> str | None:
 
 
 def _rejected_product(
-    product: ShopProductPosition, reason: str, raw_evidence: dict[str, Any]
+    product: ShopProductPosition,
+    reason: str,
+    raw_evidence: dict[str, Any],
+    *,
+    reference: str,
 ) -> RejectedCollectionItem:
     return RejectedCollectionItem(
-        reference=f"shop_product:{sha256(product.title.encode('utf-8')).hexdigest()}",
+        reference=reference,
         reason=reason,
         raw_evidence={
             "title": product.title,
             "price": product.price,
             "sold": product.sold,
-            "evidence": raw_evidence,
+            **raw_evidence,
         },
     )
 

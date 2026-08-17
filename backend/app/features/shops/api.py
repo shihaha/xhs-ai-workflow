@@ -6,8 +6,9 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from backend.app.adapters.contracts import DeviceHealth
 from backend.app.features.shops.service import (
+    InvalidVerificationPath,
     ShopCollectionCreate,
-    ShopCollectionRead,
+    ShopCollectionQueued,
     ShopCollectionService,
 )
 
@@ -37,10 +38,13 @@ def list_devices(request: Request) -> list[DeviceHealth]:
 
 @router.post(
     "/shop-collections",
-    response_model=ShopCollectionRead,
-    status_code=status.HTTP_201_CREATED,
+    response_model=ShopCollectionQueued,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 def collect_shop(
     payload: ShopCollectionCreate, request: Request
-) -> ShopCollectionRead:
-    return _service(request).collect(payload)
+) -> ShopCollectionQueued:
+    try:
+        return _service(request).enqueue(payload)
+    except InvalidVerificationPath as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error

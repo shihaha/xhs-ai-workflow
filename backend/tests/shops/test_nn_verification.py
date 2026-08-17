@@ -206,3 +206,130 @@ def test_nn_verification_rejects_product_directory_escape(tmp_path: Path) -> Non
     assert result.missing_count == 1
     assert result.missing_items[0].reason == "invalid_product_dir"
     assert result.complete is False
+
+
+@pytest.mark.parametrize(
+    ("target_kind", "reason"),
+    [
+        ("detail", "detail_json_invalid_path"),
+        ("images_dir", "images_directory_invalid_path"),
+        ("image", "image_file_invalid_path"),
+    ],
+)
+def test_nn_verification_rejects_nested_targets_resolving_outside_product(
+    tmp_path: Path, target_kind: str, reason: str
+) -> None:
+    """Following a nested symlink/junction outside the product would certify external bytes."""
+    account_dir = tmp_path / "account"
+    account_dir.mkdir()
+    source_url = "https://xhslink.com/product-a"
+    _write_product(account_dir, "01_product-a", source_url)
+    _write_collection(
+        account_dir,
+        [{"source_url": source_url, "product_dir": "01_product-a"}],
+    )
+    product_dir = account_dir / "01_product-a"
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    try:
+        if target_kind == "detail":
+            outside_detail = outside_dir / "detail.json"
+            outside_detail.write_bytes((product_dir / "detail.json").read_bytes())
+            (product_dir / "detail.json").unlink()
+            (product_dir / "detail.json").symlink_to(outside_detail)
+        elif target_kind == "images_dir":
+            outside_images = outside_dir / "images"
+            (product_dir / "images").rename(outside_images)
+            (product_dir / "images").symlink_to(outside_images, target_is_directory=True)
+        else:
+            outside_image = outside_dir / "00.webp"
+            outside_image.write_bytes((product_dir / "images" / "00.webp").read_bytes())
+            (product_dir / "images" / "00.webp").unlink()
+            (product_dir / "images" / "00.webp").symlink_to(outside_image)
+    except OSError as error:
+        pytest.skip(f"filesystem links are unavailable: {error}")
+
+    result = verify_shop_collection(account_dir, expected_count=1)
+
+    assert result.succeeded_count == 0
+    assert result.missing_items[0].reason == reason
+    assert result.complete is False
+
+
+@pytest.mark.parametrize(
+    ("target_kind", "reason"),
+    [
+        ("detail", "detail_json_invalid_path"),
+        ("image", "image_file_invalid_path"),
+    ],
+)
+def test_nn_verification_rejects_non_regular_nested_targets(
+    tmp_path: Path, target_kind: str, reason: str
+) -> None:
+    """A directory named like evidence is not a regular detail or image file."""
+    account_dir = tmp_path / "account"
+    account_dir.mkdir()
+    source_url = "https://xhslink.com/product-a"
+    _write_product(account_dir, "01_product-a", source_url)
+    _write_collection(
+        account_dir,
+        [{"source_url": source_url, "product_dir": "01_product-a"}],
+    )
+    product_dir = account_dir / "01_product-a"
+    if target_kind == "detail":
+        (product_dir / "detail.json").unlink()
+        (product_dir / "detail.json").mkdir()
+    else:
+        (product_dir / "images" / "00.webp").unlink()
+        (product_dir / "images" / "00.webp").mkdir()
+
+    result = verify_shop_collection(account_dir, expected_count=1)
+
+    assert result.succeeded_count == 0
+    assert result.missing_items[0].reason == reason
+
+
+def test_nn_verification_rejects_manifest_path_traversal(tmp_path: Path) -> None:
+    """A manifest row must resolve to its regular file inside the product images directory."""
+    account_dir = tmp_path / "account"
+    account_dir.mkdir()
+    source_url = "https://xhslink.com/product-a"
+    _write_product(account_dir, "01_product-a", source_url)
+    _write_collection(
+        account_dir,
+        [{"source_url": source_url, "product_dir": "01_product-a"}],
+    )
+    detail_path = account_dir / "01_product-a" / "detail.json"
+    detail = json.loads(detail_path.read_text(encoding="utf-8"))
+    detail["image_manifest"][0]["file"] = "images/../images/00.webp"
+    detail_path.write_text(json.dumps(detail), encoding="utf-8")
+
+    result = verify_shop_collection(account_dir, expected_count=1)
+
+    assert result.succeeded_count == 0
+    assert result.missing_items[0].reason == "image_manifest_invalid_path"
+
+
+@pytest.mark.parametrize("manifest_path", ["images/./00.webp", "images//00.webp"])
+def test_nn_verification_rejects_noncanonical_manifest_paths(
+    tmp_path: Path, manifest_path: str
+) -> None:
+    """Manifest identity is the exact canonical images/name path, not a normalized alias."""
+    account_dir = tmp_path / "account"
+    account_dir.mkdir()
+    source_url = "https://xhslink.com/product-a"
+    _write_product(account_dir, "01_product-a", source_url)
+    _write_collection(
+        account_dir,
+        [{"source_url": source_url, "product_dir": "01_product-a"}],
+    )
+    detail_path = account_dir / "01_product-a" / "detail.json"
+    detail = json.loads(detail_path.read_text(encoding="utf-8"))
+    detail["image_manifest"][0]["file"] = manifest_path
+    detail_path.write_text(json.dumps(detail), encoding="utf-8")
+
+    result = verify_shop_collection(account_dir, expected_count=1)
+
+    assert result.succeeded_count == 0
+    assert result.missing_items[0].reason == "image_manifest_invalid_path"
