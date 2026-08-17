@@ -13,6 +13,7 @@ from backend.app.features.content import models as content_models
 from backend.app.features.content import schemas as content_schemas
 from backend.app.features.content.models import ContentPackageRecord
 from backend.app.features.content.schemas import ExportCreate
+from backend.app.features.content.service import ContentStateError
 from backend.tests.content.test_hardening import _approval, _image_item
 
 
@@ -84,6 +85,12 @@ def test_fresh_schema_has_cleanup_queue_build_token_and_migration_marker(tmp_pat
                 text(
                     "SELECT COUNT(*) FROM workbench_schema_migrations "
                     "WHERE name='task8_artifact_quarantine_v1'"
+                )
+            ) == 1
+            assert connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM workbench_schema_migrations "
+                    "WHERE name='task8_artifact_quarantine_reference_guard_v1'"
                 )
             ) == 1
     finally:
@@ -179,6 +186,177 @@ def test_quarantine_identity_is_all_or_none_and_required_for_quarantined_state(
         assert record.quarantine_file_id == 34
     finally:
         database.close()
+
+
+def test_material_and_package_writes_cannot_reference_quarantine_path(
+    tmp_path: Path,
+) -> None:
+    service, item, image = _image_item(tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    package = service.export_package(
+        item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+    )
+    quarantine_path = "artifacts-quarantine/guarded/Café.ZIP"
+    try:
+        _insert_cleanup(
+            service.database,
+            state="deleted",
+            quarantine_path=quarantine_path,
+            quarantine_volume_id=1,
+            quarantine_file_id=2,
+            quarantine_size_bytes=12,
+            quarantine_mtime_ns=3,
+        )
+        with pytest.raises(IntegrityError, match="quarantine path"):
+            with service.database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO content_product_materials "
+                        "(id,product_id,logical_name,logical_key,version,path,sha256,"
+                        "size_bytes,media_type,kind,created_at) VALUES "
+                        "(:id,:product_id,'guard.txt','guard.txt',99,:path,:sha256,"
+                        "12,'text/plain','source',CURRENT_TIMESTAMP)"
+                    ),
+                    {
+                        "id": str(uuid4()),
+                        "product_id": image.product_id,
+                        "path": "ARTIFACTS-QUARANTINE/guarded/Cafe\u0301.zip",
+                        "sha256": "a" * 64,
+                    },
+                )
+        with pytest.raises(IntegrityError, match="quarantine path"):
+            with service.database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE content_product_materials SET path=:path WHERE id=:id"
+                    ),
+                    {"path": quarantine_path.lower(), "id": image.id},
+                )
+        with pytest.raises(IntegrityError, match="quarantine path"):
+            with service.database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO content_packages "
+                        "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                        "build_token,created_at,error_detail) VALUES "
+                        "(:id,:item_id,:revision_id,'failed',:path,:sha256,0,NULL,"
+                        "CURRENT_TIMESTAMP,NULL)"
+                    ),
+                    {
+                        "id": str(uuid4()),
+                        "item_id": package.content_item_id,
+                        "revision_id": package.revision_id,
+                        "path": quarantine_path.lower(),
+                        "sha256": "a" * 64,
+                    },
+                )
+        with pytest.raises(IntegrityError, match="quarantine path"):
+            with service.database.engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE content_packages SET path=:path WHERE id=:id"),
+                    {"path": quarantine_path.lower(), "id": package.id},
+                )
+    finally:
+        service.database.close()
+
+
+def test_content_service_rejects_existing_package_that_is_quarantined(
+    tmp_path: Path,
+) -> None:
+    service, item, image = _image_item(tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    package = service.export_package(
+        item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+    )
+    try:
+        _insert_cleanup(
+            service.database,
+            state="deleted",
+            quarantine_path=package.path,
+            quarantine_volume_id=1,
+            quarantine_file_id=2,
+            quarantine_size_bytes=package.size_bytes,
+            quarantine_mtime_ns=3,
+        )
+
+        with pytest.raises(ContentStateError, match="quarantine"):
+            service.export_package(
+                item.id,
+                ExportCreate(expected_revision_id=approved.current_revision.id),
+            )
+    finally:
+        service.database.close()
+
+
+def test_reference_guard_marker_detects_trigger_tampering(tmp_path: Path) -> None:
+    path = tmp_path / "tampered-reference-trigger.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER ck_gc_material_path_insert")
+
+    with pytest.raises(SchemaMigrationError, match="reference guard"):
+        Database(path, runtime_dir=tmp_path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='trigger' AND name='ck_gc_material_path_insert'"
+        ).fetchone()[0] == 0
+
+
+def test_reference_guard_marker_rejects_weak_trigger(tmp_path: Path) -> None:
+    path = tmp_path / "weak-reference-trigger.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER ck_gc_material_path_insert")
+        connection.execute(
+            "CREATE TRIGGER ck_gc_material_path_insert "
+            "BEFORE INSERT ON content_product_materials WHEN 0 BEGIN "
+            "SELECT RAISE(ABORT, 'disabled'); END"
+        )
+
+    with pytest.raises(SchemaMigrationError, match="reference guard"):
+        Database(path, runtime_dir=tmp_path)
+
+
+def test_reference_guard_migration_fails_closed_on_historical_conflict(
+    tmp_path: Path,
+) -> None:
+    service, item, image = _image_item(tmp_path)
+    path = service.database.database_path
+    approved = service.review(item.id, _approval(item, image))
+    package = service.export_package(
+        item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+    )
+    _insert_cleanup(
+        service.database,
+        state="deleted",
+        quarantine_path=package.path.upper(),
+        quarantine_volume_id=1,
+        quarantine_file_id=2,
+        quarantine_size_bytes=package.size_bytes,
+        quarantine_mtime_ns=3,
+    )
+    service.database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DELETE FROM workbench_schema_migrations "
+            "WHERE name='task8_artifact_quarantine_reference_guard_v1'"
+        )
+        for name in (
+            "ck_gc_material_path_insert",
+            "ck_gc_material_path_update",
+            "ck_gc_package_path_insert",
+            "ck_gc_package_path_update",
+        ):
+            connection.execute(f"DROP TRIGGER {name}")
+
+    with pytest.raises(SchemaMigrationError, match="Historical quarantine"):
+        Database(path, runtime_dir=tmp_path)
+
+    assert (tmp_path / package.path).exists()
 
 
 @pytest.mark.parametrize(

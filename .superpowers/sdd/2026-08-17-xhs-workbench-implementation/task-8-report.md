@@ -585,3 +585,73 @@ Compilation and diff checks exited 0; Git emitted only the repository's Windows
 LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
 remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
 remains blocked pending redesign Tasks 3—5 and independent review.
+
+## Approved quarantine redesign — Task 2 fix round 2/5
+
+The three Important review groups were added as focused regressions before the
+production changes. The initial RED runs were:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py -q -k "fresh_clock or commit_fault or disarm_failure or deleted_quarantine"
+4 failed, 30 deselected
+
+python -m pytest backend/tests/content/test_artifact_cleanup_schema.py -q -k "reference_guard or cannot_reference or quarantined"
+3 failed, 1 passed, 33 deselected
+```
+
+The failures showed that a long missing-file reference check could finalize with an
+expired lease, a commit fault left the armed Windows deletion to complete on handle
+close, the disarm path did not exist, and material/package writes could reference a
+quarantine path. A separate commit-acknowledgement-loss probe was observed RED
+(`1 failed`) before handling the already-committed database outcome.
+
+Implemented review findings:
+
+- Missing-file finalization no longer receives the process-start timestamp.
+  `_mark_deleted` reads a fresh clock immediately before its exact terminal CAS and
+  requires `lease_expires_at > fresh_now`; crossing expiry during reference checking
+  leaves the row claimed and incomplete.
+- Windows deletion disposition is now reversible while the verified file handle
+  remains open. Final deletion arms the handle, performs the exact database UPDATE
+  and commits. Any UPDATE/commit failure first attempts `FileDispositionInfo(False)`.
+  A successful disarm retains the exact file and rolls back to the original claimed
+  lease; if commit actually succeeded but acknowledgement was lost, the retained
+  artifact is persisted as `needs_human/delete_outcome_ambiguous`.
+- If disarm fails, the existing `BEGIN IMMEDIATE` boundary remains held while the
+  identity-bound cleanup row is changed to
+  `needs_human/delete_outcome_ambiguous` and committed. Only then is the handle
+  closed. The concurrency regression proves a writer cannot proceed through this
+  interval and observes the durable human-review state after release.
+- Added the deterministic `windows_artifact_path_key` SQLite UDF plus four exact
+  material/package INSERT/path-UPDATE triggers. Claimed, quarantined, deleted and
+  needs-human quarantine paths remain reserved under case, NFC, separator, dot and
+  Windows trailing-dot/space equivalence.
+- Added the retry-safe, physically validated
+  `task8_artifact_quarantine_reference_guard_v1` marker. Missing or weak triggers
+  fail startup closed without repair. Historical material/package conflicts fail
+  migration closed and retain bytes.
+- Content material/package flows check the same quarantine reservation before a
+  managed path is created, reused or rebuilt and return the explicit state error
+  `Artifact path is reserved by quarantine cleanup.` Database triggers remain the
+  authoritative boundary for direct SQL and check/use races.
+
+Final fix-round verification:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py backend/tests/content/test_artifact_cleanup_schema.py backend/tests/content/test_round3_hardening.py backend/tests/content/test_round5_hardening.py -q
+106 passed in 10.23s
+
+python -m pytest backend/tests/content -q
+168 passed in 17.81s
+
+python -m pytest backend/tests -q
+481 passed, 1 skipped in 33.26s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only the repository's Windows
+LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
+remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
+remains blocked pending redesign Tasks 3—5 and independent review.

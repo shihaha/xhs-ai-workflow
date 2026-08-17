@@ -11,7 +11,7 @@ from threading import Lock
 from typing import Callable, Literal
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from pydantic import ValidationError
@@ -356,7 +356,7 @@ class ArtifactCleanupService:
         if reference_issue is not None:
             return self._needs_human(record.id, token, reference_issue)
         if inspection.status == "missing":
-            return self._mark_deleted(record.id, token, now, "already_missing")
+            return self._mark_deleted(record.id, token, "already_missing")
         if not self._lease_owned(record.id, token):
             return self.get_record(record.id) or record
 
@@ -465,11 +465,13 @@ class ArtifactCleanupService:
         if reference_issue is not None:
             return self._needs_human(record.id, token, reference_issue)
         if inspection.status == "missing":
-            return self._mark_deleted(record.id, token, now, "already_missing")
+            return self._mark_deleted(record.id, token, "already_missing")
         if inspection.identity is None or not self._lease_owned(record.id, token):
             return self.get_record(record.id) or record
         expected_identity = inspection.identity
-        deleted_on_disk = False
+        delete_committed = False
+        safely_disarmed = False
+        ambiguous_persisted = False
         authorization_issue: str | None = None
         with open_contained_delete_handle(
             self.runtime_dir,
@@ -486,6 +488,69 @@ class ArtifactCleanupService:
                     record.id, token, "original_path_reappeared"
                 )
             connection = self.database.engine.connect()
+            armed = False
+            delete_time: datetime | None = None
+
+            def recover_armed_failure() -> None:
+                nonlocal armed, safely_disarmed, ambiguous_persisted
+                try:
+                    disarmed = content_export._set_delete_disposition(
+                        descriptor, False
+                    )
+                except (OSError, OverflowError, ValueError, TypeError):
+                    disarmed = False
+                if disarmed:
+                    armed = False
+                    safely_disarmed = True
+                    if connection.in_transaction():
+                        connection.rollback()
+                        return
+                ambiguity_time = _naive_utc(self.clock())
+                if not connection.in_transaction():
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                result = connection.execute(
+                    update(ArtifactCleanupRecord)
+                    .where(
+                        ArtifactCleanupRecord.id == record.id,
+                        ArtifactCleanupRecord.quarantine_path
+                        == record.quarantine_path,
+                        ArtifactCleanupRecord.quarantine_volume_id
+                        == expected_identity[0],
+                        ArtifactCleanupRecord.quarantine_file_id
+                        == expected_identity[1],
+                        ArtifactCleanupRecord.quarantine_size_bytes
+                        == expected_identity[2],
+                        ArtifactCleanupRecord.quarantine_mtime_ns
+                        == expected_identity[3],
+                        or_(
+                            and_(
+                                ArtifactCleanupRecord.state == "claimed",
+                                ArtifactCleanupRecord.lease_token == token,
+                                ArtifactCleanupRecord.lease_expires_at
+                                > ambiguity_time,
+                            ),
+                            and_(
+                                ArtifactCleanupRecord.state == "deleted",
+                                ArtifactCleanupRecord.completed_at == delete_time,
+                            ),
+                        ),
+                    )
+                    .values(
+                        state="needs_human",
+                        lease_token=None,
+                        lease_expires_at=None,
+                        last_error_category="delete_outcome_ambiguous",
+                        updated_at=ambiguity_time,
+                        completed_at=None,
+                    )
+                )
+                if result.rowcount != 1:
+                    raise RuntimeError(
+                        "Ambiguous handle deletion could not be persisted."
+                    )
+                connection.commit()
+                ambiguous_persisted = True
+
             try:
                 connection.exec_driver_sql("BEGIN IMMEDIATE")
                 delete_time = _naive_utc(self.clock())
@@ -501,7 +566,7 @@ class ArtifactCleanupService:
                         ArtifactCleanupRecord.id == record.id,
                         ArtifactCleanupRecord.state == "claimed",
                         ArtifactCleanupRecord.lease_token == token,
-                        ArtifactCleanupRecord.lease_expires_at >= delete_time,
+                        ArtifactCleanupRecord.lease_expires_at > delete_time,
                     )
                 ).first()
                 if current is None or (
@@ -524,37 +589,53 @@ class ArtifactCleanupService:
                         authorization_issue = "delete_failed"
                         connection.rollback()
                     else:
-                        deleted_on_disk = True
-                        result = connection.execute(
-                            update(ArtifactCleanupRecord)
-                            .where(
-                                ArtifactCleanupRecord.id == record.id,
-                                ArtifactCleanupRecord.state == "claimed",
-                                ArtifactCleanupRecord.lease_token == token,
-                                ArtifactCleanupRecord.lease_expires_at >= delete_time,
+                        armed = True
+                        try:
+                            result = connection.execute(
+                                update(ArtifactCleanupRecord)
+                                .where(
+                                    ArtifactCleanupRecord.id == record.id,
+                                    ArtifactCleanupRecord.state == "claimed",
+                                    ArtifactCleanupRecord.lease_token == token,
+                                    ArtifactCleanupRecord.lease_expires_at > delete_time,
+                                )
+                                .values(
+                                    state="deleted",
+                                    lease_token=None,
+                                    lease_expires_at=None,
+                                    last_error_category=None,
+                                    updated_at=delete_time,
+                                    completed_at=delete_time,
+                                )
                             )
-                            .values(
-                                state="deleted",
-                                lease_token=None,
-                                lease_expires_at=None,
-                                last_error_category=None,
-                                updated_at=delete_time,
-                                completed_at=delete_time,
-                            )
-                        )
-                        if result.rowcount != 1:
-                            raise RuntimeError("Final cleanup lease CAS failed.")
-                        connection.commit()
+                            if result.rowcount != 1:
+                                raise RuntimeError("Final cleanup lease CAS failed.")
+                            connection.commit()
+                            delete_committed = True
+                        except (SQLAlchemyError, RuntimeError):
+                            recover_armed_failure()
             except (SQLAlchemyError, RuntimeError):
-                try:
-                    connection.rollback()
-                except SQLAlchemyError:
-                    pass
+                if armed and not ambiguous_persisted:
+                    recover_armed_failure()
+                else:
+                    try:
+                        connection.rollback()
+                    except SQLAlchemyError:
+                        pass
             finally:
                 connection.close()
 
-        if deleted_on_disk:
+        if delete_committed or ambiguous_persisted:
             return self.get_record(record.id) or record
+        if safely_disarmed:
+            retained = inspect_contained_artifact(
+                self.runtime_dir, record.quarantine_path
+            )
+            if retained.status == "trusted" and retained.identity == expected_identity:
+                return self.get_record(record.id) or record
+            return self._needs_human(
+                record.id, token, "delete_outcome_ambiguous"
+            )
         if authorization_issue == "reference_set_changed":
             refreshed_snapshot = self._reference_snapshot(record.id)
             if refreshed_snapshot is not None:
@@ -768,9 +849,9 @@ class ArtifactCleanupService:
         self,
         cleanup_id: str,
         token: str,
-        now: datetime,
         category: str | None,
     ) -> ArtifactCleanupRead:
+        fresh_now = _naive_utc(self.clock())
         with self.database.session() as session:
             session.execute(
                 update(ArtifactCleanupRecord)
@@ -778,15 +859,15 @@ class ArtifactCleanupService:
                     ArtifactCleanupRecord.id == cleanup_id,
                     ArtifactCleanupRecord.state == "claimed",
                     ArtifactCleanupRecord.lease_token == token,
-                    ArtifactCleanupRecord.lease_expires_at >= now,
+                    ArtifactCleanupRecord.lease_expires_at > fresh_now,
                 )
                 .values(
                     state="deleted",
                     lease_token=None,
                     lease_expires_at=None,
                     last_error_category=category,
-                    updated_at=now,
-                    completed_at=now,
+                    updated_at=fresh_now,
+                    completed_at=fresh_now,
                 )
             )
             session.commit()

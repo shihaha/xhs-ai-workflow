@@ -70,6 +70,30 @@ def canonical_artifact_path_key(value: object) -> str | None:
     return "/".join(canonical_parts)
 
 
+def windows_artifact_reference_path_key(value: object) -> str | None:
+    """Normalize Windows-equivalent relative paths for cross-table guards."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    rendered = unicodedata.normalize("NFC", value).replace("\\", "/")
+    if rendered.startswith("/") or ":" in rendered:
+        return None
+    parts: list[str] = []
+    for raw_part in rendered.split("/"):
+        if not raw_part or raw_part == ".":
+            continue
+        if raw_part == "..":
+            if not parts:
+                return None
+            parts.pop()
+            continue
+        part = raw_part.rstrip(" .")
+        if not part:
+            return None
+        parts.append(unicodedata.normalize("NFC", part.casefold()))
+    return "/".join(parts) if parts else None
+
+
 class Database:
     """Own the local SQLite engine and initialize its durable schema."""
 
@@ -126,10 +150,15 @@ class Database:
         quarantine_identity_marker_present = self._migration_marker_exists(
             "task8_artifact_quarantine_identity_v1"
         )
+        quarantine_reference_guard_marker_present = self._migration_marker_exists(
+            "task8_artifact_quarantine_reference_guard_v1"
+        )
         if quarantine_marker_present:
             self._require_artifact_quarantine_schema(
                 require_identity=quarantine_identity_marker_present
             )
+        if quarantine_reference_guard_marker_present:
+            self._require_artifact_quarantine_reference_guards()
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
@@ -139,6 +168,9 @@ class Database:
         )
         self._migrate_artifact_quarantine_identity(
             marker_present=quarantine_identity_marker_present
+        )
+        self._migrate_artifact_quarantine_reference_guards(
+            marker_present=quarantine_reference_guard_marker_present
         )
 
     def _migration_marker_exists(self, name: str) -> bool:
@@ -314,6 +346,41 @@ class Database:
                 )
             )
         self._require_artifact_quarantine_schema(require_identity=True)
+
+    def _require_artifact_quarantine_reference_guards(self) -> None:
+        with self.engine.connect() as connection:
+            if (
+                not _artifact_reference_guard_triggers_valid(connection)
+                or not _artifact_reference_guard_data_valid(connection)
+            ):
+                raise SchemaMigrationError(
+                    "Task 8 artifact quarantine reference guard validation failed."
+                )
+
+    def _migrate_artifact_quarantine_reference_guards(
+        self, *, marker_present: bool
+    ) -> None:
+        if marker_present:
+            self._require_artifact_quarantine_reference_guards()
+            return
+        with self.engine.begin() as connection:
+            if not _artifact_reference_guard_data_valid(connection):
+                raise SchemaMigrationError(
+                    "Historical quarantine reference conflict requires isolated manual migration."
+                )
+            _create_artifact_reference_guard_triggers(connection)
+            if not _artifact_reference_guard_triggers_valid(connection):
+                raise SchemaMigrationError(
+                    "Task 8 artifact quarantine reference guard validation failed."
+                )
+            connection.execute(
+                text(
+                    "INSERT INTO workbench_schema_migrations (name, applied_at) "
+                    "VALUES ('task8_artifact_quarantine_reference_guard_v1', "
+                    "CURRENT_TIMESTAMP)"
+                )
+            )
+        self._require_artifact_quarantine_reference_guards()
 
     def _recover_stranded_content_packages(self, *, write_marker: bool = False) -> None:
         from backend.app.features.content.models import ArtifactCleanupRecord
@@ -565,6 +632,10 @@ def _configure_sqlite(connection: object, _: object) -> None:
     )
     connection.create_function(  # type: ignore[union-attr]
         "is_canonical_uuid", 1, lambda value: int(is_canonical_uuid_text(value)),
+        deterministic=True,
+    )
+    connection.create_function(  # type: ignore[union-attr]
+        "windows_artifact_path_key", 1, windows_artifact_reference_path_key,
         deterministic=True,
     )
     cursor = connection.cursor()  # type: ignore[union-attr]
@@ -965,6 +1036,49 @@ BEGIN
 END
 """
 
+_QUARANTINE_REFERENCE_WHEN = """
+windows_artifact_path_key(NEW.path) IS NULL
+OR EXISTS (
+    SELECT 1 FROM artifact_gc_queue AS cleanup
+    WHERE cleanup.quarantine_path IS NOT NULL
+      AND cleanup.state IN ('claimed','quarantined','deleted','needs_human')
+      AND windows_artifact_path_key(cleanup.quarantine_path)
+          = windows_artifact_path_key(NEW.path)
+)
+"""
+
+
+def _reference_guard_trigger(name: str, table: str, operation: str) -> str:
+    return f"""
+CREATE TRIGGER {name}
+BEFORE {operation} ON {table}
+WHEN {_QUARANTINE_REFERENCE_WHEN}
+BEGIN
+    SELECT RAISE(ABORT, 'artifact path is invalid or references a quarantine path');
+END
+"""
+
+
+_MATERIAL_PATH_INSERT_TRIGGER = _reference_guard_trigger(
+    "ck_gc_material_path_insert", "content_product_materials", "INSERT"
+)
+_MATERIAL_PATH_UPDATE_TRIGGER = _reference_guard_trigger(
+    "ck_gc_material_path_update", "content_product_materials", "UPDATE OF path"
+)
+_PACKAGE_PATH_INSERT_TRIGGER = _reference_guard_trigger(
+    "ck_gc_package_path_insert", "content_packages", "INSERT"
+)
+_PACKAGE_PATH_UPDATE_TRIGGER = _reference_guard_trigger(
+    "ck_gc_package_path_update", "content_packages", "UPDATE OF path"
+)
+
+_REFERENCE_GUARD_TRIGGERS = {
+    "ck_gc_material_path_insert": _MATERIAL_PATH_INSERT_TRIGGER,
+    "ck_gc_material_path_update": _MATERIAL_PATH_UPDATE_TRIGGER,
+    "ck_gc_package_path_insert": _PACKAGE_PATH_INSERT_TRIGGER,
+    "ck_gc_package_path_update": _PACKAGE_PATH_UPDATE_TRIGGER,
+}
+
 
 def _create_artifact_quarantine_triggers(connection: Connection) -> None:
     connection.execute(text("DROP TRIGGER IF EXISTS ck_content_packages_build_token_insert"))
@@ -978,6 +1092,47 @@ def _create_artifact_quarantine_identity_triggers(connection: Connection) -> Non
     connection.execute(text("DROP TRIGGER IF EXISTS ck_artifact_gc_identity_update"))
     connection.execute(text(_CLEANUP_IDENTITY_INSERT_TRIGGER))
     connection.execute(text(_CLEANUP_IDENTITY_UPDATE_TRIGGER))
+
+
+def _create_artifact_reference_guard_triggers(connection: Connection) -> None:
+    for name, definition in _REFERENCE_GUARD_TRIGGERS.items():
+        connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+        connection.execute(text(definition))
+
+
+def _artifact_reference_guard_triggers_valid(connection: Connection) -> bool:
+    names = ",".join(f"'{name}'" for name in _REFERENCE_GUARD_TRIGGERS)
+    rows = connection.execute(
+        text(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+            f"AND name IN ({names})"
+        )
+    ).mappings().all()
+    actual = {row["name"]: _compact_sql(row["sql"]) for row in rows}
+    expected = {
+        name: _compact_sql(definition)
+        for name, definition in _REFERENCE_GUARD_TRIGGERS.items()
+    }
+    return actual == expected
+
+
+def _artifact_reference_guard_data_valid(connection: Connection) -> bool:
+    try:
+        return connection.scalar(
+            text(
+                "SELECT 1 FROM ("
+                "SELECT material.path AS path FROM content_product_materials AS material "
+                "UNION ALL SELECT package.path AS path FROM content_packages AS package"
+                ") AS reference JOIN artifact_gc_queue AS cleanup "
+                "ON windows_artifact_path_key(reference.path) "
+                "= windows_artifact_path_key(cleanup.quarantine_path) "
+                "WHERE cleanup.quarantine_path IS NOT NULL "
+                "AND cleanup.state IN ('claimed','quarantined','deleted','needs_human') "
+                "LIMIT 1"
+            )
+        ) is None
+    except SQLAlchemyError:
+        return False
 
 
 def _artifact_quarantine_triggers_valid(

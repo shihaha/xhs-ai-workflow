@@ -12,7 +12,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select, text, update
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Update
 
@@ -248,6 +248,27 @@ def test_quarantine_then_delete_only_after_24_hours(cleanup_environment) -> None
     assert deleted.state == "deleted"
     assert deleted.completed_at == clock.now()
     assert not quarantined_file.exists()
+
+
+def test_deleted_quarantine_path_rejects_new_direct_reference(
+    cleanup_environment,
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    record = service.enqueue(_candidate(runtime, clock))
+    quarantined = service.process_one(record.id)
+    assert quarantined.quarantine_path is not None
+    clock.advance(timedelta(hours=24))
+    assert service.process_one(record.id).state == "deleted"
+
+    with pytest.raises(IntegrityError, match="quarantine path"):
+        _insert_material_reference(
+            database,
+            material_id=str(uuid4()),
+            relative_path=quarantined.quarantine_path.upper(),
+            digest=record.expected_sha256,
+            size_bytes=record.expected_size_bytes,
+            created_at=clock.now(),
+        )
 
 
 def test_live_reference_blocks_quarantine_and_retains_file(cleanup_environment) -> None:
@@ -693,7 +714,7 @@ def test_reference_created_after_authorization_cannot_race_final_delete(
         ).scalar_one() == 0
 
 
-def test_final_delete_commit_fault_recovers_from_missing_file(
+def test_final_delete_commit_fault_disarms_and_retains_file(
     cleanup_environment, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, runtime, clock, service, _ = cleanup_environment
@@ -718,14 +739,135 @@ def test_final_delete_commit_fault_recovers_from_missing_file(
 
     assert failed is True
     assert ambiguous.state == "claimed"
-    assert not target.exists()
+    assert target.exists()
+    assert target.read_bytes() == b"abandoned artifact"
     clock.advance(timedelta(minutes=6))
     assert service.recover_expired_leases() == 1
 
     recovered = service.process_one(record.id)
 
     assert recovered.state == "deleted"
-    assert recovered.last_error_category == "already_missing"
+    assert not target.exists()
+
+
+def test_final_delete_commit_acknowledgement_loss_retains_as_needs_human(
+    cleanup_environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime, clock, service, _ = cleanup_environment
+    record = service.enqueue(_candidate(runtime, clock))
+    quarantined = service.process_one(record.id)
+    assert quarantined.quarantine_path is not None
+    target = runtime / quarantined.quarantine_path
+    clock.advance(timedelta(hours=24))
+    real_commit = Connection.commit
+    failed = False
+
+    def commit_then_lose_ack(connection: Connection) -> None:
+        nonlocal failed
+        real_commit(connection)
+        if not failed:
+            failed = True
+            raise SQLAlchemyError("injected lost commit acknowledgement")
+
+    with monkeypatch.context() as context:
+        context.setattr(Connection, "commit", commit_then_lose_ack)
+        result = service.process_one(record.id)
+
+    assert failed is True
+    assert target.exists()
+    assert result.state == "needs_human"
+    assert result.last_error_category == "delete_outcome_ambiguous"
+
+
+def test_disarm_failure_persists_ambiguous_before_writer_can_continue(
+    cleanup_environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    record = service.enqueue(_candidate(runtime, clock))
+    quarantined = service.process_one(record.id)
+    assert quarantined.quarantine_path is not None
+    clock.advance(timedelta(hours=24))
+    import backend.app.features.content.export as export_module
+
+    real_disposition = export_module._set_delete_disposition
+    real_commit = Connection.commit
+    commit_failed = False
+    disarm_called = Event()
+    writer_started = Event()
+    writer_finished = Event()
+    observed_states: list[str] = []
+    writer_future = None
+
+    def writer() -> None:
+        try:
+            with database.engine.connect() as connection:
+                connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                writer_started.set()
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                state = connection.execute(
+                    select(ArtifactCleanupRecord.state).where(
+                        ArtifactCleanupRecord.id == record.id
+                    )
+                ).scalar_one()
+                observed_states.append(state)
+                if state not in {"deleted", "needs_human"}:
+                    connection.execute(
+                        text(
+                            "INSERT INTO content_product_materials "
+                            "(id,product_id,logical_name,logical_key,version,path,sha256,"
+                            "size_bytes,media_type,kind,created_at) VALUES "
+                            "(:id,:product_id,'material.bin','material.bin',1,:path,:sha256,"
+                            ":size_bytes,'application/octet-stream','source',:created_at)"
+                        ),
+                        {
+                            "id": str(uuid4()),
+                            "product_id": str(uuid4()),
+                            "path": quarantined.quarantine_path,
+                            "sha256": record.expected_sha256,
+                            "size_bytes": record.expected_size_bytes,
+                            "created_at": clock.now().isoformat(sep=" "),
+                        },
+                    )
+                connection.commit()
+        finally:
+            writer_finished.set()
+
+    def fail_first_commit(connection: Connection) -> None:
+        nonlocal commit_failed
+        if not commit_failed:
+            commit_failed = True
+            raise SQLAlchemyError("injected final commit fault")
+        real_commit(connection)
+
+    def disposition(descriptor: int, delete: bool) -> bool:
+        nonlocal writer_future
+        if delete:
+            return real_disposition(descriptor, True)
+        disarm_called.set()
+        writer_future = pool.submit(writer)
+        assert writer_started.wait(1)
+        assert not writer_finished.wait(0.1)
+        return False
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with monkeypatch.context() as context:
+            context.setattr(Connection, "commit", fail_first_commit)
+            context.setattr(
+                export_module, "_set_delete_disposition", disposition, raising=False
+            )
+            result = service.process_one(record.id)
+        if writer_future is not None:
+            writer_future.result(timeout=5)
+
+    assert commit_failed is True
+    assert disarm_called.is_set()
+    assert observed_states == ["needs_human"]
+    assert result.state == "needs_human"
+    assert result.last_error_category == "delete_outcome_ambiguous"
+    with database.engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM content_product_materials")
+        ).scalar_one() == 0
 
 
 def test_same_bytes_replaced_in_quarantine_are_not_deleted(cleanup_environment) -> None:
@@ -753,6 +895,28 @@ def test_missing_branch_cannot_finalize_with_expired_lease(cleanup_environment) 
     (runtime / candidate.relative_path).unlink()
     assert service.claim_due(limit=1) == [record.id]
     clock.advance(timedelta(minutes=6))
+
+    result = service.process_one(record.id)
+
+    assert result.state == "claimed"
+    assert result.completed_at is None
+
+
+def test_missing_branch_uses_fresh_clock_for_terminal_lease_cas(
+    cleanup_environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime, clock, service, _ = cleanup_environment
+    candidate = _candidate(runtime, clock)
+    record = service.enqueue(candidate)
+    (runtime / candidate.relative_path).unlink()
+    original_reference_issue = service._reference_issue
+
+    def slow_reference_check(*args, **kwargs):
+        result = original_reference_issue(*args, **kwargs)
+        clock.advance(timedelta(minutes=6))
+        return result
+
+    monkeypatch.setattr(service, "_reference_issue", slow_reference_check)
 
     result = service.process_one(record.id)
 

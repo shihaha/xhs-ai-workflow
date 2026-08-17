@@ -11,7 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
@@ -120,18 +120,22 @@ class ContentService:
                     ProductMaterialRecord.logical_key == logical_key,
                 )
             )) + 1
+            record_id = str(uuid4())
+            suffix = Path(payload.logical_name).suffix[:20]
+            managed_path = (
+                f"content-materials/{product_id}/{record_id}/source{suffix}"
+            )
+            self._assert_path_not_quarantined(session, managed_path)
             record = ProductMaterialRecord(
+                id=record_id,
                 product_id=product_id, logical_name=payload.logical_name, version=version,
                 logical_key=logical_key,
-                path="pending",
+                path=managed_path,
                 sha256=sha256(data).hexdigest(), size_bytes=len(data),
                 media_type=detected, kind=payload.kind, created_at=_now(),
             )
             session.add(record)
             session.flush()
-            suffix = Path(payload.logical_name).suffix[:20]
-            record.path = f"content-materials/{product_id}/{record.id}/source{suffix}"
-            managed_path = record.path
             try:
                 write_contained_atomic(self.runtime_dir, record.path, data)
                 session.commit()
@@ -351,6 +355,7 @@ class ContentService:
             existing = session.scalar(select(ContentPackageRecord).where(ContentPackageRecord.revision_id == item.current_revision_id))
             old_path_to_remove: str | None = None
             if existing is not None:
+                self._assert_path_not_quarantined(session, existing.path)
                 projected = self._package_read(existing)
                 if existing.status == "ready" and projected.availability == "available":
                     return projected
@@ -359,6 +364,7 @@ class ContentService:
                 old_path = existing.path
                 previous_status = existing.status
                 replacement_path = f"content-packages/{item.id}/{existing.id}-{uuid4().hex}.zip"
+                self._assert_path_not_quarantined(session, replacement_path)
                 won = session.execute(update(ContentPackageRecord).where(
                     ContentPackageRecord.id == existing.id,
                     ContentPackageRecord.status == previous_status,
@@ -376,10 +382,14 @@ class ContentService:
                 old_path_to_remove = old_path
             else:
                 package_id_value = str(uuid4())
+                package_path_value = (
+                    f"content-packages/{item.id}/{package_id_value}.zip"
+                )
+                self._assert_path_not_quarantined(session, package_path_value)
                 package = ContentPackageRecord(
                     id=package_id_value,
                     content_item_id=item.id, revision_id=item.current_revision_id,
-                    status="building", path=f"content-packages/{item.id}/{package_id_value}.zip",
+                    status="building", path=package_path_value,
                     sha256="0" * 64, size_bytes=0, created_at=_now(), error_detail=None,
                 )
                 session.add(package)
@@ -397,6 +407,7 @@ class ContentService:
                 item = _load_item(session, item_id)
                 self._validate_item_trust(item, session=session)
                 package = session.get(ContentPackageRecord, package_id)
+                self._assert_path_not_quarantined(session, package_path)
                 approval = session.scalar(select(ContentReviewRecord).where(
                     ContentReviewRecord.content_item_id == item.id,
                     ContentReviewRecord.revision_id == item.current_revision_id,
@@ -530,6 +541,22 @@ class ContentService:
         except (SQLAlchemyError, OSError, ValueError, TypeError):
             return
         remove_contained_regular(self.runtime_dir, relative_path)
+
+    def _assert_path_not_quarantined(self, session, relative_path: str) -> None:
+        conflict = session.scalar(
+            text(
+                "SELECT 1 FROM artifact_gc_queue "
+                "WHERE quarantine_path IS NOT NULL "
+                "AND state IN ('claimed','quarantined','deleted','needs_human') "
+                "AND windows_artifact_path_key(quarantine_path) "
+                "= windows_artifact_path_key(:path) LIMIT 1"
+            ),
+            {"path": relative_path},
+        )
+        if conflict is not None:
+            raise ContentStateError(
+                "Artifact path is reserved by quarantine cleanup."
+            )
 
     def list_packages(self) -> list[ContentPackageRead]:
         with self.database.session() as session:

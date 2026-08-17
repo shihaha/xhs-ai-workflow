@@ -601,6 +601,10 @@ def _windows_last_error() -> int:
 
 
 def _delete_open_file(descriptor: int) -> bool:
+    return _set_delete_disposition(descriptor, True)
+
+
+def _set_delete_disposition(descriptor: int, delete: bool) -> bool:
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -608,7 +612,7 @@ def _delete_open_file(descriptor: int) -> bool:
     class FileDispositionInfo(ctypes.Structure):
         _fields_ = [("delete_file", wintypes.BOOL)]
 
-    disposition = FileDispositionInfo(True)
+    disposition = FileDispositionInfo(delete)
     set_information = ctypes.WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
     set_information.argtypes = (
         wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,

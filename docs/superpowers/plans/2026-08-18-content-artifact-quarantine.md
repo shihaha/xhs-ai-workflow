@@ -210,7 +210,7 @@ Add a single helper in `export.py` that returns `trusted`, `ambiguous`, or `miss
 
 - [ ] **Step 5: Implement delayed final deletion**
 
-For `quarantined` rows, require `not_before = quarantined_at + timedelta(hours=24)`. Recompute path containment, physical identity, size, SHA, owner references and lease before calling the existing handle-bound removal primitive. Mark `deleted` only after disappearance is confirmed. A missing quarantined file is `deleted` with `last_error_category="already_missing"` only when no live reference exists.
+For `quarantined` rows, require `not_before = quarantined_at + timedelta(hours=24)`. Recompute path containment, physical identity, size, SHA, owner references and lease before calling the existing handle-bound removal primitive. Arm the Windows handle disposition before the database CAS, but keep the handle open: any UPDATE/commit failure must disarm it before close; if disarm fails, retain the `BEGIN IMMEDIATE` writer boundary and persist `needs_human/delete_outcome_ambiguous` before releasing the handle. Mark `deleted` only after the exact database commit. A missing quarantined file is `deleted` with `last_error_category="already_missing"` only when no live reference exists, using a fresh clock and a strictly unexpired lease CAS. Install physically validated material/package INSERT and path-UPDATE triggers so no Windows-equivalent path can reference any claimed/quarantined/deleted/needs-human quarantine path; historical conflicts fail migration closed without deleting bytes.
 
 - [ ] **Step 6: Run lifecycle, path, and fault-injection tests**
 
