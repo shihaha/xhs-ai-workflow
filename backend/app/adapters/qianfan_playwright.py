@@ -557,7 +557,16 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
                     "author_name": raw_item.get("userNickname"),
                 },
             )
-            chosen.setdefault(item_id, item)
+            if item_id in chosen:
+                rejected_items.append(
+                    RejectedCollectionItem(
+                        reference=reference,
+                        reason="duplicate_identity",
+                        raw_evidence=item_evidence,
+                    )
+                )
+                continue
+            chosen[item_id] = item
     return _NormalizedRankings(
         items=[chosen[item_id] for item_id in sorted(chosen)],
         rejected_items=rejected_items,
@@ -566,8 +575,11 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
 
 
 def _item_identity(raw_item: dict[str, Any]) -> tuple[str, str | None, str | None]:
-    note_id = _identity_text(_first_present(raw_item, "noteId", "note_id"))
-    if note_id is not None:
+    raw_note_id = _first_present(raw_item, "noteId", "note_id")
+    if raw_note_id is not None:
+        note_id = _safe_identity_token(raw_note_id)
+        if note_id is None:
+            raise _RankItemUnusable("malformed_note_id")
         return note_id[:500], note_id, None
     content_url = _canonical_note_url(raw_item)
     if content_url is not None:
@@ -598,24 +610,25 @@ def _item_identity(raw_item: dict[str, Any]) -> tuple[str, str | None, str | Non
     )
     if publish_date is None:
         raise _RankItemUnusable("identity_insufficient")
-    content_type = _identity_text(
-        _first_present(
-            raw_item,
-            "contentType",
-            "content_type",
-            "noteType",
-            "note_type",
-            "mediaType",
-            "media_type",
-            "type",
-        )
+    raw_content_type = _first_present(
+        raw_item,
+        "contentType",
+        "content_type",
+        "noteType",
+        "note_type",
+        "mediaType",
+        "media_type",
+        "type",
     )
+    if not isinstance(raw_content_type, str) or not raw_content_type.strip():
+        raise _RankItemUnusable("identity_insufficient")
+    content_type = raw_content_type.strip()
     canonical = json.dumps(
         {
             "user_id": user_id,
             "title": title,
             "publish_date": publish_date,
-            "content_type": content_type.casefold() if content_type else "unknown",
+            "content_type": content_type.casefold(),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -664,19 +677,24 @@ def _canonical_note_url(raw_item: dict[str, Any]) -> str | None:
         ".xiaohongshu.com"
     ):
         return None
-    path_segments = [segment.lower() for segment in parts.path.split("/") if segment]
-    has_note_identity = (
-        "explore" in path_segments
-        and path_segments.index("explore") + 1 < len(path_segments)
-    ) or (
-        "item" in path_segments
-        and path_segments.index("item") + 1 < len(path_segments)
-    )
-    if not has_note_identity:
+    canonical_path = _canonical_note_path(parts.path)
+    if canonical_path is None:
         return None
     return urlunsplit(
-        ("https", "www.xiaohongshu.com", parts.path.rstrip("/"), "", "")
+        ("https", "www.xiaohongshu.com", canonical_path, "", "")
     )
+
+
+def _canonical_note_path(path: str) -> str | None:
+    for pattern in (
+        r"/explore/([A-Za-z0-9_-]{1,500})/?",
+        r"/item/([A-Za-z0-9_-]{1,500})/?",
+        r"/discovery/item/([A-Za-z0-9_-]{1,500})/?",
+    ):
+        match = re.fullmatch(pattern, path)
+        if match is not None:
+            return path.rstrip("/")
+    return None
 
 
 def _successful_response(response: dict[str, Any], body: dict[str, Any]) -> bool:
@@ -717,6 +735,15 @@ def _identity_text(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _safe_identity_token(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    normalized = str(value).strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,500}", normalized) is None:
+        return None
+    return normalized
 
 
 def _first_present(raw_item: dict[str, Any], *keys: str) -> Any:

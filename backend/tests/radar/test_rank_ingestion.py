@@ -570,6 +570,7 @@ def test_qianfan_item_identity_ignores_mutable_rank_and_metric_evidence() -> Non
                 "userId": "same-account",
                 "noteTitle": "同一篇笔记",
                 "publishTime": "2026-08-17 09:00",
+                "contentType": "image",
                 "userNickname": "同一作者",
                 "readRange": "1万-5万",
                 "gmvRange": "100-200",
@@ -585,6 +586,7 @@ def test_qianfan_item_identity_ignores_mutable_rank_and_metric_evidence() -> Non
                 "userId": "same-account",
                 "noteTitle": "同一篇笔记",
                 "publishTime": "2026-08-17 09:00",
+                "contentType": "image",
                 "userNickname": "同一作者",
                 "readRange": "10万以上",
                 "gmvRange": "1000以上",
@@ -615,6 +617,7 @@ def test_qianfan_item_identity_ignores_nickname_changes() -> None:
                     "userId": "stable-account",
                     "noteTitle": "同一篇笔记",
                     "publishTime": "2026-08-17 09:00",
+                    "contentType": "image",
                     "userNickname": "旧昵称",
                 }
             ]
@@ -628,6 +631,7 @@ def test_qianfan_item_identity_ignores_nickname_changes() -> None:
                     "userId": "stable-account",
                     "noteTitle": "同一篇笔记",
                     "publishTime": "2026-08-17 09:00",
+                    "contentType": "image",
                     "userNickname": "新昵称",
                 }
             ]
@@ -773,6 +777,36 @@ def test_fallback_identity_requires_publication_time() -> None:
     assert result.rejected_items[0].raw_evidence["item"] == raw_row
 
 
+@pytest.mark.parametrize(
+    "content_type",
+    [None, "", "   ", 7, {"kind": "image"}],
+    ids=["missing", "empty", "whitespace", "numeric", "object"],
+)
+def test_fallback_identity_requires_non_empty_string_content_type(
+    content_type: object,
+) -> None:
+    """Fallback identity must reject absent or coerced content types as insufficient."""
+    raw_row: dict[str, object] = {
+        "rank": 1,
+        "userId": "account-a",
+        "noteTitle": "同题内容",
+        "publishTime": "2026-08-17 09:00",
+    }
+    if content_type is not None:
+        raw_row["contentType"] = content_type
+
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([raw_row])
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+
+    assert result.status == "needs_human"
+    assert result.items == []
+    assert result.observed_count == 1
+    assert result.missing_items == []
+    assert result.rejected_items[0].reason == "identity_insufficient"
+    assert result.rejected_items[0].raw_evidence["item"] == raw_row
+
+
 def test_qianfan_item_identity_keeps_distinct_semantic_notes_from_one_user() -> None:
     """The user ID alone must not collapse different titles or publication times."""
     page = _ranking_page(
@@ -782,12 +816,14 @@ def test_qianfan_item_identity_keeps_distinct_semantic_notes_from_one_user() -> 
                 "userId": "same-account",
                 "noteTitle": "第一篇",
                 "publishTime": "2026-08-17 09:00",
+                "contentType": "image",
             },
             {
                 "rank": 2,
                 "userId": "same-account",
                 "noteTitle": "第二篇",
                 "publishTime": "2026-08-17 10:00",
+                "contentType": "image",
             },
         ]
     )
@@ -801,8 +837,8 @@ def test_qianfan_item_identity_keeps_distinct_semantic_notes_from_one_user() -> 
     assert result.items[0].id != result.items[1].id
 
 
-def test_qianfan_item_identity_prefers_canonical_note_url() -> None:
-    """Tracking-query changes on the same note URL must dedupe before semantic fallback."""
+def test_duplicate_canonical_note_identity_is_explicit_rejected_observation() -> None:
+    """A colliding source row must retain evidence and count as rejected, never disappear."""
     page = _ranking_page(
         [
             {
@@ -821,15 +857,21 @@ def test_qianfan_item_identity_prefers_canonical_note_url() -> None:
     )
 
     result = QianfanPlaywrightAdapter(page_factory=lambda: page).collect_rankings(
-        CollectionRequest(capability="rankings", expected_count=1)
+        CollectionRequest(capability="rankings", expected_count=2)
     )
 
-    assert result.status == "succeeded"
+    assert result.status == "needs_human"
     assert result.succeeded_count == 1
+    assert result.observed_count == 2
+    assert result.missing_items == []
     assert result.items[0].id.startswith("url:")
     assert str(result.items[0].source_url) == (
         "https://www.xiaohongshu.com/explore/url-note"
     )
+    assert len(result.rejected_items) == 1
+    assert result.rejected_items[0].reference == "qianfan_response:1:item:2"
+    assert result.rejected_items[0].reason == "duplicate_identity"
+    assert result.rejected_items[0].raw_evidence["item"]["rank"] == 8
 
 
 def test_relative_note_url_is_resolved_and_claimed_job_succeeds(tmp_path: Path) -> None:
@@ -857,6 +899,50 @@ def test_relative_note_url_is_resolved_and_claimed_job_succeeds(tmp_path: Path) 
     persisted = jobs.get(job.id)
     assert persisted.state is JobState.succeeded
     assert len(persisted.artifacts) == 1
+
+
+@pytest.mark.parametrize(
+    "unsafe_relative_url",
+    ["/explore/../evil", "/explore/n1/extra", "/prefix/explore/n1"],
+    ids=["dot-segment", "extra-segment", "unknown-prefix"],
+)
+def test_relative_note_url_requires_one_safe_id_on_a_known_route(
+    unsafe_relative_url: str,
+) -> None:
+    """Relative URLs outside an exact known note route must remain rejected evidence."""
+    raw_row = {"rank": 1, "noteUrl": unsafe_relative_url}
+
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([raw_row])
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+
+    assert result.status == "needs_human"
+    assert result.items == []
+    assert result.observed_count == 1
+    assert result.missing_items == []
+    assert result.rejected_items[0].reason == "malformed_note_url"
+    assert result.rejected_items[0].raw_evidence["item"] == raw_row
+
+
+@pytest.mark.parametrize(
+    "unsafe_note_id",
+    [{"id": "nested"}, "../evil", "has/slash", "dot.segment"],
+    ids=["object", "dot-segment", "slash", "dot"],
+)
+def test_note_id_must_be_a_scalar_safe_token(unsafe_note_id: object) -> None:
+    """Unsafe or structured note IDs must be rejected instead of becoming fabricated URLs."""
+    raw_row = {"rank": 1, "noteId": unsafe_note_id}
+
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([raw_row])
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+
+    assert result.status == "needs_human"
+    assert result.items == []
+    assert result.observed_count == 1
+    assert result.missing_items == []
+    assert result.rejected_items[0].reason == "malformed_note_id"
+    assert result.rejected_items[0].raw_evidence["item"] == raw_row
 
 
 def test_absolute_https_note_url_on_platform_subdomain_is_accepted() -> None:
