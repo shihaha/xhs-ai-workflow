@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.app.models.jobs import JobState
 
@@ -17,6 +17,8 @@ class JobCreate(BaseModel):
 
 
 class JobTransition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     state: JobState
     progress_current: int | None = Field(default=None, ge=0)
     progress_total: int | None = Field(default=None, ge=0)

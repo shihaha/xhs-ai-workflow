@@ -174,6 +174,7 @@ async def test_reserved_worker_public_transition_rejects_fake_success_and_cancel
         injected_responses = []
         for injected in (
             {"progress_current": 1},
+            {"progress_current": None},
             {"progress_total": 1},
             {"current_stage": "shop_complete"},
             {"error_category": "forged_success"},
@@ -190,7 +191,7 @@ async def test_reserved_worker_public_transition_rejects_fake_success_and_cancel
 
     assert fake_success.status_code == 422
     assert app.state.job_service.get(running.id).state is JobState.running
-    assert [response.status_code for response in injected_responses] == [422] * 4
+    assert [response.status_code for response in injected_responses] == [422] * 5
 
 
 @pytest.mark.parametrize(
@@ -236,3 +237,80 @@ async def test_reserved_worker_public_pure_cancellation_sets_server_facts(
     assert body["progress_current"] == 0
     assert body["progress_total"] == 2
     assert body["artifacts"] == []
+
+
+@pytest.mark.parametrize(
+    "reserved_job_type", ["android_shop_collection", "shop_collection"]
+)
+@pytest.mark.anyio
+async def test_reserved_worker_public_cancellation_rejects_unknown_fields(
+    tmp_path: Path, reserved_job_type: str
+) -> None:
+    runtime_dir = tmp_path / reserved_job_type
+    app = create_app(
+        Settings(
+            runtime_dir=runtime_dir,
+            database_path=runtime_dir / "workbench.sqlite3",
+        )
+    )
+    job = app.state.job_service.create(
+        job_type=reserved_job_type,
+        input_data={},
+        progress_total=1,
+        current_stage="device_pending",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            f"/api/v1/jobs/{job.id}/transition",
+            json={"state": "cancelled", "extra_field": "ignored"},
+        )
+
+    assert response.status_code == 422
+    durable = app.state.job_service.get(job.id)
+    assert durable.state is JobState.queued
+    assert durable.current_stage == "device_pending"
+
+
+@pytest.mark.anyio
+async def test_generic_public_transition_rejects_unknown_fields(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "generic-unknown-field"
+    app = create_app(
+        Settings(
+            runtime_dir=runtime_dir,
+            database_path=runtime_dir / "workbench.sqlite3",
+        )
+    )
+    job = app.state.job_service.create(
+        job_type="generic", input_data={}, progress_total=1
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            f"/api/v1/jobs/{job.id}/transition",
+            json={"state": "cancelled", "extra_field": "ignored"},
+        )
+        assert response.status_code == 422
+        assert app.state.job_service.get(job.id).state is JobState.queued
+        documented = await client.post(
+            f"/api/v1/jobs/{job.id}/transition",
+            json={
+                "state": "cancelled",
+                "progress_current": 1,
+                "progress_total": 1,
+                "current_stage": "operator_cancelled",
+                "error_category": "operator_cancelled",
+            },
+        )
+
+    assert documented.status_code == 200
+    body = documented.json()
+    assert body["state"] == "cancelled"
+    assert body["progress_current"] == 1
+    assert body["progress_total"] == 1
+    assert body["current_stage"] == "operator_cancelled"
+    assert body["error_category"] == "operator_cancelled"
