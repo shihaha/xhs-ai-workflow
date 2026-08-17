@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -19,6 +20,7 @@ from backend.app.adapters.contracts import (
     CollectionRequest,
     CollectionResult,
     MissingCollectionItem,
+    RejectedCollectionItem,
 )
 from backend.app.models.jobs import JobState
 from backend.app.services.jobs import JobService
@@ -42,16 +44,9 @@ class QianfanCaptureOutcome(BaseModel):
 
 
 @dataclass(frozen=True)
-class _RejectedRankItem:
-    reference: str
-    reason: str
-    raw_evidence: dict[str, Any]
-
-
-@dataclass(frozen=True)
 class _NormalizedRankings:
     items: list[CollectionItem]
-    rejected_items: list[_RejectedRankItem]
+    rejected_items: list[RejectedCollectionItem]
     valid_response_observed: bool
 
 
@@ -95,6 +90,7 @@ class QianfanPlaywrightAdapter:
             artifact_paths = self._persist_job_evidence(job_id, outcome)
 
             if outcome.status == "needs_human":
+                stage = "result_validation"
                 result = _needs_human_result(
                     request=request,
                     detail=outcome.reason or "needs_human",
@@ -116,18 +112,11 @@ class QianfanPlaywrightAdapter:
                         artifact_paths=artifact_paths,
                         raw_evidence=outcome.raw_evidence,
                     )
-                elif normalized.rejected_items:
-                    result = _needs_human_result(
-                        request=request,
-                        detail="response_unusable",
-                        artifact_paths=artifact_paths,
-                        raw_evidence=outcome.raw_evidence,
-                        rejected_items=normalized.rejected_items,
-                    )
                 else:
                     result = _accounted_result(
                         request=request,
                         items=normalized.items,
+                        rejected_items=normalized.rejected_items,
                         artifact_paths=artifact_paths,
                         raw_evidence=outcome.raw_evidence,
                     )
@@ -352,38 +341,27 @@ def _needs_human_result(
     detail: str,
     artifact_paths: list[str],
     raw_evidence: dict[str, Any],
-    rejected_items: list[_RejectedRankItem] | None = None,
 ) -> CollectionResult:
     expected_count = request.expected_count
     missing_count = expected_count if expected_count is not None else 0
-    rejected = rejected_items or []
-    missing_items: list[MissingCollectionItem] = []
-    for index in range(missing_count):
-        if index < len(rejected):
-            rejected_item = rejected[index]
-            missing_items.append(
-                MissingCollectionItem(
-                    reference=rejected_item.reference,
-                    reason=rejected_item.reason,
-                    raw_evidence=rejected_item.raw_evidence,
-                )
-            )
-        else:
-            missing_items.append(
-                MissingCollectionItem(
-                    reference=f"qianfan_ranking:{index + 1}",
-                    reason=detail,
-                    raw_evidence=raw_evidence,
-                )
-            )
+    missing_items = [
+        MissingCollectionItem(
+            reference=f"qianfan_ranking:{index + 1}",
+            reason=detail,
+            raw_evidence=raw_evidence,
+        )
+        for index in range(missing_count)
+    ]
     return CollectionResult(
         status="needs_human",
         detail=detail,
         evidence_artifacts=artifact_paths,
         items=[],
+        rejected_items=[],
         expected_count_known=expected_count is not None,
         expected_count=expected_count,
         succeeded_count=0,
+        observed_count=0,
         missing_items=missing_items,
         overflow_count=0,
         complete=False,
@@ -394,12 +372,14 @@ def _accounted_result(
     *,
     request: CollectionRequest,
     items: list[CollectionItem],
+    rejected_items: list[RejectedCollectionItem],
     artifact_paths: list[str],
     raw_evidence: dict[str, Any],
 ) -> CollectionResult:
     expected_count = request.expected_count
+    observed_count = len(items) + len(rejected_items)
     if expected_count is None:
-        if not items:
+        if not items and not rejected_items:
             return _needs_human_result(
                 request=request,
                 detail="expected_count_unknown",
@@ -407,48 +387,63 @@ def _accounted_result(
                 raw_evidence=raw_evidence,
             )
         return CollectionResult(
-            status="partial",
-            detail="expected_count_unknown",
+            status="needs_human" if rejected_items else "partial",
+            detail="response_unusable" if rejected_items else "expected_count_unknown",
             evidence_artifacts=artifact_paths,
             items=items,
+            rejected_items=rejected_items,
             expected_count_known=False,
             expected_count=None,
             succeeded_count=len(items),
+            observed_count=observed_count,
             missing_items=[],
             overflow_count=0,
             complete=False,
         )
-    if len(items) > expected_count:
+    if observed_count > expected_count:
         return CollectionResult(
             status="failed",
             detail="observed_count_exceeds_expected",
             evidence_artifacts=artifact_paths,
             items=items,
+            rejected_items=rejected_items,
             expected_count_known=True,
             expected_count=expected_count,
             succeeded_count=len(items),
+            observed_count=observed_count,
             missing_items=[],
-            overflow_count=len(items) - expected_count,
+            overflow_count=observed_count - expected_count,
             complete=False,
         )
-    missing_count = expected_count - len(items)
+    missing_count = expected_count - observed_count
     missing_items = [
         MissingCollectionItem(
-            reference=f"qianfan_ranking:{len(items) + index + 1}",
+            reference=f"qianfan_ranking:{observed_count + index + 1}",
             reason="expected_item_not_observed",
             raw_evidence={"capture": raw_evidence},
         )
         for index in range(missing_count)
     ]
-    complete = missing_count == 0
+    complete = missing_count == 0 and not rejected_items
+    if complete:
+        status = "succeeded"
+        detail = None
+    elif rejected_items:
+        status = "needs_human"
+        detail = "response_unusable"
+    else:
+        status = "partial"
+        detail = "expected_items_missing"
     return CollectionResult(
-        status="succeeded" if complete else "partial",
-        detail=None if complete else "expected_items_missing",
+        status=status,
+        detail=detail,
         evidence_artifacts=artifact_paths,
         items=items,
+        rejected_items=rejected_items,
         expected_count_known=True,
         expected_count=expected_count,
         succeeded_count=len(items),
+        observed_count=observed_count,
         missing_items=missing_items,
         overflow_count=0,
         complete=complete,
@@ -505,13 +500,15 @@ def _capture_error(stage: str, error: Exception) -> dict[str, str]:
 
 def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
     chosen: dict[str, CollectionItem] = {}
-    rejected_items: list[_RejectedRankItem] = []
+    rejected_items: list[RejectedCollectionItem] = []
     valid_response_observed = False
     for response_index, response in enumerate(raw_evidence.get("responses", [])):
         if not isinstance(response, dict):
             continue
         body = response.get("body")
         if not isinstance(body, dict):
+            continue
+        if not _successful_response(response, body):
             continue
         data = body.get("data")
         if not isinstance(data, dict) or "dataList" not in data:
@@ -525,7 +522,7 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
             item_evidence = {"response_url": response.get("url"), "item": raw_item}
             if not isinstance(raw_item, dict):
                 rejected_items.append(
-                    _RejectedRankItem(
+                    RejectedCollectionItem(
                         reference=reference,
                         reason="row_not_object",
                         raw_evidence=item_evidence,
@@ -536,7 +533,7 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
                 item_id, note_id, canonical_note_url = _item_identity(raw_item)
             except _RankItemUnusable as error:
                 rejected_items.append(
-                    _RejectedRankItem(
+                    RejectedCollectionItem(
                         reference=reference,
                         reason=error.reason,
                         raw_evidence=item_evidence,
@@ -599,11 +596,26 @@ def _item_identity(raw_item: dict[str, Any]) -> tuple[str, str | None, str | Non
             "publish_date",
         )
     )
+    if publish_date is None:
+        raise _RankItemUnusable("identity_insufficient")
+    content_type = _identity_text(
+        _first_present(
+            raw_item,
+            "contentType",
+            "content_type",
+            "noteType",
+            "note_type",
+            "mediaType",
+            "media_type",
+            "type",
+        )
+    )
     canonical = json.dumps(
         {
             "user_id": user_id,
             "title": title,
             "publish_date": publish_date,
+            "content_type": content_type.casefold() if content_type else "unknown",
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -620,15 +632,32 @@ def _canonical_note_url(raw_item: dict[str, Any]) -> str | None:
         "source_url",
         "url",
     )
-    if not source_url:
+    if not isinstance(source_url, str):
         return None
+    candidate = source_url.strip()
+    if (
+        not candidate
+        or "\\" in candidate
+        or any(character.isspace() for character in candidate)
+    ):
+        return None
+    if re.search(r"%(?![0-9A-Fa-f]{2})", candidate):
+        return None
+    if candidate.startswith("/"):
+        if candidate.startswith("//"):
+            return None
+        candidate = f"{_XHS_PUBLIC_ORIGIN}{candidate}"
     try:
-        absolute_url = urljoin(f"{_XHS_PUBLIC_ORIGIN}/", str(source_url).strip())
-        parts = urlsplit(absolute_url)
+        parts = urlsplit(candidate)
         hostname = parts.hostname
+        port = parts.port
     except (TypeError, ValueError, UnicodeError):
         return None
-    if parts.scheme.lower() not in {"http", "https"} or hostname is None:
+    if parts.scheme.lower() != "https" or hostname is None:
+        return None
+    if parts.username is not None or parts.password is not None or port is not None:
+        return None
+    if parts.fragment:
         return None
     normalized_hostname = hostname.lower().rstrip(".")
     if normalized_hostname != "xiaohongshu.com" and not normalized_hostname.endswith(
@@ -648,6 +677,39 @@ def _canonical_note_url(raw_item: dict[str, Any]) -> str | None:
     return urlunsplit(
         ("https", "www.xiaohongshu.com", parts.path.rstrip("/"), "", "")
     )
+
+
+def _successful_response(response: dict[str, Any], body: dict[str, Any]) -> bool:
+    http_status = response.get("status")
+    if isinstance(http_status, bool) or not isinstance(http_status, int):
+        return False
+    if not 200 <= http_status < 300:
+        return False
+    for key in ("success", "code", "status"):
+        if key in body and not _successful_business_marker(key, body[key]):
+            return False
+    return True
+
+
+def _successful_business_marker(key: str, marker: Any) -> bool:
+    if key == "success":
+        if isinstance(marker, bool):
+            return marker
+        if isinstance(marker, str):
+            return marker.strip().casefold() in {
+                "true",
+                "success",
+                "succeeded",
+                "ok",
+            }
+        return False
+    if isinstance(marker, bool):
+        return marker
+    if isinstance(marker, int):
+        return marker in {0, 200}
+    if isinstance(marker, str):
+        return marker.strip().casefold() in {"0", "200", "success", "succeeded", "ok"}
+    return False
 
 
 def _identity_text(value: Any) -> str | None:

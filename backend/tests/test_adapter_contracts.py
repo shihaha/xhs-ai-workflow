@@ -25,6 +25,70 @@ def _missing(reference: str) -> MissingCollectionItem:
     )
 
 
+def _rejected(reference: str) -> dict[str, object]:
+    return {
+        "reference": reference,
+        "reason": "identity_insufficient",
+        "raw_evidence": {"row": reference},
+    }
+
+
+def test_collection_result_preserves_rejected_observations_separately_from_deficit() -> None:
+    """A rejected observed row must not erase an accepted row or masquerade as missing."""
+    result = CollectionResult(
+        status="needs_human",
+        detail="response_unusable",
+        items=[_item("note-1")],
+        rejected_items=[_rejected("row-2")],
+        expected_count_known=True,
+        expected_count=2,
+        succeeded_count=1,
+        observed_count=2,
+        missing_items=[],
+        overflow_count=0,
+        complete=False,
+    )
+
+    assert result.items == [_item("note-1")]
+    assert result.rejected_items[0].reference == "row-2"
+    assert result.observed_count == 2
+    assert result.missing_items == []
+
+
+def test_collection_result_rejects_incorrect_observed_count() -> None:
+    """Published observation accounting must equal accepted plus rejected rows."""
+    with pytest.raises(ValidationError):
+        CollectionResult(
+            status="succeeded",
+            items=[_item("note-1")],
+            rejected_items=[],
+            expected_count_known=True,
+            expected_count=1,
+            succeeded_count=1,
+            observed_count=2,
+            missing_items=[],
+            overflow_count=0,
+            complete=True,
+        )
+
+
+def test_collection_result_rejects_success_when_any_observation_was_rejected() -> None:
+    """An exact accepted count cannot hide a separately rejected source row."""
+    with pytest.raises(ValidationError):
+        CollectionResult(
+            status="succeeded",
+            items=[_item("note-1")],
+            rejected_items=[_rejected("row-2")],
+            expected_count_known=True,
+            expected_count=2,
+            succeeded_count=1,
+            observed_count=2,
+            missing_items=[],
+            overflow_count=0,
+            complete=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("source_url", "raw_evidence"),
     [

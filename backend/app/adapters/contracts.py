@@ -33,6 +33,14 @@ class MissingCollectionItem(BaseModel):
     raw_evidence: dict[str, Any] = Field(min_length=1)
 
 
+class RejectedCollectionItem(BaseModel):
+    """An observed source row rejected during normalization, with its original evidence."""
+
+    reference: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=500)
+    raw_evidence: dict[str, Any] = Field(min_length=1)
+
+
 class CollectionResult(BaseModel):
     """Accounted collection output; completion is invalid unless the N/N facts match."""
 
@@ -40,9 +48,11 @@ class CollectionResult(BaseModel):
     detail: str | None = Field(default=None, max_length=1000)
     evidence_artifacts: list[str] = Field(default_factory=list)
     items: list[CollectionItem] = Field(default_factory=list)
+    rejected_items: list[RejectedCollectionItem] = Field(default_factory=list)
     expected_count_known: bool
     expected_count: int | None = Field(default=None, ge=0)
     succeeded_count: int = Field(ge=0)
+    observed_count: int | None = Field(default=None, ge=0)
     missing_items: list[MissingCollectionItem] = Field(default_factory=list)
     overflow_count: int = Field(ge=0)
     complete: bool = False
@@ -52,8 +62,23 @@ class CollectionResult(BaseModel):
         item_ids = [item.id for item in self.items]
         if len(item_ids) != len(set(item_ids)):
             raise ValueError("Collection result items must have distinct stable ids.")
+        rejected_references = [item.reference for item in self.rejected_items]
+        if len(rejected_references) != len(set(rejected_references)):
+            raise ValueError("Rejected observations must have distinct source references.")
         if self.succeeded_count != len(self.items):
             raise ValueError("succeeded_count must equal the number of stored items.")
+        accounted_observed = self.succeeded_count + len(self.rejected_items)
+        if self.observed_count is None:
+            self.observed_count = accounted_observed
+        elif self.observed_count != accounted_observed:
+            raise ValueError(
+                "observed_count must equal accepted items plus rejected observations."
+            )
+        if self.rejected_items:
+            if self.status not in {"needs_human", "failed"} or self.complete:
+                raise ValueError(
+                    "rejected observations require needs_human or failed incomplete status."
+                )
         if not self.expected_count_known:
             if self.expected_count is not None:
                 raise ValueError("unknown expected counts must not publish an N total.")
@@ -65,7 +90,10 @@ class CollectionResult(BaseModel):
                 raise ValueError("unknown expected counts cannot fabricate missing items.")
             if self.overflow_count:
                 raise ValueError("unknown expected counts cannot claim overflow.")
-            if self.items and self.status not in {"partial", "needs_human"}:
+            if self.items and not self.rejected_items and self.status not in {
+                "partial",
+                "needs_human",
+            }:
                 raise ValueError(
                     "unknown-total observations require partial or needs_human status."
                 )
@@ -73,8 +101,8 @@ class CollectionResult(BaseModel):
 
         if self.expected_count is None:
             raise ValueError("known expected counts require an expected_count.")
-        deficit = max(self.expected_count - self.succeeded_count, 0)
-        overflow = max(self.succeeded_count - self.expected_count, 0)
+        deficit = max(self.expected_count - accounted_observed, 0)
+        overflow = max(accounted_observed - self.expected_count, 0)
         if len(self.missing_items) != deficit:
             raise ValueError(
                 "missing_items must exactly account for the known expected deficit."
@@ -88,6 +116,8 @@ class CollectionResult(BaseModel):
         if deficit:
             if self.status == "succeeded" or self.complete:
                 raise ValueError("known deficits cannot be succeeded or complete.")
+            return self
+        if self.rejected_items:
             return self
         if self.expected_count > 0:
             if self.status != "succeeded" or not self.complete:

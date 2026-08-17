@@ -639,8 +639,8 @@ def test_qianfan_item_identity_ignores_nickname_changes() -> None:
     assert before.items[0].id == after.items[0].id
 
 
-def test_identity_insufficient_rows_are_explicit_missing_evidence_not_deduped() -> None:
-    """Multiple all-null semantic rows must remain individually auditable and never complete."""
+def test_identity_insufficient_rows_are_explicit_rejected_evidence_not_deduped() -> None:
+    """Multiple all-null semantic rows must remain rejected observations, never missing."""
     raw_rows = [{"rank": 1}, {"rank": 2}]
     result = QianfanPlaywrightAdapter(
         page_factory=lambda: _ranking_page(raw_rows)
@@ -649,13 +649,128 @@ def test_identity_insufficient_rows_are_explicit_missing_evidence_not_deduped() 
     assert result.status == "needs_human"
     assert result.detail == "response_unusable"
     assert result.succeeded_count == 0
+    assert result.observed_count == 2
     assert result.items == []
-    assert [missing.reason for missing in result.missing_items] == [
+    assert result.missing_items == []
+    assert [rejected.reason for rejected in result.rejected_items] == [
         "identity_insufficient",
         "identity_insufficient",
     ]
-    assert [missing.raw_evidence["item"] for missing in result.missing_items] == raw_rows
+    assert [rejected.raw_evidence["item"] for rejected in result.rejected_items] == raw_rows
     assert result.complete is False
+
+
+def test_mixed_accepted_and_rejected_rows_preserve_exact_known_accounting() -> None:
+    """One accepted plus one rejected observation is 2 observed, not 1 accepted plus 1 missing."""
+    raw_rejected = {
+        "rank": 2,
+        "userId": "account-b",
+        "noteTitle": "缺发布时间",
+        "contentType": "image",
+    }
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page(
+            [{"rank": 1, "noteId": "accepted-note"}, raw_rejected]
+        )
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=2))
+
+    assert result.status == "needs_human"
+    assert result.detail == "response_unusable"
+    assert [item.id for item in result.items] == ["accepted-note"]
+    assert result.succeeded_count == 1
+    assert result.observed_count == 2
+    assert result.missing_items == []
+    assert result.overflow_count == 0
+    assert result.rejected_items[0].reference == "qianfan_response:1:item:2"
+    assert result.rejected_items[0].reason == "identity_insufficient"
+    assert result.rejected_items[0].raw_evidence["item"] == raw_rejected
+    assert result.complete is False
+
+
+def test_mixed_accepted_and_rejected_rows_count_overflow_from_all_observations() -> None:
+    """One accepted plus one rejected observation over expected one must report one overflow."""
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page(
+            [
+                {"rank": 1, "noteId": "accepted-note"},
+                {"rank": 2, "userId": "account-b", "noteTitle": "无发布时间"},
+            ]
+        )
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+
+    assert result.status == "failed"
+    assert result.detail == "observed_count_exceeds_expected"
+    assert [item.id for item in result.items] == ["accepted-note"]
+    assert len(result.rejected_items) == 1
+    assert result.observed_count == 2
+    assert result.missing_items == []
+    assert result.overflow_count == 1
+    assert result.complete is False
+
+
+def test_mixed_unknown_total_preserves_observations_without_fabricated_nn() -> None:
+    """Unknown-total mixed rows retain both evidence classes without inventing N or overflow."""
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page(
+            [
+                {"rank": 1, "noteId": "accepted-note"},
+                {"rank": 2, "userId": "account-b", "noteTitle": "无发布时间"},
+            ]
+        )
+    ).collect_rankings(CollectionRequest(capability="rankings"))
+
+    assert result.status == "needs_human"
+    assert result.detail == "response_unusable"
+    assert [item.id for item in result.items] == ["accepted-note"]
+    assert len(result.rejected_items) == 1
+    assert result.observed_count == 2
+    assert result.expected_count_known is False
+    assert result.expected_count is None
+    assert result.missing_items == []
+    assert result.overflow_count == 0
+    assert result.complete is False
+
+
+def test_fallback_identity_includes_content_type_discriminator() -> None:
+    """Image and video notes sharing user, title and publication time must not collide."""
+    common = {
+        "userId": "same-account",
+        "noteTitle": "同题内容",
+        "publishTime": "2026-08-17 09:00",
+    }
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page(
+            [
+                {**common, "rank": 1, "contentType": "image"},
+                {**common, "rank": 2, "contentType": "video"},
+            ]
+        )
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=2))
+
+    assert result.status == "succeeded"
+    assert len(result.items) == 2
+    assert result.items[0].id != result.items[1].id
+
+
+def test_fallback_identity_requires_publication_time() -> None:
+    """User and title alone are not a stable note identity and must remain rejected evidence."""
+    raw_row = {
+        "rank": 1,
+        "userId": "account-a",
+        "noteTitle": "可能重复的标题",
+        "contentType": "image",
+    }
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([raw_row])
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+
+    assert result.status == "needs_human"
+    assert result.items == []
+    assert result.succeeded_count == 0
+    assert result.observed_count == 1
+    assert result.missing_items == []
+    assert result.rejected_items[0].reason == "identity_insufficient"
+    assert result.rejected_items[0].raw_evidence["item"] == raw_row
 
 
 def test_qianfan_item_identity_keeps_distinct_semantic_notes_from_one_user() -> None:
@@ -744,6 +859,68 @@ def test_relative_note_url_is_resolved_and_claimed_job_succeeds(tmp_path: Path) 
     assert len(persisted.artifacts) == 1
 
 
+def test_absolute_https_note_url_on_platform_subdomain_is_accepted() -> None:
+    """A real HTTPS Xiaohongshu subdomain URL is a valid canonical identity source."""
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page(
+            [
+                {
+                    "rank": 1,
+                    "noteUrl": "  https://ark.xiaohongshu.com/item/n1?token=private  ",
+                }
+            ]
+        )
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+
+    assert result.status == "succeeded"
+    assert result.items[0].id == "url:https://www.xiaohongshu.com/item/n1"
+    assert str(result.items[0].source_url) == "https://www.xiaohongshu.com/item/n1"
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    [
+        {"path": "/explore/n1"},
+        ["/explore/n1"],
+        123,
+        "www.xiaohongshu.com/explore/n1",
+        "//www.xiaohongshu.com/explore/n1",
+        "http://www.xiaohongshu.com/explore/n1",
+        "https://example.com/explore/n1",
+        "https://user:secret@www.xiaohongshu.com/explore/n1",
+        "https://www.xiaohongshu.com/explore/n1#unsafe",
+        "https://www.xiaohongshu.com/explore/n 1",
+        "http://[",
+    ],
+    ids=[
+        "dict",
+        "list",
+        "numeric",
+        "scheme-less-host",
+        "network-path",
+        "http",
+        "foreign-host",
+        "credentials",
+        "fragment",
+        "space",
+        "malformed",
+    ],
+)
+def test_untrusted_note_url_is_rejected_without_string_coercion(unsafe_url: object) -> None:
+    """Only an actual safe platform URL string may become collection identity or source."""
+    raw_row = {"rank": 1, "noteUrl": unsafe_url}
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([raw_row])
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+
+    assert result.status == "needs_human"
+    assert result.items == []
+    assert result.observed_count == 1
+    assert result.missing_items == []
+    assert result.rejected_items[0].reason == "malformed_note_url"
+    assert result.rejected_items[0].raw_evidence["item"] == raw_row
+
+
 def test_malformed_note_url_preserves_evidence_and_never_strands_claimed_job(
     tmp_path: Path,
 ) -> None:
@@ -769,8 +946,10 @@ def test_malformed_note_url_preserves_evidence_and_never_strands_claimed_job(
 
     assert result.status == "needs_human"
     assert result.detail == "response_unusable"
-    assert result.missing_items[0].reason == "malformed_note_url"
-    assert result.missing_items[0].raw_evidence["item"] == raw_row
+    assert result.observed_count == 1
+    assert result.missing_items == []
+    assert result.rejected_items[0].reason == "malformed_note_url"
+    assert result.rejected_items[0].raw_evidence["item"] == raw_row
     persisted = jobs.get(job.id)
     assert persisted.state is JobState.needs_human
     assert persisted.error_category == "response_unusable"
@@ -815,6 +994,47 @@ def test_unexpected_normalization_error_persists_evidence_and_fails_claimed_job(
     persisted = jobs.get(job.id)
     assert persisted.state is JobState.failed
     assert persisted.error_category == "normalization_failed"
+    assert len(persisted.artifacts) == 1
+    evidence = json.loads(
+        (runtime_dir / persisted.artifacts[0].path).read_text(encoding="utf-8")
+    )
+    assert evidence["raw_evidence"]["responses"][0]["body"]["data"]["dataList"] == [
+        raw_row
+    ]
+
+
+def test_unexpected_result_validation_error_preserves_evidence_and_fails_claimed_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A propagated contract-validation bug must retain capture and end the running job."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    raw_row = {"rank": 1, "noteId": "captured-before-validation-bug"}
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([raw_row]),
+        job_service=jobs,
+        runtime_dir=runtime_dir,
+    )
+
+    def fail_validation(**_: object) -> object:
+        raise ValueError("unexpected result validation bug")
+
+    monkeypatch.setattr(qianfan_module, "_accounted_result", fail_validation)
+
+    with pytest.raises(ValueError, match="unexpected result validation bug"):
+        adapter.collect_rankings(
+            CollectionRequest(
+                capability="rankings",
+                parameters={"job_id": job.id},
+                expected_count=1,
+            )
+        )
+
+    persisted = jobs.get(job.id)
+    assert persisted.state is JobState.failed
+    assert persisted.error_category == "result_validation_failed"
     assert len(persisted.artifacts) == 1
     evidence = json.loads(
         (runtime_dir / persisted.artifacts[0].path).read_text(encoding="utf-8")
@@ -953,6 +1173,103 @@ def test_valid_empty_response_with_known_zero_is_complete_and_succeeds_job(
     assert result.missing_items == []
     assert result.complete is True
     assert jobs.get(job.id).state is JobState.succeeded
+
+
+def test_http_error_empty_response_cannot_satisfy_known_zero_and_is_terminal(
+    tmp_path: Path,
+) -> None:
+    """HTTP 500 with an empty-shaped body is transport failure evidence, never 0/0 success."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<section class='note-rank'><table></table></section>",
+        selectors={"input[type='password']": 0, ".note-rank table": 1},
+        responses=[
+            _FakeResponse(
+                "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
+                500,
+                {"data": {"dataList": []}},
+            )
+        ],
+    )
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: page,
+        job_service=jobs,
+        runtime_dir=runtime_dir,
+    ).collect_rankings(
+        CollectionRequest(
+            capability="rankings",
+            parameters={"job_id": job.id},
+            expected_count=0,
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert result.detail == "response_unusable"
+    assert result.complete is False
+    assert result.observed_count == 0
+    assert jobs.get(job.id).state is JobState.needs_human
+    assert jobs.get(job.id).artifacts
+
+
+@pytest.mark.parametrize(
+    "business_marker",
+    [{"code": 500}, {"status": "failed"}],
+    ids=["code", "status"],
+)
+def test_business_error_empty_response_cannot_satisfy_known_zero(
+    business_marker: dict[str, object],
+) -> None:
+    """A recognized non-success business marker makes an HTTP-200 payload unusable."""
+    body = {**business_marker, "data": {"dataList": []}}
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<section class='note-rank'><table></table></section>",
+        selectors={"input[type='password']": 0, ".note-rank table": 1},
+        responses=[
+            _FakeResponse(
+                "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
+                200,
+                body,
+            )
+        ],
+    )
+
+    result = QianfanPlaywrightAdapter(page_factory=lambda: page).collect_rankings(
+        CollectionRequest(capability="rankings", expected_count=0)
+    )
+
+    assert result.status == "needs_human"
+    assert result.detail == "response_unusable"
+    assert result.complete is False
+    assert result.observed_count == 0
+
+
+def test_business_success_code_allows_known_zero_completion() -> None:
+    """A recognized success business code plus HTTP 2xx permits literal empty-list accounting."""
+    page = _FakePage(
+        url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
+        html="<section class='note-rank'><table></table></section>",
+        selectors={"input[type='password']": 0, ".note-rank table": 1},
+        responses=[
+            _FakeResponse(
+                "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
+                200,
+                {"code": 0, "data": {"dataList": []}},
+            )
+        ],
+    )
+
+    result = QianfanPlaywrightAdapter(page_factory=lambda: page).collect_rankings(
+        CollectionRequest(capability="rankings", expected_count=0)
+    )
+
+    assert result.status == "succeeded"
+    assert result.complete is True
+    assert result.observed_count == 0
 
 
 def test_valid_empty_response_with_unknown_total_needs_human(
