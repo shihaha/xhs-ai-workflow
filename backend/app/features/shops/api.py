@@ -9,6 +9,7 @@ from backend.app.features.shops.service import (
     InvalidVerificationPath,
     ShopCollectionCreate,
     ShopCollectionQueued,
+    ShopCollectionServiceClosed,
     ShopCollectionService,
 )
 
@@ -48,3 +49,5 @@ def collect_shop(
         return _service(request).enqueue(payload)
     except InvalidVerificationPath as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except ShopCollectionServiceClosed as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error

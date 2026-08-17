@@ -366,6 +366,29 @@ def test_collection_honors_in_flight_job_cancellation_at_transition_checkpoint(
     assert not any(action[0] == "selector" for action in device.actions)
 
 
+def test_collection_honors_external_worker_shutdown_callback(
+    tmp_path: Path,
+) -> None:
+    """Shutdown signaling must stop Android work even when database polling is unavailable."""
+    shutdown_requested = Event()
+    device = _FakeU2Device(on_open_url=shutdown_requested.set)
+
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={
+                "account_user_id": "account-1",
+                "is_cancelled": shutdown_requested.is_set,
+            },
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.detail == "cancelled"
+    assert not any(action[0] == "selector" for action in device.actions)
+
+
 def test_collection_stops_immediately_when_cancelled_on_share_transition(
     tmp_path: Path,
 ) -> None:
@@ -620,6 +643,72 @@ def test_duplicate_url_card_is_an_explicit_rejected_observation(tmp_path: Path) 
     assert len(result.rejected_items) == 1
     assert result.rejected_items[0].reason == "duplicate_source_url"
     assert result.rejected_items[0].raw_evidence["source_url"] == duplicate
+
+
+def test_overlapping_viewports_use_unique_urls_for_nn_and_keep_duplicate_evidence(
+    tmp_path: Path,
+) -> None:
+    """Counting the repeated B card in A,B then B,C as overflow would fail a real 3/3."""
+    first_viewport = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="商品甲完整标题" bounds="[20,120][600,180]" />
+  <node content-desc="到手价¥10.00已售10+" bounds="[20,225][600,280]" />
+  <node text="商品乙完整标题" bounds="[20,420][600,480]" />
+  <node content-desc="到手价¥20.00已售20+" bounds="[20,525][600,580]" />
+</hierarchy>"""
+    second_viewport = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="商品乙完整标题" bounds="[20,120][600,180]" />
+  <node content-desc="到手价¥20.00已售20+" bounds="[20,225][600,280]" />
+  <node text="商品丙完整标题" bounds="[20,420][600,480]" />
+  <node content-desc="到手价¥30.00已售30+" bounds="[20,525][600,580]" />
+  <node text="没有更多商品了" bounds="[0,1400][720,1500]" />
+</hierarchy>"""
+    viewport_links = [
+        {
+            150: "https://xhslink.com/product-a",
+            450: "https://xhslink.com/product-b",
+        },
+        {
+            150: "https://xhslink.com/product-b",
+            450: "https://xhslink.com/product-c",
+        },
+    ]
+
+    class OverlappingViewportDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__(shop_xml=first_viewport)
+            self.viewport = 0
+
+        def click(self, x: int, y: int) -> None:
+            self.link = viewport_links[self.viewport][y]
+            super().click(x, y)
+
+        def swipe(
+            self, x1: int, y1: int, x2: int, y2: int, duration: float
+        ) -> None:
+            super().swipe(x1, y1, x2, y2, duration)
+            self.viewport = 1
+            self.screens["shop"] = second_viewport
+
+    result = _adapter(tmp_path, OverlappingViewportDevice()).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=3,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.succeeded_count == 3
+    assert result.observed_count == 4
+    assert result.raw_observation_count == 4
+    assert result.duplicate_observation_count == 1
+    assert len(result.rejected_items) == 1
+    assert result.rejected_items[0].reason == "duplicate_source_url"
+    assert result.missing_items == []
+    assert result.overflow_count == 0
+    assert result.complete is True
 
 
 def test_collection_uses_the_requested_device_when_multiple_are_connected(
@@ -982,9 +1071,11 @@ async def test_device_and_shop_collection_apis_return_database_backed_counts(
     )
     assert persisted["expected_count"] == 1
     assert persisted["discovered_count"] == 1
-    assert persisted["succeeded_count"] == 1
-    assert persisted["missing_count"] == 0
+    assert persisted["collected_count"] == 1
+    assert persisted["succeeded_count"] == 0
+    assert persisted["missing_count"] == 1
     assert persisted["rejected_count"] == 0
     assert persisted["complete"] is False
+    assert job.progress_current == 0
     assert adapter.requests[0].parameters["job_id"] == payload["job_id"]
     app.state.shop_service.close()

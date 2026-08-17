@@ -53,6 +53,8 @@ class CollectionResult(BaseModel):
     expected_count: int | None = Field(default=None, ge=0)
     succeeded_count: int = Field(ge=0)
     observed_count: int | None = Field(default=None, ge=0)
+    raw_observation_count: int | None = Field(default=None, ge=0)
+    duplicate_observation_count: int = Field(default=0, ge=0)
     missing_items: list[MissingCollectionItem] = Field(default_factory=list)
     overflow_count: int = Field(ge=0)
     complete: bool = False
@@ -74,10 +76,29 @@ class CollectionResult(BaseModel):
             raise ValueError(
                 "observed_count must equal accepted items plus rejected observations."
             )
-        if self.rejected_items:
+        if self.raw_observation_count is None:
+            self.raw_observation_count = accounted_observed
+        elif self.raw_observation_count != accounted_observed:
+            raise ValueError(
+                "raw_observation_count must equal accepted items plus rejected observations."
+            )
+        inferred_duplicate_observations = sum(
+            item.reason == "duplicate_source_url" for item in self.rejected_items
+        )
+        if "duplicate_observation_count" not in self.model_fields_set:
+            self.duplicate_observation_count = inferred_duplicate_observations
+        elif self.duplicate_observation_count != inferred_duplicate_observations:
+            raise ValueError(
+                "duplicate_observation_count must equal duplicate_source_url rejections."
+            )
+        identity_observed = accounted_observed - self.duplicate_observation_count
+        non_duplicate_rejections = (
+            len(self.rejected_items) - self.duplicate_observation_count
+        )
+        if non_duplicate_rejections:
             if self.status not in {"needs_human", "failed"} or self.complete:
                 raise ValueError(
-                    "rejected observations require needs_human or failed incomplete status."
+                    "non-duplicate rejected observations require needs_human or failed incomplete status."
                 )
         if not self.expected_count_known:
             if self.expected_count is not None:
@@ -101,8 +122,8 @@ class CollectionResult(BaseModel):
 
         if self.expected_count is None:
             raise ValueError("known expected counts require an expected_count.")
-        deficit = max(self.expected_count - accounted_observed, 0)
-        overflow = max(accounted_observed - self.expected_count, 0)
+        deficit = max(self.expected_count - identity_observed, 0)
+        overflow = max(identity_observed - self.expected_count, 0)
         if len(self.missing_items) != deficit:
             raise ValueError(
                 "missing_items must exactly account for the known expected deficit."
@@ -117,7 +138,7 @@ class CollectionResult(BaseModel):
             if self.status == "succeeded" or self.complete:
                 raise ValueError("known deficits cannot be succeeded or complete.")
             return self
-        if self.rejected_items:
+        if non_duplicate_rejections:
             return self
         if self.expected_count > 0:
             if self.status != "succeeded" or not self.complete:

@@ -89,6 +89,35 @@ def test_collection_result_rejects_success_when_any_observation_was_rejected() -
         )
 
 
+def test_collection_result_infers_duplicate_url_observations_from_rejection_reason() -> None:
+    """A duplicate URL row must not become overflow because a producer omitted a count."""
+    result = CollectionResult(
+        status="succeeded",
+        items=[_item("note-1")],
+        rejected_items=[
+            {
+                "reference": "shop-card-2",
+                "reason": "duplicate_source_url",
+                "raw_evidence": {
+                    "source_url": "https://www.xiaohongshu.com/explore/example"
+                },
+            }
+        ],
+        expected_count_known=True,
+        expected_count=1,
+        succeeded_count=1,
+        observed_count=2,
+        missing_items=[],
+        overflow_count=0,
+        complete=True,
+    )
+
+    assert result.raw_observation_count == 2
+    assert result.duplicate_observation_count == 1
+    assert result.overflow_count == 0
+    assert result.complete is True
+
+
 @pytest.mark.parametrize(
     ("source_url", "raw_evidence"),
     [

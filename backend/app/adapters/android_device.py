@@ -12,7 +12,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from shutil import which
-from threading import Lock
+from threading import Lock, local
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
@@ -252,11 +252,33 @@ class AndroidDeviceAdapter:
         self.clipboard_timeout_seconds = max(clipboard_timeout_seconds, 0)
         self._sleep = sleep
         self._monotonic = monotonic
+        self._cancellation_context = local()
 
     def health(self) -> DeviceHealth:
         return self._connect(self.device_id).health
 
     def collect_shop(
+        self,
+        request: CollectionRequest,
+        *,
+        _connected: _ConnectedDevice | None = None,
+        _reservation_held: bool = False,
+    ) -> CollectionResult:
+        callback = request.parameters.get("is_cancelled")
+        previous_callback = getattr(
+            self._cancellation_context, "callback", None
+        )
+        self._cancellation_context.callback = callback if callable(callback) else None
+        try:
+            return self._collect_shop(
+                request,
+                _connected=_connected,
+                _reservation_held=_reservation_held,
+            )
+        finally:
+            self._cancellation_context.callback = previous_callback
+
+    def _collect_shop(
         self,
         request: CollectionRequest,
         *,
@@ -823,7 +845,7 @@ class AndroidDeviceAdapter:
 
                 if self._is_end(shop_screen.hierarchy):
                     break
-                if expected is not None and len(items) + len(rejected_items) >= expected:
+                if expected is not None and len(items) >= expected:
                     break
                 cancelled = self._cancelled_result(
                     request,
@@ -892,16 +914,25 @@ class AndroidDeviceAdapter:
                 artifacts=artifact_paths,
                 transitions=transitions,
             )
-        observed = len(items) + len(rejected_items)
-        if observed > expected:
+        raw_observed = len(items) + len(rejected_items)
+        duplicate_observations = sum(
+            item.reason == "duplicate_source_url" for item in rejected_items
+        )
+        identity_observed = raw_observed - duplicate_observations
+        non_duplicate_rejections = len(rejected_items) - duplicate_observations
+        if identity_observed > expected:
             status = "failed"
             detail = "discovered_count_exceeds_expected"
-        elif rejected_items:
+        elif non_duplicate_rejections:
             status = "needs_human"
             detail = "product_evidence_unavailable"
-        elif observed < expected:
-            status = "partial"
-            detail = "expected_products_missing"
+        elif identity_observed < expected:
+            if rejected_items:
+                status = "needs_human"
+                detail = "product_evidence_unavailable"
+            else:
+                status = "partial"
+                detail = "expected_products_missing"
         else:
             status = "succeeded"
             detail = None
@@ -1247,6 +1278,13 @@ class AndroidDeviceAdapter:
         shell(["am", "start", "-a", "android.intent.action.VIEW", "-d", url])
 
     def _is_cancelled(self, job_id: str | None) -> bool:
+        callback = getattr(self._cancellation_context, "callback", None)
+        if callable(callback):
+            try:
+                if bool(callback()):
+                    return True
+            except Exception:
+                return True
         return bool(
             job_id is not None
             and self.job_service is not None
@@ -1289,12 +1327,17 @@ class AndroidDeviceAdapter:
         rejected_items = list(rejected_items)
         expected = request.expected_count
         observed = len(items) + len(rejected_items)
+        duplicate_observations = sum(
+            item.reason == "duplicate_source_url" for item in rejected_items
+        )
+        identity_observed = observed - duplicate_observations
+        non_duplicate_rejections = len(rejected_items) - duplicate_observations
         if (
             status != "succeeded"
             and expected is not None
             and expected > 0
-            and observed == expected
-            and not rejected_items
+            and identity_observed == expected
+            and non_duplicate_rejections == 0
             and items
         ):
             terminal_item = items.pop()
@@ -1309,7 +1352,13 @@ class AndroidDeviceAdapter:
                 )
             )
             observed = len(items) + len(rejected_items)
-        missing_count = max((expected or 0) - observed, 0) if expected is not None else 0
+            non_duplicate_rejections += 1
+        identity_observed = observed - duplicate_observations
+        missing_count = (
+            max((expected or 0) - identity_observed, 0)
+            if expected is not None
+            else 0
+        )
         missing_reason = (
             "expected_product_not_discovered"
             if detail in {"expected_products_missing", None}
@@ -1326,12 +1375,14 @@ class AndroidDeviceAdapter:
             )
             for index in range(missing_count)
         ]
-        overflow_count = max(observed - expected, 0) if expected is not None else 0
+        overflow_count = (
+            max(identity_observed - expected, 0) if expected is not None else 0
+        )
         complete = (
             status == "succeeded"
             and expected is not None
-            and observed == expected
-            and not rejected_items
+            and identity_observed == expected
+            and non_duplicate_rejections == 0
         )
         return CollectionResult(
             status=status,
@@ -1343,6 +1394,8 @@ class AndroidDeviceAdapter:
             expected_count=expected,
             succeeded_count=len(items),
             observed_count=observed,
+            raw_observation_count=observed,
+            duplicate_observation_count=duplicate_observations,
             missing_items=missing_items,
             overflow_count=overflow_count,
             complete=complete,

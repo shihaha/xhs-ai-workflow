@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from threading import Event, RLock
 from typing import Any, Literal
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, StrictInt, field_validator
 
@@ -25,6 +28,7 @@ from backend.app.services.jobs import InvalidJobTransition, JobService
 
 
 _IMAGE_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg"}
+ANDROID_SHOP_JOB_TYPE = "android_shop_collection"
 
 
 class ShopVerificationMissing(BaseModel):
@@ -56,7 +60,9 @@ class ShopCollectionCreate(BaseModel):
         default=DEFAULT_SELECTOR_PROFILE_VERSION, min_length=1, max_length=100
     )
 
-    @field_validator("account_name", "device_id", "verification_dir")
+    @field_validator(
+        "account_name", "device_id", "verification_dir", "selector_profile_version"
+    )
     @classmethod
     def trim_non_empty_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -80,9 +86,14 @@ class ShopCollectionRead(BaseModel):
     selector_profile_version: str
     expected_count: int
     discovered_count: int
+    collected_count: int
+    raw_observation_count: int
+    duplicate_observation_count: int
     succeeded_count: int
     missing_count: int
     missing_items: list[ShopCollectionMissing]
+    collection_missing_count: int
+    collection_missing_items: list[ShopCollectionMissing]
     rejected_count: int
     rejected_items: list[RejectedCollectionItem]
     overflow_count: int
@@ -101,6 +112,17 @@ class InvalidVerificationPath(ValueError):
     """Raised when supplied verification evidence is outside runtime storage."""
 
 
+class ShopCollectionServiceClosed(RuntimeError):
+    """Raised when shutdown has closed admission for physical device work."""
+
+
+@dataclass(frozen=True)
+class _PendingShopResult:
+    temp_path: str
+    final_path: str
+    payload: dict[str, Any]
+
+
 class ShopCollectionService:
     """Queue a durable job, run one bounded device pass and finalize factual state."""
 
@@ -114,6 +136,7 @@ class ShopCollectionService:
     ) -> None:
         self.job_service = job_service
         self.device_adapter = device_adapter
+        self.job_service.recover_interrupted_workers(job_type=ANDROID_SHOP_JOB_TYPE)
         self._executor = (
             ThreadPoolExecutor(
                 max_workers=max(1, max_workers),
@@ -123,35 +146,63 @@ class ShopCollectionService:
             else None
         )
         self._submitter = submitter or self._executor.submit
+        self._lifecycle_lock = RLock()
+        self._accepting_work = True
+        self._cancel_events: dict[str, Event] = {}
+        self._futures: dict[str, Future[Any]] = {}
 
     def enqueue(self, payload: ShopCollectionCreate) -> ShopCollectionQueued:
         self._resolve_verification_dir(payload.verification_dir)
-        input_data = payload.model_dump(mode="json")
-        job = self.job_service.create(
-            job_type="shop_collection",
-            input_data=input_data,
-            progress_total=payload.expected_count,
-            current_stage="device_pending",
-        )
-        try:
-            self._submitter(self.execute, job.id, payload)
-        except Exception as error:
-            self.job_service.append_log(
-                job.id,
-                level="error",
-                message=f"Shop collection scheduling raised: {type(error).__name__}: {error}",
+        with self._lifecycle_lock:
+            if not self._accepting_work:
+                raise ShopCollectionServiceClosed(
+                    "Shop collection service is closed."
+                )
+            input_data = payload.model_dump(mode="json")
+            job = self.job_service.create(
+                job_type=ANDROID_SHOP_JOB_TYPE,
+                input_data=input_data,
+                progress_total=payload.expected_count,
+                current_stage="device_pending",
             )
-            self.job_service.claim(job.id)
-            self.job_service.transition(
-                job.id,
-                JobState.failed,
-                current_stage="shop_failed",
-                error_category="shop_collection_schedule_failed",
-            )
-            raise
+            cancel_event = Event()
+            self._cancel_events[job.id] = cancel_event
+            try:
+                submitted = self._submitter(self.execute, job.id, payload)
+            except Exception as error:
+                self._cancel_events.pop(job.id, None)
+                self.job_service.append_log(
+                    job.id,
+                    level="error",
+                    message=(
+                        "Shop collection scheduling raised: "
+                        f"{type(error).__name__}: {error}"
+                    ),
+                )
+                self.job_service.claim(job.id)
+                self.job_service.transition(
+                    job.id,
+                    JobState.failed,
+                    current_stage="shop_failed",
+                    error_category="shop_collection_schedule_failed",
+                )
+                raise
+            if isinstance(submitted, Future):
+                self._futures[job.id] = submitted
+                submitted.add_done_callback(
+                    lambda _future, job_id=job.id: self._mark_job_finished(job_id)
+                )
         return ShopCollectionQueued(job_id=job.id)
 
     def execute(
+        self, job_id: str, payload: ShopCollectionCreate
+    ) -> ShopCollectionRead | None:
+        try:
+            return self._execute_claimed(job_id, payload)
+        finally:
+            self._mark_job_finished(job_id)
+
+    def _execute_claimed(
         self, job_id: str, payload: ShopCollectionCreate
     ) -> ShopCollectionRead | None:
         try:
@@ -168,6 +219,7 @@ class ShopCollectionService:
                         "device_id": payload.device_id,
                         "selector_profile_version": payload.selector_profile_version,
                         "job_id": job_id,
+                        "is_cancelled": self._cancellation_callback(job_id),
                     },
                     expected_count=payload.expected_count,
                 )
@@ -251,7 +303,41 @@ class ShopCollectionService:
                     }
                 )
             else:
-                read = read.model_copy(update={"verification": verification})
+                source_mismatch = (
+                    "collected_source_url_mismatch" in verification.issues
+                )
+                if source_mismatch:
+                    verified_missing = [
+                        ShopCollectionMissing(
+                            reference=str(item.source_url),
+                            reason="collected_source_url_mismatch",
+                            raw_evidence={
+                                "collected_item_id": item.id,
+                                "verification_issues": verification.issues,
+                            },
+                        )
+                        for item in result.items
+                    ]
+                    verified_succeeded_count = 0
+                else:
+                    verified_missing = [
+                        ShopCollectionMissing(
+                            reference=item.reference,
+                            reason=item.reason,
+                            raw_evidence={"product_dir": item.product_dir},
+                        )
+                        for item in verification.missing_items
+                    ]
+                    verified_succeeded_count = verification.succeeded_count
+                read = read.model_copy(
+                    update={
+                        "verification": verification,
+                        "succeeded_count": verified_succeeded_count,
+                        "missing_count": len(verified_missing),
+                        "missing_items": verified_missing,
+                        "complete": verification.complete,
+                    }
+                )
                 if not verification.complete:
                     read = read.model_copy(
                         update={
@@ -262,13 +348,56 @@ class ShopCollectionService:
                     )
         if self.job_service.get(job_id).state is JobState.cancelled:
             read = _cancelled_shop_read(read)
-        self._persist_result(job_id, read)
-        self._finalize(job_id, read)
+        pending = self._persist_result(job_id, read)
+        finalized = self._finalize(job_id, read, pending)
+        if finalized is None:
+            durable = self.job_service.get(job_id)
+            if durable.state is JobState.cancelled:
+                return _cancelled_shop_read(read)
+            return read.model_copy(
+                update={
+                    "status": "needs_human",
+                    "detail": durable.error_category or "job_state_changed",
+                    "complete": False,
+                }
+            )
         return read
 
     def close(self) -> None:
+        with self._lifecycle_lock:
+            if not self._accepting_work:
+                return
+            self._accepting_work = False
+            active = list(self._cancel_events.items())
+            futures = list(self._futures.values())
+            for _, cancel_event in active:
+                cancel_event.set()
+        for future in futures:
+            future.cancel()
+        for job_id, _ in active:
+            try:
+                current = self.job_service.get(job_id)
+                if current.state in {JobState.queued, JobState.running}:
+                    self.job_service.transition(
+                        job_id,
+                        JobState.cancelled,
+                        current_stage="worker_shutdown_cancelled",
+                        error_category="worker_shutdown_cancelled",
+                    )
+            except InvalidJobTransition:
+                pass
         if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=False)
+            self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _cancellation_callback(self, job_id: str) -> Callable[[], bool]:
+        with self._lifecycle_lock:
+            cancel_event = self._cancel_events.get(job_id)
+        return cancel_event.is_set if cancel_event is not None else lambda: True
+
+    def _mark_job_finished(self, job_id: str) -> None:
+        with self._lifecycle_lock:
+            self._futures.pop(job_id, None)
+            self._cancel_events.pop(job_id, None)
 
     def _resolve_verification_dir(self, value: str | None) -> Path | None:
         if value is None:
@@ -289,55 +418,60 @@ class ShopCollectionService:
             raise InvalidVerificationPath("Verification directory is not a directory.")
         return resolved
 
-    def _persist_result(self, job_id: str, result: ShopCollectionRead) -> None:
+    def _persist_result(
+        self, job_id: str, result: ShopCollectionRead
+    ) -> _PendingShopResult:
         relative = Path("evidence") / "shops" / job_id / "result.json"
+        temp_relative = relative.with_name(f".result-{uuid4().hex}.tmp")
         absolute = (self.job_service.runtime_dir / relative).resolve()
+        temp_absolute = (self.job_service.runtime_dir / temp_relative).resolve()
         try:
             absolute.relative_to(self.job_service.runtime_dir)
+            temp_absolute.relative_to(self.job_service.runtime_dir)
         except ValueError as error:
             raise RuntimeError("Shop result path escapes runtime storage.") from error
-        absolute.parent.mkdir(parents=True, exist_ok=True)
+        temp_absolute.parent.mkdir(parents=True, exist_ok=True)
         payload = result.model_dump(mode="json")
-        absolute.write_text(
+        temp_absolute.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        self.job_service.attach_artifact(
-            job_id,
-            kind="shop_collection_result",
-            path=relative.as_posix(),
-            metadata={"result": payload},
+        return _PendingShopResult(
+            temp_path=temp_relative.as_posix(),
+            final_path=relative.as_posix(),
+            payload=payload,
         )
 
-    def _finalize(self, job_id: str, result: ShopCollectionRead) -> None:
-        if self.job_service.get(job_id).state is JobState.cancelled:
-            return
+    def _finalize(
+        self,
+        job_id: str,
+        result: ShopCollectionRead,
+        pending: _PendingShopResult,
+    ) -> Any | None:
         if result.status == "succeeded":
-            self.job_service.transition(
-                job_id,
-                JobState.succeeded,
-                progress_current=result.succeeded_count,
-                progress_total=result.expected_count,
-                current_stage="shop_complete",
-            )
+            state = JobState.succeeded
+            current_stage = "shop_complete"
+            error_category = None
         elif result.status == "failed":
-            self.job_service.transition(
-                job_id,
-                JobState.failed,
-                progress_current=result.succeeded_count,
-                progress_total=result.expected_count,
-                current_stage="shop_failed",
-                error_category=result.detail or "shop_collection_failed",
-            )
+            state = JobState.failed
+            current_stage = "shop_failed"
+            error_category = result.detail or "shop_collection_failed"
         else:
-            self.job_service.transition(
-                job_id,
-                JobState.needs_human,
-                progress_current=result.succeeded_count,
-                progress_total=result.expected_count,
-                current_stage="shop_needs_human",
-                error_category=result.detail or result.status,
-            )
+            state = JobState.needs_human
+            current_stage = "shop_needs_human"
+            error_category = result.detail or result.status
+        return self.job_service.finalize_running_with_artifact(
+            job_id,
+            state=state,
+            progress_current=result.succeeded_count,
+            progress_total=result.expected_count,
+            current_stage=current_stage,
+            error_category=error_category,
+            kind="shop_collection_result",
+            temp_path=pending.temp_path,
+            path=pending.final_path,
+            metadata={"result": pending.payload},
+        )
 
 
 def verify_shop_collection(
@@ -495,7 +629,7 @@ def _shop_collection_read(
     expected_count: int,
     result: CollectionResult,
 ) -> ShopCollectionRead:
-    missing_items = [
+    collection_missing_items = [
         ShopCollectionMissing(
             reference=item.reference,
             reason=item.reason,
@@ -503,22 +637,43 @@ def _shop_collection_read(
         )
         for item in result.missing_items
     ]
+    verification_reason = (
+        "product_evidence_verification_pending"
+        if result.status == "succeeded"
+        else result.detail or "product_evidence_unavailable"
+    )
+    missing_items = [
+        ShopCollectionMissing(
+            reference=f"expected_product:{index + 1}",
+            reason=verification_reason,
+            raw_evidence={
+                "job_id": job_id,
+                "collection_status": result.status,
+            },
+        )
+        for index in range(expected_count)
+    ]
     return ShopCollectionRead(
         job_id=job_id,
         status=result.status,
         detail=result.detail,
         selector_profile_version=selector_profile_version,
         expected_count=expected_count,
-        discovered_count=int(result.observed_count or 0),
-        succeeded_count=result.succeeded_count,
+        discovered_count=len(result.items),
+        collected_count=result.succeeded_count,
+        raw_observation_count=int(result.raw_observation_count or 0),
+        duplicate_observation_count=result.duplicate_observation_count,
+        succeeded_count=0,
         missing_count=len(missing_items),
         missing_items=missing_items,
+        collection_missing_count=len(collection_missing_items),
+        collection_missing_items=collection_missing_items,
         rejected_count=len(result.rejected_items),
         rejected_items=list(result.rejected_items),
         overflow_count=result.overflow_count,
         evidence_artifacts=result.evidence_artifacts,
         items=result.items,
-        complete=result.complete,
+        complete=False,
     )
 
 
