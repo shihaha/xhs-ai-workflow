@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -25,6 +26,7 @@ from backend.app.services.jobs import JobService
 
 QIANFAN_RANK_URL = "https://ark.xiaohongshu.com/app-datacenter/market/note-rank"
 _RANK_RESPONSE_PATH = "/api/edith/business/data/note/"
+_XHS_PUBLIC_ORIGIN = "https://www.xiaohongshu.com"
 
 
 class QianfanCaptureOutcome(BaseModel):
@@ -37,6 +39,26 @@ class QianfanCaptureOutcome(BaseModel):
         "response_unusable",
     ] | None = None
     raw_evidence: dict[str, Any] = Field(min_length=1)
+
+
+@dataclass(frozen=True)
+class _RejectedRankItem:
+    reference: str
+    reason: str
+    raw_evidence: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _NormalizedRankings:
+    items: list[CollectionItem]
+    rejected_items: list[_RejectedRankItem]
+    valid_response_observed: bool
+
+
+class _RankItemUnusable(ValueError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class QianfanPlaywrightAdapter:
@@ -66,104 +88,56 @@ class QianfanPlaywrightAdapter:
     def collect_rankings(self, request: CollectionRequest) -> CollectionResult:
         """Implement the normalized collector contract and link capture evidence to a job."""
         job_id = self._validated_job_id(request)
-        outcome = self.capture_visible_page()
-        items = (
-            _normalized_items(outcome.raw_evidence)
-            if outcome.status == "captured"
-            else []
-        )
-        if outcome.status == "captured" and not items:
-            outcome = QianfanCaptureOutcome(
-                status="needs_human",
-                reason=(
-                    "response_unusable"
-                    if outcome.raw_evidence.get("responses")
-                    else "response_not_observed"
-                ),
-                raw_evidence=outcome.raw_evidence,
-            )
-        artifact_paths = self._persist_job_evidence(job_id, outcome)
-        if outcome.status == "needs_human":
-            expected_count = request.expected_count
-            missing_count = expected_count if expected_count is not None else 0
-            missing_items = [
-                MissingCollectionItem(
-                    reference=f"qianfan_ranking:{index + 1}",
-                    reason=outcome.reason or "needs_human",
+        stage = "capture"
+        try:
+            outcome = self.capture_visible_page()
+            stage = "evidence_persistence"
+            artifact_paths = self._persist_job_evidence(job_id, outcome)
+
+            if outcome.status == "needs_human":
+                result = _needs_human_result(
+                    request=request,
+                    detail=outcome.reason or "needs_human",
+                    artifact_paths=artifact_paths,
                     raw_evidence=outcome.raw_evidence,
                 )
-                for index in range(missing_count)
-            ]
-            result = CollectionResult(
-                status="needs_human",
-                detail=outcome.reason,
-                evidence_artifacts=artifact_paths,
-                items=[],
-                expected_count_known=expected_count is not None,
-                expected_count=expected_count,
-                succeeded_count=0,
-                missing_items=missing_items,
-                overflow_count=0,
-                complete=False,
-            )
-            self._finalize_job(job_id, result)
-            return result
+            else:
+                stage = "normalization"
+                normalized = _normalized_items(outcome.raw_evidence)
+                stage = "result_validation"
+                if not normalized.valid_response_observed:
+                    result = _needs_human_result(
+                        request=request,
+                        detail=(
+                            "response_unusable"
+                            if outcome.raw_evidence.get("responses")
+                            else "response_not_observed"
+                        ),
+                        artifact_paths=artifact_paths,
+                        raw_evidence=outcome.raw_evidence,
+                    )
+                elif normalized.rejected_items:
+                    result = _needs_human_result(
+                        request=request,
+                        detail="response_unusable",
+                        artifact_paths=artifact_paths,
+                        raw_evidence=outcome.raw_evidence,
+                        rejected_items=normalized.rejected_items,
+                    )
+                else:
+                    result = _accounted_result(
+                        request=request,
+                        items=normalized.items,
+                        artifact_paths=artifact_paths,
+                        raw_evidence=outcome.raw_evidence,
+                    )
 
-        expected_count = request.expected_count
-        if expected_count is None:
-            result = CollectionResult(
-                status="partial",
-                detail="expected_count_unknown",
-                evidence_artifacts=artifact_paths,
-                items=items,
-                expected_count_known=False,
-                expected_count=None,
-                succeeded_count=len(items),
-                missing_items=[],
-                overflow_count=0,
-                complete=False,
-            )
+            stage = "job_finalization"
             self._finalize_job(job_id, result)
             return result
-        if len(items) > expected_count:
-            result = CollectionResult(
-                status="failed",
-                detail="observed_count_exceeds_expected",
-                evidence_artifacts=artifact_paths,
-                items=items,
-                expected_count_known=True,
-                expected_count=expected_count,
-                succeeded_count=len(items),
-                missing_items=[],
-                overflow_count=len(items) - expected_count,
-                complete=False,
-            )
-            self._finalize_job(job_id, result)
-            return result
-        missing_count = expected_count - len(items)
-        missing_items = [
-            MissingCollectionItem(
-                reference=f"qianfan_ranking:{len(items) + index + 1}",
-                reason="expected_item_not_observed",
-                raw_evidence={"capture": outcome.raw_evidence},
-            )
-            for index in range(missing_count)
-        ]
-        complete = missing_count == 0
-        result = CollectionResult(
-            status="succeeded" if complete else "partial",
-            detail=None if complete else "expected_items_missing",
-            evidence_artifacts=artifact_paths,
-            items=items,
-            expected_count_known=True,
-            expected_count=expected_count,
-            succeeded_count=len(items),
-            missing_items=missing_items,
-            overflow_count=0,
-            complete=complete,
-        )
-        self._finalize_job(job_id, result)
-        return result
+        except Exception as error:
+            self._fail_running_job(job_id, category=f"{stage}_failed", error=error)
+            raise
 
     def capture_visible_page(self) -> QianfanCaptureOutcome:
         page = self._page_factory()
@@ -337,6 +311,149 @@ class QianfanPlaywrightAdapter:
                 error_category=result.detail or result.status,
             )
 
+    def _fail_running_job(
+        self, job_id: str | None, *, category: str, error: Exception
+    ) -> None:
+        if job_id is None:
+            return
+        assert self._job_service is not None
+        try:
+            self._job_service.append_log(
+                job_id,
+                level="error",
+                message=(
+                    f"Qianfan collection raised during {category}: "
+                    f"{type(error).__name__}: {error}"
+                ),
+            )
+        except Exception as log_error:
+            error.add_note(
+                "Could not append Qianfan failure log: "
+                f"{type(log_error).__name__}: {log_error}"
+            )
+        try:
+            if self._job_service.get(job_id).state is JobState.running:
+                self._job_service.transition(
+                    job_id,
+                    JobState.failed,
+                    current_stage="qianfan_failed",
+                    error_category=category,
+                )
+        except Exception as transition_error:
+            error.add_note(
+                "Could not transition Qianfan job after failure: "
+                f"{type(transition_error).__name__}: {transition_error}"
+            )
+
+
+def _needs_human_result(
+    *,
+    request: CollectionRequest,
+    detail: str,
+    artifact_paths: list[str],
+    raw_evidence: dict[str, Any],
+    rejected_items: list[_RejectedRankItem] | None = None,
+) -> CollectionResult:
+    expected_count = request.expected_count
+    missing_count = expected_count if expected_count is not None else 0
+    rejected = rejected_items or []
+    missing_items: list[MissingCollectionItem] = []
+    for index in range(missing_count):
+        if index < len(rejected):
+            rejected_item = rejected[index]
+            missing_items.append(
+                MissingCollectionItem(
+                    reference=rejected_item.reference,
+                    reason=rejected_item.reason,
+                    raw_evidence=rejected_item.raw_evidence,
+                )
+            )
+        else:
+            missing_items.append(
+                MissingCollectionItem(
+                    reference=f"qianfan_ranking:{index + 1}",
+                    reason=detail,
+                    raw_evidence=raw_evidence,
+                )
+            )
+    return CollectionResult(
+        status="needs_human",
+        detail=detail,
+        evidence_artifacts=artifact_paths,
+        items=[],
+        expected_count_known=expected_count is not None,
+        expected_count=expected_count,
+        succeeded_count=0,
+        missing_items=missing_items,
+        overflow_count=0,
+        complete=False,
+    )
+
+
+def _accounted_result(
+    *,
+    request: CollectionRequest,
+    items: list[CollectionItem],
+    artifact_paths: list[str],
+    raw_evidence: dict[str, Any],
+) -> CollectionResult:
+    expected_count = request.expected_count
+    if expected_count is None:
+        if not items:
+            return _needs_human_result(
+                request=request,
+                detail="expected_count_unknown",
+                artifact_paths=artifact_paths,
+                raw_evidence=raw_evidence,
+            )
+        return CollectionResult(
+            status="partial",
+            detail="expected_count_unknown",
+            evidence_artifacts=artifact_paths,
+            items=items,
+            expected_count_known=False,
+            expected_count=None,
+            succeeded_count=len(items),
+            missing_items=[],
+            overflow_count=0,
+            complete=False,
+        )
+    if len(items) > expected_count:
+        return CollectionResult(
+            status="failed",
+            detail="observed_count_exceeds_expected",
+            evidence_artifacts=artifact_paths,
+            items=items,
+            expected_count_known=True,
+            expected_count=expected_count,
+            succeeded_count=len(items),
+            missing_items=[],
+            overflow_count=len(items) - expected_count,
+            complete=False,
+        )
+    missing_count = expected_count - len(items)
+    missing_items = [
+        MissingCollectionItem(
+            reference=f"qianfan_ranking:{len(items) + index + 1}",
+            reason="expected_item_not_observed",
+            raw_evidence={"capture": raw_evidence},
+        )
+        for index in range(missing_count)
+    ]
+    complete = missing_count == 0
+    return CollectionResult(
+        status="succeeded" if complete else "partial",
+        detail=None if complete else "expected_items_missing",
+        evidence_artifacts=artifact_paths,
+        items=items,
+        expected_count_known=True,
+        expected_count=expected_count,
+        succeeded_count=len(items),
+        missing_items=missing_items,
+        overflow_count=0,
+        complete=complete,
+    )
+
 
 def _record_response(response: Any, sink: list[dict[str, Any]]) -> None:
     url = str(response.url)
@@ -386,22 +503,46 @@ def _capture_error(stage: str, error: Exception) -> dict[str, str]:
     return {"stage": stage, "type": type(error).__name__, "message": str(error)}
 
 
-def _normalized_items(raw_evidence: dict[str, Any]) -> list[CollectionItem]:
+def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
     chosen: dict[str, CollectionItem] = {}
-    for response in raw_evidence.get("responses", []):
+    rejected_items: list[_RejectedRankItem] = []
+    valid_response_observed = False
+    for response_index, response in enumerate(raw_evidence.get("responses", [])):
+        if not isinstance(response, dict):
+            continue
         body = response.get("body")
         if not isinstance(body, dict):
             continue
         data = body.get("data")
-        raw_items = data.get("dataList", []) if isinstance(data, dict) else []
+        if not isinstance(data, dict) or "dataList" not in data:
+            continue
+        raw_items = data.get("dataList")
         if not isinstance(raw_items, list):
             continue
-        for raw_item in raw_items:
+        valid_response_observed = True
+        for item_index, raw_item in enumerate(raw_items):
+            reference = f"qianfan_response:{response_index + 1}:item:{item_index + 1}"
+            item_evidence = {"response_url": response.get("url"), "item": raw_item}
             if not isinstance(raw_item, dict):
+                rejected_items.append(
+                    _RejectedRankItem(
+                        reference=reference,
+                        reason="row_not_object",
+                        raw_evidence=item_evidence,
+                    )
+                )
                 continue
-            item_id = _item_id(raw_item)
-            note_id = str(raw_item.get("noteId") or raw_item.get("note_id") or "")
-            canonical_note_url = _canonical_note_url(raw_item)
+            try:
+                item_id, note_id, canonical_note_url = _item_identity(raw_item)
+            except _RankItemUnusable as error:
+                rejected_items.append(
+                    _RejectedRankItem(
+                        reference=reference,
+                        reason=error.reason,
+                        raw_evidence=item_evidence,
+                    )
+                )
+                continue
             source_url = (
                 f"https://www.xiaohongshu.com/explore/{quote(note_id)}"
                 if note_id
@@ -411,7 +552,7 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> list[CollectionItem]:
                 id=item_id,
                 kind="rank_item",
                 source_url=source_url,
-                raw_evidence={"response_url": response.get("url"), "item": raw_item},
+                raw_evidence=item_evidence,
                 data={
                     "rank": raw_item.get("rank"),
                     "note_id": note_id or None,
@@ -420,38 +561,54 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> list[CollectionItem]:
                 },
             )
             chosen.setdefault(item_id, item)
-    return [chosen[item_id] for item_id in sorted(chosen)]
+    return _NormalizedRankings(
+        items=[chosen[item_id] for item_id in sorted(chosen)],
+        rejected_items=rejected_items,
+        valid_response_observed=valid_response_observed,
+    )
 
 
-def _item_id(raw_item: dict[str, Any]) -> str:
-    stable = raw_item.get("noteId") or raw_item.get("note_id")
-    if stable:
-        return str(stable)[:500]
+def _item_identity(raw_item: dict[str, Any]) -> tuple[str, str | None, str | None]:
+    note_id = _identity_text(_first_present(raw_item, "noteId", "note_id"))
+    if note_id is not None:
+        return note_id[:500], note_id, None
     content_url = _canonical_note_url(raw_item)
     if content_url is not None:
-        return f"url:{content_url}"[:500]
+        return f"url:{content_url}"[:500], None, content_url
+    if _first_present(
+        raw_item,
+        "noteUrl",
+        "note_url",
+        "sourceUrl",
+        "source_url",
+        "url",
+    ) is not None:
+        raise _RankItemUnusable("malformed_note_url")
+    user_id = _identity_text(_first_present(raw_item, "userId", "user_id"))
+    title = _identity_text(
+        _first_present(raw_item, "noteTitle", "title", "note_title")
+    )
+    if user_id is None or title is None:
+        raise _RankItemUnusable("identity_insufficient")
+    publish_date = _identity_text(
+        _first_present(
+            raw_item,
+            "publishTime",
+            "publishDate",
+            "publish_time",
+            "publish_date",
+        )
+    )
     canonical = json.dumps(
         {
-            "user_id": _first_present(raw_item, "userId", "user_id"),
-            "title": _first_present(raw_item, "noteTitle", "title", "note_title"),
-            "publish_date": _first_present(
-                raw_item,
-                "publishTime",
-                "publishDate",
-                "publish_time",
-                "publish_date",
-            ),
-            "author_name": _first_present(
-                raw_item, "userNickname", "authorName", "author_name", "nickname"
-            ),
-            "content_type": _first_present(
-                raw_item, "noteType", "note_type", "contentType", "content_type"
-            ),
+            "user_id": user_id,
+            "title": title,
+            "publish_date": publish_date,
         },
         ensure_ascii=False,
         sort_keys=True,
     )
-    return sha256(canonical.encode("utf-8")).hexdigest()
+    return sha256(canonical.encode("utf-8")).hexdigest(), None, None
 
 
 def _canonical_note_url(raw_item: dict[str, Any]) -> str | None:
@@ -465,7 +622,19 @@ def _canonical_note_url(raw_item: dict[str, Any]) -> str | None:
     )
     if not source_url:
         return None
-    parts = urlsplit(str(source_url))
+    try:
+        absolute_url = urljoin(f"{_XHS_PUBLIC_ORIGIN}/", str(source_url).strip())
+        parts = urlsplit(absolute_url)
+        hostname = parts.hostname
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if parts.scheme.lower() not in {"http", "https"} or hostname is None:
+        return None
+    normalized_hostname = hostname.lower().rstrip(".")
+    if normalized_hostname != "xiaohongshu.com" and not normalized_hostname.endswith(
+        ".xiaohongshu.com"
+    ):
+        return None
     path_segments = [segment.lower() for segment in parts.path.split("/") if segment]
     has_note_identity = (
         "explore" in path_segments
@@ -477,8 +646,15 @@ def _canonical_note_url(raw_item: dict[str, Any]) -> str | None:
     if not has_note_identity:
         return None
     return urlunsplit(
-        (parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), "", "")
+        ("https", "www.xiaohongshu.com", parts.path.rstrip("/"), "", "")
     )
+
+
+def _identity_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _first_present(raw_item: dict[str, Any], *keys: str) -> Any:

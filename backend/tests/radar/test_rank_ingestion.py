@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 
+import backend.app.adapters.qianfan_playwright as qianfan_module
 from backend.app.adapters.qianfan_playwright import QianfanPlaywrightAdapter
 from backend.app.adapters.contracts import CollectionRequest, CollectionResult
 from backend.app.adapters.registry import AdapterRegistry
@@ -604,6 +605,59 @@ def test_qianfan_item_identity_ignores_mutable_rank_and_metric_evidence() -> Non
     assert first.items[0].raw_evidence != changed.items[0].raw_evidence
 
 
+def test_qianfan_item_identity_ignores_nickname_changes() -> None:
+    """A mutable account nickname must not change one note's fallback identity."""
+    before = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page(
+            [
+                {
+                    "rank": 1,
+                    "userId": "stable-account",
+                    "noteTitle": "同一篇笔记",
+                    "publishTime": "2026-08-17 09:00",
+                    "userNickname": "旧昵称",
+                }
+            ]
+        )
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+    after = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page(
+            [
+                {
+                    "rank": 7,
+                    "userId": "stable-account",
+                    "noteTitle": "同一篇笔记",
+                    "publishTime": "2026-08-17 09:00",
+                    "userNickname": "新昵称",
+                }
+            ]
+        )
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+
+    assert before.status == "succeeded"
+    assert after.status == "succeeded"
+    assert before.items[0].id == after.items[0].id
+
+
+def test_identity_insufficient_rows_are_explicit_missing_evidence_not_deduped() -> None:
+    """Multiple all-null semantic rows must remain individually auditable and never complete."""
+    raw_rows = [{"rank": 1}, {"rank": 2}]
+    result = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page(raw_rows)
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=2))
+
+    assert result.status == "needs_human"
+    assert result.detail == "response_unusable"
+    assert result.succeeded_count == 0
+    assert result.items == []
+    assert [missing.reason for missing in result.missing_items] == [
+        "identity_insufficient",
+        "identity_insufficient",
+    ]
+    assert [missing.raw_evidence["item"] for missing in result.missing_items] == raw_rows
+    assert result.complete is False
+
+
 def test_qianfan_item_identity_keeps_distinct_semantic_notes_from_one_user() -> None:
     """The user ID alone must not collapse different titles or publication times."""
     page = _ranking_page(
@@ -661,6 +715,113 @@ def test_qianfan_item_identity_prefers_canonical_note_url() -> None:
     assert str(result.items[0].source_url) == (
         "https://www.xiaohongshu.com/explore/url-note"
     )
+
+
+def test_relative_note_url_is_resolved_and_claimed_job_succeeds(tmp_path: Path) -> None:
+    """A platform-relative note URL must become a stable absolute source before validation."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    page = _ranking_page([{"rank": 1, "noteUrl": "/explore/n1"}])
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: page, job_service=jobs, runtime_dir=runtime_dir
+    )
+
+    result = adapter.collect_rankings(
+        CollectionRequest(
+            capability="rankings",
+            parameters={"job_id": job.id},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.items[0].id == "url:https://www.xiaohongshu.com/explore/n1"
+    assert str(result.items[0].source_url) == "https://www.xiaohongshu.com/explore/n1"
+    persisted = jobs.get(job.id)
+    assert persisted.state is JobState.succeeded
+    assert len(persisted.artifacts) == 1
+
+
+def test_malformed_note_url_preserves_evidence_and_never_strands_claimed_job(
+    tmp_path: Path,
+) -> None:
+    """An unusable note URL must become a reviewable terminal fact, not a validation crash."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    raw_row = {"rank": 1, "noteUrl": "http://["}
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([raw_row]),
+        job_service=jobs,
+        runtime_dir=runtime_dir,
+    )
+
+    result = adapter.collect_rankings(
+        CollectionRequest(
+            capability="rankings",
+            parameters={"job_id": job.id},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert result.detail == "response_unusable"
+    assert result.missing_items[0].reason == "malformed_note_url"
+    assert result.missing_items[0].raw_evidence["item"] == raw_row
+    persisted = jobs.get(job.id)
+    assert persisted.state is JobState.needs_human
+    assert persisted.error_category == "response_unusable"
+    assert len(persisted.artifacts) == 1
+    evidence = json.loads(
+        (runtime_dir / persisted.artifacts[0].path).read_text(encoding="utf-8")
+    )
+    assert evidence["raw_evidence"]["responses"][0]["body"]["data"]["dataList"] == [
+        raw_row
+    ]
+
+
+def test_unexpected_normalization_error_persists_evidence_and_fails_claimed_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unexpected post-capture bugs may propagate, but must not abandon the running lease."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    raw_row = {"rank": 1, "noteId": "captured-before-bug"}
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([raw_row]),
+        job_service=jobs,
+        runtime_dir=runtime_dir,
+    )
+
+    def fail_normalization(_: dict[str, Any]) -> object:
+        raise RuntimeError("unexpected normalization bug")
+
+    monkeypatch.setattr(qianfan_module, "_normalized_items", fail_normalization)
+
+    with pytest.raises(RuntimeError, match="unexpected normalization bug"):
+        adapter.collect_rankings(
+            CollectionRequest(
+                capability="rankings",
+                parameters={"job_id": job.id},
+                expected_count=1,
+            )
+        )
+
+    persisted = jobs.get(job.id)
+    assert persisted.state is JobState.failed
+    assert persisted.error_category == "normalization_failed"
+    assert len(persisted.artifacts) == 1
+    evidence = json.loads(
+        (runtime_dir / persisted.artifacts[0].path).read_text(encoding="utf-8")
+    )
+    assert evidence["raw_evidence"]["responses"][0]["body"]["data"]["dataList"] == [
+        raw_row
+    ]
 
 
 def test_collect_rankings_maps_login_to_needs_human_job_and_contract(
@@ -760,6 +921,67 @@ def test_collect_rankings_without_expected_count_is_incomplete_and_needs_human_j
     persisted = jobs.get(job.id)
     assert persisted.state is JobState.needs_human
     assert persisted.error_category == "expected_count_unknown"
+
+
+def test_valid_empty_response_with_known_zero_is_complete_and_succeeds_job(
+    tmp_path: Path,
+) -> None:
+    """A structurally valid empty ranking list truthfully satisfies a caller-known zero total."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([]),
+        job_service=jobs,
+        runtime_dir=runtime_dir,
+    )
+
+    result = adapter.collect_rankings(
+        CollectionRequest(
+            capability="rankings",
+            parameters={"job_id": job.id},
+            expected_count=0,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.expected_count_known is True
+    assert result.expected_count == 0
+    assert result.succeeded_count == 0
+    assert result.items == []
+    assert result.missing_items == []
+    assert result.complete is True
+    assert jobs.get(job.id).state is JobState.succeeded
+
+
+def test_valid_empty_response_with_unknown_total_needs_human(
+    tmp_path: Path,
+) -> None:
+    """An observed empty list cannot establish completion when the caller supplied no total."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir)
+    job = jobs.create(job_type="qianfan_rankings", input_data={})
+    jobs.claim(job.id)
+    adapter = QianfanPlaywrightAdapter(
+        page_factory=lambda: _ranking_page([]),
+        job_service=jobs,
+        runtime_dir=runtime_dir,
+    )
+
+    result = adapter.collect_rankings(
+        CollectionRequest(capability="rankings", parameters={"job_id": job.id})
+    )
+
+    assert result.status == "needs_human"
+    assert result.detail == "expected_count_unknown"
+    assert result.expected_count_known is False
+    assert result.succeeded_count == 0
+    assert result.complete is False
+    persisted = jobs.get(job.id)
+    assert persisted.state is JobState.needs_human
+    assert persisted.error_category == "expected_count_unknown"
+    assert len(persisted.artifacts) == 1
 
 
 def test_partial_collection_moves_claimed_job_to_needs_human(tmp_path: Path) -> None:
