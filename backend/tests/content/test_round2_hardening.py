@@ -152,7 +152,7 @@ def test_startup_recovery_removes_safe_contained_building_artifact(tmp_path: Pat
         session.commit()
     database_path = service.database.database_path
     service.database.close()
-    reopened = Database(database_path)
+    reopened = Database(database_path, runtime_dir=tmp_path)
     assert not target.exists()
     with reopened.session() as session:
         assert session.get(ContentPackageRecord, package.id).status == "failed"

@@ -122,24 +122,124 @@ def write_contained_atomic(root: Path, relative: str, payload: bytes) -> None:
 
 
 def remove_contained_regular(root: Path, relative: str, *, limit: int = MAX_PACKAGE_BYTES) -> bool:
+    """Delete only the already-opened Windows file, never a later path target.
+
+    On platforms without handle-bound deletion support the conservative result is
+    to retain the artifact; callers still mark its database reservation failed.
+    """
+    posix = PurePosixPath(relative)
+    if (
+        posix.is_absolute() or not posix.parts
+        or any(part in {"", ".", ".."} or ":" in part or "\\" in part for part in posix.parts)
+    ):
+        return False
+    descriptor: int | None = None
     try:
-        read_contained_regular(root, relative, limit=limit)
-        posix = PurePosixPath(relative)
-        candidate = root.joinpath(*posix.parts)
         resolved_root = root.resolve(strict=True)
-        candidate.resolve(strict=True).relative_to(resolved_root)
-        if candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()):
+        candidate = root.joinpath(*posix.parts)
+        current = root
+        for part in posix.parts:
+            current = current / part
+            if current.is_symlink() or (hasattr(current, "is_junction") and current.is_junction()):
+                return False
+        resolved_before = candidate.resolve(strict=True)
+        resolved_before.relative_to(resolved_root)
+        before = candidate.stat()
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit or os.name != "nt":
             return False
-        candidate.unlink()
-        return True
+        descriptor = _open_delete_handle(candidate)
+        opened = os.fstat(descriptor)
+        resolved_after = candidate.resolve(strict=True)
+        after = candidate.stat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _identity(opened) != _identity(before)
+            or _identity(after) != _identity(opened)
+            or resolved_after != resolved_before
+        ):
+            return False
+        return _delete_open_file(descriptor)
     except (UnsafeContentPath, OSError, ValueError, TypeError):
         return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _open_delete_handle(path: Path) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    delete_access = 0x00010000
+    share_all = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    open_reparse_point = 0x00200000
+    handle = create_file(
+        str(path), delete_access | 0x80000000, share_all, None,
+        open_existing, open_reparse_point, None,
+    )
+    invalid_handle = wintypes.HANDLE(-1).value
+    if handle == invalid_handle:
+        raise OSError(ctypes.get_last_error(), "Unable to open deletion handle.")
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except Exception:
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+        raise
+
+
+def _delete_open_file(descriptor: int) -> bool:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("delete_file", wintypes.BOOL)]
+
+    disposition = FileDispositionInfo(True)
+    set_information = ctypes.WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
+    set_information.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+    )
+    set_information.restype = wintypes.BOOL
+    succeeded = set_information(
+        msvcrt.get_osfhandle(descriptor), 4,
+        ctypes.byref(disposition), ctypes.sizeof(disposition),
+    )
+    return bool(succeeded)
+
+
+def _windows_component_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value)
+    stem = normalized.split(".", 1)[0].rstrip(" .").casefold()
+    reserved = {
+        "con", "prn", "aux", "nul", "conin$", "conout$", "clock$",
+        *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10)),
+        "com¹", "com²", "com³", "lpt¹", "lpt²", "lpt³",
+    }
+    if (
+        not normalized or normalized.rstrip(" .") != normalized or stem in reserved
+        or any(
+            ord(char) < 32 or 127 <= ord(char) <= 159 or char in '<>:"/\\|?*'
+            for char in normalized
+        )
+    ):
+        raise UnsafeContentPath("ZIP entry path is unsafe on Windows.")
+    return normalized.casefold().rstrip(" .")
 
 
 def deterministic_zip(entries: dict[str, bytes], manifest: dict[str, object]) -> bytes:
     if len(entries) > 127 or sum(len(value) for value in entries.values()) > MAX_PACKAGE_BYTES:
         raise UnsafeContentPath("ZIP entry count or uncompressed size limit exceeded.")
     normalized: dict[str, bytes] = {}
+    windows_keys: set[str] = set()
     for name, value in entries.items():
         name = unicodedata.normalize("NFC", name)
         path = PurePosixPath(name)
@@ -149,13 +249,15 @@ def deterministic_zip(entries: dict[str, bytes], manifest: dict[str, object]) ->
         ):
             raise UnsafeContentPath("ZIP entry path is unsafe.")
         canonical = path.as_posix()
-        if canonical in normalized or canonical.casefold() in {item.casefold() for item in normalized}:
+        windows_key = "/".join(_windows_component_key(part) for part in path.parts)
+        if canonical in normalized or windows_key in windows_keys:
             raise UnsafeContentPath("ZIP entry path collision.")
         normalized[canonical] = value
+        windows_keys.add(windows_key)
     manifest_payload = json.dumps(
         manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
-    if "manifest.json".casefold() in {item.casefold() for item in normalized}:
+    if _windows_component_key("manifest.json") in windows_keys:
         raise UnsafeContentPath("Manifest entry collision.")
     normalized["manifest.json"] = manifest_payload
     target = io.BytesIO()

@@ -20,9 +20,10 @@ class SchemaMigrationError(SQLAlchemyError):
 class Database:
     """Own the local SQLite engine and initialize its durable schema."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, runtime_dir: Path | None = None) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self.database_path = database_path
+        self.runtime_dir = runtime_dir.resolve() if runtime_dir is not None else None
         self.engine = create_engine(
             f"sqlite:///{database_path.as_posix()}",
             connect_args={"check_same_thread": False},
@@ -96,14 +97,15 @@ class Database:
         if not _content_schema_valid(inspector):
             raise SchemaMigrationError("Task 8 schema validation failed.")
         with self.engine.begin() as connection:
-            from backend.app.features.content.export import remove_contained_regular
-
             stranded_paths = connection.execute(
                 text("SELECT path FROM content_packages WHERE status='building'")
             ).scalars().all()
-            for relative_path in stranded_paths:
-                if isinstance(relative_path, str):
-                    remove_contained_regular(self.database_path.parent, relative_path)
+            if self.runtime_dir is not None:
+                from backend.app.features.content.export import remove_contained_regular
+
+                for relative_path in stranded_paths:
+                    if isinstance(relative_path, str):
+                        remove_contained_regular(self.runtime_dir, relative_path)
             connection.execute(
                 text(
                     "UPDATE content_packages SET status='failed', "
@@ -338,65 +340,95 @@ def _content_schema_valid(inspector: object) -> bool:
 
         required_checks = {
             "content_product_materials": {
-                "ck_material_version_positive": ("version>0",),
-                "ck_material_size_positive": ("size_bytes>0",),
-                "ck_material_sha_format": ("length(sha256)=64", "glob"),
-                "ck_material_kind": ("source", "output_image"),
+                "ck_material_version_positive": "version>0",
+                "ck_material_size_positive": "size_bytes>0",
+                "ck_material_sha_format": "length(sha256)=64andsha256notglob*[^0-9a-f]*",
+                "ck_material_kind": "kindin(source,output_image)",
             },
             "content_items": {
-                "ck_content_item_status": ("research", "draft", "review", "rejected", "approved", "exported"),
+                "ck_content_item_status": "statusin(research,draft,review,rejected,approved,exported)",
             },
-            "content_revisions": {"ck_revision_number_positive": ("number>0",)},
-            "content_reviews": {"ck_review_decision": ("approve", "reject", "regenerate")},
+            "content_revisions": {"ck_revision_number_positive": "number>0"},
+            "content_reviews": {"ck_review_decision": "decisionin(approve,reject,regenerate)"},
             "content_packages": {
-                "ck_package_status": ("building", "ready", "failed"),
-                "ck_package_size_nonnegative": ("size_bytes>=0",),
-                "ck_package_sha_format": ("length(sha256)=64", "glob"),
+                "ck_package_status": "statusin(building,ready,failed)",
+                "ck_package_size_nonnegative": "size_bytes>=0",
+                "ck_package_sha_format": "length(sha256)=64andsha256notglob*[^0-9a-f]*",
             },
         }
         for table, expected in required_checks.items():
             actual = {item.get("name"): _compact_sql(item.get("sqltext")) for item in inspector.get_check_constraints(table)}
-            for name, fragments in expected.items():
-                sql = actual.get(name, "")
-                if any(_compact_sql(fragment) not in sql for fragment in fragments):
-                    return False
+            if actual != expected:
+                return False
 
         required_fks = {
-            "content_products": {(('opportunity_id',), "opportunities", ('id',))},
-            "content_product_materials": {(('product_id',), "content_products", ('id',))},
+            "content_products": {(('opportunity_id',), "opportunities", ('id',), "RESTRICT")},
+            "content_product_materials": {(('product_id',), "content_products", ('id',), "CASCADE")},
             "content_items": {
-                (('product_id',), "content_products", ('id',)),
-                (('opportunity_id',), "opportunities", ('id',)),
-                (('current_revision_id', 'id'), "content_revisions", ('id', 'content_item_id')),
+                (('product_id',), "content_products", ('id',), "RESTRICT"),
+                (('opportunity_id',), "opportunities", ('id',), "RESTRICT"),
+                (('current_revision_id', 'id'), "content_revisions", ('id', 'content_item_id'), None),
             },
-            "content_revisions": {(('content_item_id',), "content_items", ('id',))},
-            "content_reviews": {(('revision_id', 'content_item_id'), "content_revisions", ('id', 'content_item_id'))},
-            "content_packages": {(('revision_id', 'content_item_id'), "content_revisions", ('id', 'content_item_id'))},
+            "content_revisions": {(('content_item_id',), "content_items", ('id',), "CASCADE")},
+            "content_reviews": {
+                (('revision_id', 'content_item_id'), "content_revisions", ('id', 'content_item_id'), None),
+                (('content_item_id',), "content_items", ('id',), "CASCADE"),
+            },
+            "content_packages": {
+                (('revision_id', 'content_item_id'), "content_revisions", ('id', 'content_item_id'), None),
+                (('content_item_id',), "content_items", ('id',), "RESTRICT"),
+            },
         }
         for table, expected in required_fks.items():
             actual = {
-                (tuple(item.get("constrained_columns") or ()), item.get("referred_table"), tuple(item.get("referred_columns") or ()))
+                (
+                    tuple(item.get("constrained_columns") or ()), item.get("referred_table"),
+                    tuple(item.get("referred_columns") or ()),
+                    (item.get("options") or {}).get("ondelete"),
+                )
                 for item in inspector.get_foreign_keys(table)
             }
-            if not expected.issubset(actual):
+            if actual != expected:
                 return False
 
         required_unique = {
+            "content_products": set(),
             "content_product_materials": {("product_id", "logical_key", "version")},
+            "content_items": set(),
             "content_revisions": {("content_item_id", "number"), ("id", "content_item_id")},
+            "content_reviews": set(),
             "content_packages": {("revision_id",)},
         }
         for table, expected in required_unique.items():
             actual = {tuple(item.get("column_names") or ()) for item in inspector.get_unique_constraints(table)}
-            if not expected.issubset(actual):
+            if actual != expected:
                 return False
 
-        index = next((item for item in inspector.get_indexes("content_reviews") if item.get("name") == "uq_review_terminal_revision"), None)
-        if index is None or bool(index.get("unique")) is not True or tuple(index.get("column_names") or ()) != ("revision_id",):
-            return False
-        where = _compact_sql((index.get("dialect_options") or {}).get("sqlite_where"))
-        if where != "decisionin(approve,reject)":
-            return False
+        required_indexes = {
+            "content_products": {"ix_content_products_opportunity_id": (("opportunity_id",), False, "")},
+            "content_product_materials": {"ix_content_product_materials_product_id": (("product_id",), False, "")},
+            "content_items": {
+                "ix_content_items_opportunity_id": (("opportunity_id",), False, ""),
+                "ix_content_items_product_id": (("product_id",), False, ""),
+                "ix_content_items_status": (("status",), False, ""),
+            },
+            "content_revisions": {"ix_content_revisions_content_item_id": (("content_item_id",), False, "")},
+            "content_reviews": {
+                "ix_content_reviews_content_item_id": (("content_item_id",), False, ""),
+                "uq_review_terminal_revision": (("revision_id",), True, "decisionin(approve,reject)"),
+            },
+            "content_packages": {"ix_content_packages_content_item_id": (("content_item_id",), False, "")},
+        }
+        for table, expected in required_indexes.items():
+            actual = {
+                item.get("name"): (
+                    tuple(item.get("column_names") or ()), bool(item.get("unique")),
+                    _compact_sql((item.get("dialect_options") or {}).get("sqlite_where")),
+                )
+                for item in inspector.get_indexes(table)
+            }
+            if actual != expected:
+                return False
     except (KeyError, TypeError, AttributeError, SQLAlchemyError):
         return False
     return True

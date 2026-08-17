@@ -159,3 +159,58 @@ git diff --check
 ```
 
 Compilation and diff checks exited 0; Git emitted only the repository's Windows LF/CRLF notices. The live Bailian/model and Android-device checks remain `not_run` because no live key/device was supplied; this round makes no live-provider or real-device claim.
+
+## Fix round 3: runtime-root and artifact race closure
+
+The two Critical and four Important review groups were captured before production changes. The two approved Minor findings remained deferred.
+
+Initial RED:
+
+```text
+python -m pytest backend/tests/content/test_round3_hardening.py -q
+13 failed, 3 passed in 0.94s
+```
+
+The schema fixtures were then made independent of the terminal-review index so all malicious definitions failed for their intended reason:
+
+```text
+python -m pytest backend/tests/content/test_round3_hardening.py -q -k schema
+3 failed in 0.49s
+```
+
+A final Windows trim-equivalence probe was also observed RED before normalizing device-name stems:
+
+```text
+python -m pytest backend/tests/content/test_round3_hardening.py -q -k windows_unsafe_entry_names
+2 failed, 7 passed in 0.30s
+```
+
+Implemented review findings:
+
+- `Database` now receives the configured trusted runtime root explicitly from application startup. Startup recovery never derives artifact paths from the database parent; without an explicit runtime root it conservatively retains files while still failing stranded reservations.
+- Windows artifact removal opens the intended regular file with delete access, verifies containment and file identity before and after opening, and applies deletion to that open handle. It never performs a check-then-path-unlink. Parent-swap races either delete only the already-opened intended orphan or fail safely while preserving the outside victim.
+- Every step after a package reservation commit, including re-load, trust validation, material loading, build and finalization, is inside one failure boundary. A path-and-status CAS changes only that builder's reservation from `building` to `failed`, enabling a later retry without overwriting a concurrent builder.
+- Task 8 schema validation compares complete normalized CHECK definitions, all expected FK local/remote columns and `ondelete` actions, exact unique constraints, and exact index columns/uniqueness/partial predicates. Weak constant-true checks, changed actions and missing direct item FKs fail closed when data exists.
+- Image dimensions and the pixel cap are checked before both verification and pixel decode. Pillow decompression-bomb warnings are promoted to rejection and both warning/error forms are mapped to factual material validation failures; valid PNG/JPEG/WebP behavior remains covered by the content suite.
+- Deterministic ZIP construction independently rejects Windows device names (including trimmed device-name equivalents), C0/DEL/C1 controls, unsafe punctuation, trailing dot/space and NFC+casefold Windows-equivalent collisions for every path component.
+
+Round-3 GREEN and verification:
+
+```text
+python -m pytest backend/tests/content/test_round3_hardening.py -q
+18 passed in 0.88s
+
+python -m pytest backend/tests/content -q
+73 passed in 6.07s
+
+python -m pytest backend/tests/analysis backend/tests/test_jobs_api.py backend/tests/test_job_state_machine.py backend/tests/test_jobs_hardening.py -q
+118 passed, 1 skipped in 6.24s
+
+python -m pytest backend/tests -q
+386 passed, 1 skipped in 18.14s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only the repository's Windows LF/CRLF notices. Live Bailian and Android-device validation remain `not_run` because no live key or device was supplied; no live-provider or real-device behavior is claimed.

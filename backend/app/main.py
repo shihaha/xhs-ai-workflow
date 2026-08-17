@@ -62,7 +62,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     try:
         if database_path.is_dir():
             raise OSError("Configured database path is a directory.")
-        app.state.database = Database(database_path)
+        app.state.database = Database(
+            database_path, runtime_dir=app.state.settings.runtime_dir
+        )
         app.state.job_service = JobService(
             app.state.database, runtime_dir=app.state.settings.runtime_dir
         )

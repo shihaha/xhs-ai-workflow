@@ -322,6 +322,7 @@ class ContentService:
             if approval is None:
                 raise ContentStateError("The current revision has no approval decision.")
             existing = session.scalar(select(ContentPackageRecord).where(ContentPackageRecord.revision_id == item.current_revision_id))
+            old_path_to_remove: str | None = None
             if existing is not None:
                 projected = self._package_read(existing)
                 if existing.status == "ready" and projected.availability == "available":
@@ -345,7 +346,7 @@ class ContentService:
                 session.commit()
                 package_id = existing.id
                 package_path = replacement_path
-                remove_contained_regular(self.runtime_dir, old_path)
+                old_path_to_remove = old_path
             else:
                 package_id_value = str(uuid4())
                 package = ContentPackageRecord(
@@ -362,15 +363,38 @@ class ContentService:
                     raise ContentStateError("This revision package was concurrently reserved.") from error
                 package_id = package.id
                 package_path = package.path
-            revision = next(value for value in item.revisions if value.id == item.current_revision_id)
-            product = _load_product(session, item.product_id)
-            materials = []
-            for material_id in list(item.material_ids_json) + list(item.image_material_ids_json):
-                material = session.get(ProductMaterialRecord, material_id)
-                if material is None or material.product_id != item.product_id:
-                    raise ContentValidationError("Approved material is missing or foreign to the product.")
-                materials.append(material)
         try:
+            if old_path_to_remove is not None:
+                remove_contained_regular(self.runtime_dir, old_path_to_remove)
+            with self.database.session() as session:
+                item = _load_item(session, item_id)
+                self._validate_item_trust(item, session=session)
+                package = session.get(ContentPackageRecord, package_id)
+                approval = session.scalar(select(ContentReviewRecord).where(
+                    ContentReviewRecord.content_item_id == item.id,
+                    ContentReviewRecord.revision_id == item.current_revision_id,
+                    ContentReviewRecord.decision == "approve",
+                ))
+                if (
+                    package is None or package.status != "building"
+                    or package.path != package_path
+                    or item.current_revision_id != payload.expected_revision_id
+                    or item.status not in {"approved", "exported"}
+                    or approval is None
+                ):
+                    raise ContentStateError("Package or content state changed after reservation.")
+                revision = next(
+                    value for value in item.revisions if value.id == item.current_revision_id
+                )
+                product = _load_product(session, item.product_id)
+                materials = []
+                for material_id in list(item.material_ids_json) + list(item.image_material_ids_json):
+                    material = session.get(ProductMaterialRecord, material_id)
+                    if material is None or material.product_id != item.product_id:
+                        raise ContentValidationError(
+                            "Approved material is missing or foreign to the product."
+                        )
+                    materials.append(material)
             entries = self._package_entries(item, revision, product, materials)
             manifest = {
                 "schema_version": 1, "content_item_id": item.id,
@@ -400,15 +424,6 @@ class ContentService:
             }
             archive = deterministic_zip(entries, manifest)
             write_contained_atomic(self.runtime_dir, package_path, archive)
-        except (UnsafeContentPath, ContentValidationError) as error:
-            with self.database.session() as session:
-                failed = session.get(ContentPackageRecord, package_id)
-                if failed is not None and failed.status == "building":
-                    failed.status = "failed"
-                    failed.error_detail = "package_build_failed"
-                    session.commit()
-            raise ContentValidationError("Package build failed; no ready artifact was recorded.") from error
-        try:
             with self.database.session() as session:
                 package = session.get(ContentPackageRecord, package_id)
                 item_record = _load_item(session, item_id)
@@ -426,14 +441,23 @@ class ContentService:
                 item_record.updated_at = _now()
                 session.commit()
                 return self._package_read(package)
-        except (ContentValidationError, ContentStateError):
-            with self.database.session() as session:
-                failed = session.get(ContentPackageRecord, package_id)
-                if failed is not None and failed.status == "building":
-                    failed.status = "failed"
-                    failed.error_detail = "finalization_trust_failed"
-                    session.commit()
+        except UnsafeContentPath as error:
+            self._fail_package_reservation(package_id, package_path)
+            raise ContentValidationError(
+                "Package build failed; no ready artifact was recorded."
+            ) from error
+        except Exception:
+            self._fail_package_reservation(package_id, package_path)
             raise
+
+    def _fail_package_reservation(self, package_id: str, package_path: str) -> None:
+        with self.database.session() as session:
+            session.execute(update(ContentPackageRecord).where(
+                ContentPackageRecord.id == package_id,
+                ContentPackageRecord.status == "building",
+                ContentPackageRecord.path == package_path,
+            ).values(status="failed", error_detail="package_build_failed"))
+            session.commit()
 
     def list_packages(self) -> list[ContentPackageRead]:
         with self.database.session() as session:
@@ -820,16 +844,26 @@ def _validate_material_bytes(payload: bytes, *, declared: str, kind: str) -> str
     detected: str | None
     if declared in supported_images:
         from io import BytesIO
+        import warnings
         from PIL import Image, UnidentifiedImageError
         try:
-            with Image.open(BytesIO(payload)) as image:
-                actual_format = image.format
-                image.verify()
-            with Image.open(BytesIO(payload)) as image:
-                image.load()
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(BytesIO(payload)) as image:
+                    actual_format = image.format
+                    if image.width < 1 or image.height < 1 or image.width * image.height > 100_000_000:
+                        raise ValueError("unsafe image dimensions")
+                    image.verify()
+                with Image.open(BytesIO(payload)) as image:
+                    if image.width < 1 or image.height < 1 or image.width * image.height > 100_000_000:
+                        raise ValueError("unsafe image dimensions")
+                    image.load()
                 if image.width < 1 or image.height < 1 or image.width * image.height > 100_000_000:
                     raise ValueError("unsafe image dimensions")
-        except (UnidentifiedImageError, OSError, ValueError, SyntaxError, Image.DecompressionBombError) as error:
+        except (
+            UnidentifiedImageError, OSError, ValueError, SyntaxError,
+            Image.DecompressionBombWarning, Image.DecompressionBombError,
+        ) as error:
             raise ContentValidationError("Image material cannot be fully decoded.") from error
         detected = next((media for media, image_format in supported_images.items() if image_format == actual_format), None)
     elif declared in supported_text:
