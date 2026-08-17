@@ -131,6 +131,7 @@ class AnalysisService:
             )
 
         now = _utc_now()
+        raw_evidence = model_result.raw_evidence
         record = AnalysisRecord(
             analysis_type=payload.analysis_type,
             account_user_id=payload.account_user_id,
@@ -144,7 +145,9 @@ class AnalysisService:
             output_json=output.model_dump(mode="json"),
             usage_json=dict(model_result.usage),
             duration_ms=model_result.duration_ms,
-            attempts_json=list(model_result.raw_evidence.get("attempts", [])),
+            attempts_json=_safe_model_attempts(
+                raw_evidence.get("attempts") if isinstance(raw_evidence, dict) else None
+            ),
             created_at=now,
         )
         for card in output.opportunities:

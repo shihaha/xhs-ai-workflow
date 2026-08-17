@@ -234,3 +234,174 @@ def test_legacy_artifact_provenance_is_migrated_as_external(tmp_path: Path) -> N
         ).one()
     assert row[0] == "external"
     database.close()
+
+
+def _add_scope_column_and_marker(
+    database_path: Path, *, default_sql: str = "'[]'"
+) -> sqlite3.Connection:
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "ALTER TABLE analyses ADD COLUMN account_user_ids_json JSON "
+        f"NOT NULL DEFAULT {default_sql}"
+    )
+    connection.execute("UPDATE analyses SET account_user_ids_json='[]'")
+    connection.execute(
+        "CREATE TABLE workbench_schema_migrations ("
+        "name VARCHAR(200) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO workbench_schema_migrations VALUES "
+        "('task7_trusted_grounding_v2','2026-08-17')"
+    )
+    connection.commit()
+    return connection
+
+
+@pytest.mark.anyio
+async def test_migration_marker_rejects_default_that_only_contains_empty_array_text(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "evil-default"
+    runtime.mkdir()
+    database_path = runtime / "db.sqlite3"
+    _create_f0_schema(database_path)
+    connection = _add_scope_column_and_marker(
+        database_path, default_sql="(( 'evil[]' ))"
+    )
+    connection.close()
+
+    app = create_app(Settings(runtime_dir=runtime, database_path=database_path))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        health = await client.get("/api/v1/health")
+        analyses = await client.get("/api/v1/analyses")
+
+    assert app.state.database is None
+    assert health.json()["checks"]["database"]["healthy"] is False
+    assert analyses.status_code == 503
+
+
+def test_migration_marker_accepts_parenthesized_exact_empty_array_literal(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "parenthesized-default"
+    runtime.mkdir()
+    database_path = runtime / "db.sqlite3"
+    _create_f0_schema(database_path)
+    connection = _add_scope_column_and_marker(
+        database_path, default_sql="((( '[]' )))"
+    )
+    connection.close()
+
+    database = Database(database_path)
+
+    with database.session() as session:
+        assert session.execute(
+            __import__("sqlalchemy").text("SELECT COUNT(*) FROM analyses")
+        ).scalar_one() == 2
+    database.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_scope",
+    [
+        "not-json",
+        json.dumps({"account": "account-a"}),
+        json.dumps([""]),
+        json.dumps(["   "]),
+        json.dumps(["account-a", "account-a"]),
+        json.dumps(["x" * 501]),
+    ],
+    ids=[
+        "malformed-json",
+        "not-a-list",
+        "empty-item",
+        "blank-item",
+        "duplicate-item",
+        "oversized-item",
+    ],
+)
+@pytest.mark.anyio
+async def test_migration_marker_rejects_invalid_persisted_account_scope_immediately(
+    tmp_path: Path, invalid_scope: str
+) -> None:
+    runtime = tmp_path / "invalid-scope"
+    runtime.mkdir()
+    database_path = runtime / "db.sqlite3"
+    _create_f0_schema(database_path)
+    connection = _add_scope_column_and_marker(database_path)
+    connection.execute(
+        "UPDATE analyses SET account_user_ids_json=? WHERE id='old-success'",
+        (invalid_scope,),
+    )
+    connection.commit()
+    connection.close()
+
+    app = create_app(Settings(runtime_dir=runtime, database_path=database_path))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        health = await client.get("/api/v1/health")
+        analyses = await client.get("/api/v1/analyses")
+
+    assert app.state.database is None
+    assert health.json()["checks"]["database"]["healthy"] is False
+    assert analyses.status_code == 503
+
+
+def test_half_applied_scope_column_is_backfilled_and_quarantined_on_restart(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "half-applied"
+    runtime.mkdir()
+    database_path = runtime / "db.sqlite3"
+    _create_f0_schema(database_path)
+    connection = sqlite3.connect(database_path)
+    # Simulate an interrupted prior startup where ALTER survived but its DML and
+    # migration marker did not.
+    connection.execute(
+        "ALTER TABLE analyses ADD COLUMN account_user_ids_json JSON "
+        "NOT NULL DEFAULT '[]'"
+    )
+    connection.execute(
+        "UPDATE analyses SET analysis_type='product_cluster' "
+        "WHERE id='old-success'"
+    )
+    connection.commit()
+    connection.close()
+
+    first_recovery = Database(database_path)
+    first_recovery.close()
+    second_recovery = Database(database_path)
+    second_recovery.close()
+
+    connection = sqlite3.connect(database_path)
+    rows = {
+        row[0]: row[1:]
+        for row in connection.execute(
+            "SELECT id,status,account_user_ids_json,output_json,error_category "
+            "FROM analyses ORDER BY id"
+        )
+    }
+    opportunity_count = connection.execute(
+        "SELECT COUNT(*) FROM opportunities"
+    ).fetchone()[0]
+    marker_count = connection.execute(
+        "SELECT COUNT(*) FROM workbench_schema_migrations "
+        "WHERE name='task7_trusted_grounding_v2'"
+    ).fetchone()[0]
+    connection.close()
+
+    assert rows["old-success"] == (
+        "needs_human",
+        json.dumps(["account-a"]),
+        None,
+        "grounding_reverification_required",
+    )
+    assert rows["old-failed"][0] == "failed"
+    assert json.loads(rows["old-failed"][1]) == []
+    assert opportunity_count == 0
+    assert marker_count == 1

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -99,54 +100,57 @@ class Database:
             )
             if already_applied:
                 self._validate_analysis_scope_schema(columns)
+                self._validate_analysis_scope_data(connection)
                 return
-            added_scope_column = "account_user_ids_json" not in columns
-            if added_scope_column:
+            if "account_user_ids_json" not in columns:
                 connection.execute(
                     text(
                         "ALTER TABLE analyses ADD COLUMN account_user_ids_json JSON "
                         "NOT NULL DEFAULT '[]'"
                     )
                 )
+            columns = {
+                column["name"]: column
+                for column in inspect(connection).get_columns("analyses")
+            }
+            self._validate_analysis_scope_schema(columns)
             rows = connection.execute(
                 text("SELECT id, analysis_type, account_user_id, status FROM analyses")
             ).mappings()
-            succeeded_ids: list[str] = []
             for row in rows:
+                account_user_id = row["account_user_id"]
                 account_ids = (
-                    [row["account_user_id"]]
+                    [account_user_id.strip()]
                     if row["analysis_type"] != "account_report"
-                    and isinstance(row["account_user_id"], str)
-                    and row["account_user_id"].strip()
+                    and isinstance(account_user_id, str)
+                    and account_user_id.strip()
                     else []
-                )
-                if added_scope_column:
-                    connection.execute(
-                        text(
-                            "UPDATE analyses SET account_user_ids_json=:account_ids "
-                            "WHERE id=:analysis_id"
-                        ),
-                        {
-                            "account_ids": json.dumps(account_ids, ensure_ascii=False),
-                            "analysis_id": row["id"],
-                        },
-                    )
-                if row["status"] == "succeeded":
-                    succeeded_ids.append(row["id"])
-            for analysis_id in succeeded_ids:
-                connection.execute(
-                    text("DELETE FROM opportunities WHERE analysis_id=:analysis_id"),
-                    {"analysis_id": analysis_id},
                 )
                 connection.execute(
                     text(
-                        "UPDATE analyses SET status='needs_human', output_json=NULL, "
-                        "error_category='grounding_reverification_required', "
-                        "error_detail='Legacy success requires trusted evidence re-verification.' "
+                        "UPDATE analyses SET account_user_ids_json=:account_ids "
                         "WHERE id=:analysis_id"
                     ),
-                    {"analysis_id": analysis_id},
+                    {
+                        "account_ids": json.dumps(account_ids, ensure_ascii=False),
+                        "analysis_id": row["id"],
+                    },
                 )
+            connection.execute(
+                text(
+                    "DELETE FROM opportunities WHERE analysis_id IN "
+                    "(SELECT id FROM analyses WHERE status='succeeded')"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE analyses SET status='needs_human', output_json=NULL, "
+                    "error_category='grounding_reverification_required', "
+                    "error_detail='Legacy success requires trusted evidence re-verification.' "
+                    "WHERE status='succeeded'"
+                )
+            )
+            self._validate_analysis_scope_data(connection)
             connection.execute(
                 text(
                     "INSERT INTO workbench_schema_migrations (name, applied_at) "
@@ -158,9 +162,13 @@ class Database:
             for column in inspect(self.engine).get_columns("analyses")
         }
         self._validate_analysis_scope_schema(refreshed)
+        with self.engine.connect() as connection:
+            self._validate_analysis_scope_data(connection)
 
     @staticmethod
-    def _validate_analysis_scope_schema(columns: dict[str, object]) -> None:
+    def _validate_analysis_scope_schema(
+        columns: dict[str, dict[str, object]],
+    ) -> None:
         required_columns = {
             "id",
             "analysis_type",
@@ -185,11 +193,40 @@ class Database:
         account_scope = columns.get("account_user_ids_json")
         if (
             account_scope is None
-            or account_scope.get("nullable") is not False  # type: ignore[union-attr]
-            or "[]" not in str(account_scope.get("default") or "")  # type: ignore[union-attr]
-            or "JSON" not in str(account_scope.get("type") or "").upper()  # type: ignore[union-attr]
+            or account_scope.get("nullable") is not False
+            or not _is_exact_empty_json_array_default(
+                account_scope.get("default")
+            )
+            or "JSON" not in str(account_scope.get("type") or "").upper()
         ):
             raise SchemaMigrationError("analyses.account_user_ids_json schema is invalid")
+
+    @staticmethod
+    def _validate_analysis_scope_data(connection: Connection) -> None:
+        rows = connection.execute(
+            text("SELECT id, account_user_ids_json FROM analyses")
+        ).mappings()
+        for row in rows:
+            raw_scope = row["account_user_ids_json"]
+            try:
+                scope = json.loads(raw_scope) if isinstance(raw_scope, str) else None
+            except (json.JSONDecodeError, RecursionError):
+                scope = None
+            if (
+                not isinstance(scope, list)
+                or len(scope) > 500
+                or any(
+                    not isinstance(account_user_id, str)
+                    or not account_user_id.strip()
+                    or len(account_user_id) > 500
+                    for account_user_id in scope
+                )
+                or len({account_user_id.strip() for account_user_id in scope})
+                != len(scope)
+            ):
+                raise SchemaMigrationError(
+                    f"Analysis {row['id']} has invalid account scope data"
+                )
 
     def session(self) -> Session:
         return self.sessions()
@@ -204,3 +241,12 @@ def _configure_sqlite(connection: object, _: object) -> None:
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
+
+
+def _is_exact_empty_json_array_default(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    expression = value.strip()
+    while expression.startswith("(") and expression.endswith(")"):
+        expression = expression[1:-1].strip()
+    return expression == "'[]'"

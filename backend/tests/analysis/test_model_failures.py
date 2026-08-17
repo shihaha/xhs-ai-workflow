@@ -3,6 +3,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from sqlalchemy import text
 
 from backend.app.adapters.bailian import (
     BailianAuthenticationError,
@@ -184,6 +185,35 @@ class _FailingProvider:
         raise self.error
 
 
+class _SuccessfulProvider:
+    configured = True
+    provider = "replacement_provider"
+    model = "replacement-model"
+
+    def __init__(self, raw_evidence: object) -> None:
+        self.raw_evidence = raw_evidence
+
+    def generate_structured(
+        self, request: StructuredModelRequest, schema: object
+    ) -> ModelResult:
+        return ModelResult.model_construct(
+            model=self.model,
+            output={
+                "claims": [
+                    {
+                        "claim": "persisted fact",
+                        "evidence_ids": list(request.evidence_ids),
+                    }
+                ],
+                "product_clusters": [],
+                "opportunities": [],
+            },
+            raw_evidence=self.raw_evidence,
+            usage={},
+            duration_ms=1,
+        )
+
+
 @pytest.mark.parametrize(
     ("error", "category"),
     [
@@ -352,6 +382,108 @@ async def test_shared_error_secret_never_reaches_api_or_database_response(
     assert response.status_code == 201
     assert secret not in response.text
     assert secret not in listing.text
+
+
+@pytest.mark.anyio
+async def test_success_attempt_metadata_is_projected_to_safe_bounded_fields(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "safe-success"
+    app = create_app(
+        Settings(
+            runtime_dir=runtime,
+            database_path=runtime / "db.sqlite3",
+            bailian_api_key="configured",
+        )
+    )
+    evidence_id = _rank_evidence(app.state.database)
+    secret = "Bearer success-secret-token"
+    safe_attempt = {
+        "attempt": 1,
+        "category": "network",
+        "authorization": secret,
+        "headers": {"Authorization": secret},
+        "body": {"token": secret},
+    }
+    adapter = _SuccessfulProvider(
+        {
+            "attempts": [safe_attempt] * 25
+            + [
+                {"attempt": -1, "category": "network", "token": secret},
+                {"attempt": 2, "category": secret, "token": secret},
+            ],
+            "headers": {"Authorization": secret},
+        }
+    )
+    app.state.bailian_adapter = adapter
+    app.state.analysis_service.model_adapter = adapter
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v1/analyses",
+            json={
+                "analysis_type": "account_report",
+                "account_user_id": "account-a",
+                "evidence_ids": [evidence_id],
+            },
+        )
+        listing = await client.get("/api/v1/analyses")
+        fetched = await client.get(f"/api/v1/analyses/{response.json()['id']}")
+
+    expected_attempts = [{"attempt": 1, "category": "network"}] * 20
+    assert response.status_code == 201
+    assert response.json()["attempts"] == expected_attempts
+    assert listing.json()[0]["attempts"] == expected_attempts
+    assert fetched.json()["attempts"] == expected_attempts
+    with app.state.database.session() as session:
+        persisted_attempts = session.scalar(
+            text("SELECT attempts_json FROM analyses WHERE id=:analysis_id"),
+            {"analysis_id": response.json()["id"]},
+        )
+    combined = response.text + listing.text + fetched.text + str(persisted_attempts)
+    assert secret not in combined
+
+
+@pytest.mark.anyio
+async def test_success_with_non_mapping_raw_evidence_is_safe_and_persists_no_attempts(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "non-mapping-success"
+    app = create_app(
+        Settings(
+            runtime_dir=runtime,
+            database_path=runtime / "db.sqlite3",
+            bailian_api_key="configured",
+        )
+    )
+    evidence_id = _rank_evidence(app.state.database)
+    secret = "Bearer malformed-success-secret"
+    adapter = _SuccessfulProvider(secret)
+    app.state.bailian_adapter = adapter
+    app.state.analysis_service.model_adapter = adapter
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/analyses",
+            json={
+                "analysis_type": "account_report",
+                "account_user_id": "account-a",
+                "evidence_ids": [evidence_id],
+            },
+        )
+        listing = await client.get("/api/v1/analyses")
+
+    assert response.status_code == 201
+    assert response.json()["attempts"] == []
+    assert listing.json()[0]["attempts"] == []
+    with app.state.database.session() as session:
+        persisted_attempts = session.scalar(text("SELECT attempts_json FROM analyses"))
+    assert secret not in response.text + listing.text + str(persisted_attempts)
 
 
 @pytest.fixture

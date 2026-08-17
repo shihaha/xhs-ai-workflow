@@ -712,6 +712,7 @@ def test_atomic_finalization_cannot_be_overwritten_by_a_stale_cancellation(
     assert durable.state is JobState.succeeded
     assert durable.progress_current == 1
     assert len(durable.artifacts) == 1
+    assert durable.artifacts[0].producer == "android_shop_worker_v1"
     assert durable.artifacts[0].path == final_relative.as_posix()
     assert (runtime_dir / final_relative).is_file()
     assert not (runtime_dir / temp_relative).exists()

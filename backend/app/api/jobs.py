@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 from fastapi import APIRouter, HTTPException, Request, status
 
+from backend.app.models.jobs import JobState
 from backend.app.schemas.jobs import (
     JobArtifactCreate,
     JobArtifactRead,
@@ -61,11 +62,30 @@ def get_job(job_id: str, request: Request) -> JobRead:
 
 @router.post("/{job_id}/claim", response_model=JobRead)
 def claim_job(job_id: str, request: Request) -> JobRead:
+    _reject_reserved_worker_job(job_id, request)
     return _job_read_or_409(lambda: _service(request).claim(job_id))
 
 
 @router.post("/{job_id}/transition", response_model=JobRead)
 def transition_job(job_id: str, payload: JobTransition, request: Request) -> JobRead:
+    job = _get_job_or_404(job_id, request)
+    if job.type in _RESERVED_JOB_TYPES:
+        if (
+            payload.state is not JobState.cancelled
+            or payload.model_fields_set != {"state"}
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Reserved worker jobs only allow server-controlled cancellation.",
+            )
+        return _job_read_or_409(
+            lambda: _service(request).transition(
+                job_id,
+                JobState.cancelled,
+                current_stage="operator_cancelled",
+                error_category="operator_cancelled",
+            )
+        )
     return _job_read_or_409(
         lambda: _service(request).transition(
             job_id,
@@ -82,6 +102,7 @@ def transition_job(job_id: str, payload: JobTransition, request: Request) -> Job
     "/{job_id}/logs", response_model=JobLogRead, status_code=status.HTTP_201_CREATED
 )
 def append_log(job_id: str, payload: JobLogCreate, request: Request) -> JobLogRead:
+    _reject_reserved_worker_job(job_id, request)
     try:
         log = _service(request).append_log(
             job_id, level=payload.level, message=payload.message
@@ -101,6 +122,7 @@ def attach_artifact(
 ) -> JobArtifactRead:
     if payload.kind in _RESERVED_ARTIFACT_KINDS:
         raise HTTPException(status_code=422, detail="Reserved worker artifact kind.")
+    _reject_reserved_worker_job(job_id, request)
     try:
         artifact = _service(request).attach_artifact(
             job_id, kind=payload.kind, path=payload.path, metadata=payload.metadata
@@ -122,6 +144,18 @@ def _job_read_or_404(action: Callable[[], Job]) -> JobRead:
         return _job_read(action())
     except JobNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+def _get_job_or_404(job_id: str, request: Request) -> Job:
+    try:
+        return _service(request).get(job_id)
+    except JobNotFound as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+def _reject_reserved_worker_job(job_id: str, request: Request) -> None:
+    if _get_job_or_404(job_id, request).type in _RESERVED_JOB_TYPES:
+        raise HTTPException(status_code=422, detail="Reserved worker job is read-only.")
 
 
 def _job_read_or_409(action: Callable[[], Job]) -> JobRead:
