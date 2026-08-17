@@ -457,3 +457,63 @@ Compilation and diff checks exited 0; Git emitted only Windows LF/CRLF notices.
 Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android remains
 `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8 remains
 blocked pending redesign Tasks 2—5 and independent clean review.
+
+## Approved quarantine redesign — Task 2
+
+The cleanup service was implemented test-first. The first focused run was the
+expected RED because `backend.app.features.content.cleanup` did not exist:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py -q
+ModuleNotFoundError: No module named 'backend.app.features.content.cleanup'
+```
+
+Three additional ownership tests were observed RED (`3 failed, 19 passed`): an
+original path could reappear during the grace period, an owner UUID could be reused
+at another material path, and a second cleanup could reference the same hardlinked
+file. A final delete-handle race was independently observed RED (`1 failed`): a
+reference inserted after the delete handle opened did not yet cancel deletion.
+
+Implemented in this task:
+
+- Added frozen `ArtifactCleanupCandidate` and `ArtifactCleanupService` with strict,
+  idempotent enqueue; ordered SQLite CAS claims; five-minute durable leases;
+  expired-lease recovery; one-batch execution; and strict list/get projections.
+- Added a fail-closed `trusted` / `ambiguous` / `missing` artifact inspection helper.
+  Canonical containment, every parent link/junction, regular-file type, size, SHA-256
+  and physical identity are verified without holding a SQLite write transaction.
+- Pending files are atomically renamed on the same volume to
+  `artifacts-quarantine/{gc_id}/{original_name}`. Lease, reference and file identity
+  are checked before and after the move; ambiguous move/commit outcomes retain the
+  quarantine bytes and become `needs_human`.
+- Quarantined files receive an exact 24-hour grace deadline. Final deletion rechecks
+  the original path, owner and all material/package/cleanup references, including
+  Windows-equivalent paths and hardlinks. The opened Windows deletion handle must
+  still match the expected identity and performs one last database authorization;
+  a late reference cancels deletion.
+- Missing files are recorded `deleted/already_missing` only after proving there is
+  no live reference. Links, junctions, owner mismatch, file replacement, original
+  path reappearance, database ambiguity and failed deletion remain visible as
+  `needs_human` without deleting bytes.
+
+Final Task-2 verification:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py backend/tests/content/test_round3_hardening.py backend/tests/content/test_round5_hardening.py -q
+55 passed in 4.69s
+
+python -m pytest backend/tests/content -q
+149 passed in 13.61s
+
+python -m pytest backend/tests -q
+462 passed, 1 skipped in 33.43s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only Windows LF/CRLF notices.
+Bailian remains
+`not_run: BAILIAN_API_KEY unavailable`, Android remains
+`not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8 remains
+blocked until redesign Tasks 3—5 and an independent clean review finish.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from hashlib import sha256
 import io
 import json
@@ -10,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import zipfile
 import unicodedata
+from typing import Callable, Literal
 
 
 MAX_MATERIAL_BYTES = 50 * 1024 * 1024
@@ -21,6 +23,66 @@ class UnsafeContentPath(ValueError):
 
 
 ArtifactReference = tuple[str, tuple[int, int] | None]
+
+
+@dataclass(frozen=True)
+class ArtifactPathInspection:
+    """Fail-closed description of one runtime-relative artifact path."""
+
+    status: Literal["trusted", "ambiguous", "missing"]
+    absolute_key: str | None = None
+    path: Path | None = None
+    identity: tuple[int, int, int, int] | None = None
+    size_bytes: int | None = None
+
+
+def inspect_contained_artifact(root: Path, relative: str) -> ArtifactPathInspection:
+    """Inspect without following links and distinguish absence from ambiguity."""
+
+    posix = PurePosixPath(relative)
+    if (
+        posix.is_absolute() or not posix.parts
+        or any(part in {"", ".", ".."} or ":" in part or "\\" in part for part in posix.parts)
+    ):
+        return ArtifactPathInspection("ambiguous")
+    try:
+        resolved_root = root.resolve(strict=True)
+        candidate = root.joinpath(*posix.parts)
+        current = root
+        for index, part in enumerate(posix.parts):
+            current = current / part
+            if current.is_symlink() or (
+                hasattr(current, "is_junction") and current.is_junction()
+            ):
+                return ArtifactPathInspection("ambiguous")
+            try:
+                metadata = current.stat()
+            except FileNotFoundError:
+                if index < len(posix.parts) - 1:
+                    return ArtifactPathInspection("missing")
+                resolved = candidate.resolve(strict=False)
+                resolved.relative_to(resolved_root)
+                return ArtifactPathInspection(
+                    "missing",
+                    absolute_key=unicodedata.normalize("NFC", str(resolved)).casefold(),
+                    path=candidate,
+                )
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(resolved_root)
+        metadata = candidate.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            return ArtifactPathInspection("ambiguous")
+        return ArtifactPathInspection(
+            "trusted",
+            absolute_key=unicodedata.normalize("NFC", str(resolved)).casefold(),
+            path=candidate,
+            identity=_identity(metadata),
+            size_bytes=metadata.st_size,
+        )
+    except FileNotFoundError:
+        return ArtifactPathInspection("missing")
+    except (OSError, ValueError, TypeError):
+        return ArtifactPathInspection("ambiguous")
 
 
 def windows_artifact_reference(root: Path, relative: str) -> ArtifactReference | None:
@@ -168,7 +230,14 @@ def write_contained_atomic(root: Path, relative: str, payload: bytes) -> None:
             os.close(descriptor)
 
 
-def remove_contained_regular(root: Path, relative: str, *, limit: int = MAX_PACKAGE_BYTES) -> bool:
+def remove_contained_regular(
+    root: Path,
+    relative: str,
+    *,
+    limit: int = MAX_PACKAGE_BYTES,
+    expected_identity: tuple[int, int, int, int] | None = None,
+    authorize_delete: Callable[[], bool] | None = None,
+) -> bool:
     """Delete only the already-opened Windows file, never a later path target.
 
     On platforms without handle-bound deletion support the conservative result is
@@ -203,8 +272,15 @@ def remove_contained_regular(root: Path, relative: str, *, limit: int = MAX_PACK
             or _identity(opened) != _identity(before)
             or _identity(after) != _identity(opened)
             or resolved_after != resolved_before
+            or (expected_identity is not None and _identity(opened) != expected_identity)
         ):
             return False
+        if authorize_delete is not None:
+            try:
+                if not authorize_delete():
+                    return False
+            except Exception:
+                return False
         return _delete_open_file(descriptor)
     except (UnsafeContentPath, OSError, ValueError, TypeError):
         return False
