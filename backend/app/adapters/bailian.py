@@ -10,41 +10,48 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from backend.app.adapters.contracts import ModelResult, StructuredModelRequest
+from backend.app.adapters.contracts import (
+    ModelAdapterError,
+    ModelResult,
+    StructuredModelRequest,
+)
 
 
 DEFAULT_BAILIAN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_BAILIAN_TEXT_MODEL = "deepseek-v4-flash"
 
 
-class BailianError(RuntimeError):
+class BailianError(ModelAdapterError):
+    category = "model_request_failed"
+
     def __init__(self, message: str, *, attempts: list[dict[str, Any]] | None = None) -> None:
-        super().__init__(message)
-        self.attempts = attempts or []
+        super().__init__(message, category=self.category, attempts=attempts)
 
 
 class BailianNotConfigured(BailianError):
-    pass
+    category = "model_unconfigured"
 
 
 class BailianAuthenticationError(BailianError):
-    pass
+    category = "model_authentication_failed"
 
 
 class BailianRetryExhausted(BailianError):
-    pass
+    category = "model_retry_exhausted"
 
 
 class BailianRequestFailed(BailianError):
-    pass
+    category = "model_request_failed"
 
 
 class ModelOutputInvalid(BailianError):
-    pass
+    category = "model_output_invalid"
 
 
 class BailianModelAdapter:
     """Call one configured text model without persisting or exposing credentials."""
+
+    provider = "alibaba_bailian"
 
     def __init__(
         self,

@@ -11,6 +11,11 @@ from backend.app.adapters.bailian import (
     BailianRetryExhausted,
 )
 from backend.app.adapters.contracts import StructuredModelRequest
+from backend.app.adapters.contracts import ModelAdapterError, ModelResult
+from backend.app.db import Database
+from backend.app.features.analysis.schemas import AnalysisCreate
+from backend.app.features.analysis.service import AnalysisService
+from backend.app.features.radar.models import RankItemRecord, RankSnapshotRecord
 from backend.app.features.analysis.schemas import AnalysisOutput
 from backend.app.main import create_app
 from backend.app.settings import Settings
@@ -141,6 +146,108 @@ def test_absurd_usage_integer_is_a_structured_failure_not_overflow() -> None:
 
     with pytest.raises(ModelOutputInvalid):
         adapter.generate_structured(_request(), AnalysisOutput)
+
+
+def _rank_evidence(database: Database) -> str:
+    with database.session() as session:
+        snapshot = RankSnapshotRecord(
+            source_date="2026-08-17",
+            collected_at="2026-08-17T12:00:00",
+            board="成交榜",
+            dimension="优秀账号",
+            source_url="https://example.com/rank",
+            raw_evidence={"source": "test"},
+            submitted_count=1,
+        )
+        item = RankItemRecord(
+            stable_key="note:n1",
+            rank_no=1,
+            user_id="account-a",
+            source_url="https://example.com/n1",
+            raw_evidence={"source": "test"},
+        )
+        snapshot.items.append(item)
+        session.add(snapshot)
+        session.commit()
+        return f"rank-item:{item.id}"
+
+
+class _FailingProvider:
+    configured = True
+    provider = "replacement_provider"
+    model = "replacement-model"
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def generate_structured(self, request: object, schema: object) -> ModelResult:
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ("error", "category"),
+    [
+        (TimeoutError("secret timeout detail"), "model_timeout"),
+        (
+            ModelAdapterError(
+                "safe transport failure",
+                category="model_transport_failed",
+                attempts=[{"attempt": 1, "category": "network"}],
+            ),
+            "model_transport_failed",
+        ),
+    ],
+)
+def test_provider_neutral_failures_persist_safe_facts(
+    tmp_path: Path, error: Exception, category: str
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _rank_evidence(database)
+    adapter = _FailingProvider(error)
+    service = AnalysisService(database, adapter, runtime_dir=tmp_path)
+
+    result = service.create(
+        AnalysisCreate(
+            analysis_type="account_report",
+            account_user_id="account-a",
+            evidence_ids=[evidence_id],
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.provider == "replacement_provider"
+    assert result.model == "replacement-model"
+    assert result.error_category == category
+    assert "secret" not in (result.error_detail or "")
+    database.close()
+
+
+@pytest.mark.anyio
+async def test_protocol_adapter_reporting_unconfigured_returns_503(tmp_path: Path) -> None:
+    class Unconfigured:
+        configured = False
+        provider = "replacement_provider"
+        model = "replacement-model"
+
+    runtime = tmp_path / "runtime-unconfigured"
+    app = create_app(
+        Settings(runtime_dir=runtime, database_path=runtime / "db.sqlite3", bailian_api_key="x")
+    )
+    adapter = Unconfigured()
+    app.state.bailian_adapter = adapter
+    app.state.analysis_service.model_adapter = adapter
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v1/analyses",
+            json={
+                "analysis_type": "account_report",
+                "account_user_id": "account-a",
+                "evidence_ids": ["artifact:1"],
+            },
+        )
+    assert response.status_code == 503
 
 
 @pytest.fixture

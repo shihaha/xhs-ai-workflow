@@ -1,8 +1,9 @@
 """SQLite database lifecycle for durable local workbench facts."""
 
+import json
 from pathlib import Path
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -44,6 +45,79 @@ class Database:
             RankSnapshotRecord,
         )
         Base.metadata.create_all(self.engine)
+        self._migrate_analysis_scope()
+
+    def _migrate_analysis_scope(self) -> None:
+        """Upgrade the pre-scope Task 7 schema and quarantine its success claims."""
+        columns = {column["name"] for column in inspect(self.engine).get_columns("analyses")}
+        with self.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS workbench_schema_migrations ("
+                    "name VARCHAR(200) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL)"
+                )
+            )
+            already_applied = connection.scalar(
+                text(
+                    "SELECT 1 FROM workbench_schema_migrations "
+                    "WHERE name='task7_trusted_grounding_v2'"
+                )
+            )
+            if already_applied:
+                return
+            added_scope_column = "account_user_ids_json" not in columns
+            if added_scope_column:
+                connection.execute(
+                    text(
+                        "ALTER TABLE analyses ADD COLUMN account_user_ids_json JSON "
+                        "NOT NULL DEFAULT '[]'"
+                    )
+                )
+            rows = connection.execute(
+                text("SELECT id, analysis_type, account_user_id, status FROM analyses")
+            ).mappings()
+            succeeded_ids: list[str] = []
+            for row in rows:
+                account_ids = (
+                    [row["account_user_id"]]
+                    if row["analysis_type"] != "account_report"
+                    and isinstance(row["account_user_id"], str)
+                    and row["account_user_id"].strip()
+                    else []
+                )
+                if added_scope_column:
+                    connection.execute(
+                        text(
+                            "UPDATE analyses SET account_user_ids_json=:account_ids "
+                            "WHERE id=:analysis_id"
+                        ),
+                        {
+                            "account_ids": json.dumps(account_ids, ensure_ascii=False),
+                            "analysis_id": row["id"],
+                        },
+                    )
+                if row["status"] == "succeeded":
+                    succeeded_ids.append(row["id"])
+            for analysis_id in succeeded_ids:
+                connection.execute(
+                    text("DELETE FROM opportunities WHERE analysis_id=:analysis_id"),
+                    {"analysis_id": analysis_id},
+                )
+                connection.execute(
+                    text(
+                        "UPDATE analyses SET status='needs_human', output_json=NULL, "
+                        "error_category='grounding_reverification_required', "
+                        "error_detail='Legacy success requires trusted evidence re-verification.' "
+                        "WHERE id=:analysis_id"
+                    ),
+                    {"analysis_id": analysis_id},
+                )
+            connection.execute(
+                text(
+                    "INSERT INTO workbench_schema_migrations (name, applied_at) "
+                    "VALUES ('task7_trusted_grounding_v2', CURRENT_TIMESTAMP)"
+                )
+            )
 
     def session(self) -> Session:
         return self.sessions()

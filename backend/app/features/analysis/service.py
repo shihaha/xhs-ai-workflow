@@ -13,8 +13,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from backend.app.adapters.bailian import BailianError
-from backend.app.adapters.contracts import StructuredModelRequest
+from backend.app.adapters.contracts import ModelAdapterError, StructuredModelRequest
 from backend.app.db import Database
 from backend.app.features.analysis.models import AnalysisRecord, OpportunityRecord
 from backend.app.features.analysis.schemas import (
@@ -31,6 +30,7 @@ from backend.app.models.jobs import JobState
 
 
 PROMPT_VERSION = "tutorial-demand-radar-grounded-v1"
+MAX_TRUSTED_RESULT_BYTES = 5 * 1024 * 1024
 
 
 class EvidenceNotFound(ValueError):
@@ -100,14 +100,22 @@ class AnalysisService:
             _validate_grounding(output, allowed=set(payload.evidence_ids))
             if output.opportunities and not eligible:
                 raise ValueError("Opportunity output requires complete deep verification.")
-        except BailianError as error:
+        except ModelAdapterError as error:
             return self._persist_failure(
                 payload,
                 digest=digest,
                 status="failed",
-                error_category=_model_error_category(error),
-                error_detail=str(error),
+                error_category=error.category,
+                error_detail="Model adapter reported a safe failure.",
                 attempts=error.attempts,
+            )
+        except TimeoutError:
+            return self._persist_failure(
+                payload,
+                digest=digest,
+                status="failed",
+                error_category="model_timeout",
+                error_detail="Model adapter timed out.",
             )
         except (ValidationError, ValueError) as error:
             return self._persist_failure(
@@ -125,8 +133,8 @@ class AnalysisService:
             account_user_ids_json=list(payload.account_user_ids),
             status="succeeded",
             prompt_version=PROMPT_VERSION,
-            provider="alibaba_bailian",
-            model=model_result.model,
+            provider=self.model_adapter.provider,
+            model=self.model_adapter.model,
             input_digest=digest,
             evidence_ids_json=list(payload.evidence_ids),
             output_json=output.model_dump(mode="json"),
@@ -246,8 +254,8 @@ class AnalysisService:
             account_user_ids_json=list(payload.account_user_ids),
             status=status,
             prompt_version=PROMPT_VERSION,
-            provider="alibaba_bailian",
-            model=getattr(self.model_adapter, "model", "unavailable"),
+            provider=self.model_adapter.provider,
+            model=self.model_adapter.model,
             input_digest=digest,
             evidence_ids_json=list(payload.evidence_ids),
             output_json=None,
@@ -350,12 +358,24 @@ class AnalysisService:
         if result_path is None:
             return None
         try:
-            file_result = json.loads(result_path.read_text(encoding="utf-8"))
+            with result_path.open("rb") as result_stream:
+                raw_result = result_stream.read(MAX_TRUSTED_RESULT_BYTES + 1)
+            if len(raw_result) > MAX_TRUSTED_RESULT_BYTES:
+                return None
+            file_result = json.loads(raw_result.decode("utf-8", errors="strict"))
             metadata_result = artifact.metadata_json.get("result")
             if not isinstance(file_result, dict) or file_result != metadata_result:
                 return None
             parsed = ShopCollectionRead.model_validate(file_result)
-        except (OSError, json.JSONDecodeError, ValidationError):
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            TypeError,
+            AttributeError,
+            ValidationError,
+        ):
             return None
         job_account = job.input_data.get("account_user_id")
         expected_count = job.input_data.get("expected_count")
@@ -405,6 +425,28 @@ def _eligible_for_opportunity(
         )
         if any(isinstance(value, bool) or not isinstance(value, int) for value in counts):
             return False
+        all_counters = (
+            result.get("expected_count"),
+            result.get("discovered_count"),
+            result.get("collected_count"),
+            result.get("raw_observation_count"),
+            result.get("duplicate_observation_count"),
+            result.get("succeeded_count"),
+            result.get("missing_count"),
+            result.get("collection_missing_count"),
+            result.get("rejected_count"),
+            result.get("overflow_count"),
+            verification.get("expected_count"),
+            verification.get("discovered_count"),
+            verification.get("succeeded_count"),
+            verification.get("missing_count"),
+            verification.get("overflow_count"),
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in all_counters
+        ):
+            return False
         if (
             len(set(counts)) != 1
             or counts[0] <= 0
@@ -425,15 +467,24 @@ def _eligible_for_opportunity(
         if (
             not isinstance(rejected_items, list)
             or rejected_count != len(rejected_items)
-            or any(
-                not isinstance(item, dict)
-                or item.get("reason") != "duplicate_source_url"
-                for item in rejected_items
-            )
+        ):
+            return False
+        duplicate_rows = sum(
+            isinstance(item, dict) and item.get("reason") == "duplicate_source_url"
+            for item in rejected_items
+        )
+        if (
+            duplicate_rows != result.get("duplicate_observation_count")
+            or duplicate_rows != rejected_count
+            or result.get("raw_observation_count")
+            != result.get("collected_count") + rejected_count
         ):
             return False
         items = result.get("items")
         if not isinstance(items, list) or len(items) != counts[0]:
+            return False
+        item_ids = [item.get("id") for item in items if isinstance(item, dict)]
+        if len(item_ids) != counts[0] or len(set(item_ids)) != counts[0]:
             return False
         urls = [item.get("source_url") for item in items if isinstance(item, dict)]
         if len(urls) != counts[0] or len(set(urls)) != counts[0]:
@@ -486,17 +537,6 @@ def _system_prompt() -> str:
         "persisted facts. Opportunity status must be one of 观察中/升温/已验证/降温/放弃. "
         "Provide evidence and a next_action; do not make the operator's final business decision."
     )
-
-
-def _model_error_category(error: BailianError) -> str:
-    name = type(error).__name__
-    mapping = {
-        "BailianAuthenticationError": "model_authentication_failed",
-        "BailianRetryExhausted": "model_retry_exhausted",
-        "ModelOutputInvalid": "model_output_invalid",
-        "BailianNotConfigured": "model_unconfigured",
-    }
-    return mapping.get(name, "model_request_failed")
 
 
 def _load_analysis(session: Any, analysis_id: str) -> AnalysisRecord:

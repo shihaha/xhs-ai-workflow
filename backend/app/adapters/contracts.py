@@ -174,6 +174,21 @@ class ModelResult(BaseModel):
     duration_ms: int | None = Field(default=None, ge=0)
 
 
+class ModelAdapterError(RuntimeError):
+    """Provider-neutral, persistence-safe model failure fact."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        attempts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.attempts = attempts or []
+
+
 class StructuredModelRequest(BaseModel):
     """Provider-neutral structured generation input with an explicit evidence scope."""
 
@@ -207,6 +222,10 @@ class DeviceAdapter(Protocol):
 
 class ModelAdapter(Protocol):
     """Protocol for a model provider adapter."""
+
+    configured: bool
+    provider: str
+    model: str
 
     def generate_structured(
         self, request: StructuredModelRequest, schema: type[BaseModel]

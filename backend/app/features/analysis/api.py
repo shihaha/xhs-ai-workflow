@@ -29,8 +29,8 @@ def _service(request: Request) -> AnalysisService:
 @router.post("/analyses", response_model=AnalysisRead, status_code=status.HTTP_201_CREATED)
 def create_analysis(payload: AnalysisCreate, request: Request) -> AnalysisRead:
     adapter = request.app.state.bailian_adapter
-    if adapter is None or not adapter.configured:
-        raise HTTPException(status_code=503, detail="Bailian is not configured.")
+    if adapter is None or getattr(adapter, "configured", False) is not True:
+        raise HTTPException(status_code=503, detail="Model provider is not configured.")
     try:
         return _service(request).create(payload)
     except (EvidenceNotFound, EvidenceAccountMismatch) as error:

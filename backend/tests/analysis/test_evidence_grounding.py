@@ -17,6 +17,9 @@ from backend.app.settings import Settings
 
 
 class StubModel:
+    provider = "stub_provider"
+    model = "deepseek-test"
+
     def __init__(self, output: dict[str, object]) -> None:
         self.output = output
         self.calls = 0
@@ -28,7 +31,7 @@ class StubModel:
     def generate_structured(self, request: object, schema: object) -> ModelResult:
         self.calls += 1
         return ModelResult(
-            model="deepseek-test",
+            model=self.model,
             output=self.output,
             raw_evidence={"provider_request_id": "req-1"},
             usage={"total_tokens": 10},
@@ -487,3 +490,106 @@ async def test_public_jobs_api_forgery_is_never_opportunity_eligible(
     assert analysis.status_code == 201
     assert analysis.json()["status"] == "needs_human"
     assert model.calls == 0
+
+
+def _replace_result(
+    database: Database,
+    runtime_dir: Path,
+    evidence_id: str,
+    result: dict[str, object],
+    *,
+    expected_count: int | None = None,
+) -> None:
+    with database.session() as session:
+        artifact = session.get(JobArtifactRecord, int(evidence_id.split(":")[1]))
+        assert artifact is not None
+        if expected_count is not None:
+            job_input = dict(artifact.job.input_data)
+            job_input["expected_count"] = expected_count
+            artifact.job.input_data = job_input
+            artifact.job.progress_current = expected_count
+            artifact.job.progress_total = expected_count
+        artifact.metadata_json = {"result": result}
+        path = artifact.path
+        session.commit()
+    target = runtime_dir / path
+    target.write_text(__import__("json").dumps(result, ensure_ascii=False), encoding="utf-8")
+
+
+@pytest.mark.parametrize("tamper", ["duplicate_item_id", "raw_conservation", "negative_counter"])
+def test_historical_shop_result_must_satisfy_full_collection_invariants(
+    tmp_path: Path, tamper: str
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    with database.session() as session:
+        artifact = session.get(JobArtifactRecord, int(evidence_id.split(":")[1]))
+        assert artifact is not None
+        result = deepcopy(artifact.metadata_json["result"])
+    expected = 1
+    if tamper == "duplicate_item_id":
+        expected = 2
+        second = deepcopy(result["items"][0])
+        second["source_url"] = "https://www.xiaohongshu.com/goods/p2"
+        result["items"].append(second)
+        for container in (result, result["verification"]):
+            container["expected_count"] = 2
+            container["discovered_count"] = 2
+            container["succeeded_count"] = 2
+        result["collected_count"] = 2
+        result["raw_observation_count"] = 2
+    elif tamper == "raw_conservation":
+        result["raw_observation_count"] = 99
+    else:
+        result["duplicate_observation_count"] = -1
+    _replace_result(database, tmp_path, evidence_id, result, expected_count=expected)
+    model = StubModel(_output(evidence_id, status="已验证"))
+
+    created = AnalysisService(database, model, runtime_dir=tmp_path).create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+
+    assert created.status == "needs_human"
+    assert model.calls == 0
+    database.close()
+
+
+@pytest.mark.parametrize("file_kind", ["invalid_utf8", "oversize"])
+def test_untrusted_result_file_is_bounded_and_never_crashes_discovery_or_create(
+    tmp_path: Path, file_kind: str
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    with database.session() as session:
+        artifact = session.get(JobArtifactRecord, int(evidence_id.split(":")[1]))
+        assert artifact is not None
+        target = tmp_path / artifact.path
+        result = deepcopy(artifact.metadata_json["result"])
+        if file_kind == "oversize":
+            result["padding"] = "x" * (5 * 1024 * 1024)
+            artifact.metadata_json = {"result": result}
+        session.commit()
+    if file_kind == "invalid_utf8":
+        target.write_bytes(b"\xff\xfe\x80")
+    else:
+        target.write_text(__import__("json").dumps(result), encoding="utf-8")
+    model = StubModel(_output(evidence_id))
+    service = AnalysisService(database, model, runtime_dir=tmp_path)
+
+    discovered = service.list_evidence(account_user_id="account-a")
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+
+    assert discovered[0].eligible_for_opportunity is False
+    assert created.status == "needs_human"
+    assert model.calls == 0
+    database.close()
