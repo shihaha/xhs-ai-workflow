@@ -825,6 +825,8 @@ class ArtifactCleanupService:
                     select(
                         ProductMaterialRecord.id,
                         ProductMaterialRecord.path,
+                        ProductMaterialRecord.sha256,
+                        ProductMaterialRecord.size_bytes,
                     )
                     .order_by(ProductMaterialRecord.id)
                 )
@@ -888,39 +890,59 @@ class ArtifactCleanupService:
             artifact.path is not None and artifact.path == quarantine_absolute
         )
 
-        references: list[tuple[str, str]] = []
-        for material_id, material_path in materials:
+        original_windows_key = windows_artifact_reference_path_key(record.relative_path)
+        references: list[tuple[str, str, str | None, int | None]] = []
+        for material_id, material_path, material_sha, material_size in materials:
             if record.owner_type == "material" and material_id == record.owner_id:
+                material_windows_key = windows_artifact_reference_path_key(material_path)
                 return "live_reference" if (
-                    canonical_artifact_path_key(material_path) == record.path_key
+                    material_windows_key is not None
+                    and material_windows_key == original_windows_key
+                    and material_sha == record.expected_sha256
+                    and material_size == record.expected_size_bytes
                 ) else "owner_identity_mismatch"
-            references.append(("material", material_path))
+            references.append(("material", material_path, material_sha, material_size))
         for package_id, package_path, package_status, package_sha, package_size in packages:
-            package_key = canonical_artifact_path_key(package_path)
+            package_windows_key = windows_artifact_reference_path_key(package_path)
             exact_failed_owner = (
                 record.owner_type == "content_package"
                 and package_id == record.owner_id
                 and package_status == "failed"
-                and package_key == record.path_key
+                and package_windows_key is not None
+                and package_windows_key == original_windows_key
                 and package_sha == record.expected_sha256
                 and package_size == record.expected_size_bytes
             )
             if exact_failed_owner:
                 continue
             if record.owner_type == "content_package" and package_id == record.owner_id:
-                return "owner_identity_mismatch"
-            references.append(("package", package_path))
+                if (
+                    quarantine_key is None
+                    or package_windows_key != quarantine_key
+                    or package_sha != record.expected_sha256
+                    or package_size != record.expected_size_bytes
+                ):
+                    return "owner_identity_mismatch"
+            references.append(("package", package_path, package_sha, package_size))
         for _, cleanup_path, cleanup_key, quarantine_path, _ in cleanups:
             if cleanup_key == record.path_key:
                 return "other_cleanup_reference"
-            references.append(("cleanup", cleanup_path))
+            references.append(("cleanup", cleanup_path, None, None))
             if quarantine_path is not None:
-                references.append(("cleanup", quarantine_path))
+                references.append(("cleanup", quarantine_path, None, None))
 
-        for _kind, relative_path in references:
+        for kind, relative_path, reference_sha, reference_size in references:
             reference_key = canonical_artifact_path_key(relative_path)
             windows_reference_key = windows_artifact_reference_path_key(relative_path)
             if quarantine_key is not None and windows_reference_key == quarantine_key:
+                if (
+                    kind != "cleanup"
+                    and (
+                        reference_sha != record.expected_sha256
+                        or reference_size != record.expected_size_bytes
+                    )
+                ):
+                    return "ambiguous_reference"
                 if artifact_is_quarantined:
                     return "live_reference"
                 # A reference may reserve the deterministic destination while this
@@ -930,7 +952,15 @@ class ArtifactCleanupService:
                 continue
             if reference_key is None:
                 return "ambiguous_reference"
-            if reference_key == record.path_key:
+            if windows_reference_key is not None and windows_reference_key == original_windows_key:
+                if (
+                    kind != "cleanup"
+                    and (
+                        reference_sha != record.expected_sha256
+                        or reference_size != record.expected_size_bytes
+                    )
+                ):
+                    return "ambiguous_reference"
                 return "live_reference"
             inspected = inspect_contained_artifact(self.runtime_dir, relative_path)
             if inspected.status == "ambiguous":

@@ -759,3 +759,66 @@ Compilation and diff checks exited 0; Git emitted only the repository's Windows
 LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
 remains `not_run: device unavailable`, and seven-day UAT remains `not_run`. Task 8
 remains blocked pending redesign Tasks 3—5 and independent review.
+
+## Approved quarantine redesign — Task 2 fix round 5/5
+
+The remaining Important reference-classification gap was reproduced before the
+production change. The focused RED evidence was:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_schema.py -q -k "failed_package_owner"
+2 failed, 43 deselected
+
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py -q -k "material_owner_at_original"
+1 failed, 37 deselected
+
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py -q -k "same_package_owner_nonoriginal"
+1 failed, 38 deselected
+```
+
+A mutation check also proved the exact failed-package Windows-equivalence
+regression fails when classification is changed back to the prior strict
+canonical-path comparison.
+
+Implemented review finding:
+
+- Reverse cleanup triggers and startup data validation now consume the same SQL
+  reference-predicate builder over typed material/package rows. Classification
+  includes reference type, ID, package status, Windows-equivalent path, SHA-256
+  and size instead of accepting any row at the original path.
+- An exact failed content-package owner at the Windows-equivalent original path
+  with the cleanup's expected SHA-256 and size remains the cleanup source; it is
+  excluded from live-reference evidence and cannot authorize a fabricated moved
+  quarantine path or physical identity.
+- A material owner at its Windows-equivalent original path with the expected
+  identity remains a live persisted material and stops cleanup before a move. It
+  cannot authorize a fabricated moved fact. Reused owner IDs with a different
+  path or identity remain `owner_identity_mismatch`.
+- A moved `needs_human/live_reference` exception requires an identity-matching
+  external Windows-equivalent reference. A content package reusing the same owner
+  ID qualifies only at the non-original deterministic quarantine path; a mismatched
+  SHA-256 or size fails closed. The legitimate future-quarantine-path race remains
+  durable under case, NFC and Windows trailing-dot equivalence.
+- Python service classification now mirrors these ownership and identity rules,
+  including Windows path equivalence for the exact failed package source.
+
+Final fix-round verification:
+
+```text
+python -m pytest backend/tests/content/test_artifact_cleanup_service.py backend/tests/content/test_artifact_cleanup_schema.py backend/tests/content/test_round3_hardening.py backend/tests/content/test_round5_hardening.py -q
+119 passed in 12.20s
+
+python -m pytest backend/tests/content -q
+181 passed in 20.33s
+
+python -m pytest backend/tests -q
+494 passed, 1 skipped in 35.86s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0; Git emitted only the repository's Windows
+LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
+remains `not_run: device unavailable`, and seven-day UAT remains `not_run`.
+Task 8 remains blocked pending redesign Tasks 3—5 and independent review.

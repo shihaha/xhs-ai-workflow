@@ -102,6 +102,38 @@ def _insert_material_reference(
         connection.commit()
 
 
+def _insert_package_reference(
+    database: Database,
+    *,
+    package_id: str,
+    relative_path: str,
+    digest: str,
+    size_bytes: int,
+    created_at: datetime,
+) -> None:
+    with database.engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            text(
+                "INSERT INTO content_packages "
+                "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                "build_token,created_at,error_detail) VALUES "
+                "(:id,:item_id,:revision_id,'failed',:path,:sha256,:size_bytes,"
+                "NULL,:created_at,'different_artifact')"
+            ),
+            {
+                "id": package_id,
+                "item_id": str(uuid4()),
+                "revision_id": str(uuid4()),
+                "path": relative_path,
+                "sha256": digest,
+                "size_bytes": size_bytes,
+                "created_at": created_at.isoformat(sep=" "),
+            },
+        )
+        connection.commit()
+
+
 def test_candidate_is_frozen(cleanup_environment) -> None:
     _, runtime, clock, _, _ = cleanup_environment
     candidate = _candidate(runtime, clock)
@@ -584,6 +616,81 @@ def test_preexisting_future_quarantine_reference_is_durable_needs_human(
         )
 
 
+def test_same_package_owner_nonoriginal_future_quarantine_path_is_live(
+    cleanup_environment,
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    payload = b"abandoned package"
+    original = runtime / "orphaned" / "package.zip"
+    original.parent.mkdir(parents=True)
+    original.write_bytes(payload)
+    candidate = ArtifactCleanupCandidate(
+        owner_type="content_package",
+        owner_id=str(uuid4()),
+        relative_path="orphaned/package.zip",
+        expected_sha256=sha256(payload).hexdigest(),
+        expected_size_bytes=len(payload),
+        reason="failed_package",
+        not_before=clock.now(),
+    )
+    record = service.enqueue(candidate)
+    quarantine_path = f"artifacts-quarantine/{record.id}/package.zip"
+    _insert_package_reference(
+        database,
+        package_id=candidate.owner_id,
+        relative_path=quarantine_path.swapcase(),
+        digest=candidate.expected_sha256,
+        size_bytes=candidate.expected_size_bytes,
+        created_at=clock.now(),
+    )
+
+    result = service.process_one(record.id)
+
+    assert result.state == "needs_human"
+    assert result.last_error_category == "live_reference"
+    assert result.quarantine_path == quarantine_path
+    assert not original.exists()
+    assert (runtime / quarantine_path).exists()
+
+
+def test_exact_failed_package_owner_with_windows_equivalent_original_is_source(
+    cleanup_environment,
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    payload = b"failed package source"
+    original = runtime / "content-packages" / "item" / "Caf\u00e9.ZIP"
+    original.parent.mkdir(parents=True)
+    original.write_bytes(payload)
+    candidate = ArtifactCleanupCandidate(
+        owner_type="content_package",
+        owner_id=str(uuid4()),
+        relative_path="content-packages/item/Caf\u00e9.ZIP",
+        expected_sha256=sha256(payload).hexdigest(),
+        expected_size_bytes=len(payload),
+        reason="failed_package",
+        not_before=clock.now(),
+    )
+    record = service.enqueue(candidate)
+    _insert_package_reference(
+        database,
+        package_id=candidate.owner_id,
+        relative_path="CONTENT-PACKAGES/ITEM/Cafe\u0301.zip.",
+        digest=candidate.expected_sha256,
+        size_bytes=candidate.expected_size_bytes,
+        created_at=clock.now(),
+    )
+
+    result = service.process_one(record.id)
+
+    assert result.state == "quarantined"
+    assert result.last_error_category is None
+    assert result.quarantine_path == (
+        f"artifacts-quarantine/{record.id}/Caf\u00e9.ZIP"
+    )
+    assert not original.exists()
+    assert (runtime / result.quarantine_path).exists()
+
+
 def test_quarantined_record_continues_after_service_restart(cleanup_environment) -> None:
     database, runtime, clock, service, _ = cleanup_environment
     record = service.enqueue(_candidate(runtime, clock))
@@ -700,6 +807,29 @@ def test_owner_identity_reuse_at_another_path_is_needs_human(cleanup_environment
     assert result.state == "needs_human"
     assert result.last_error_category == "owner_identity_mismatch"
     assert (runtime / candidate.relative_path).exists()
+
+
+def test_material_owner_at_original_path_remains_a_live_reference(
+    cleanup_environment,
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    candidate = _candidate(runtime, clock)
+    record = service.enqueue(candidate)
+    _insert_material_reference(
+        database,
+        material_id=candidate.owner_id,
+        relative_path="ORPHANED/material.bin.",
+        digest=candidate.expected_sha256,
+        size_bytes=candidate.expected_size_bytes,
+        created_at=clock.now(),
+    )
+
+    result = service.process_one(record.id)
+
+    assert result.state == "needs_human"
+    assert result.last_error_category == "live_reference"
+    assert (runtime / candidate.relative_path).exists()
+    assert result.quarantine_path is None
 
 
 def test_other_cleanup_hardlink_identity_blocks_quarantine(cleanup_environment) -> None:

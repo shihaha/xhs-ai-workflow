@@ -364,6 +364,38 @@ def test_live_reference_exception_requires_real_conflict_and_complete_identity(
                     "INSERT INTO content_product_materials "
                     "(id,product_id,logical_name,logical_key,version,path,sha256,"
                     "size_bytes,media_type,kind,created_at) VALUES "
+                    "(:id,:product_id,'wrong.txt','wrong.txt',1,:path,:sha256,"
+                    "13,'text/plain','source',CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "id": str(uuid4()),
+                    "product_id": str(uuid4()),
+                    "path": quarantine_path.swapcase(),
+                    "sha256": "d" * 64,
+                },
+            )
+            connection.commit()
+
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE artifact_gc_queue SET state='needs_human', "
+                        "last_error_category='live_reference', quarantine_path=:path, "
+                        "quarantine_volume_id=1, quarantine_file_id=2, "
+                        "quarantine_size_bytes=12, quarantine_mtime_ns=3 "
+                        "WHERE id=:id"
+                    ),
+                    {"path": quarantine_path, "id": pending.id},
+                )
+
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                text(
+                    "INSERT INTO content_product_materials "
+                    "(id,product_id,logical_name,logical_key,version,path,sha256,"
+                    "size_bytes,media_type,kind,created_at) VALUES "
                     "(:id,:product_id,'guard.txt','guard.txt',1,:path,:sha256,"
                     "12,'text/plain','source',CURRENT_TIMESTAMP)"
                 ),
@@ -406,6 +438,57 @@ def test_live_reference_exception_requires_real_conflict_and_complete_identity(
         reopened.close()
 
 
+def test_same_package_owner_with_nonoriginal_quarantine_reference_is_live(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "same-owner-new-reference.sqlite3", runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    digest = "e" * 64
+    pending = _insert_cleanup(
+        database,
+        owner_type="content_package",
+        owner_id=owner_id,
+        expected_sha256=digest,
+        expected_size_bytes=23,
+    )
+    quarantine_path = f"artifacts-quarantine/{pending.id}/package.zip"
+    try:
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                text(
+                    "INSERT INTO content_packages "
+                    "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                    "build_token,created_at,error_detail) VALUES "
+                    "(:id,:item_id,:revision_id,'failed',:path,:sha256,:size,NULL,"
+                    "CURRENT_TIMESTAMP,'different_artifact')"
+                ),
+                {
+                    "id": owner_id,
+                    "item_id": str(uuid4()),
+                    "revision_id": str(uuid4()),
+                    "path": quarantine_path.swapcase(),
+                    "sha256": digest,
+                    "size": 23,
+                },
+            )
+            connection.commit()
+
+        with database.engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    "UPDATE artifact_gc_queue SET state='needs_human', "
+                    "last_error_category='live_reference', quarantine_path=:path, "
+                    "quarantine_volume_id=1, quarantine_file_id=2, "
+                    "quarantine_size_bytes=23, quarantine_mtime_ns=3 WHERE id=:id"
+                ),
+                {"path": quarantine_path, "id": pending.id},
+            )
+            assert result.rowcount == 1
+    finally:
+        database.close()
+
+
 def test_startup_rejects_fabricated_live_reference_exception(tmp_path: Path) -> None:
     path = tmp_path / "fabricated-live-reference.sqlite3"
     database = Database(path, runtime_dir=tmp_path)
@@ -428,6 +511,181 @@ def test_startup_rejects_fabricated_live_reference_exception(tmp_path: Path) -> 
             {
                 "path": f"artifacts-quarantine/{pending.id}/file.zip",
                 "id": pending.id,
+            },
+        )
+        connection.execute(text(trigger_sql))
+    database.close()
+
+    with pytest.raises(SchemaMigrationError, match="reference guard"):
+        Database(path, runtime_dir=tmp_path)
+
+
+def test_failed_package_owner_cannot_authorize_fabricated_moved_live_reference(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "failed-owner-not-live.sqlite3", runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    relative_path = "content-packages/item/Caf\u00e9.ZIP"
+    digest = "b" * 64
+    cleanup = _insert_cleanup(
+        database,
+        owner_type="content_package",
+        owner_id=owner_id,
+        relative_path=relative_path,
+        path_key=relative_path.lower(),
+        expected_sha256=digest,
+        expected_size_bytes=17,
+    )
+    try:
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                text(
+                    "INSERT INTO content_packages "
+                    "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                    "build_token,created_at,error_detail) VALUES "
+                    "(:id,:item_id,:revision_id,'failed',:path,:sha256,:size,NULL,"
+                    "CURRENT_TIMESTAMP,'worker_restart_required')"
+                ),
+                {
+                    "id": owner_id,
+                    "item_id": str(uuid4()),
+                    "revision_id": str(uuid4()),
+                    "path": "CONTENT-PACKAGES/ITEM/Cafe\u0301.zip.",
+                    "sha256": digest,
+                    "size": 17,
+                },
+            )
+            connection.commit()
+
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE artifact_gc_queue SET state='needs_human', "
+                        "last_error_category='live_reference', "
+                        "quarantine_path=:path, quarantine_volume_id=111, "
+                        "quarantine_file_id=222, quarantine_size_bytes=17, "
+                        "quarantine_mtime_ns=333 WHERE id=:id"
+                    ),
+                    {
+                        "path": f"artifacts-quarantine/{cleanup.id}/fake.zip",
+                        "id": cleanup.id,
+                    },
+                )
+    finally:
+        database.close()
+
+
+def test_material_owner_original_cannot_authorize_fabricated_moved_fact(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "material-owner-not-moved.sqlite3", runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    digest = "f" * 64
+    cleanup = _insert_cleanup(
+        database,
+        owner_type="material",
+        owner_id=owner_id,
+        relative_path="content-materials/item/Caf\u00e9.PNG",
+        path_key="content-materials/item/caf\u00e9.png",
+        expected_sha256=digest,
+        expected_size_bytes=29,
+    )
+    try:
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                text(
+                    "INSERT INTO content_product_materials "
+                    "(id,product_id,logical_name,logical_key,version,path,sha256,"
+                    "size_bytes,media_type,kind,created_at) VALUES "
+                    "(:id,:product_id,'image.png','image.png',1,:path,:sha256,"
+                    "29,'image/png','output_image',CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "id": owner_id,
+                    "product_id": str(uuid4()),
+                    "path": "CONTENT-MATERIALS/ITEM/Cafe\u0301.png.",
+                    "sha256": digest,
+                },
+            )
+            connection.commit()
+
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE artifact_gc_queue SET state='needs_human', "
+                        "last_error_category='live_reference', "
+                        "quarantine_path=:path, quarantine_volume_id=111, "
+                        "quarantine_file_id=222, quarantine_size_bytes=29, "
+                        "quarantine_mtime_ns=333 WHERE id=:id"
+                    ),
+                    {
+                        "path": f"artifacts-quarantine/{cleanup.id}/fake.png",
+                        "id": cleanup.id,
+                    },
+                )
+    finally:
+        database.close()
+
+
+def test_startup_rejects_failed_package_owner_as_only_moved_live_reference(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "failed-owner-startup.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    relative_path = "content-packages/item/Caf\u00e9.ZIP"
+    digest = "c" * 64
+    cleanup = _insert_cleanup(
+        database,
+        owner_type="content_package",
+        owner_id=owner_id,
+        relative_path=relative_path,
+        path_key=relative_path.lower(),
+        expected_sha256=digest,
+        expected_size_bytes=19,
+    )
+    with database.engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            text(
+                "INSERT INTO content_packages "
+                "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                "build_token,created_at,error_detail) VALUES "
+                "(:id,:item_id,:revision_id,'failed',:path,:sha256,:size,NULL,"
+                "CURRENT_TIMESTAMP,'worker_restart_required')"
+            ),
+            {
+                "id": owner_id,
+                "item_id": str(uuid4()),
+                "revision_id": str(uuid4()),
+                "path": "CONTENT-PACKAGES/ITEM/Cafe\u0301.zip.",
+                "sha256": digest,
+                "size": 19,
+            },
+        )
+        connection.commit()
+    with database.engine.begin() as connection:
+        trigger_sql = connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='ck_gc_cleanup_reference_update'"
+            )
+        ).scalar_one()
+        connection.execute(text("DROP TRIGGER ck_gc_cleanup_reference_update"))
+        connection.execute(
+            text(
+                "UPDATE artifact_gc_queue SET state='needs_human', "
+                "last_error_category='live_reference', quarantine_path=:path, "
+                "quarantine_volume_id=111, quarantine_file_id=222, "
+                "quarantine_size_bytes=19, quarantine_mtime_ns=333 WHERE id=:id"
+            ),
+            {
+                "path": f"artifacts-quarantine/{cleanup.id}/fake.zip",
+                "id": cleanup.id,
             },
         )
         connection.execute(text(trigger_sql))
