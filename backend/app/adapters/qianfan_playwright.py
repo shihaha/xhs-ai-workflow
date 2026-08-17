@@ -8,7 +8,7 @@ from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -85,7 +85,7 @@ class QianfanPlaywrightAdapter:
         artifact_paths = self._persist_job_evidence(job_id, outcome)
         if outcome.status == "needs_human":
             expected_count = request.expected_count
-            missing_count = expected_count if expected_count is not None else 1
+            missing_count = expected_count if expected_count is not None else 0
             missing_items = [
                 MissingCollectionItem(
                     reference=f"qianfan_ranking:{index + 1}",
@@ -99,9 +99,11 @@ class QianfanPlaywrightAdapter:
                 detail=outcome.reason,
                 evidence_artifacts=artifact_paths,
                 items=[],
+                expected_count_known=expected_count is not None,
                 expected_count=expected_count,
                 succeeded_count=0,
                 missing_items=missing_items,
+                overflow_count=0,
                 complete=False,
             )
             self._finalize_job(job_id, result)
@@ -114,30 +116,26 @@ class QianfanPlaywrightAdapter:
                 detail="expected_count_unknown",
                 evidence_artifacts=artifact_paths,
                 items=items,
+                expected_count_known=False,
                 expected_count=None,
                 succeeded_count=len(items),
                 missing_items=[],
+                overflow_count=0,
                 complete=False,
             )
             self._finalize_job(job_id, result)
             return result
         if len(items) > expected_count:
-            missing_items = [
-                MissingCollectionItem(
-                    reference=f"qianfan_ranking:{index + 1}",
-                    reason="observed_count_exceeds_expected",
-                    raw_evidence={"capture": outcome.raw_evidence},
-                )
-                for index in range(expected_count)
-            ]
             result = CollectionResult(
                 status="failed",
                 detail="observed_count_exceeds_expected",
                 evidence_artifacts=artifact_paths,
-                items=[],
+                items=items,
+                expected_count_known=True,
                 expected_count=expected_count,
-                succeeded_count=0,
-                missing_items=missing_items,
+                succeeded_count=len(items),
+                missing_items=[],
+                overflow_count=len(items) - expected_count,
                 complete=False,
             )
             self._finalize_job(job_id, result)
@@ -157,9 +155,11 @@ class QianfanPlaywrightAdapter:
             detail=None if complete else "expected_items_missing",
             evidence_artifacts=artifact_paths,
             items=items,
+            expected_count_known=True,
             expected_count=expected_count,
             succeeded_count=len(items),
             missing_items=missing_items,
+            overflow_count=0,
             complete=complete,
         )
         self._finalize_job(job_id, result)
@@ -401,10 +401,11 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> list[CollectionItem]:
                 continue
             item_id = _item_id(raw_item)
             note_id = str(raw_item.get("noteId") or raw_item.get("note_id") or "")
+            canonical_note_url = _canonical_note_url(raw_item)
             source_url = (
                 f"https://www.xiaohongshu.com/explore/{quote(note_id)}"
                 if note_id
-                else QIANFAN_RANK_URL
+                else canonical_note_url or QIANFAN_RANK_URL
             )
             item = CollectionItem(
                 id=item_id,
@@ -426,5 +427,63 @@ def _item_id(raw_item: dict[str, Any]) -> str:
     stable = raw_item.get("noteId") or raw_item.get("note_id")
     if stable:
         return str(stable)[:500]
-    canonical = json.dumps(raw_item, ensure_ascii=False, sort_keys=True)
+    content_url = _canonical_note_url(raw_item)
+    if content_url is not None:
+        return f"url:{content_url}"[:500]
+    canonical = json.dumps(
+        {
+            "user_id": _first_present(raw_item, "userId", "user_id"),
+            "title": _first_present(raw_item, "noteTitle", "title", "note_title"),
+            "publish_date": _first_present(
+                raw_item,
+                "publishTime",
+                "publishDate",
+                "publish_time",
+                "publish_date",
+            ),
+            "author_name": _first_present(
+                raw_item, "userNickname", "authorName", "author_name", "nickname"
+            ),
+            "content_type": _first_present(
+                raw_item, "noteType", "note_type", "contentType", "content_type"
+            ),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _canonical_note_url(raw_item: dict[str, Any]) -> str | None:
+    source_url = _first_present(
+        raw_item,
+        "noteUrl",
+        "note_url",
+        "sourceUrl",
+        "source_url",
+        "url",
+    )
+    if not source_url:
+        return None
+    parts = urlsplit(str(source_url))
+    path_segments = [segment.lower() for segment in parts.path.split("/") if segment]
+    has_note_identity = (
+        "explore" in path_segments
+        and path_segments.index("explore") + 1 < len(path_segments)
+    ) or (
+        "item" in path_segments
+        and path_segments.index("item") + 1 < len(path_segments)
+    )
+    if not has_note_identity:
+        return None
+    return urlunsplit(
+        (parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), "", "")
+    )
+
+
+def _first_present(raw_item: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = raw_item.get(key)
+        if value not in (None, ""):
+            return value
+    return None

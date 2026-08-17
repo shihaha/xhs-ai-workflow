@@ -485,8 +485,10 @@ def test_collect_rankings_never_claims_empty_success_without_a_ranking_response(
     result = adapter.collect_rankings(CollectionRequest(capability="rankings"))
 
     assert result.status == "needs_human"
+    assert result.detail == "response_not_observed"
+    assert result.expected_count_known is False
     assert result.complete is False
-    assert result.missing_items[0].reason == "response_not_observed"
+    assert result.missing_items == []
 
 
 def test_collect_rankings_returns_contract_and_attaches_raw_job_evidence(
@@ -558,6 +560,109 @@ def test_collect_rankings_returns_contract_and_attaches_raw_job_evidence(
     assert jobs.get(job.id).state is JobState.succeeded
 
 
+def test_qianfan_item_identity_ignores_mutable_rank_and_metric_evidence() -> None:
+    """Changing only rank/read/GMV/pay/raw metrics must not create a new semantic note ID."""
+    first_page = _ranking_page(
+        [
+            {
+                "rank": 1,
+                "userId": "same-account",
+                "noteTitle": "同一篇笔记",
+                "publishTime": "2026-08-17 09:00",
+                "userNickname": "同一作者",
+                "readRange": "1万-5万",
+                "gmvRange": "100-200",
+                "payRange": "10-20",
+                "rawMetricEvidence": {"rank": 1, "read": 12000},
+            }
+        ]
+    )
+    changed_metrics_page = _ranking_page(
+        [
+            {
+                "rank": 9,
+                "userId": "same-account",
+                "noteTitle": "同一篇笔记",
+                "publishTime": "2026-08-17 09:00",
+                "userNickname": "同一作者",
+                "readRange": "10万以上",
+                "gmvRange": "1000以上",
+                "payRange": "100以上",
+                "rawMetricEvidence": {"rank": 9, "read": 180000},
+            }
+        ]
+    )
+
+    first = QianfanPlaywrightAdapter(page_factory=lambda: first_page).collect_rankings(
+        CollectionRequest(capability="rankings", expected_count=1)
+    )
+    changed = QianfanPlaywrightAdapter(
+        page_factory=lambda: changed_metrics_page
+    ).collect_rankings(CollectionRequest(capability="rankings", expected_count=1))
+
+    assert first.items[0].id == changed.items[0].id
+    assert first.items[0].raw_evidence != changed.items[0].raw_evidence
+
+
+def test_qianfan_item_identity_keeps_distinct_semantic_notes_from_one_user() -> None:
+    """The user ID alone must not collapse different titles or publication times."""
+    page = _ranking_page(
+        [
+            {
+                "rank": 1,
+                "userId": "same-account",
+                "noteTitle": "第一篇",
+                "publishTime": "2026-08-17 09:00",
+            },
+            {
+                "rank": 2,
+                "userId": "same-account",
+                "noteTitle": "第二篇",
+                "publishTime": "2026-08-17 10:00",
+            },
+        ]
+    )
+
+    result = QianfanPlaywrightAdapter(page_factory=lambda: page).collect_rankings(
+        CollectionRequest(capability="rankings", expected_count=2)
+    )
+
+    assert result.status == "succeeded"
+    assert len(result.items) == 2
+    assert result.items[0].id != result.items[1].id
+
+
+def test_qianfan_item_identity_prefers_canonical_note_url() -> None:
+    """Tracking-query changes on the same note URL must dedupe before semantic fallback."""
+    page = _ranking_page(
+        [
+            {
+                "rank": 1,
+                "noteUrl": "https://www.xiaohongshu.com/explore/url-note?xsec_token=one",
+                "userId": "account-a",
+                "noteTitle": "旧标题",
+            },
+            {
+                "rank": 8,
+                "noteUrl": "https://www.xiaohongshu.com/explore/url-note?xsec_token=two",
+                "userId": "account-a",
+                "noteTitle": "新标题",
+            },
+        ]
+    )
+
+    result = QianfanPlaywrightAdapter(page_factory=lambda: page).collect_rankings(
+        CollectionRequest(capability="rankings", expected_count=1)
+    )
+
+    assert result.status == "succeeded"
+    assert result.succeeded_count == 1
+    assert result.items[0].id.startswith("url:")
+    assert str(result.items[0].source_url) == (
+        "https://www.xiaohongshu.com/explore/url-note"
+    )
+
+
 def test_collect_rankings_maps_login_to_needs_human_job_and_contract(
     tmp_path: Path,
 ) -> None:
@@ -584,8 +689,10 @@ def test_collect_rankings_maps_login_to_needs_human_job_and_contract(
     )
 
     assert result.status == "needs_human"
+    assert result.detail == "login_required"
+    assert result.expected_count_known is False
     assert result.complete is False
-    assert result.missing_items[0].reason == "login_required"
+    assert result.missing_items == []
     persisted_job = jobs.get(job.id)
     assert persisted_job.state is JobState.needs_human
     assert len(persisted_job.artifacts) == 1
@@ -645,8 +752,10 @@ def test_collect_rankings_without_expected_count_is_incomplete_and_needs_human_j
 
     assert result.status == "partial"
     assert result.detail == "expected_count_unknown"
+    assert result.expected_count_known is False
     assert result.expected_count is None
     assert result.succeeded_count == 1
+    assert result.overflow_count == 0
     assert result.complete is False
     persisted = jobs.get(job.id)
     assert persisted.state is JobState.needs_human
@@ -673,6 +782,8 @@ def test_partial_collection_moves_claimed_job_to_needs_human(tmp_path: Path) -> 
 
     assert result.status == "partial"
     assert result.detail == "expected_items_missing"
+    assert result.expected_count_known is True
+    assert result.overflow_count == 0
     assert result.complete is False
     persisted = jobs.get(job.id)
     assert persisted.state is JobState.needs_human
@@ -704,6 +815,12 @@ def test_observed_count_over_expected_fails_result_and_job(tmp_path: Path) -> No
 
     assert result.status == "failed"
     assert result.detail == "observed_count_exceeds_expected"
+    assert result.expected_count_known is True
+    assert result.expected_count == 1
+    assert result.succeeded_count == 2
+    assert len(result.items) == 2
+    assert result.missing_items == []
+    assert result.overflow_count == 1
     assert result.complete is False
     persisted = jobs.get(job.id)
     assert persisted.state is JobState.failed

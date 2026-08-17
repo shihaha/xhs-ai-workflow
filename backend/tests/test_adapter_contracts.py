@@ -1,7 +1,11 @@
 import pytest
 from pydantic import ValidationError
 
-from backend.app.adapters.contracts import CollectionItem, CollectionResult
+from backend.app.adapters.contracts import (
+    CollectionItem,
+    CollectionResult,
+    MissingCollectionItem,
+)
 
 
 def _item(item_id: str) -> CollectionItem:
@@ -10,6 +14,14 @@ def _item(item_id: str) -> CollectionItem:
         kind="note",
         source_url="https://www.xiaohongshu.com/explore/example",
         raw_evidence={"response": {"id": item_id}},
+    )
+
+
+def _missing(reference: str) -> MissingCollectionItem:
+    return MissingCollectionItem(
+        reference=reference,
+        reason="not_observed",
+        raw_evidence={"reference": reference},
     )
 
 
@@ -38,9 +50,11 @@ def test_collection_result_rejects_claimed_nn_completion_with_missing_successes(
     with pytest.raises(ValidationError):
         CollectionResult(
             items=[_item("note-1")],
+            expected_count_known=True,
             expected_count=2,
             succeeded_count=1,
             missing_items=[],
+            overflow_count=0,
             complete=True,
         )
 
@@ -50,9 +64,11 @@ def test_collection_result_requires_each_missing_item_to_account_for_partial_nn(
     with pytest.raises(ValidationError):
         CollectionResult(
             items=[_item("note-1")],
+            expected_count_known=True,
             expected_count=2,
             succeeded_count=1,
             missing_items=[],
+            overflow_count=0,
             complete=False,
         )
 
@@ -62,9 +78,11 @@ def test_collection_result_rejects_duplicate_success_ids_that_falsely_claim_nn()
     with pytest.raises(ValidationError):
         CollectionResult(
             items=[_item("note-1"), _item("note-1")],
+            expected_count_known=True,
             expected_count=2,
             succeeded_count=2,
             missing_items=[],
+            overflow_count=0,
             complete=True,
         )
 
@@ -78,8 +96,10 @@ def test_collection_result_rejects_complete_non_success_status(
         CollectionResult(
             status=result_status,
             items=[_item("note-1")],
+            expected_count_known=True,
             expected_count=1,
             succeeded_count=1,
+            overflow_count=0,
             complete=True,
         )
 
@@ -90,8 +110,10 @@ def test_collection_result_rejects_incomplete_succeeded_status() -> None:
         CollectionResult(
             status="succeeded",
             items=[_item("note-1")],
+            expected_count_known=False,
             expected_count=None,
             succeeded_count=1,
+            overflow_count=0,
             complete=False,
         )
 
@@ -102,11 +124,233 @@ def test_failed_zero_expected_result_can_remain_incomplete() -> None:
         status="failed",
         detail="observed_count_exceeds_expected",
         items=[],
+        expected_count_known=True,
         expected_count=0,
         succeeded_count=0,
         missing_items=[],
+        overflow_count=0,
         complete=False,
     )
 
     assert result.status == "failed"
     assert result.complete is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "status": "succeeded",
+            "items": [_item("note-1")],
+            "expected_count_known": True,
+            "expected_count": 1,
+            "succeeded_count": 1,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": True,
+        },
+        {
+            "status": "partial",
+            "items": [_item("note-1")],
+            "expected_count_known": True,
+            "expected_count": 2,
+            "succeeded_count": 1,
+            "missing_items": [_missing("note-2")],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "needs_human",
+            "items": [],
+            "expected_count_known": True,
+            "expected_count": 2,
+            "succeeded_count": 0,
+            "missing_items": [_missing("note-1"), _missing("note-2")],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "failed",
+            "items": [],
+            "expected_count_known": True,
+            "expected_count": 2,
+            "succeeded_count": 0,
+            "missing_items": [_missing("note-1"), _missing("note-2")],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "failed",
+            "items": [],
+            "expected_count_known": True,
+            "expected_count": 0,
+            "succeeded_count": 0,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "failed",
+            "items": [_item("note-1"), _item("note-2")],
+            "expected_count_known": True,
+            "expected_count": 1,
+            "succeeded_count": 2,
+            "missing_items": [],
+            "overflow_count": 1,
+            "complete": False,
+        },
+        {
+            "status": "partial",
+            "items": [_item("note-1")],
+            "expected_count_known": False,
+            "expected_count": None,
+            "succeeded_count": 1,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "needs_human",
+            "items": [],
+            "expected_count_known": False,
+            "expected_count": None,
+            "succeeded_count": 0,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": False,
+        },
+    ],
+    ids=[
+        "known-complete",
+        "known-partial-deficit",
+        "known-needs-human-deficit",
+        "known-failed-deficit",
+        "known-failed-zero-of-zero",
+        "known-failed-overflow",
+        "unknown-partial-observations",
+        "unknown-needs-human",
+    ],
+)
+def test_collection_result_accepts_only_truthfully_accounted_states(
+    payload: dict[str, object],
+) -> None:
+    """Every supported known/unknown outcome has literal, auditable accounting."""
+    result = CollectionResult(**payload)
+
+    assert result.succeeded_count == len(result.items)
+    assert result.overflow_count == payload["overflow_count"]
+    assert result.expected_count_known is payload["expected_count_known"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "status": "partial",
+            "items": [_item("note-1")],
+            "expected_count_known": True,
+            "expected_count": 1,
+            "succeeded_count": 1,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "failed",
+            "items": [_item("note-1")],
+            "expected_count_known": True,
+            "expected_count": 1,
+            "succeeded_count": 1,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "needs_human",
+            "items": [_item("note-1")],
+            "expected_count_known": True,
+            "expected_count": 1,
+            "succeeded_count": 1,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "partial",
+            "items": [],
+            "expected_count_known": True,
+            "expected_count": 0,
+            "succeeded_count": 0,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "partial",
+            "items": [_item("note-1")],
+            "expected_count_known": True,
+            "expected_count": None,
+            "succeeded_count": 1,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "succeeded",
+            "items": [_item("note-1")],
+            "expected_count_known": False,
+            "expected_count": 1,
+            "succeeded_count": 1,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": True,
+        },
+        {
+            "status": "partial",
+            "items": [_item("note-1")],
+            "expected_count_known": False,
+            "expected_count": None,
+            "succeeded_count": 1,
+            "missing_items": [_missing("unknown-note")],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "failed",
+            "items": [_item("note-1"), _item("note-2")],
+            "expected_count_known": True,
+            "expected_count": 1,
+            "succeeded_count": 2,
+            "missing_items": [],
+            "overflow_count": 0,
+            "complete": False,
+        },
+        {
+            "status": "partial",
+            "items": [_item("note-1"), _item("note-2")],
+            "expected_count_known": True,
+            "expected_count": 1,
+            "succeeded_count": 2,
+            "missing_items": [],
+            "overflow_count": 1,
+            "complete": False,
+        },
+    ],
+    ids=[
+        "partial-without-deficit",
+        "failed-positive-exact",
+        "needs-human-positive-exact",
+        "partial-zero-of-zero",
+        "known-without-total",
+        "unknown-with-total",
+        "unknown-with-fabricated-missing",
+        "unaccounted-overflow",
+        "overflow-not-failed",
+    ],
+)
+def test_collection_result_rejects_contradictory_accounting(
+    payload: dict[str, object],
+) -> None:
+    """A contradictory status, known-total flag, deficit, or overflow must fail validation."""
+    with pytest.raises(ValidationError):
+        CollectionResult(**payload)

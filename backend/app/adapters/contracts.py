@@ -40,9 +40,11 @@ class CollectionResult(BaseModel):
     detail: str | None = Field(default=None, max_length=1000)
     evidence_artifacts: list[str] = Field(default_factory=list)
     items: list[CollectionItem] = Field(default_factory=list)
+    expected_count_known: bool
     expected_count: int | None = Field(default=None, ge=0)
     succeeded_count: int = Field(ge=0)
     missing_items: list[MissingCollectionItem] = Field(default_factory=list)
+    overflow_count: int = Field(ge=0)
     complete: bool = False
 
     @model_validator(mode="after")
@@ -52,20 +54,53 @@ class CollectionResult(BaseModel):
             raise ValueError("Collection result items must have distinct stable ids.")
         if self.succeeded_count != len(self.items):
             raise ValueError("succeeded_count must equal the number of stored items.")
-        if self.status == "succeeded" and not self.complete:
-            raise ValueError("succeeded collection results must be complete.")
-        if self.status != "succeeded" and self.complete:
-            raise ValueError("only succeeded collection results can be complete.")
-        if self.expected_count is None:
+        if not self.expected_count_known:
+            if self.expected_count is not None:
+                raise ValueError("unknown expected counts must not publish an N total.")
             if self.complete:
-                raise ValueError("complete collection results require an expected_count.")
+                raise ValueError("unknown expected counts cannot be complete.")
+            if self.status == "succeeded":
+                raise ValueError("unknown expected counts cannot be succeeded.")
+            if self.missing_items:
+                raise ValueError("unknown expected counts cannot fabricate missing items.")
+            if self.overflow_count:
+                raise ValueError("unknown expected counts cannot claim overflow.")
+            if self.items and self.status not in {"partial", "needs_human"}:
+                raise ValueError(
+                    "unknown-total observations require partial or needs_human status."
+                )
             return self
-        if self.expected_count != self.succeeded_count + len(self.missing_items):
+
+        if self.expected_count is None:
+            raise ValueError("known expected counts require an expected_count.")
+        deficit = max(self.expected_count - self.succeeded_count, 0)
+        overflow = max(self.succeeded_count - self.expected_count, 0)
+        if len(self.missing_items) != deficit:
             raise ValueError(
-                "expected_count must equal succeeded items plus explicitly missing items."
+                "missing_items must exactly account for the known expected deficit."
             )
-        if self.complete and self.expected_count != self.succeeded_count:
-            raise ValueError("complete requires succeeded_count to equal expected_count.")
+        if self.overflow_count != overflow:
+            raise ValueError("overflow_count must exactly account for excess observed items.")
+        if overflow:
+            if self.status != "failed" or self.complete:
+                raise ValueError("overflow results must be failed and incomplete.")
+            return self
+        if deficit:
+            if self.status == "succeeded" or self.complete:
+                raise ValueError("known deficits cannot be succeeded or complete.")
+            return self
+        if self.expected_count > 0:
+            if self.status != "succeeded" or not self.complete:
+                raise ValueError(
+                    "positive exact known results must be succeeded and complete."
+                )
+            return self
+        if self.status == "partial":
+            raise ValueError("partial results require a real known deficit.")
+        if self.status == "succeeded" and not self.complete:
+            raise ValueError("succeeded zero-of-zero results must be complete.")
+        if self.status != "succeeded" and self.complete:
+            raise ValueError("only succeeded results can be complete.")
         return self
 
 
