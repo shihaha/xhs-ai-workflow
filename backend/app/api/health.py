@@ -1,6 +1,7 @@
 """Truthful local dependency health reporting."""
 
 import os
+from pathlib import Path
 from shutil import which
 
 from fastapi import APIRouter, Request
@@ -15,6 +16,14 @@ def _is_available_executable(executable: str | None) -> bool:
     return executable is not None and which(executable) is not None
 
 
+def _is_writable_database_path(database_path: Path) -> bool:
+    if database_path.is_dir() or not database_path.parent.is_dir():
+        return False
+    if not os.access(database_path.parent, os.W_OK):
+        return False
+    return not database_path.exists() or os.access(database_path, os.W_OK)
+
+
 @router.get("/health")
 def health(request: Request) -> dict[str, object]:
     """Report current local prerequisites without probing external services."""
@@ -24,8 +33,7 @@ def health(request: Request) -> dict[str, object]:
 
     checks = {
         "database": {
-            "healthy": database_path.parent.is_dir()
-            and os.access(database_path.parent, os.W_OK),
+            "healthy": _is_writable_database_path(database_path),
             "path": str(database_path),
         },
         "adb": {

@@ -90,3 +90,26 @@ async def test_health_reports_whitespace_bailian_key_as_unconfigured(
         response = await client.get("/api/v1/health")
 
     assert response.json()["checks"]["bailian"] == {"healthy": False}
+
+
+@pytest.mark.anyio
+async def test_health_reports_database_directory_as_unhealthy(tmp_path: Path) -> None:
+    """A directory cannot be used as a SQLite database file target."""
+    runtime_dir = tmp_path / "runtime"
+    settings = Settings(
+        runtime_dir=runtime_dir,
+        database_path=runtime_dir,
+        adb_executable="definitely-not-an-adb-executable",
+        browser_executable="definitely-not-a-browser-executable",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(settings)),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.get("/api/v1/health")
+
+    assert response.json()["checks"]["database"] == {
+        "healthy": False,
+        "path": str(runtime_dir),
+    }
