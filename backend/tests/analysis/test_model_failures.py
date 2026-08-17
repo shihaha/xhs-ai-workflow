@@ -9,8 +9,8 @@ from backend.app.adapters.bailian import (
     BailianModelAdapter,
     BailianNotConfigured,
     BailianRetryExhausted,
-    StructuredModelRequest,
 )
+from backend.app.adapters.contracts import StructuredModelRequest
 from backend.app.features.analysis.schemas import AnalysisOutput
 from backend.app.main import create_app
 from backend.app.settings import Settings
@@ -18,7 +18,10 @@ from backend.app.settings import Settings
 
 def _request() -> StructuredModelRequest:
     return StructuredModelRequest(
-        system_prompt="json", user_prompt="facts", prompt_version="v1", evidence_ids=["x"]
+        system_prompt="json",
+        user_prompt="facts",
+        prompt_version="v1",
+        evidence_ids=["artifact:1"],
     )
 
 
@@ -32,7 +35,7 @@ def test_rate_limit_retries_bounded_then_succeeds() -> None:
     calls = 0
     payload = json.dumps(
         {
-            "claims": [{"claim": "observed fact", "evidence_ids": ["x"]}],
+            "claims": [{"claim": "observed fact", "evidence_ids": ["artifact:1"]}],
             "product_clusters": [],
             "opportunities": [],
         }
@@ -89,6 +92,57 @@ def test_auth_failure_is_not_retried_and_secret_is_redacted() -> None:
     assert "top-secret" not in str(caught.value)
 
 
+def test_http_408_is_retried_as_transient() -> None:
+    calls = 0
+    payload = json.dumps(
+        {
+            "claims": [{"claim": "fact", "evidence_ids": ["artifact:1"]}],
+            "product_clusters": [],
+            "opportunities": [],
+        }
+    )
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(408, json={"error": {"message": "timeout"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": payload}}]})
+
+    adapter = BailianModelAdapter(
+        api_key="secret", max_attempts=2, backoff_seconds=0,
+        transport=httpx.MockTransport(handler),
+    )
+    adapter.generate_structured(_request(), AnalysisOutput)
+    assert calls == 2
+
+
+def test_absurd_usage_integer_is_a_structured_failure_not_overflow() -> None:
+    payload = json.dumps(
+        {
+            "claims": [{"claim": "fact", "evidence_ids": ["artifact:1"]}],
+            "product_clusters": [],
+            "opportunities": [],
+        }
+    )
+    adapter = BailianModelAdapter(
+        api_key="secret",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": payload}}],
+                    "usage": {"total_tokens": 10**1000},
+                },
+            )
+        ),
+    )
+    from backend.app.adapters.bailian import ModelOutputInvalid
+
+    with pytest.raises(ModelOutputInvalid):
+        adapter.generate_structured(_request(), AnalysisOutput)
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
@@ -113,6 +167,30 @@ async def test_unconfigured_api_returns_503_without_success_row(tmp_path: Path) 
     assert response.status_code == 503
     assert listing.json() == []
     assert "key" not in response.text.lower() or "not configured" in response.text.lower()
+
+
+@pytest.mark.anyio
+async def test_oversized_evidence_id_is_422_before_sqlite(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    app = create_app(
+        Settings(
+            runtime_dir=runtime,
+            database_path=runtime / "db.sqlite3",
+            bailian_api_key="configured",
+        )
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v1/analyses",
+            json={
+                "analysis_type": "account_report",
+                "account_user_id": "account-a",
+                "evidence_ids": ["artifact:9223372036854775808"],
+            },
+        )
+    assert response.status_code == 422
 
 
 @pytest.mark.skipif(not __import__("os").environ.get("BAILIAN_API_KEY"), reason="not_run: BAILIAN_API_KEY unavailable")

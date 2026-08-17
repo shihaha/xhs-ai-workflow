@@ -65,7 +65,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         app.state.radar_service = RadarService(app.state.database)
         app.state.analysis_service = AnalysisService(
-            app.state.database, app.state.bailian_adapter
+            app.state.database,
+            app.state.bailian_adapter,
+            runtime_dir=app.state.settings.runtime_dir,
         )
         app.state.job_service.recover_expired_running(
             worker_job_types=ANDROID_SHOP_JOB_TYPES

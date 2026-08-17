@@ -6,8 +6,8 @@ import pytest
 from backend.app.adapters.bailian import (
     BailianModelAdapter,
     ModelOutputInvalid,
-    StructuredModelRequest,
 )
+from backend.app.adapters.contracts import StructuredModelRequest
 from backend.app.features.analysis.schemas import AnalysisOutput
 
 
@@ -70,3 +70,27 @@ def test_adapter_rejects_malformed_markdown_or_wrong_schema(content: str) -> Non
 
     with pytest.raises(ModelOutputInvalid):
         adapter.generate_structured(_request(), AnalysisOutput)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "claims": [
+                {"claim": "duplicate", "evidence_ids": ["artifact:1", "artifact:1"]}
+            ],
+            "product_clusters": [],
+            "opportunities": [],
+        },
+        {
+            "claims": [{"claim": "noncanonical", "evidence_ids": ["artifact:01"]}],
+            "product_clusters": [],
+            "opportunities": [],
+        },
+    ],
+)
+def test_output_citation_groups_are_unique_and_canonical(payload: dict[str, object]) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        AnalysisOutput.model_validate(payload)

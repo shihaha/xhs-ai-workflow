@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import stat
 from datetime import UTC, datetime
 from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from backend.app.adapters.bailian import BailianError, StructuredModelRequest
+from backend.app.adapters.bailian import BailianError
+from backend.app.adapters.contracts import StructuredModelRequest
 from backend.app.db import Database
 from backend.app.features.analysis.models import AnalysisRecord, OpportunityRecord
 from backend.app.features.analysis.schemas import (
@@ -22,7 +25,8 @@ from backend.app.features.analysis.schemas import (
     OpportunityRead,
 )
 from backend.app.features.radar.models import RankItemRecord
-from backend.app.models.jobs import JobArtifactRecord, JobRecord
+from backend.app.features.shops.service import ANDROID_SHOP_JOB_TYPES, ShopCollectionRead
+from backend.app.models.jobs import JobArtifactRecord
 from backend.app.models.jobs import JobState
 
 
@@ -42,16 +46,27 @@ class AnalysisNotFound(LookupError):
 
 
 class AnalysisService:
-    def __init__(self, database: Database, model_adapter: Any) -> None:
+    def __init__(
+        self, database: Database, model_adapter: Any, *, runtime_dir: Path
+    ) -> None:
         self.database = database
         self.model_adapter = model_adapter
+        self.runtime_dir = runtime_dir.resolve()
 
     def create(self, payload: AnalysisCreate) -> AnalysisRead:
         evidence = self._resolve_evidence(payload)
         digest = _digest(payload, evidence)
-        if payload.analysis_type == "account_opportunity" and not _eligible_for_opportunity(
-            evidence
-        ):
+        shop_evidence_present = any(
+            fact["kind"] == "shop_collection_result" for fact in evidence
+        )
+        requires_complete_shop = payload.analysis_type in {
+            "product_cluster",
+            "account_opportunity",
+        } or shop_evidence_present
+        eligible = _eligible_for_opportunity(
+            evidence, required_accounts=payload.account_scope
+        )
+        if requires_complete_shop and not eligible:
             return self._persist_failure(
                 payload,
                 digest=digest,
@@ -69,6 +84,7 @@ class AnalysisService:
                 {
                     "analysis_type": payload.analysis_type,
                     "account_user_id": payload.account_user_id,
+                    "account_user_ids": payload.account_user_ids,
                     "allowed_evidence": evidence,
                     "required_schema": AnalysisOutput.model_json_schema(),
                 },
@@ -82,7 +98,7 @@ class AnalysisService:
             model_result = self.model_adapter.generate_structured(request, AnalysisOutput)
             output = AnalysisOutput.model_validate(model_result.output)
             _validate_grounding(output, allowed=set(payload.evidence_ids))
-            if output.opportunities and not _eligible_for_opportunity(evidence):
+            if output.opportunities and not eligible:
                 raise ValueError("Opportunity output requires complete deep verification.")
         except BailianError as error:
             return self._persist_failure(
@@ -106,6 +122,7 @@ class AnalysisService:
         record = AnalysisRecord(
             analysis_type=payload.analysis_type,
             account_user_id=payload.account_user_id,
+            account_user_ids_json=list(payload.account_user_ids),
             status="succeeded",
             prompt_version=PROMPT_VERSION,
             provider="alibaba_bailian",
@@ -174,8 +191,11 @@ class AnalysisService:
                 fact = {
                     "evidence_id": f"artifact:{artifact.id}",
                     "kind": artifact.kind,
+                    "account_user_id": (
+                        artifact_account if isinstance(artifact_account, str) else None
+                    ),
                     "job_state": JobState(artifact.job.state).value,
-                    "metadata": dict(artifact.metadata_json),
+                    "trusted_shop_result": self._trusted_shop_result(artifact),
                 }
                 rows.append(
                     AnalysisEvidenceRead(
@@ -184,7 +204,14 @@ class AnalysisService:
                         account_user_id=(
                             artifact_account if isinstance(artifact_account, str) else None
                         ),
-                        eligible_for_opportunity=_eligible_for_opportunity([fact]),
+                        eligible_for_opportunity=_eligible_for_opportunity(
+                            [fact],
+                            required_accounts=(
+                                frozenset((artifact_account,))
+                                if isinstance(artifact_account, str) and artifact_account
+                                else frozenset()
+                            ),
+                        ),
                     )
                 )
             rank_items = session.scalars(
@@ -216,6 +243,7 @@ class AnalysisService:
         record = AnalysisRecord(
             analysis_type=payload.analysis_type,
             account_user_id=payload.account_user_id,
+            account_user_ids_json=list(payload.account_user_ids),
             status=status,
             prompt_version=PROMPT_VERSION,
             provider="alibaba_bailian",
@@ -237,6 +265,7 @@ class AnalysisService:
 
     def _resolve_evidence(self, payload: AnalysisCreate) -> list[dict[str, Any]]:
         facts: list[dict[str, Any]] = []
+        account_scope = payload.account_scope
         with self.database.session() as session:
             for evidence_id in payload.evidence_ids:
                 prefix, separator, raw_id = evidence_id.partition(":")
@@ -253,12 +282,12 @@ class AnalysisService:
                     job_input = dict(artifact.job.input_data)
                     artifact_account = job_input.get("account_user_id")
                     if (
-                        payload.account_user_id
-                        and artifact_account
-                        and artifact_account != payload.account_user_id
+                        not isinstance(artifact_account, str)
+                        or not artifact_account.strip()
+                        or artifact_account not in account_scope
                     ):
                         raise EvidenceAccountMismatch(
-                            f"Evidence {evidence_id} belongs to another account."
+                            f"Evidence {evidence_id} has no matching account ownership."
                         )
                     facts.append(
                         {
@@ -266,8 +295,9 @@ class AnalysisService:
                             "kind": artifact.kind,
                             "job_id": artifact.job_id,
                             "job_state": JobState(artifact.job.state).value,
+                            "account_user_id": artifact_account,
                             "job_input": job_input,
-                            "metadata": dict(artifact.metadata_json),
+                            "trusted_shop_result": self._trusted_shop_result(artifact),
                         }
                     )
                 elif prefix == "rank-item":
@@ -275,17 +305,18 @@ class AnalysisService:
                     if item is None:
                         raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
                     if (
-                        payload.account_user_id
-                        and item.user_id
-                        and item.user_id != payload.account_user_id
+                        not isinstance(item.user_id, str)
+                        or not item.user_id.strip()
+                        or item.user_id not in account_scope
                     ):
                         raise EvidenceAccountMismatch(
-                            f"Evidence {evidence_id} belongs to another account."
+                            f"Evidence {evidence_id} has no matching account ownership."
                         )
                     facts.append(
                         {
                             "evidence_id": evidence_id,
                             "kind": "rank_item",
+                            "account_user_id": item.user_id,
                             "user_id": item.user_id,
                             "source_url": item.source_url,
                             "facts": {
@@ -302,20 +333,64 @@ class AnalysisService:
                     raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
         return facts
 
-
-def _eligible_for_opportunity(evidence: list[dict[str, Any]]) -> bool:
-    shop_facts = [fact for fact in evidence if fact["kind"] == "shop_collection_result"]
-    if not shop_facts:
-        return False
-    for fact in shop_facts:
-        if fact.get("job_state") != JobState.succeeded.value:
-            return False
-        result = fact.get("metadata", {}).get("result")
+    def _trusted_shop_result(
+        self, artifact: JobArtifactRecord
+    ) -> dict[str, Any] | None:
+        job = artifact.job
         if (
-            not isinstance(result, dict)
-            or result.get("status") != "succeeded"
-            or result.get("complete") is not True
+            job.type not in ANDROID_SHOP_JOB_TYPES
+            or artifact.kind != "shop_collection_result"
+            or JobState(job.state) is not JobState.succeeded
         ):
+            return None
+        expected_path = Path("evidence") / "shops" / job.id / "result.json"
+        if artifact.path != expected_path.as_posix():
+            return None
+        result_path = _contained_regular_file(self.runtime_dir, expected_path)
+        if result_path is None:
+            return None
+        try:
+            file_result = json.loads(result_path.read_text(encoding="utf-8"))
+            metadata_result = artifact.metadata_json.get("result")
+            if not isinstance(file_result, dict) or file_result != metadata_result:
+                return None
+            parsed = ShopCollectionRead.model_validate(file_result)
+        except (OSError, json.JSONDecodeError, ValidationError):
+            return None
+        job_account = job.input_data.get("account_user_id")
+        expected_count = job.input_data.get("expected_count")
+        if (
+            parsed.job_id != job.id
+            or not isinstance(job_account, str)
+            or not job_account.strip()
+            or isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or parsed.expected_count != expected_count
+            or job.progress_total != expected_count
+            or job.progress_current != expected_count
+            or job.current_stage != "shop_complete"
+            or job.error_category is not None
+        ):
+            return None
+        return parsed.model_dump(mode="json")
+
+
+def _eligible_for_opportunity(
+    evidence: list[dict[str, Any]], *, required_accounts: frozenset[str]
+) -> bool:
+    shop_facts = [fact for fact in evidence if fact["kind"] == "shop_collection_result"]
+    if not shop_facts or not required_accounts:
+        return False
+    covered_accounts: set[str] = set()
+    for fact in shop_facts:
+        account_user_id = fact.get("account_user_id")
+        result = fact.get("trusted_shop_result")
+        if not isinstance(account_user_id, str) or account_user_id not in required_accounts:
+            return False
+        if not isinstance(result, dict):
+            return False
+        covered_accounts.add(account_user_id)
+        if result.get("status") != "succeeded" or result.get("complete") is not True:
             return False
         verification = result.get("verification")
         if not isinstance(verification, dict) or verification.get("complete") is not True:
@@ -333,9 +408,28 @@ def _eligible_for_opportunity(evidence: list[dict[str, Any]]) -> bool:
         if (
             len(set(counts)) != 1
             or counts[0] <= 0
+            or result.get("collected_count") != counts[0]
+            or result.get("missing_count") != 0
+            or result.get("missing_items") != []
+            or result.get("collection_missing_count") != 0
+            or result.get("collection_missing_items") != []
+            or result.get("overflow_count") != 0
             or verification.get("missing_count") != 0
+            or verification.get("missing_items") != []
             or verification.get("overflow_count", 0) != 0
             or verification.get("issues", []) != []
+        ):
+            return False
+        rejected_items = result.get("rejected_items")
+        rejected_count = result.get("rejected_count")
+        if (
+            not isinstance(rejected_items, list)
+            or rejected_count != len(rejected_items)
+            or any(
+                not isinstance(item, dict)
+                or item.get("reason") != "duplicate_source_url"
+                for item in rejected_items
+            )
         ):
             return False
         items = result.get("items")
@@ -344,7 +438,26 @@ def _eligible_for_opportunity(evidence: list[dict[str, Any]]) -> bool:
         urls = [item.get("source_url") for item in items if isinstance(item, dict)]
         if len(urls) != counts[0] or len(set(urls)) != counts[0]:
             return False
-    return True
+    return covered_accounts == set(required_accounts)
+
+
+def _contained_regular_file(root: Path, relative_path: Path) -> Path | None:
+    try:
+        resolved_root = root.resolve(strict=True)
+        candidate = root.joinpath(*relative_path.parts)
+        current = root
+        for part in relative_path.parts:
+            current = current / part
+            if current.is_symlink() or (
+                hasattr(current, "is_junction") and current.is_junction()
+            ):
+                return None
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(resolved_root)
+        mode = resolved.stat().st_mode
+    except (OSError, ValueError):
+        return None
+    return resolved if stat.S_ISREG(mode) else None
 
 
 def _validate_grounding(output: AnalysisOutput, *, allowed: set[str]) -> None:
@@ -402,6 +515,7 @@ def _analysis_read(record: AnalysisRecord) -> AnalysisRead:
         id=record.id,
         analysis_type=record.analysis_type,
         account_user_id=record.account_user_id,
+        account_user_ids=list(record.account_user_ids_json),
         status=record.status,
         prompt_version=record.prompt_version,
         provider=record.provider,

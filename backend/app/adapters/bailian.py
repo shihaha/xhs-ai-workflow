@@ -8,22 +8,13 @@ import time
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 
-from backend.app.adapters.contracts import ModelResult
+from backend.app.adapters.contracts import ModelResult, StructuredModelRequest
 
 
 DEFAULT_BAILIAN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_BAILIAN_TEXT_MODEL = "deepseek-v4-flash"
-
-
-class StructuredModelRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    system_prompt: str = Field(min_length=1)
-    user_prompt: str = Field(min_length=1)
-    prompt_version: str = Field(min_length=1, max_length=100)
-    evidence_ids: list[str] = Field(min_length=1)
 
 
 class BailianError(RuntimeError):
@@ -116,7 +107,7 @@ class BailianModelAdapter:
                     raise BailianAuthenticationError(
                         "Bailian authentication failed.", attempts=attempts
                     )
-                if response.status_code == 429 or response.status_code >= 500:
+                if response.status_code in {408, 429} or response.status_code >= 500:
                     attempts.append(
                         {"attempt": attempt_no, "category": f"http_{response.status_code}"}
                     )
@@ -193,7 +184,9 @@ def _validated_usage(value: Any) -> dict[str, int]:
     for key, item in value.items():
         if isinstance(item, bool) or not isinstance(item, (int, float)):
             raise ValueError("usage values must be finite non-negative integers")
-        if not math.isfinite(float(item)) or item < 0 or int(item) != item:
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("usage values must be finite non-negative integers")
+        if item < 0 or int(item) != item or item > 1_000_000_000:
             raise ValueError("usage values must be finite non-negative integers")
         result[str(key)] = int(item)
     return result

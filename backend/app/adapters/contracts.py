@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Protocol
 
-from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
 
 
 class CollectionRequest(BaseModel):
@@ -174,6 +174,17 @@ class ModelResult(BaseModel):
     duration_ms: int | None = Field(default=None, ge=0)
 
 
+class StructuredModelRequest(BaseModel):
+    """Provider-neutral structured generation input with an explicit evidence scope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    system_prompt: str = Field(min_length=1)
+    user_prompt: str = Field(min_length=1)
+    prompt_version: str = Field(min_length=1, max_length=100)
+    evidence_ids: list[str] = Field(min_length=1)
+
+
 class CollectorAdapter(Protocol):
     """Protocol implemented by collection sources without leaking their native shapes."""
 
@@ -198,5 +209,5 @@ class ModelAdapter(Protocol):
     """Protocol for a model provider adapter."""
 
     def generate_structured(
-        self, request: CollectionRequest, schema: type[BaseModel]
+        self, request: StructuredModelRequest, schema: type[BaseModel]
     ) -> ModelResult: ...
