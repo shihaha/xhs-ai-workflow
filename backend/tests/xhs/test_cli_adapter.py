@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import backend.app.adapters.xhs_cli_read as cli_module
 from backend.app.adapters.contracts import CollectionRequest
 from backend.app.adapters.xhs_cli_read import (
     XhsCliAccountRequest,
@@ -19,10 +20,12 @@ class FakeRunner:
     def __init__(self, responses: list[subprocess.CompletedProcess[bytes]]) -> None:
         self._responses = iter(responses)
         self.argv: list[str] | None = None
+        self.argvs: list[list[str]] = []
         self.shell: bool | None = None
 
     def __call__(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         self.argv = list(argv)
+        self.argvs.append(self.argv)
         self.shell = kwargs.get("shell")
         return next(self._responses)
 
@@ -56,6 +59,22 @@ def test_search_uses_argument_array_and_json_allowlist() -> None:
     assert fake_runner.argv == ["xhs", "search", "收纳", "--json"]
     assert fake_runner.shell is False
     assert result.status == "succeeded"
+
+
+def test_fixed_xhs_search_syntax_keeps_json_flag_after_a_safe_query() -> None:
+    """Moving --json before the positional query would no longer match the supported xhs CLI syntax."""
+    fake_runner = FakeRunner([_completed(["xhs"], {"notes": []})])
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    adapter.search_notes(
+        CollectionRequest(
+            capability="search_notes",
+            parameters={"keyword": "storage boxes", "job_id": JOB_ID},
+            expected_count=0,
+        )
+    )
+
+    assert fake_runner.argv == ["xhs", "search", "storage boxes", "--json"]
 
 
 @pytest.mark.parametrize("field", ["command", "executable", "cookie", "url", "env"])
@@ -94,6 +113,59 @@ def test_fetch_account_returns_one_profile_and_requested_notes() -> None:
     assert str(result.items[1].source_url) == "https://www.xiaohongshu.com/explore/note-1"
     assert result.status == "succeeded"
     assert result.complete is True
+    assert fake_runner.argvs == [
+        ["xhs", "user", "user-1", "--json"],
+        ["xhs", "user-posts", "user-1", "--json"],
+    ]
+
+
+@pytest.mark.parametrize("field", ["keyword", "user_id"])
+@pytest.mark.parametrize("unsafe_value", ["--json", "-x", "line\nbreak", "nul\x00byte"])
+def test_positional_cli_values_reject_options_and_control_characters(
+    field: str, unsafe_value: str
+) -> None:
+    """A positional value parsed as an option/control sequence could change the fixed CLI command."""
+    schema = XhsCliSearchRequest if field == "keyword" else XhsCliAccountRequest
+
+    with pytest.raises(ValueError):
+        schema.model_validate({field: unsafe_value})
+
+
+@pytest.mark.parametrize(
+    "payload, detail",
+    [
+        ({"notes": [], "message": "login required"}, "login_required"),
+        ({"notes": [], "message": "captcha required"}, "captcha_required"),
+        ({"notes": [], "message": "rate limit exceeded"}, "rate_limited"),
+        (
+            {"data": {"notes": [], "message": "captcha required"}},
+            "captcha_required",
+        ),
+    ],
+)
+def test_exit_zero_auth_envelopes_cannot_claim_empty_success(
+    payload: dict[str, object], detail: str
+) -> None:
+    """A successful process exit is not collection success when the JSON envelope reports an access gate."""
+    fake_runner = FakeRunner([_completed(["xhs"], payload)])
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.search_notes(
+        CollectionRequest(
+            capability="search_notes",
+            parameters={"keyword": "收纳", "job_id": JOB_ID},
+            expected_count=0,
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert result.detail == detail
+    assert result.complete is False
+
+
+def test_module_exposes_no_public_arbitrary_argv_runner() -> None:
+    """A public argv runner would let future callers bypass the adapter's command allowlist."""
+    assert not hasattr(cli_module, "run_xhs_json")
 
 
 def test_duplicate_notes_are_accounted_without_claiming_completion() -> None:

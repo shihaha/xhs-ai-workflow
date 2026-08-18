@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.app.adapters.contracts import (
     CollectionItem,
@@ -44,6 +44,11 @@ class XhsCliSearchRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=500)
     job_id: str | None = Field(default=None, min_length=1, max_length=500)
 
+    @field_validator("keyword")
+    @classmethod
+    def reject_unsafe_positional_value(cls, value: str) -> str:
+        return _safe_cli_positional(value)
+
 
 class XhsCliAccountRequest(BaseModel):
     """Only an account identity is accepted from a collection request."""
@@ -52,6 +57,11 @@ class XhsCliAccountRequest(BaseModel):
 
     user_id: str = Field(min_length=1, max_length=500)
     job_id: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @field_validator("user_id")
+    @classmethod
+    def reject_unsafe_positional_value(cls, value: str) -> str:
+        return _safe_cli_positional(value)
 
 
 class XhsCliReadError(RuntimeError):
@@ -63,23 +73,6 @@ class XhsCliReadError(RuntimeError):
 
 
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
-
-
-def run_xhs_json(
-    argv: Sequence[str], *, timeout_seconds: float, max_stdout_bytes: int = 5 * 1024 * 1024
-) -> dict[str, Any]:
-    """Run one fixed CLI argument array and decode only bounded JSON object output."""
-    try:
-        completed = subprocess.run(
-            list(argv),
-            shell=False,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise XhsCliReadError("timeout") from error
-    return decode_bounded_json(completed, max_stdout_bytes=max_stdout_bytes)
 
 
 def decode_bounded_json(
@@ -101,6 +94,9 @@ def decode_bounded_json(
         raise XhsCliReadError("malformed_output") from error
     if not isinstance(payload, dict):
         raise XhsCliReadError("malformed_output")
+    category = _payload_human_failure_category(payload)
+    if category is not None:
+        raise XhsCliReadError(category)
     return _redact_credentials(payload)
 
 
@@ -334,6 +330,12 @@ def _safe_token(value: Any) -> str | None:
     return text if _SAFE_TOKEN.fullmatch(text) is not None else None
 
 
+def _safe_cli_positional(value: str) -> str:
+    if not value.strip() or value.startswith("-") or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("xhs CLI positional values cannot be options or control characters.")
+    return value
+
+
 def _public_data(row: dict[str, Any], **identity: str) -> dict[str, Any]:
     allowed = {
         "title", "desc", "description", "nickname", "user_id", "userId", "author_name",
@@ -438,6 +440,24 @@ def _failure_category(stdout: bytes, stderr: bytes) -> str:
     if "private" in text or "not visible" in text or "forbidden" in text:
         return "account_visibility_restricted"
     return "cli_failed"
+
+
+def _payload_human_failure_category(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).casefold() in {"message", "msg", "error", "detail", "reason"} and isinstance(child, str):
+                category = _failure_category(child.encode("utf-8"), b"")
+                if category in _HUMAN_FAILURES:
+                    return category
+            category = _payload_human_failure_category(child)
+            if category is not None:
+                return category
+    elif isinstance(value, list):
+        for child in value:
+            category = _payload_human_failure_category(child)
+            if category is not None:
+                return category
+    return None
 
 
 def _redact_credentials(value: Any) -> Any:
