@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -68,6 +69,19 @@ class ContentModelUnavailable(ContentError):
 
 class ContentModelFailure(ContentError):
     pass
+
+
+class _ReservationOutcome(str, Enum):
+    LANDED = "landed"
+    NOT_LANDED = "not_landed"
+    UNKNOWN = "unknown"
+
+
+class _FailureOutcome(str, Enum):
+    FAILED = "failed"
+    PROVEN_FAILED = "proven_failed"
+    UNKNOWN = "unknown"
+    LOST = "lost"
 
 
 class ContentService:
@@ -160,7 +174,11 @@ class ContentService:
         try:
             write_contained_atomic(self.runtime_dir, record.path, data)
         except UnsafeContentPath as error:
+            self._make_material_cleanup_due(cleanup.id, candidate)
             raise ContentValidationError(str(error)) from error
+        except Exception:
+            self._make_material_cleanup_due(cleanup.id, candidate)
+            raise
         try:
             with self.database.session() as session:
                 session.add(record)
@@ -223,6 +241,36 @@ class ContentService:
                 return self._material_read(record)
         except SQLAlchemyError:
             return None
+
+    def _make_material_cleanup_due(
+        self, cleanup_id: str, candidate: ArtifactCleanupCandidate
+    ) -> None:
+        due_at = _now()
+        try:
+            with self.database.session() as session:
+                if not self.cleanup_service.make_due_in_session(
+                    session, cleanup_id, candidate=candidate, due_at=due_at
+                ):
+                    raise ContentStateError(
+                        "material_failure_transaction_unknown: cleanup reservation changed."
+                    )
+                session.commit()
+                return
+        except ContentStateError:
+            raise
+        except SQLAlchemyError as error:
+            try:
+                with self.database.session() as session:
+                    cleanup = session.get(ArtifactCleanupRecord, cleanup_id)
+                    proven = self._cleanup_matches(
+                        cleanup, candidate, state="pending"
+                    ) and cleanup.not_before <= due_at
+            except SQLAlchemyError:
+                proven = False
+            if not proven:
+                raise ContentStateError(
+                    "material_failure_transaction_unknown: cleanup due state could not be proven."
+                ) from error
 
     def create_content_item(self, payload: ContentItemCreate) -> ContentItemRead:
         with self.database.session() as session:
@@ -464,10 +512,16 @@ class ContentService:
             if existing is not None and existing.status == "building":
                 raise ContentStateError("This revision package is already building.")
             replaced_candidate: ArtifactCleanupCandidate | None = None
+            replaced_cleanup = None
+            prior_package: tuple[str, str, str, int, str | None] | None = None
             if existing is not None:
                 package_id = existing.id
                 old_path = existing.path
                 previous_status = existing.status
+                prior_package = (
+                    previous_status, old_path, existing.sha256,
+                    existing.size_bytes, existing.build_token,
+                )
                 package_path = f"content-packages/{item_id}/{package_id}-{uuid4().hex}.zip"
                 self._assert_path_not_quarantined(session, package_path)
                 replaced_candidate = ArtifactCleanupCandidate(
@@ -488,7 +542,9 @@ class ContentService:
                 )).rowcount
                 if won != 1:
                     raise ContentStateError("This revision package was concurrently reserved.")
-                self.cleanup_service.enqueue_in_session(session, replaced_candidate)
+                replaced_cleanup = self.cleanup_service.enqueue_in_session(
+                    session, replaced_candidate
+                )
             else:
                 package_id = str(uuid4())
                 package_path = f"content-packages/{item_id}/{package_id}.zip"
@@ -509,7 +565,25 @@ class ContentService:
             build_cleanup = self.cleanup_service.enqueue_in_session(
                 session, build_candidate
             )
-            session.commit()
+            try:
+                session.commit()
+            except SQLAlchemyError as error:
+                session.rollback()
+                outcome = self._package_reservation_after_unknown(
+                    package_id, item_id, payload.expected_revision_id,
+                    package_path, build_token, archive_sha, archive_size,
+                    build_cleanup.id, build_candidate, prior_package,
+                    replaced_cleanup.id if replaced_cleanup is not None else None,
+                    replaced_candidate,
+                )
+                if outcome is _ReservationOutcome.NOT_LANDED:
+                    raise ContentStateError(
+                        "package_reservation_failed: reservation transaction did not commit."
+                    ) from error
+                if outcome is _ReservationOutcome.UNKNOWN:
+                    raise ContentStateError(
+                        "package_reservation_transaction_unknown: reservation facts could not be proven."
+                    ) from error
         reserved_item_id = item_id
         reserved_revision_id = payload.expected_revision_id
 
@@ -562,19 +636,86 @@ class ContentService:
                     raise ContentStateError("Package disappeared after finalization.")
                 return self._package_read(package)
         except UnsafeContentPath as error:
-            self._fail_package_reservation(
+            failure = self._fail_package_reservation(
                 package_id, reserved_item_id, reserved_revision_id, package_path,
                 build_token, build_cleanup.id, build_candidate,
             )
+            if failure is _FailureOutcome.UNKNOWN:
+                raise ContentStateError(
+                    "package_failure_transaction_unknown: failed package facts could not be proven."
+                ) from error
             raise ContentValidationError(
                 "Package build failed; no ready artifact was recorded."
             ) from error
-        except Exception:
-            self._fail_package_reservation(
+        except Exception as error:
+            failure = self._fail_package_reservation(
                 package_id, reserved_item_id, reserved_revision_id, package_path,
                 build_token, build_cleanup.id, build_candidate,
             )
+            if failure is _FailureOutcome.UNKNOWN:
+                raise ContentStateError(
+                    "package_failure_transaction_unknown: failed package facts could not be proven."
+                ) from error
             raise
+
+    def _package_reservation_after_unknown(
+        self,
+        package_id: str,
+        item_id: str,
+        revision_id: str,
+        package_path: str,
+        build_token: str,
+        expected_sha256: str,
+        expected_size_bytes: int,
+        cleanup_id: str,
+        candidate: ArtifactCleanupCandidate,
+        prior_package: tuple[str, str, str, int, str | None] | None,
+        replaced_cleanup_id: str | None,
+        replaced_candidate: ArtifactCleanupCandidate | None,
+    ) -> _ReservationOutcome:
+        try:
+            with self.database.session() as session:
+                package = session.get(ContentPackageRecord, package_id)
+                cleanup = session.get(ArtifactCleanupRecord, cleanup_id)
+                landed = bool(
+                    package is not None and package.content_item_id == item_id
+                    and package.revision_id == revision_id
+                    and package.status == "building" and package.path == package_path
+                    and package.build_token == build_token
+                    and package.sha256 == expected_sha256
+                    and package.size_bytes == expected_size_bytes
+                    and self._cleanup_matches(cleanup, candidate, state="pending")
+                    and cleanup.not_before == _naive_datetime(candidate.not_before)
+                )
+                if landed and replaced_candidate is not None:
+                    replaced = session.get(
+                        ArtifactCleanupRecord, replaced_cleanup_id
+                    ) if replaced_cleanup_id is not None else None
+                    landed = bool(
+                        self._cleanup_matches(
+                            replaced, replaced_candidate, state="pending"
+                        )
+                        and replaced.not_before
+                        == _naive_datetime(replaced_candidate.not_before)
+                    )
+                if landed:
+                    return _ReservationOutcome.LANDED
+                if prior_package is None:
+                    if package is None and cleanup is None:
+                        return _ReservationOutcome.NOT_LANDED
+                elif package is not None and cleanup is None:
+                    old_status, old_path, old_sha, old_size, old_token = prior_package
+                    if (
+                        package.content_item_id == item_id
+                        and package.revision_id == revision_id
+                        and package.status == old_status and package.path == old_path
+                        and package.sha256 == old_sha and package.size_bytes == old_size
+                        and package.build_token == old_token
+                    ):
+                        return _ReservationOutcome.NOT_LANDED
+                return _ReservationOutcome.UNKNOWN
+        except SQLAlchemyError:
+            return _ReservationOutcome.UNKNOWN
 
     def _fail_package_reservation(
         self,
@@ -585,7 +726,8 @@ class ContentService:
         build_token: str,
         cleanup_id: str,
         candidate: ArtifactCleanupCandidate,
-    ) -> bool | None:
+    ) -> _FailureOutcome:
+        due_at = _now()
         try:
             with self.database.session() as session:
                 won = session.execute(update(ContentPackageRecord).where(
@@ -598,14 +740,24 @@ class ContentService:
                 ).values(
                     status="failed",
                     error_detail="package_build_failed",
+                    sha256=candidate.expected_sha256,
+                    size_bytes=candidate.expected_size_bytes,
                 )).rowcount
+                if won != 1:
+                    session.rollback()
+                    return _FailureOutcome.LOST
+                if not self.cleanup_service.make_due_in_session(
+                    session, cleanup_id, candidate=candidate, due_at=due_at
+                ):
+                    session.rollback()
+                    return _FailureOutcome.UNKNOWN
                 session.commit()
-                return won == 1
+                return _FailureOutcome.FAILED
         except SQLAlchemyError:
-            return True if self._package_failed_after_unknown(
+            return self._package_failed_after_unknown(
                 package_id, item_id, revision_id, package_path, build_token,
-                cleanup_id, candidate,
-            ) else None
+                cleanup_id, candidate, due_at,
+            )
 
     def _package_after_unknown(
         self,
@@ -650,19 +802,33 @@ class ContentService:
         build_token: str,
         cleanup_id: str,
         candidate: ArtifactCleanupCandidate,
-    ) -> bool:
+        due_at: datetime,
+    ) -> _FailureOutcome:
         try:
             with self.database.session() as session:
                 package = session.get(ContentPackageRecord, package_id)
                 cleanup = session.get(ArtifactCleanupRecord, cleanup_id)
-                return bool(
+                if (
                     package is not None and package.content_item_id == item_id
                     and package.revision_id == revision_id and package.status == "failed"
                     and package.path == package_path and package.build_token == build_token
+                    and package.sha256 == candidate.expected_sha256
+                    and package.size_bytes == candidate.expected_size_bytes
                     and self._cleanup_matches(cleanup, candidate, state="pending")
-                )
+                    and cleanup.not_before <= due_at
+                ):
+                    return _FailureOutcome.PROVEN_FAILED
+                if package is not None and (
+                    package.content_item_id != item_id
+                    or package.revision_id != revision_id
+                    or package.path != package_path
+                    or package.build_token != build_token
+                    or package.status not in {"building", "failed"}
+                ):
+                    return _FailureOutcome.LOST
+                return _FailureOutcome.UNKNOWN
         except SQLAlchemyError:
-            return False
+            return _FailureOutcome.UNKNOWN
 
     @staticmethod
     def _cleanup_matches(
@@ -1164,3 +1330,9 @@ def _valid_webp(payload: bytes) -> bool:
 
 def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _naive_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)

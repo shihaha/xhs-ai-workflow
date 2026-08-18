@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -183,6 +184,237 @@ def test_package_pending_reservation_exists_before_archive_write(
         ))
         assert package is not None and package.status == "failed"
         assert cleanup is not None and cleanup.state == "pending"
+        assert cleanup.not_before <= datetime.now(UTC).replace(tzinfo=None)
+
+
+def test_package_reservation_commit_ack_lost_continues_after_exact_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, item, image = _image_item(tmp_path)
+    _inject_cleanup(service, tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    real_commit = Session.commit
+    raised = False
+
+    def reservation_commit_then_raise(session: Session) -> None:
+        nonlocal raised
+        real_commit(session)
+        if raised:
+            return
+        with service.database.engine.connect() as connection:
+            landed = connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM content_packages p JOIN artifact_gc_queue g "
+                "ON g.owner_id=p.id AND g.relative_path=p.path "
+                "WHERE p.status='building' AND g.state='pending' "
+                "AND g.reason='package_build_reserved'"
+            ).scalar_one()
+        if landed == 1:
+            raised = True
+            raise SQLAlchemyError("reservation acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", reservation_commit_then_raise)
+    package = service.export_package(
+        item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+    )
+    assert package.status == "ready"
+    assert package.availability == "available"
+
+
+def test_package_reservation_not_landed_never_writes_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, item, image = _image_item(tmp_path)
+    _inject_cleanup(service, tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    writes: list[str] = []
+
+    monkeypatch.setattr(
+        Session, "commit", lambda _session: (_ for _ in ()).throw(
+            SQLAlchemyError("reservation commit rejected")
+        )
+    )
+    monkeypatch.setattr(
+        "backend.app.features.content.service.write_contained_atomic",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with pytest.raises(ContentStateError, match="package_reservation_failed"):
+        service.export_package(
+            item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+        )
+    assert writes == []
+    with service.database.session() as session:
+        assert session.scalar(select(ContentPackageRecord)) is None
+
+
+def test_package_reservation_partial_landing_is_transaction_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, item, image = _image_item(tmp_path)
+    _inject_cleanup(service, tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    real_commit = Session.commit
+    mutated = False
+    writes: list[str] = []
+
+    def commit_mutate_cleanup_then_raise(session: Session) -> None:
+        nonlocal mutated
+        real_commit(session)
+        if mutated:
+            return
+        with service.database.engine.begin() as connection:
+            cleanup_id = connection.exec_driver_sql(
+                "SELECT id FROM artifact_gc_queue "
+                "WHERE reason='package_build_reserved' AND state='pending'"
+            ).scalar_one_or_none()
+            if cleanup_id is not None:
+                connection.exec_driver_sql(
+                    "UPDATE artifact_gc_queue SET expected_size_bytes=expected_size_bytes+1 "
+                    "WHERE id=?", (cleanup_id,)
+                )
+                mutated = True
+        if mutated:
+            raise SQLAlchemyError("reservation acknowledgement ambiguous")
+
+    monkeypatch.setattr(Session, "commit", commit_mutate_cleanup_then_raise)
+    monkeypatch.setattr(
+        "backend.app.features.content.service.write_contained_atomic",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with pytest.raises(ContentStateError, match="package_reservation_transaction_unknown"):
+        service.export_package(
+            item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+        )
+    assert writes == []
+
+
+def test_package_reservation_unreadable_proof_is_transaction_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, item, image = _image_item(tmp_path)
+    _inject_cleanup(service, tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    real_session = service.database.session
+    session_calls = 0
+    writes: list[str] = []
+
+    @contextmanager
+    def unreadable_proof_session():
+        nonlocal session_calls
+        session_calls += 1
+        if session_calls == 3:
+            raise SQLAlchemyError("fresh reservation proof unavailable")
+        with real_session() as session:
+            yield session
+
+    monkeypatch.setattr(service.database, "session", unreadable_proof_session)
+    monkeypatch.setattr(
+        Session, "commit", lambda _session: (_ for _ in ()).throw(
+            SQLAlchemyError("reservation acknowledgement unavailable")
+        )
+    )
+    monkeypatch.setattr(
+        "backend.app.features.content.service.write_contained_atomic",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with pytest.raises(ContentStateError, match="package_reservation_transaction_unknown"):
+        service.export_package(
+            item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+        )
+    assert writes == []
+
+
+def test_failed_package_commit_not_landed_is_transaction_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import backend.app.features.content.service as service_module
+
+    service, item, image = _image_item(tmp_path)
+    _inject_cleanup(service, tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    real_write = service_module.write_contained_atomic
+    real_commit = Session.commit
+    commit_count = 0
+
+    def write_then_fail(root: Path, relative: str, data: bytes) -> None:
+        real_write(root, relative, data)
+        raise RuntimeError("forced package failure")
+
+    def reject_failed_commit(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 2:
+            raise SQLAlchemyError("failed transition rejected")
+        real_commit(session)
+
+    monkeypatch.setattr(service_module, "write_contained_atomic", write_then_fail)
+    monkeypatch.setattr(Session, "commit", reject_failed_commit)
+    with pytest.raises(ContentStateError, match="package_failure_transaction_unknown"):
+        service.export_package(
+            item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+        )
+
+
+def test_failed_package_ack_with_cleanup_identity_mismatch_is_transaction_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import backend.app.features.content.service as service_module
+
+    service, item, image = _image_item(tmp_path)
+    _inject_cleanup(service, tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    real_write = service_module.write_contained_atomic
+    real_commit = Session.commit
+    commit_count = 0
+
+    def write_then_fail(root: Path, relative: str, data: bytes) -> None:
+        real_write(root, relative, data)
+        raise RuntimeError("forced package failure")
+
+    def commit_mutate_cleanup_then_raise(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        real_commit(session)
+        if commit_count == 2:
+            with service.database.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE artifact_gc_queue SET expected_size_bytes=expected_size_bytes+1 "
+                    "WHERE reason='package_build_reserved' AND state='pending'"
+                )
+            raise SQLAlchemyError("failed transition acknowledgement ambiguous")
+
+    monkeypatch.setattr(service_module, "write_contained_atomic", write_then_fail)
+    monkeypatch.setattr(Session, "commit", commit_mutate_cleanup_then_raise)
+    with pytest.raises(ContentStateError, match="package_failure_transaction_unknown"):
+        service.export_package(
+            item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
+        )
+
+
+def test_explicit_material_write_failure_makes_reservation_due_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, item, _ = _image_item(tmp_path)
+    _inject_cleanup(service, tmp_path)
+
+    monkeypatch.setattr(
+        "backend.app.features.content.service.write_contained_atomic",
+        lambda _root, _relative, _data: (_ for _ in ()).throw(
+            RuntimeError("explicit material write failure")
+        ),
+    )
+    before = datetime.now(UTC).replace(tzinfo=None)
+    with pytest.raises(RuntimeError, match="explicit material write failure"):
+        service.add_material(item.product_id, _source_payload(tmp_path))
+
+    record = next(
+        value for value in service.cleanup_service.list_records()
+        if value.reason == "material_write_reserved" and value.state == "pending"
+    )
+    assert record.not_before <= datetime.now(UTC).replace(tzinfo=None)
+    assert record.not_before >= before - timedelta(seconds=1)
 
 
 def test_material_database_failure_enqueues_without_deleting(
@@ -422,8 +654,11 @@ def test_ambiguous_failed_finalizer_retains_artifact_and_records_cleanup(
         assert package is not None
         assert package.status == "failed"
         assert cleanup is not None
+        assert package.sha256 == cleanup.expected_sha256
+        assert package.size_bytes == cleanup.expected_size_bytes
         assert cleanup.state == "pending"
         assert cleanup.reason == "package_build_reserved"
+        assert cleanup.not_before <= datetime.now(UTC).replace(tzinfo=None)
         assert (tmp_path / cleanup.relative_path).exists()
 
 

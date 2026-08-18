@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -1440,13 +1440,23 @@ def test_legacy_building_package_is_failed_and_enqueued_without_deleting_file(
     )
     artifact = tmp_path / package.path
     original = artifact.read_bytes()
-    with service.database.session() as session:
-        record = session.get(ContentPackageRecord, package.id)
-        record.status = "building"
-        session.commit()
+    future_due = datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=24)
+    with service.database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE content_packages SET status='building' WHERE id=:id"),
+            {"id": package.id},
+        )
+        connection.execute(
+            text(
+                "UPDATE artifact_gc_queue SET state='pending', not_before=:future_due "
+                "WHERE owner_type='content_package' AND owner_id=:id"
+            ),
+            {"id": package.id, "future_due": future_due},
+        )
     database_path = service.database.database_path
     service.database.close()
 
+    recovery_started = datetime.now(UTC).replace(tzinfo=None)
     upgraded = Database(database_path, runtime_dir=tmp_path)
     try:
         with upgraded.session() as session:
@@ -1458,6 +1468,8 @@ def test_legacy_building_package_is_failed_and_enqueued_without_deleting_file(
             assert recovered.status == "failed"
             assert recovered.error_detail == "worker_restart_required"
             assert cleanup.state == "pending"
+            assert cleanup.not_before <= datetime.now(UTC).replace(tzinfo=None)
+            assert cleanup.not_before >= recovery_started
             assert cleanup.expected_sha256 == package.sha256
             assert cleanup.expected_size_bytes == package.size_bytes
         assert artifact.read_bytes() == original

@@ -430,6 +430,28 @@ class Database:
                         "completed_at": None,
                     },
                 )
+                advanced = connection.execute(
+                    text(
+                        "UPDATE artifact_gc_queue SET not_before=:now, updated_at=:now "
+                        "WHERE owner_type='content_package' AND owner_id=:owner_id "
+                        "AND relative_path=:relative_path AND path_key=:path_key "
+                        "AND expected_sha256=:expected_sha256 "
+                        "AND expected_size_bytes=:expected_size_bytes "
+                        "AND state='pending'"
+                    ),
+                    {
+                        "now": now,
+                        "owner_id": package["id"],
+                        "relative_path": package["path"],
+                        "path_key": path_key,
+                        "expected_sha256": package["sha256"],
+                        "expected_size_bytes": package["size_bytes"],
+                    },
+                ).rowcount
+                if advanced != 1:
+                    raise SchemaMigrationError(
+                        "Interrupted package cleanup identity requires isolated manual migration."
+                    )
             connection.execute(
                 text(
                     "UPDATE content_packages SET status='failed', "
