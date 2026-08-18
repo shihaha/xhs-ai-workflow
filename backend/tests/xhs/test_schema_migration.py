@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from backend.app.db import (
     Database,
     SchemaMigrationError,
+    _rebuild_xhs_account_notes_with_permanent_ids,
     _require_xhs_account_note_canonical_id_preconditions,
     _require_xhs_account_note_identity_preconditions,
     _xhs_account_note_autoincrement_ddl_valid,
@@ -33,6 +34,24 @@ from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 MIGRATION = "xhs_account_note_evidence_v1"
 IDENTITY_MIGRATION = "xhs_account_note_identity_v2"
 CANONICAL_ID_MIGRATION = "xhs_account_note_canonical_id_v3"
+_KNOWN_IDENTITY_TEMPORARY_TABLES = (
+    "xhs_account_notes_identity_v1",
+    "xhs_account_notes_canonical_id_v2",
+)
+_IDENTITY_TEMPORARY_TABLE_CASES = (
+    "xhs_account_notes_identity_v1",
+    "XHS_ACCOUNT_NOTES_IDENTITY_V1",
+    "XhS_aCcOuNt_NoTeS_iDeNtItY_V1",
+    "xhs_account_notes_canonical_id_v2",
+    "XHS_ACCOUNT_NOTES_CANONICAL_ID_V2",
+    "XhS_aCcOuNt_NoTeS_cAnOnIcAl_Id_V2",
+)
+_CASE_VARIANT_REBUILD_CASES = (
+    ("XHS_ACCOUNT_NOTES_IDENTITY_V1", "xhs_account_notes_identity_v1"),
+    ("XhS_aCcOuNt_NoTeS_iDeNtItY_V1", "xhs_account_notes_identity_v1"),
+    ("XHS_ACCOUNT_NOTES_CANONICAL_ID_V2", "xhs_account_notes_canonical_id_v2"),
+    ("XhS_aCcOuNt_NoTeS_cAnOnIcAl_Id_V2", "xhs_account_notes_canonical_id_v2"),
+)
 
 
 def _insert_trusted_note(
@@ -177,11 +196,8 @@ def _identity_disk_state(path: Path) -> tuple[object, ...]:
     with sqlite3.connect(path) as connection:
         temporary_tables = connection.execute(
             "SELECT name, sql FROM sqlite_master WHERE type='table' "
-            "AND name IN (?, ?) ORDER BY name",
-            (
-                "xhs_account_notes_identity_v1",
-                "xhs_account_notes_canonical_id_v2",
-            ),
+            "AND name COLLATE NOCASE IN (?, ?) ORDER BY name",
+            _KNOWN_IDENTITY_TEMPORARY_TABLES,
         ).fetchall()
         return (
             connection.execute(
@@ -785,10 +801,7 @@ def test_identity_half_migration_with_new_ddl_and_old_table_fails_every_restart(
 
 @pytest.mark.parametrize(
     "temporary_table",
-    [
-        "xhs_account_notes_identity_v1",
-        "xhs_account_notes_canonical_id_v2",
-    ],
+    _IDENTITY_TEMPORARY_TABLE_CASES,
 )
 def test_identity_marker_validator_rejects_every_known_leftover_without_writes(
     tmp_path: Path,
@@ -796,6 +809,7 @@ def test_identity_marker_validator_rejects_every_known_leftover_without_writes(
 ) -> None:
     path = tmp_path / f"identity-marker-leftover-{temporary_table}.sqlite3"
     database = Database(path)
+    _insert_trusted_note(database, note_id="preserved")
     _create_identity_leftover(path, temporary_table)
     before = _identity_disk_state(path)
     try:
@@ -812,10 +826,7 @@ def test_identity_marker_validator_rejects_every_known_leftover_without_writes(
 
 @pytest.mark.parametrize(
     "temporary_table",
-    [
-        "xhs_account_notes_identity_v1",
-        "xhs_account_notes_canonical_id_v2",
-    ],
+    _IDENTITY_TEMPORARY_TABLE_CASES,
 )
 def test_identity_marker_absent_preflight_rejects_every_known_leftover_without_writes(
     tmp_path: Path,
@@ -823,6 +834,7 @@ def test_identity_marker_absent_preflight_rejects_every_known_leftover_without_w
 ) -> None:
     path = tmp_path / f"identity-preflight-leftover-{temporary_table}.sqlite3"
     database = Database(path)
+    _insert_trusted_note(database, note_id="preserved")
     with database.engine.begin() as connection:
         connection.execute(
             text(
@@ -841,6 +853,71 @@ def test_identity_marker_absent_preflight_rejects_every_known_leftover_without_w
             assert _identity_disk_state(path) == before
     finally:
         database.close()
+
+    for _attempt in range(2):
+        with pytest.raises(SchemaMigrationError, match="Interrupted"):
+            Database(path)
+        assert _identity_disk_state(path) == before
+
+
+@pytest.mark.parametrize(
+    ("temporary_table", "rebuild_target"),
+    _CASE_VARIANT_REBUILD_CASES,
+)
+def test_rebuild_rejects_ascii_case_variant_known_leftover_without_writes(
+    tmp_path: Path,
+    temporary_table: str,
+    rebuild_target: str,
+) -> None:
+    path = tmp_path / f"rebuild-case-leftover-{temporary_table}.sqlite3"
+    database = Database(path)
+    _insert_trusted_note(database, note_id="preserved")
+    _create_identity_leftover(path, temporary_table)
+    before = _identity_disk_state(path)
+    try:
+        with database.engine.begin() as connection:
+            with pytest.raises(SchemaMigrationError, match="Interrupted"):
+                _rebuild_xhs_account_notes_with_permanent_ids(
+                    connection,
+                    XhsAccountNoteRecord,
+                    temporary_table=rebuild_target,
+                )
+        assert _identity_disk_state(path) == before
+    finally:
+        database.close()
+
+
+def test_unicode_casefold_lookalike_is_not_a_sqlite_identifier_match(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unicode-casefold-control.sqlite3"
+    database = Database(path)
+    database.close()
+    lookalike = "xhſ_account_notes_identity_v1"
+    with sqlite3.connect(path) as connection:
+        connection.execute(f'CREATE TABLE "{lookalike}" (sentinel TEXT NOT NULL)')
+        connection.execute(
+            f'INSERT INTO "{lookalike}"(sentinel) VALUES (?)',
+            ("unicode-control",),
+        )
+        before = connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND name=?",
+            (lookalike,),
+        ).fetchall(), connection.execute(
+            f'SELECT * FROM "{lookalike}" ORDER BY rowid'
+        ).fetchall()
+
+    restarted = Database(path)
+    restarted.close()
+
+    with sqlite3.connect(path) as connection:
+        after = connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND name=?",
+            (lookalike,),
+        ).fetchall(), connection.execute(
+            f'SELECT * FROM "{lookalike}" ORDER BY rowid'
+        ).fetchall()
+    assert after == before
 
 
 def test_fresh_schema_has_canonical_note_id_check_and_v3_marker(
@@ -1018,10 +1095,7 @@ def test_canonical_id_marker_rejects_leftover_half_migration_table(
 
 @pytest.mark.parametrize(
     "temporary_table",
-    [
-        "xhs_account_notes_identity_v1",
-        "xhs_account_notes_canonical_id_v2",
-    ],
+    _IDENTITY_TEMPORARY_TABLE_CASES,
 )
 def test_canonical_id_marker_validator_rejects_every_known_leftover_without_writes(
     tmp_path: Path,
@@ -1029,6 +1103,7 @@ def test_canonical_id_marker_validator_rejects_every_known_leftover_without_writ
 ) -> None:
     path = tmp_path / f"canonical-marker-leftover-{temporary_table}.sqlite3"
     database = Database(path)
+    _insert_trusted_note(database, note_id="preserved")
     _create_identity_leftover(path, temporary_table)
     before = _identity_disk_state(path)
     try:
@@ -1041,13 +1116,15 @@ def test_canonical_id_marker_validator_rejects_every_known_leftover_without_writ
     finally:
         database.close()
 
+    for _attempt in range(2):
+        with pytest.raises(SchemaMigrationError, match="Interrupted"):
+            Database(path)
+        assert _identity_disk_state(path) == before
+
 
 @pytest.mark.parametrize(
     "temporary_table",
-    [
-        "xhs_account_notes_identity_v1",
-        "xhs_account_notes_canonical_id_v2",
-    ],
+    _IDENTITY_TEMPORARY_TABLE_CASES,
 )
 def test_canonical_id_marker_absent_preflight_rejects_every_known_leftover_without_writes(
     tmp_path: Path,
@@ -1055,6 +1132,7 @@ def test_canonical_id_marker_absent_preflight_rejects_every_known_leftover_witho
 ) -> None:
     path = tmp_path / f"canonical-preflight-leftover-{temporary_table}.sqlite3"
     database = Database(path)
+    _insert_trusted_note(database, note_id="preserved")
     with database.engine.begin() as connection:
         connection.execute(
             text(

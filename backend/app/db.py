@@ -1471,13 +1471,29 @@ _XHS_ACCOUNT_NOTE_IDENTITY_TEMPORARY_TABLES = frozenset(
         "xhs_account_notes_canonical_id_v2",
     }
 )
+_SQLITE_ASCII_IDENTIFIER_CASE_MAP = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "abcdefghijklmnopqrstuvwxyz",
+)
+
+
+def _sqlite_ascii_identifier_key(value: str) -> str:
+    """Match SQLite object names without folding non-ASCII code points."""
+
+    return value.translate(_SQLITE_ASCII_IDENTIFIER_CASE_MAP)
 
 
 def _xhs_account_note_identity_leftovers(
     connection: Connection,
 ) -> frozenset[str]:
-    return frozenset(inspect(connection).get_table_names()).intersection(
-        _XHS_ACCOUNT_NOTE_IDENTITY_TEMPORARY_TABLES
+    known_names = frozenset(
+        _sqlite_ascii_identifier_key(name)
+        for name in _XHS_ACCOUNT_NOTE_IDENTITY_TEMPORARY_TABLES
+    )
+    return frozenset(
+        name
+        for name in inspect(connection).get_table_names()
+        if _sqlite_ascii_identifier_key(name) in known_names
     )
 
 

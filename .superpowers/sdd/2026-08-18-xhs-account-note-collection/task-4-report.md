@@ -411,3 +411,73 @@ Python 3.12 SQLite datetime-adapter deprecations in content tests.
 - Provider-neutral analysis, account-note trust, exact shop N/N gating, Task 5,
   Bailian media and untracked research remain unchanged. The authenticated live
   boundary remains `not_run`.
+
+## Fix round 5/5 — SQLite-equivalent temporary-table identity matching
+
+### Review finding closed
+
+- The shared temporary-table detector now canonicalizes only ASCII `A` through
+  `Z`, matching SQLite object-name identity instead of Python's case-sensitive set
+  intersection. Uppercase and mixed-case spellings of both audited migration
+  tables are therefore the same interrupted migration objects as their lowercase
+  spellings, including when the identifiers were quoted at creation.
+- The canonicalizer deliberately does not use Unicode `casefold()`. SQLite treats
+  non-ASCII casefold lookalikes such as `ſ` and `s` as distinct identifier bytes;
+  a regression control proves that such an unrelated table remains legal and
+  unchanged across startup.
+- The one detector remains shared by v2/v3 marker validators, both marker-absent
+  preflights, the rebuild entry point and startup. Tests cover both known names in
+  lowercase, uppercase and mixed ASCII case; v2/v3 markers present and missing;
+  direct rebuild rejection; and two repeated real startup attempts.
+- Every rejection compares a complete logical migration-state snapshot containing
+  the v1/v2/v3 marker state, main note-table DDL and populated rows, persisted
+  analysis-reference state, `sqlite_sequence`, the actual case-preserved
+  temporary-table DDL and its row contents. Marker-present paths write nothing,
+  and a missing marker is never repaired while any case-equivalent leftover
+  remains.
+
+### Fix-round RED evidence
+
+Before the production change:
+
+```text
+python -m pytest backend/tests/xhs/test_schema_migration.py -k "every_known_leftover or ascii_case_variant" -q --tb=short
+20 failed, 8 passed, 35 deselected in 8.65s
+```
+
+All lowercase controls passed. Every uppercase/mixed-case validator and preflight
+case missed the leftover, while direct rebuild reached SQLite's later
+`there is already another table or index with this name` error instead of the
+shared fail-closed `SchemaMigrationError`.
+
+### Fix-round GREEN evidence
+
+```text
+python -m pytest backend/tests/xhs/test_schema_migration.py -k "every_known_leftover or ascii_case_variant or unicode_casefold" -q --tb=short
+29 passed, 34 deselected in 5.32s
+
+python -m pytest backend/tests/xhs/test_schema_migration.py -q --tb=short
+63 passed in 10.40s
+
+python -m pytest backend/tests/analysis backend/tests/xhs -q
+428 passed, 1 skipped in 28.46s
+
+python -m pytest backend/tests -q
+1020 passed, 1 skipped, 32 warnings in 112.10s
+```
+
+The skip remains the explicit opt-in live gate. The warnings remain the existing
+Python 3.12 SQLite datetime-adapter deprecations in content tests.
+`python -m compileall -q backend/app backend/tests` and `git diff --check` exited
+0 after the round-5 changes.
+
+### Fix-round self-review and boundary
+
+- Fresh initialization, legal empty half-migration recovery, v1-to-v2 and v2-to-v3
+  upgrades, permanent identity floors, canonical row checks and sequence
+  preservation remain covered by the complete migration and backend suites.
+- The change is confined to known XHS identity-migration object names. It does not
+  classify arbitrary similarly named tables or broaden into a general SQL parser.
+- Provider-neutral analysis, the account-note trust chain, exact shop N/N gating,
+  Task 5, Bailian media, platform writes and untracked research remain unchanged.
+  The authenticated live boundary remains `not_run`.
