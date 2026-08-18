@@ -328,3 +328,88 @@ backend/app` and `git diff --check` exited 0.
 
 No authenticated live `xhs-cli` command was run. Task 5 still owns that
 explicit opt-in gate, so the live boundary remains `not_run`.
+
+## Fix round 4/5 — canonical credential-name classification
+
+Commit: `HEAD` (`fix: classify xhs credential names`; one fix-round commit).
+
+### RED
+
+The new regression matrix exercised canonical credential aliases as direct
+dictionary keys and structured `{"name": ..., "value": ...}` entries through
+the real CLI adapter. Account and search cases then carried the four reported
+aliases through the real adapter-to-service persistence boundary:
+
+```text
+python -m pytest backend/tests/xhs/test_cli_adapter.py::test_direct_and_structured_credential_aliases_are_redacted backend/tests/xhs/test_cli_adapter.py::test_noncredential_full_token_sequences_are_preserved backend/tests/xhs/test_collection_service.py::test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts backend/tests/xhs/test_collection_service.py::test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_facts -q
+10 failed, 25 passed in 0.73s
+```
+
+The failures proved that `csrfToken` (including snake, kebab and spaced
+forms), `xsrfToken`, `bearerToken`, `jwtToken` and `sessionCookie` survived as
+both direct and structured credentials. The account/search persistence tests
+proved those values reached durable raw artifacts. All ordinary full-token
+controls passed, including `session title`, `secret garden`, `tokenCount`,
+`access level`, `refresh rate`, `api key note` and `client secret garden`.
+
+### GREEN
+
+Targeted alias, false-positive and real persistence regression:
+
+```text
+46 passed in 0.67s
+```
+
+Lifecycle, shutdown, commit-acknowledgement and owner-conflict lock:
+
+```text
+python -m pytest backend/tests/xhs/test_collection_service.py -q -k "lifecycle_lock_while_waiting or close_fences_a_submit or shutdown_fence_wins or commit_ack or conflicting_search_owner or historical_search_artifact or two_normal_submits"
+8 passed, 14 deselected in 1.39s
+```
+
+Fresh Task 3 focused suite:
+
+```text
+python -m pytest backend/tests/xhs/test_collection_service.py backend/tests/xhs/test_collection_api.py backend/tests/xhs/test_cli_adapter.py backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+155 passed in 9.18s
+```
+
+Fresh required XHS/jobs suite:
+
+```text
+python -m pytest backend/tests/xhs backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+171 passed in 11.23s
+```
+
+Fresh full backend regression:
+
+```text
+python -m pytest backend/tests -q
+793 passed, 1 skipped, 32 warnings in 90.07s
+```
+
+The skip remains the opt-in live gate and the warnings remain the existing
+Python 3.12 sqlite datetime adapter deprecations. `python -m compileall -q
+backend/app` and `git diff --check` exited 0.
+
+### Fixes and self-review
+
+- Credential names are canonicalized into complete, case-folded token tuples
+  after camelCase/acronym and separator splitting.
+- One `_is_credential_name` predicate now classifies both direct keys and
+  structured semantic names. It uses finite exact credential terms, explicit
+  two-token combinations, finite token/cookie qualifiers and an optional
+  canonical `x` header prefix.
+- Recognized families include cookie, auth/authorization, access/refresh,
+  CSRF/XSRF, bearer/JWT, API key, client secret and session cookie/token.
+  Previous access/refresh/auth/cookie/client-secret/API-key aliases remain in
+  the real persistence regressions.
+- Classification consumes the complete token sequence. It has no substring
+  fallback, so extra ordinary tokens do not trigger redaction.
+- No adapter command, service transaction, lifecycle, shutdown,
+  commit-acknowledgement or owner-binding control flow changed in this round.
+
+### Remaining live boundary
+
+No authenticated live `xhs-cli` command was run. Task 5 still owns that
+explicit opt-in gate, so the live boundary remains `not_run`.

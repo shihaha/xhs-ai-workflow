@@ -269,6 +269,15 @@ def test_structured_header_name_value_credentials_are_redacted_without_false_pos
 @pytest.mark.parametrize(
     "credential_name",
     [
+        "cookie",
+        "auth",
+        "authorization",
+        "access",
+        "refresh",
+        "csrf",
+        "xsrf",
+        "bearer",
+        "jwt",
         "accessToken",
         "access-token",
         "access token",
@@ -281,7 +290,18 @@ def test_structured_header_name_value_credentials_are_redacted_without_false_pos
         "cookie-string",
         "cookie string",
         "clientSecret",
+        "client_secret",
         "apiKey",
+        "api_key",
+        "csrfToken",
+        "csrf_token",
+        "csrf-token",
+        "csrf token",
+        "xsrfToken",
+        "bearerToken",
+        "jwtToken",
+        "sessionCookie",
+        "session_cookie",
     ],
 )
 def test_direct_and_structured_credential_aliases_are_redacted(
@@ -305,6 +325,45 @@ def test_direct_and_structured_credential_aliases_are_redacted(
     rendered = result.model_dump_json()
     assert direct_secret not in rendered
     assert structured_secret not in rendered
+
+
+@pytest.mark.parametrize(
+    "ordinary_name",
+    [
+        "session title",
+        "secret garden",
+        "tokenCount",
+        "access level",
+        "refresh rate",
+        "csrf protection",
+        "xsrf guide",
+        "bearer profile",
+        "jwt handbook",
+        "api key note",
+        "client secret garden",
+    ],
+)
+def test_noncredential_full_token_sequences_are_preserved(
+    ordinary_name: str,
+) -> None:
+    direct_value = f"direct-{ordinary_name}-public-sentinel"
+    structured_value = f"structured-{ordinary_name}-public-sentinel"
+    fake_runner = FakeRunner([_completed(["xhs"], {"notes": [{
+        "id": "note-1",
+        ordinary_name: direct_value,
+        "headers": [{"name": ordinary_name, "value": structured_value}],
+    }]})])
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.search_notes(CollectionRequest(
+        capability="search_notes",
+        parameters={"keyword": "收纳", "job_id": JOB_ID},
+        expected_count=1,
+    ))
+
+    rendered = result.model_dump_json()
+    assert direct_value in rendered
+    assert structured_value in rendered
 
 
 @pytest.mark.parametrize("field", ["keyword", "user_id"])

@@ -278,14 +278,20 @@ def test_structured_header_credentials_are_redacted_before_artifact_and_facts(tm
 def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
     tmp_path: Path,
 ) -> None:
-    secret = "real-account-alias-secret-sentinel"
+    secrets = [f"real-account-alias-secret-sentinel-{index}" for index in range(10)]
     responses = iter([
         subprocess.CompletedProcess(
             ["xhs"], 0,
             stdout=json.dumps({"user": {
                 "id": "user-1",
                 "nickname": "Alice",
-                "accessToken": secret,
+                "accessToken": secrets[0],
+                "csrfToken": secrets[1],
+                "bearerToken": secrets[2],
+                "headers": [
+                    {"name": "xsrfToken", "value": secrets[3]},
+                    {"name": "jwtToken", "value": secrets[4]},
+                ],
             }}).encode(),
             stderr=b"",
         ),
@@ -294,7 +300,13 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
             stdout=json.dumps({"notes": [{
                 "id": "note-1",
                 "user_id": "user-1",
-                "headers": [{"name": "refreshToken", "value": secret}],
+                "refreshToken": secrets[5],
+                "xsrfToken": secrets[6],
+                "jwtToken": secrets[7],
+                "headers": [
+                    {"name": "csrfToken", "value": secrets[8]},
+                    {"name": "bearerToken", "value": secrets[9]},
+                ],
             }]}).encode(),
             stderr=b"",
         ),
@@ -313,26 +325,39 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
     artifact_text = (
         service.runtime_dir / completed.artifacts[0].path
     ).read_text(encoding="utf-8")
-    assert secret not in artifact_text
     with service.database.session() as session:
         profile = session.get(XhsAccountProfileRecord, "user-1")
         note = session.scalar(select(XhsAccountNoteRecord))
-        assert secret not in json.dumps(profile.raw_evidence)
-        assert secret not in json.dumps(note.raw_evidence)
+        profile_evidence = json.dumps(profile.raw_evidence)
+        note_evidence = json.dumps(note.raw_evidence)
+        for secret in secrets:
+            assert secret not in artifact_text
+            assert secret not in profile_evidence
+            assert secret not in note_evidence
     service.database.close()
 
 
 def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_facts(
     tmp_path: Path,
 ) -> None:
-    secret = "real-search-alias-secret-sentinel"
+    secrets = [f"real-search-alias-secret-sentinel-{index}" for index in range(10)]
     response = subprocess.CompletedProcess(
         ["xhs"], 0,
         stdout=json.dumps({"notes": [{
             "id": "note-1",
             "title": "收纳",
-            "auth_token": secret,
-            "headers": [{"name": "cookie_string", "value": secret}],
+            "auth_token": secrets[0],
+            "csrfToken": secrets[1],
+            "xsrfToken": secrets[2],
+            "bearerToken": secrets[3],
+            "jwtToken": secrets[4],
+            "headers": [
+                {"name": "cookie_string", "value": secrets[5]},
+                {"name": "csrfToken", "value": secrets[6]},
+                {"name": "xsrfToken", "value": secrets[7]},
+                {"name": "bearerToken", "value": secrets[8]},
+                {"name": "jwtToken", "value": secrets[9]},
+            ],
         }]}).encode(),
         stderr=b"",
     )
@@ -349,8 +374,10 @@ def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_fact
     artifact_text = (
         service.runtime_dir / completed.artifacts[0].path
     ).read_text(encoding="utf-8")
-    assert secret not in artifact_text
-    assert secret not in facts.model_dump_json()
+    rendered_facts = facts.model_dump_json()
+    for secret in secrets:
+        assert secret not in artifact_text
+        assert secret not in rendered_facts
     service.database.close()
 
 

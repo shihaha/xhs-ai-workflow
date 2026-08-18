@@ -6,33 +6,46 @@ import re
 from typing import Any
 
 
-_SENSITIVE_NAMES = frozenset({
-    "access-token",
-    "api-key",
+_CREDENTIAL_TERMS = frozenset({
+    "access",
     "apikey",
-    "auth-token",
+    "auth",
     "authorization",
-    "client-secret",
+    "bearer",
     "clientsecret",
     "cookie",
-    "cookie-string",
     "credential",
     "credentials",
-    "id-token",
-    "password",
+    "csrf",
+    "jwt",
     "passwd",
-    "proxy-authorization",
-    "refresh-token",
+    "password",
+    "refresh",
     "secret",
     "session",
-    "session-token",
-    "set-cookie",
     "token",
-    "x-api-key",
-    "x-auth-token",
-    "x-csrf-token",
-    "x-xsrf-token",
+    "xsrf",
 })
+_CREDENTIAL_COMBINATIONS = frozenset({
+    ("api", "key"),
+    ("client", "secret"),
+    ("cookie", "string"),
+    ("proxy", "authorization"),
+    ("set", "cookie"),
+})
+_TOKEN_QUALIFIERS = frozenset({
+    "access",
+    "auth",
+    "authorization",
+    "bearer",
+    "csrf",
+    "id",
+    "jwt",
+    "refresh",
+    "session",
+    "xsrf",
+})
+_COOKIE_QUALIFIERS = frozenset({"auth", "csrf", "session", "xsrf"})
 _STRUCTURED_VALUE_KEYS = frozenset({"value", "values"})
 _ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
@@ -45,12 +58,12 @@ def redact_credentials(value: Any) -> Any:
         semantic_name = value.get("name")
         semantic_secret = (
             isinstance(semantic_name, str)
-            and _normalized_name(semantic_name) in _SENSITIVE_NAMES
+            and _is_credential_name(semantic_name)
         )
         return {
             str(key): (
                 "[redacted]"
-                if _normalized_name(str(key)) in _SENSITIVE_NAMES
+                if _is_credential_name(str(key))
                 or (
                     semantic_secret
                     and str(key).casefold() in _STRUCTURED_VALUE_KEYS
@@ -64,7 +77,28 @@ def redact_credentials(value: Any) -> Any:
     return value
 
 
-def _normalized_name(value: str) -> str:
+def _is_credential_name(value: str) -> bool:
+    """Classify a complete canonical name, never an arbitrary substring."""
+    tokens = _credential_name_tokens(value)
+    if tokens[:1] == ("x",):
+        tokens = tokens[1:]
+    if len(tokens) == 1 and tokens[0] in _CREDENTIAL_TERMS:
+        return True
+    if tokens in _CREDENTIAL_COMBINATIONS:
+        return True
+    if len(tokens) != 2:
+        return False
+    qualifier, carrier = tokens
+    return (
+        carrier == "token" and qualifier in _TOKEN_QUALIFIERS
+    ) or (
+        carrier == "cookie" and qualifier in _COOKIE_QUALIFIERS
+    )
+
+
+def _credential_name_tokens(value: str) -> tuple[str, ...]:
+    """Split camelCase/acronyms and separators into case-folded name tokens."""
     words = _ACRONYM_BOUNDARY.sub(r"\1-\2", value.strip())
     words = _CAMEL_BOUNDARY.sub(r"\1-\2", words)
-    return _NAME_SEPARATOR.sub("-", words).strip("-").casefold()
+    canonical = _NAME_SEPARATOR.sub("-", words).strip("-").casefold()
+    return tuple(token for token in canonical.split("-") if token)
