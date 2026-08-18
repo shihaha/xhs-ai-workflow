@@ -206,3 +206,53 @@ python -m pytest backend/tests -q
 
 Live Bailian, Android and seven-day UAT remain `not_run`. This change is limited
 to Task 8R-4; Task 8R-5 has not started.
+
+## Fix round 4/5: unconditional exact-once database finalization
+
+Independent review found that `ArtifactCleanupShutdownUnsafe` disabled the
+worker's only stopped finalizer. A contradictory durable fact or database-read
+fault therefore stopped the non-daemon worker but leaked the application-owned
+SQLAlchemy engine even though no thread remained capable of a later mutation.
+
+RED evidence:
+
+- Both real post-atomic conflict and read-fault paths stopped with
+  `cleanup_shutdown_fact_unresolved` while the database-close callback remained
+  at zero calls.
+- A direct unsafe worker plus a failing finalizer proved the primary cleanup
+  error needed to remain observable independently from the finalizer error.
+
+Implementation:
+
+- Removed `_finalizer_allowed`. `_run` now reaches one `_finalize_once` path for
+  normal stop, shutdown-unsafe stop and unexpected exceptions alike.
+- The finalizer executes at most once even across repeated `close()` calls. A
+  finalizer failure is exposed separately as the sanitized
+  `finalizer_error_category`; it does not overwrite the primary
+  `cleanup_shutdown_fact_unresolved` category.
+- Shutdown-unsafe and finalizer faults emit only their stable category through
+  the module logger. Exception text, paths and secrets are not logged.
+- Conflict/read-fault regressions verify the worker exits, SQLite finalization
+  occurs exactly once, the durable/manual fact remains readable, and repeated
+  close cannot trigger a later mutation or second finalization. Lifespan state
+  retains the stopped worker's observable error fields.
+
+Verification:
+
+```text
+python -m pytest backend/tests/content/test_cleanup_worker.py -q
+21 passed in 5.63s
+
+python -m pytest backend/tests/content/test_cleanup_worker.py backend/tests/content/test_artifact_cleanup_service.py backend/tests/content/test_cleanup_api.py backend/tests/test_health.py backend/tests/test_jobs_hardening.py -q
+77 passed in 11.52s
+
+python -m pytest backend/tests/content -q
+260 passed in 36.08s
+
+python -m pytest backend/tests -q
+573 passed, 1 skipped in 56.75s
+```
+
+The one skip remains the opt-in live Bailian contract. Live Bailian, Android
+and seven-day UAT remain `not_run`. This change is limited to Task 8R-4; Task
+8R-5 has not started.

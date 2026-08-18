@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+import logging
 from pathlib import Path, PurePosixPath
 import stat
 from threading import Event, Lock, Thread
@@ -45,6 +46,7 @@ from backend.app.features.content.schemas import ArtifactCleanupRead
 CleanupOwnerType = Literal["material", "content_package"]
 OPEN_STATES = ("pending", "claimed", "quarantined", "needs_human")
 CLAIMABLE_STATES = ("pending", "quarantined")
+logger = logging.getLogger(__name__)
 
 
 def _never_cancelled() -> bool:
@@ -89,6 +91,7 @@ class ArtifactCleanupWorker:
         self.batch_size = batch_size
         self.on_stopped = on_stopped
         self.last_error_category: str | None = None
+        self.finalizer_error_category: str | None = None
         self._stop_event = Event()
         self._stopped_event = Event()
         self._lifecycle_lock = Lock()
@@ -97,7 +100,6 @@ class ArtifactCleanupWorker:
         self._admission_closed = False
         self._generation = 0
         self._finalized = False
-        self._finalizer_allowed = True
 
     @property
     def is_alive(self) -> bool:
@@ -146,8 +148,9 @@ class ArtifactCleanupWorker:
                         cancelled=cancelled,
                     )
                 except ArtifactCleanupShutdownUnsafe:
-                    self.last_error_category = "cleanup_shutdown_fact_unresolved"
-                    self._finalizer_allowed = False
+                    category = "cleanup_shutdown_fact_unresolved"
+                    self.last_error_category = category
+                    logger.error(category, extra={"error_category": category})
                     self._stop_event.set()
                 except Exception:
                     # The worker must continue without retaining sensitive exception text.
@@ -163,10 +166,14 @@ class ArtifactCleanupWorker:
                 return
             self._finalized = True
             try:
-                if self.on_stopped is not None and self._finalizer_allowed:
+                if self.on_stopped is not None:
                     self.on_stopped()
             except Exception:
-                self.last_error_category = "cleanup_worker_finalizer_error"
+                category = "cleanup_worker_finalizer_error"
+                self.finalizer_error_category = category
+                if self.last_error_category is None:
+                    self.last_error_category = category
+                logger.error(category, extra={"error_category": category})
             finally:
                 self._stopped_event.set()
 

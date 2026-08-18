@@ -19,6 +19,7 @@ import backend.app.features.content.export as export_module
 from backend.app.features.content.cleanup import (
     ArtifactCleanupCandidate,
     ArtifactCleanupService,
+    ArtifactCleanupShutdownUnsafe,
     ArtifactCleanupWorker,
 )
 from backend.app.features.content.models import ArtifactCleanupRecord
@@ -327,6 +328,44 @@ def test_blocked_worker_aborts_after_close_and_finalizes_once() -> None:
     assert mutations == []
     assert finalizer_calls == ["closed"]
     assert finalized.is_set()
+    assert worker.close() is True
+    assert finalizer_calls == ["closed"]
+
+
+def test_shutdown_unsafe_still_finalizes_once_and_preserves_primary_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unresolved cleanup fact cannot justify leaking the app-owned database."""
+    finalizer_calls: list[str] = []
+
+    class UnsafeService:
+        def run_due_once(self, *, limit: int = 10, cancelled=lambda: False) -> int:
+            raise ArtifactCleanupShutdownUnsafe("sensitive path must not escape")
+
+    def failing_finalizer() -> None:
+        finalizer_calls.append("closed")
+        raise RuntimeError("sensitive finalizer details")
+
+    caplog.set_level("ERROR", logger="backend.app.features.content.cleanup")
+    worker = ArtifactCleanupWorker(
+        UnsafeService(),
+        poll_seconds=30,
+        batch_size=1,
+        on_stopped=failing_finalizer,
+    )
+    worker.start()
+    assert worker.wait_stopped(timeout=1)
+
+    assert finalizer_calls == ["closed"]
+    assert worker.last_error_category == "cleanup_shutdown_fact_unresolved"
+    assert worker.finalizer_error_category == "cleanup_worker_finalizer_error"
+    assert [record.message for record in caplog.records] == [
+        "cleanup_shutdown_fact_unresolved",
+        "cleanup_worker_finalizer_error",
+    ]
+    assert all("sensitive" not in record.message for record in caplog.records)
+    assert worker.close() is True
+    assert finalizer_calls == ["closed"]
 
 
 def test_stop_before_claim_does_not_claim_or_move(
@@ -471,6 +510,8 @@ async def test_app_lifespan_defers_database_close_until_blocked_worker_exits(
         release.set()
     assert app.state.artifact_cleanup_worker.wait_stopped(timeout=1)
     assert close_calls == ["closed"]
+    assert app.state.artifact_cleanup_worker.last_error_category is None
+    assert app.state.artifact_cleanup_worker.finalizer_error_category is None
 
 
 def test_stop_at_internal_rename_boundary_prevents_os_move(
@@ -765,10 +806,10 @@ def test_post_atomic_shutdown_accepts_an_existing_identical_durable_fact(
     database.close()
 
 
-def test_post_atomic_shutdown_conflict_keeps_database_open(
+def test_post_atomic_shutdown_conflict_closes_database_after_worker_stops(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A contradictory durable identity must block silent database finalization."""
+    """A durable conflict remains observable without leaking SQLite ownership."""
     database, runtime, service, artifact, record = _real_cleanup(tmp_path)
     entered = Event()
     release = Event()
@@ -808,17 +849,21 @@ def test_post_atomic_shutdown_conflict_keeps_database_open(
         release.set()
     assert worker.wait_stopped(timeout=1)
 
-    assert close_calls == []
+    assert close_calls == ["closed"]
     assert worker.last_error_category == "cleanup_shutdown_fact_unresolved"
     with database.session() as session:
-        assert session.get(ArtifactCleanupRecord, record.id) is not None
-    real_close()
+        current = session.get(ArtifactCleanupRecord, record.id)
+        assert current is not None
+        assert current.state == "needs_human"
+        assert current.last_error_category == "external_shutdown_reconcile"
+    assert worker.close() is True
+    assert close_calls == ["closed"]
 
 
-def test_post_atomic_shutdown_read_fault_keeps_database_open(
+def test_post_atomic_shutdown_read_fault_closes_database_after_worker_stops(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unverifiable move fact must not be hidden by database finalization."""
+    """An unverifiable move stays observable while SQLite is finalized exactly once."""
     database, _, service, _, record = _real_cleanup(tmp_path)
     entered = Event()
     release = Event()
@@ -853,8 +898,12 @@ def test_post_atomic_shutdown_read_fault_keeps_database_open(
         release.set()
     assert worker.wait_stopped(timeout=1)
 
-    assert close_calls == []
+    assert close_calls == ["closed"]
     assert worker.last_error_category == "cleanup_shutdown_fact_unresolved"
     with database.session() as session:
-        assert session.get(ArtifactCleanupRecord, record.id) is not None
-    real_close()
+        current = session.get(ArtifactCleanupRecord, record.id)
+        assert current is not None
+        assert current.state == "needs_human"
+        assert current.last_error_category == "shutdown_after_quarantine_move"
+    assert worker.close() is True
+    assert close_calls == ["closed"]
