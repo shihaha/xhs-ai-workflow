@@ -116,7 +116,11 @@ class ArtifactCleanupWorker:
                 target=self._run,
                 args=(generation,),
                 name="artifact-cleanup",
-                daemon=False,
+                # A permanently blocked filesystem/provider call must not keep the
+                # interpreter alive after the bounded shutdown fence returns. The
+                # worker still owns its database finalizer and runs it exactly once
+                # whenever the call eventually returns in a long-lived process.
+                daemon=True,
             )
             self._thread.start()
 

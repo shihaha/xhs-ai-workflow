@@ -3,8 +3,12 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+import os
 from pathlib import Path
+import subprocess
+import sys
 from threading import Event
+import textwrap
 import time
 from uuid import uuid4
 
@@ -115,6 +119,112 @@ def test_worker_shutdown_is_bounded_when_processing_is_blocked() -> None:
         assert time.monotonic() - started < 1.0
     finally:
         release.set()
+
+
+def test_permanently_blocked_worker_does_not_prevent_process_exit_after_lifespan(
+    tmp_path: Path,
+) -> None:
+    """A cleanup call that never returns must not keep Python alive after shutdown."""
+    marker = tmp_path / "atexit-ran.txt"
+    runtime = tmp_path / "child-runtime"
+    child = textwrap.dedent(
+        """
+        import asyncio
+        import atexit
+        import os
+        from pathlib import Path
+        from threading import Event, enumerate as enumerate_threads
+
+        from backend.app.main import create_app
+        from backend.app.settings import Settings
+
+        marker = Path(os.environ["CLEANUP_EXIT_MARKER"])
+        runtime = Path(os.environ["CLEANUP_EXIT_RUNTIME"])
+        atexit.register(marker.write_text, "closed", encoding="utf-8")
+        app = create_app(
+            Settings(runtime_dir=runtime, database_path=runtime / "workbench.sqlite3")
+        )
+        entered = Event()
+        never_release = Event()
+
+        def blocked_batch(*, limit=10, cancelled=lambda: False):
+            entered.set()
+            never_release.wait()
+            return 0
+
+        app.state.artifact_cleanup_service.run_due_once = blocked_batch
+
+        async def exercise_lifespan():
+            async with app.router.lifespan_context(app):
+                assert entered.wait(timeout=0.5)
+                print("READY", flush=True)
+
+        asyncio.run(exercise_lifespan())
+        worker = app.state.artifact_cleanup_worker
+        assert worker.close() is False
+        assert worker.is_alive is True
+        assert not any(
+            thread.name == "artifact-cleanup" and not thread.daemon
+            for thread in enumerate_threads()
+        )
+        """
+    )
+    environment = os.environ.copy()
+    environment["CLEANUP_EXIT_MARKER"] = str(marker)
+    environment["CLEANUP_EXIT_RUNTIME"] = str(runtime)
+    process = subprocess.Popen(
+        [sys.executable, "-c", child],
+        cwd=Path(__file__).parents[3],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    ready = process.stdout.readline().strip()
+    assert ready == "READY"
+
+    started = time.monotonic()
+    try:
+        stdout, stderr = process.communicate(timeout=1.5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        pytest.fail(
+            "permanently blocked cleanup thread prevented natural process exit; "
+            f"stdout={stdout!r}, stderr={stderr!r}"
+        )
+
+    assert time.monotonic() - started < 1.5
+    assert process.returncode == 0, stderr
+    assert marker.read_text(encoding="utf-8") == "closed"
+
+
+def test_normal_daemon_worker_closes_database_finalizer_exactly_once() -> None:
+    """Daemon exit safety must retain normal exact-once resource finalization."""
+    service = _ProbeService()
+    finalizer_calls: list[str] = []
+    worker = ArtifactCleanupWorker(
+        service,
+        poll_seconds=30,
+        batch_size=1,
+        on_stopped=lambda: finalizer_calls.append("database_closed"),
+    )
+    worker.start()
+    assert service.called.wait(timeout=0.5)
+    try:
+        worker_thread = next(
+            thread
+            for thread in __import__("threading").enumerate()
+            if thread.name == "artifact-cleanup"
+        )
+        assert worker_thread.daemon is True
+    finally:
+        assert worker.close() is True
+    assert worker.wait_stopped(timeout=1)
+    assert finalizer_calls == ["database_closed"]
+    assert worker.close() is True
+    assert finalizer_calls == ["database_closed"]
 
 
 def test_worker_sanitizes_fault_and_continues_next_poll() -> None:

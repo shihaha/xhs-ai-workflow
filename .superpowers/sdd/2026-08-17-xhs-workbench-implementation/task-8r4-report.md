@@ -256,3 +256,57 @@ python -m pytest backend/tests -q
 The one skip remains the opt-in live Bailian contract. Live Bailian, Android
 and seven-day UAT remain `not_run`. This change is limited to Task 8R-4; Task
 8R-5 has not started.
+
+## Fix round 5/5: bounded process exit for permanently blocked cleanup
+
+Final independent review found that the bounded join still used a non-daemon
+thread. A filesystem/provider call that never returned therefore kept the
+Python interpreter alive forever after FastAPI lifespan shutdown, even though
+`close()` itself returned on time.
+
+RED evidence:
+
+- A real child process entered application lifespan with a permanently blocked
+  cleanup service, left lifespan through the bounded close path, then failed to
+  exit naturally within 1.5 seconds. Its cleanup thread was explicitly
+  non-daemon.
+- The regression kills the child only after timeout, so a false pass cannot
+  leave the test runner hung. An `atexit` marker proves the passing child exits
+  normally rather than being terminated by the parent.
+
+Implementation:
+
+- The cleanup thread is now explicitly daemon. The existing admission fence,
+  generation-bound cancellation callback, bounded join and worker-owned
+  exact-once finalizer are unchanged.
+- In a long-lived process, a blocked call that later returns still observes the
+  closed fence, performs no late mutation and runs the database finalizer once.
+  If it never returns, the interpreter can exit and the operating system
+  reclaims the process resources instead of waiting forever.
+- The child-process regression verifies lifespan shutdown, `close() is False`,
+  the still-observable live worker, absence of a non-daemon cleanup thread,
+  natural sub-1.5-second exit and successful `atexit`. A normal worker regression
+  separately verifies exact-once database finalization across repeated close.
+
+Verification:
+
+```text
+python -m pytest backend/tests/content/test_cleanup_worker.py -k "permanently_blocked_worker or normal_daemon_worker" -q
+2 passed, 21 deselected in 1.66s
+
+python -m pytest backend/tests/content/test_cleanup_worker.py backend/tests/content/test_artifact_cleanup_service.py backend/tests/content/test_cleanup_api.py backend/tests/test_health.py backend/tests/test_jobs_hardening.py -q
+79 passed in 12.93s
+
+python -m pytest backend/tests/content -q
+262 passed in 37.99s
+
+python -m pytest backend/tests -q
+575 passed, 1 skipped in 56.94s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+The one skip remains the opt-in live Bailian contract. Live Bailian, Android
+and seven-day UAT remain `not_run`. This final fix remains limited to Task
+8R-4; Task 8R-5 has not started, and independent re-review is still required.
