@@ -2,10 +2,23 @@ from pathlib import Path
 import json
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
+from backend.app.adapters.contracts import ModelAdapterError
 from backend.app.features.content.schemas import ContentItemCreate, RegenerateCreate, ReviewCreate
-from backend.app.features.content.service import ContentStateError, ContentValidationError
-from backend.tests.content.test_workflow import add_output_image, create_product, seeded_service
+from backend.app.features.content.service import (
+    ContentModelFailure,
+    ContentStateError,
+    ContentValidationError,
+)
+from backend.tests.content.test_workflow import (
+    CallbackModel,
+    add_output_image,
+    create_product,
+    rebind_product_to_another_valid_opportunity,
+    seeded_service,
+)
 
 
 def _draft(tmp_path: Path):
@@ -41,6 +54,90 @@ def test_reject_regenerate_approve_preserves_revision_and_review_history(tmp_pat
     assert [revision.number for revision in approved.revisions] == [1, 2]
     assert approved.revisions[0].body == item.revisions[0].body
     assert [review.decision for review in approved.reviews] == ["reject", "regenerate", "approve"]
+    assert [review.outcome for review in approved.reviews] == ["succeeded", "succeeded", "succeeded"]
+    assert all(review.error_category is None for review in approved.reviews)
+
+
+def test_regenerate_trust_drift_preserves_failed_attempt_without_new_revision(tmp_path: Path) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    service.model_adapter = CallbackModel(
+        item.current_revision.source_evidence_ids[0],
+        lambda: rebind_product_to_another_valid_opportunity(
+            service, item.product_id, item.opportunity_id,
+        ),
+    )
+
+    with pytest.raises(ContentValidationError, match="product.*opportunity"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    failed = service.get_content_item(item.id)
+    assert failed.status == "rejected"
+    assert len(failed.revisions) == 1
+    assert [review.decision for review in failed.reviews] == ["reject", "regenerate"]
+    assert failed.reviews[1].outcome == "failed"
+    assert failed.reviews[1].error_category == "trust_changed"
+    assert failed.reviews[1].note == "Regeneration reserved from the rejected revision."
+
+
+def test_regenerate_model_error_preserves_failed_attempt(tmp_path: Path) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+
+    def model_error(request: object, schema: object):
+        raise ModelAdapterError("provider secret must not persist", category="network")
+
+    service.model_adapter.generate_structured = model_error  # type: ignore[attr-defined,method-assign]
+
+    with pytest.raises(ContentModelFailure):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    failed = service.get_content_item(item.id)
+    assert failed.status == "rejected"
+    assert len(failed.revisions) == 1
+    assert failed.reviews[-1].decision == "regenerate"
+    assert failed.reviews[-1].outcome == "failed"
+    assert failed.reviews[-1].error_category == "model_failure"
+    assert "secret" not in json.dumps(failed.model_dump(mode="json"))
+
+
+def test_regenerate_success_transaction_failure_records_failed_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    real_commit = Session.commit
+    commit_count = 0
+
+    def fail_new_revision_commit(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 2:
+            raise SQLAlchemyError("forced regeneration transaction failure")
+        real_commit(session)
+
+    monkeypatch.setattr(Session, "commit", fail_new_revision_commit)
+
+    with pytest.raises(SQLAlchemyError, match="forced regeneration"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    result = service.get_content_item(item.id)
+    assert result.status == "rejected"
+    assert len(result.revisions) == 1
+    assert result.reviews[-1].outcome == "failed"
+    assert result.reviews[-1].error_category == "transaction_unknown"
 
 
 def test_illegal_transitions_are_rejected(tmp_path: Path) -> None:

@@ -214,6 +214,11 @@ class ReviewRead(StrictModel):
     actor: str
     note: str
     visual_checks: list[VisualCheck]
+    outcome: Literal["pending", "succeeded", "failed"]
+    error_category: Literal[
+        "model_failure", "validation_failed", "trust_changed",
+        "transaction_unknown", "state_changed",
+    ] | None
     created_at: datetime
 
 

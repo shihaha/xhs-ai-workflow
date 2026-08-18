@@ -156,6 +156,11 @@ class Database:
         quarantine_source_token_marker_present = self._migration_marker_exists(
             "task8_artifact_quarantine_source_token_v1"
         )
+        review_audit_marker_present = self._migration_marker_exists(
+            "task8_content_review_outcome_v1"
+        )
+        if review_audit_marker_present:
+            self._require_content_review_audit_schema()
         if quarantine_marker_present:
             self._require_artifact_quarantine_schema(
                 require_identity=quarantine_identity_marker_present,
@@ -166,7 +171,15 @@ class Database:
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
+        self._migrate_content_review_audit(
+            marker_present=review_audit_marker_present
+        )
         self._migrate_content_schema()
+        self._migrate_content_review_audit(
+            marker_present=self._migration_marker_exists(
+                "task8_content_review_outcome_v1"
+            )
+        )
         self._migrate_artifact_quarantine(
             marker_present=quarantine_marker_present
         )
@@ -246,6 +259,77 @@ class Database:
                     "VALUES ('task8_content_v2', CURRENT_TIMESTAMP)"
                 )
             )
+
+    def _require_content_review_audit_schema(self) -> None:
+        with self.engine.connect() as connection:
+            if not _content_review_audit_schema_valid(
+                inspect(connection), connection
+            ):
+                raise SchemaMigrationError(
+                    "Task 8 content review audit schema validation failed."
+                )
+
+    def _migrate_content_review_audit(self, *, marker_present: bool) -> None:
+        from backend.app.features.content.models import ContentReviewRecord
+
+        if marker_present:
+            self._require_content_review_audit_schema()
+            return
+        with self.engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE IF NOT EXISTS workbench_schema_migrations ("
+                "name VARCHAR(200) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL)"
+            ))
+            tables = set(inspect(connection).get_table_names())
+            if "content_reviews" not in tables:
+                raise SchemaMigrationError(
+                    "Task 8 content review audit table is missing."
+                )
+            columns = {
+                column["name"] for column in inspect(connection).get_columns("content_reviews")
+            }
+            legacy_columns = {
+                "id", "content_item_id", "revision_id", "decision", "actor",
+                "note", "visual_checks_json", "created_at",
+            }
+            if not legacy_columns.issubset(columns):
+                # The older whole-Task-8 migrator owns incomplete historical
+                # schemas. It can safely rebuild an empty database, while a
+                # populated one remains fail-closed for manual recovery.
+                return
+            audit_columns = {"outcome", "error_category"}
+            present = columns & audit_columns
+            if present and present != audit_columns:
+                raise SchemaMigrationError(
+                    "Partial content review audit migration requires manual recovery."
+                )
+            if not present:
+                connection.execute(text("DROP INDEX IF EXISTS uq_review_terminal_revision"))
+                connection.execute(text("DROP INDEX IF EXISTS ix_content_reviews_content_item_id"))
+                connection.execute(text(
+                    "ALTER TABLE content_reviews RENAME TO content_reviews_audit_old"
+                ))
+                ContentReviewRecord.__table__.create(connection)
+                connection.execute(text(
+                    "INSERT INTO content_reviews "
+                    "(id,content_item_id,revision_id,decision,actor,note,"
+                    "visual_checks_json,outcome,error_category,created_at) "
+                    "SELECT id,content_item_id,revision_id,decision,actor,note,"
+                    "visual_checks_json,'succeeded',NULL,created_at "
+                    "FROM content_reviews_audit_old"
+                ))
+                connection.execute(text("DROP TABLE content_reviews_audit_old"))
+            if not _content_review_audit_schema_valid(
+                inspect(connection), connection
+            ):
+                raise SchemaMigrationError(
+                    "Task 8 content review audit schema validation failed."
+                )
+            connection.execute(text(
+                "INSERT INTO workbench_schema_migrations(name,applied_at) "
+                "VALUES ('task8_content_review_outcome_v1',CURRENT_TIMESTAMP)"
+            ))
+        self._require_content_review_audit_schema()
 
     def _migrate_artifact_quarantine(self, *, marker_present: bool) -> None:
         """Install and validate durable cleanup facts, then recover interrupted builds."""
@@ -835,13 +919,55 @@ def _is_exact_empty_json_array_default(value: object) -> bool:
     return expression == "'[]'"
 
 
+def _content_review_audit_schema_valid(
+    inspector: object, connection: Connection,
+) -> bool:
+    try:
+        if "content_reviews" not in set(inspector.get_table_names()):
+            return False
+        columns = {
+            item["name"]: item for item in inspector.get_columns("content_reviews")
+        }
+        if not {"outcome", "error_category"}.issubset(columns):
+            return False
+        if columns["outcome"].get("nullable") is not False:
+            return False
+        if columns["error_category"].get("nullable") is not True:
+            return False
+        default = _compact_sql(columns["outcome"].get("default"))
+        if default not in {"'succeeded'", "succeeded"}:
+            return False
+        checks = {
+            item.get("name"): _compact_sql(item.get("sqltext"))
+            for item in inspector.get_check_constraints("content_reviews")
+        }
+        if checks.get("ck_review_outcome") != "outcomein('pending','succeeded','failed')":
+            return False
+        if checks.get("ck_review_error_category") != (
+            "(outcome='failed'anderror_categoryisnotnullanderror_categoryin('model_failure','validation_failed',"
+            "'trust_changed','transaction_unknown','state_changed'))or(outcomein"
+            "('pending','succeeded')anderror_categoryisnull)"
+        ):
+            return False
+        invalid = connection.scalar(text(
+            "SELECT 1 FROM content_reviews WHERE "
+            "outcome NOT IN ('pending','succeeded','failed') OR "
+            "(outcome='failed' AND (error_category IS NULL OR error_category NOT IN "
+            "('model_failure','validation_failed','trust_changed','transaction_unknown','state_changed'))) OR "
+            "(outcome IN ('pending','succeeded') AND error_category IS NOT NULL) LIMIT 1"
+        ))
+        return invalid is None
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+
+
 def _content_schema_valid(inspector: object) -> bool:
     required_columns = {
         "content_products": {"id", "opportunity_id", "name", "target_user", "created_at"},
         "content_product_materials": {"id", "product_id", "logical_name", "logical_key", "version", "path", "sha256", "size_bytes", "media_type", "kind", "created_at"},
         "content_items": {"id", "product_id", "opportunity_id", "template_key", "status", "evidence_ids_json", "material_ids_json", "image_material_ids_json", "cover_material_id", "research_facts_json", "current_revision_id", "created_at", "updated_at"},
         "content_revisions": {"id", "content_item_id", "number", "title", "body", "claims_json", "source_evidence_ids_json", "image_plan_json", "model_provider", "model_name", "prompt_version", "usage_json", "attempts_json", "created_at"},
-        "content_reviews": {"id", "content_item_id", "revision_id", "decision", "actor", "note", "visual_checks_json", "created_at"},
+        "content_reviews": {"id", "content_item_id", "revision_id", "decision", "actor", "note", "visual_checks_json", "outcome", "error_category", "created_at"},
         "content_packages": {"id", "content_item_id", "revision_id", "status", "path", "sha256", "size_bytes", "created_at", "error_detail"},
     }
     try:
@@ -852,7 +978,7 @@ def _content_schema_valid(inspector: object) -> bool:
             columns = {item["name"]: item for item in inspector.get_columns(table)}
             if not required.issubset(columns):
                 return False
-            for name in required - {"current_revision_id", "error_detail"}:
+            for name in required - {"current_revision_id", "error_detail", "error_category"}:
                 if columns[name].get("nullable") is not False:
                     return False
 
@@ -867,7 +993,15 @@ def _content_schema_valid(inspector: object) -> bool:
                 "ck_content_item_status": "statusin('research','draft','review','rejected','approved','exported')",
             },
             "content_revisions": {"ck_revision_number_positive": "number>0"},
-            "content_reviews": {"ck_review_decision": "decisionin('approve','reject','regenerate')"},
+            "content_reviews": {
+                "ck_review_decision": "decisionin('approve','reject','regenerate')",
+                "ck_review_outcome": "outcomein('pending','succeeded','failed')",
+                "ck_review_error_category": (
+                    "(outcome='failed'anderror_categoryisnotnullanderror_categoryin('model_failure','validation_failed',"
+                    "'trust_changed','transaction_unknown','state_changed'))or(outcomein"
+                    "('pending','succeeded')anderror_categoryisnull)"
+                ),
+            },
             "content_packages": {
                 "ck_package_status": "statusin('building','ready','failed')",
                 "ck_package_size_nonnegative": "size_bytes>=0",

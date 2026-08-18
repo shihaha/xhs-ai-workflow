@@ -939,3 +939,43 @@ backend/tests: 588 passed, 1 skipped
 Task 8 remains blocked pending independent re-review. Bailian remains
 `not_run: BAILIAN_API_KEY unavailable`, Android remains `not_run: device
 unavailable`, and seven-day UAT remains `not_run`.
+
+## Task 8R-5 fix round 2/5
+
+The first re-review confirmed the round-1 trust and preflight changes but found
+that regeneration audit rows did not state whether an attempt succeeded or failed.
+It also found that a ready package could still be read before current-input
+preflight, and that per-material reads were not narrowed to the declared size.
+
+Strict RED coverage reproduced nine focused failures. The implementation now:
+
+- stores `pending`, `succeeded` or `failed` on every review, with a nullable,
+  allowlisted error category that is populated only for failed regeneration;
+- finalizes the new revision, item state and successful regeneration audit in one
+  transaction, or restores the rejected item and exact pending audit together on
+  model, validation, trust-drift or transaction failure;
+- migrates legacy reviews to `succeeded` with retry-safe physical schema checks,
+  while a present marker over a weak schema fails closed;
+- performs current-input ZIP entry and declared-aggregate preflight before any
+  ready-package or material bytes are read; and
+- bounds every material read by the owner cap, remaining aggregate budget and
+  `declared_size + 1`, then rejects actual size/hash drift immediately.
+
+Current verification:
+
+```text
+focused audit/preflight/read-bound subset: 9 passed
+backend/tests/content: 283 passed
+backend/tests: 596 passed, 1 skipped
+```
+
+The same independent review identified a pre-existing Important outside this
+Task 8 content-package boundary: `backend/app/services/jobs.py` directly unlinks
+an evidence artifact on task failure and can leave a committed
+`JobArtifactRecord` pointing at a missing file if commit acknowledgement is
+ambiguous. Per the approved scope this is recorded for Task 10 recovery/security;
+this round does not add a new jobs owner type or alter jobs cleanup behavior.
+
+Task 8 remains pending independent re-review. Bailian remains
+`not_run: BAILIAN_API_KEY unavailable`, Android remains `not_run: device
+unavailable`, and seven-day UAT remains `not_run`.

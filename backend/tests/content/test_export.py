@@ -291,6 +291,7 @@ def test_export_actual_size_mismatch_uses_bounded_incremental_read(
     assert len(limits) == 1
     assert limits[0] is not None
     assert limits[0] <= content_export.MAX_MATERIAL_BYTES
+    assert limits[0] <= len(PNG_1X1) + 1
 
 
 def test_export_declared_material_over_owner_limit_reads_nothing(
@@ -335,6 +336,48 @@ def test_export_rechecks_product_opportunity_binding(tmp_path: Path) -> None:
         )
 
     assert service.list_packages() == []
+
+
+def test_existing_ready_package_cannot_bypass_zero_read_entry_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, _ = _approved_item(tmp_path)
+    ready = service.export_package(
+        item.id, ExportCreate(expected_revision_id=item.current_revision.id),
+    )
+    _attach_virtual_sources(
+        service, item.id, item.product_id, count=122, size_bytes=1,
+    )
+    reads = 0
+
+    def forbidden_read(*args: object, **kwargs: object) -> bytes:
+        nonlocal reads
+        reads += 1
+        raise AssertionError("Ready package must not bypass current-input preflight.")
+
+    monkeypatch.setattr(content_service_module, "read_contained_regular", forbidden_read)
+
+    with pytest.raises(ContentValidationError, match="entry count"):
+        service.export_package(
+            item.id, ExportCreate(expected_revision_id=item.current_revision.id),
+        )
+
+    assert ready.status == "ready"
+    assert reads == 0
+
+
+def test_existing_ready_package_does_not_hide_current_material_drift(tmp_path: Path) -> None:
+    service, item, _ = _approved_item(tmp_path)
+    service.export_package(
+        item.id, ExportCreate(expected_revision_id=item.current_revision.id),
+    )
+    stored_path = service.get_product(item.product_id).materials[0].path
+    (tmp_path / stored_path).write_bytes(PNG_1X1 + b"changed")
+
+    with pytest.raises(ContentValidationError, match="unavailable|changed"):
+        service.export_package(
+            item.id, ExportCreate(expected_revision_id=item.current_revision.id),
+        )
 
 
 @pytest.mark.anyio

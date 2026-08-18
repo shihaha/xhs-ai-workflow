@@ -149,6 +149,15 @@ class ContentReviewRecord(Base):
         CheckConstraint(
             "decision IN ('approve','reject','regenerate')", name="ck_review_decision"
         ),
+        CheckConstraint(
+            "outcome IN ('pending','succeeded','failed')", name="ck_review_outcome"
+        ),
+        CheckConstraint(
+            "(outcome = 'failed' AND error_category IS NOT NULL AND error_category IN "
+            "('model_failure','validation_failed','trust_changed','transaction_unknown','state_changed')) "
+            "OR (outcome IN ('pending','succeeded') AND error_category IS NULL)",
+            name="ck_review_error_category",
+        ),
         Index(
             "uq_review_terminal_revision", "revision_id", unique=True,
             sqlite_where=text("decision IN ('approve','reject')"),
@@ -166,6 +175,10 @@ class ContentReviewRecord(Base):
     actor: Mapped[str] = mapped_column(String(200), nullable=False)
     note: Mapped[str] = mapped_column(Text, nullable=False)
     visual_checks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    outcome: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="succeeded", server_default=text("'succeeded'")
+    )
+    error_category: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
 
     item: Mapped[ContentItemRecord] = relationship(back_populates="reviews")

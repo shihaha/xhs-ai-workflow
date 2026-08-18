@@ -391,7 +391,7 @@ class ContentService:
                 content_item_id=record.id, revision_id=payload.expected_revision_id,
                 decision=payload.decision, actor=payload.actor.strip(), note=payload.note.strip(),
                 visual_checks_json=[item.model_dump(mode="json") for item in payload.visual_checks],
-                created_at=_now(),
+                outcome="succeeded", error_category=None, created_at=_now(),
             ))
             try:
                 session.commit()
@@ -430,23 +430,25 @@ class ContentService:
             if won != 1:
                 session.rollback()
                 raise ContentStateError("Another regeneration already reserved this revision.")
-            session.add(ContentReviewRecord(
+            attempt = ContentReviewRecord(
                 content_item_id=record.id, revision_id=prior.id, decision="regenerate",
                 actor="system", note="Regeneration reserved from the rejected revision.",
-                visual_checks_json=[], created_at=_now(),
-            ))
+                visual_checks_json=[], outcome="pending", error_category=None,
+                created_at=_now(),
+            )
+            session.add(attempt)
+            session.flush()
+            attempt_id = attempt.id
             session.commit()
         try:
             output, model_meta = self._generate(payload, revision_number=number, prior=prior_snapshot, review_notes=notes, generation_context=context)
             self._validate_output(output, allowed=set(payload.evidence_ids), image_ids=payload.image_material_ids)
-        except Exception:
-            with self.database.session() as session:
-                session.execute(update(ContentItemRecord).where(
-                    ContentItemRecord.id == item_id,
-                    ContentItemRecord.status == "draft",
-                    ContentItemRecord.current_revision_id == payload_request.expected_revision_id,
-                ).values(status="rejected", updated_at=_now()))
-                session.commit()
+        except Exception as error:
+            self._restore_rejected_reservation(
+                item_id, payload_request.expected_revision_id,
+                attempt_id=attempt_id,
+                error_category=self._regeneration_error_category(error, trust_phase=False),
+            )
             raise
         try:
             with self.database.session() as session:
@@ -460,21 +462,64 @@ class ContentService:
                 record.current_revision_id = revision.id
                 record.status = "review"
                 record.updated_at = _now()
+                audit_won = session.execute(update(ContentReviewRecord).where(
+                    ContentReviewRecord.id == attempt_id,
+                    ContentReviewRecord.content_item_id == item_id,
+                    ContentReviewRecord.revision_id == prior.id,
+                    ContentReviewRecord.decision == "regenerate",
+                    ContentReviewRecord.outcome == "pending",
+                ).values(outcome="succeeded", error_category=None)).rowcount
+                if audit_won != 1:
+                    session.rollback()
+                    raise ContentStateError(
+                        "Regeneration audit changed before success could commit."
+                    )
                 session.commit()
                 session.expire_all()
                 return _item_read(_load_item(session, item_id))
-        except Exception:
-            self._restore_rejected_reservation(item_id, payload_request.expected_revision_id)
+        except Exception as error:
+            self._restore_rejected_reservation(
+                item_id, payload_request.expected_revision_id,
+                attempt_id=attempt_id,
+                error_category=self._regeneration_error_category(error, trust_phase=True),
+            )
             raise
 
-    def _restore_rejected_reservation(self, item_id: str, revision_id: str) -> None:
+    def _restore_rejected_reservation(
+        self, item_id: str, revision_id: str, *,
+        attempt_id: int, error_category: str,
+    ) -> None:
         with self.database.session() as session:
-            session.execute(update(ContentItemRecord).where(
+            item_won = session.execute(update(ContentItemRecord).where(
                 ContentItemRecord.id == item_id,
                 ContentItemRecord.status == "draft",
                 ContentItemRecord.current_revision_id == revision_id,
-            ).values(status="rejected", updated_at=_now()))
+            ).values(status="rejected", updated_at=_now())).rowcount
+            audit_won = session.execute(update(ContentReviewRecord).where(
+                ContentReviewRecord.id == attempt_id,
+                ContentReviewRecord.content_item_id == item_id,
+                ContentReviewRecord.revision_id == revision_id,
+                ContentReviewRecord.decision == "regenerate",
+                ContentReviewRecord.outcome == "pending",
+            ).values(outcome="failed", error_category=error_category)).rowcount
+            if item_won != 1 or audit_won != 1:
+                session.rollback()
+                raise ContentStateError(
+                    "Regeneration failure could not finalize its exact audit attempt."
+                )
             session.commit()
+
+    @staticmethod
+    def _regeneration_error_category(error: Exception, *, trust_phase: bool) -> str:
+        if trust_phase and isinstance(error, ContentValidationError):
+            return "trust_changed"
+        if isinstance(error, ContentModelFailure):
+            return "model_failure"
+        if isinstance(error, ContentValidationError):
+            return "validation_failed"
+        if isinstance(error, SQLAlchemyError):
+            return "transaction_unknown"
+        return "state_changed"
 
     def export_package(self, item_id: str, payload: ExportCreate) -> ContentPackageRead:
         # Build the deterministic bytes before reserving their filesystem path so
@@ -498,9 +543,6 @@ class ContentService:
             existing = session.scalar(select(ContentPackageRecord).where(ContentPackageRecord.revision_id == item.current_revision_id))
             if existing is not None:
                 self._assert_path_not_quarantined(session, existing.path)
-                projected = self._package_read(existing)
-                if existing.status == "ready" and projected.availability == "available":
-                    return projected
                 if existing.status == "building":
                     raise ContentStateError("This revision package is already building.")
             revision = next(
@@ -537,8 +579,14 @@ class ContentService:
             existing = session.scalar(select(ContentPackageRecord).where(
                 ContentPackageRecord.revision_id == payload.expected_revision_id
             ))
-            if existing is not None and existing.status == "ready" and self._package_read(existing).availability == "available":
-                return self._package_read(existing)
+            if existing is not None and existing.status == "ready":
+                projected = self._package_read(existing)
+                if (
+                    projected.availability == "available"
+                    and existing.sha256 == archive_sha
+                    and existing.size_bytes == archive_size
+                ):
+                    return projected
             if existing is not None and existing.status == "building":
                 raise ContentStateError("This revision package is already building.")
             replaced_candidate: ArtifactCleanupCandidate | None = None
@@ -1289,7 +1337,9 @@ class ContentService:
             try:
                 content = read_contained_regular(
                     self.runtime_dir, material.path,
-                    limit=min(MAX_MATERIAL_BYTES, remaining),
+                    limit=min(
+                        MAX_MATERIAL_BYTES, remaining, material.size_bytes + 1,
+                    ),
                 )
             except UnsafeContentPath as error:
                 raise ContentValidationError(
@@ -1360,6 +1410,7 @@ def _item_read(record: ContentItemRecord) -> ContentItemRead:
         reviews=[ReviewRead(
             id=item.id, revision_id=item.revision_id, decision=item.decision,
             actor=item.actor, note=item.note, visual_checks=list(item.visual_checks_json),
+            outcome=item.outcome, error_category=item.error_category,
             created_at=item.created_at,
         ) for item in record.reviews],
         created_at=record.created_at, updated_at=record.updated_at,
