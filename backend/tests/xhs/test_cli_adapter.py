@@ -140,6 +140,82 @@ def test_fetch_account_binds_each_note_to_the_verified_profile_owner() -> None:
     assert result.items[1].data["user_id"] == "user-1"
 
 
+def test_fetch_account_accepts_matching_user_id_alias_for_the_verified_owner() -> None:
+    fake_runner = FakeRunner(
+        [
+            _completed(["xhs"], {"user": {"id": "user-1"}}),
+            _completed(["xhs"], {"notes": [{"id": "note-1", "userId": "user-1"}]}),
+        ]
+    )
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.fetch_account(
+        CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "user-1", "job_id": JOB_ID},
+            expected_count=2,
+        )
+    )
+
+    assert result.complete is True
+    assert result.items[1].data["user_id"] == "user-1"
+    assert result.items[1].data["userId"] == "user-1"
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        {"id": "note-1", "userId": "user-2"},
+        {"id": "note-1", "user_id": "user-1", "userId": "user-2"},
+        {"id": "note-1", "author": {"userId": "user-2"}},
+    ],
+)
+def test_fetch_account_rejects_conflicting_or_cross_account_owner_aliases(
+    note: dict[str, object],
+) -> None:
+    fake_runner = FakeRunner(
+        [
+            _completed(["xhs"], {"user": {"id": "user-1"}}),
+            _completed(["xhs"], {"notes": [note]}),
+        ]
+    )
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.fetch_account(
+        CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "user-1", "job_id": JOB_ID},
+            expected_count=2,
+        )
+    )
+
+    assert result.complete is False
+    assert result.status == "needs_human"
+    assert [item.reason for item in result.rejected_items] == ["note_owner_mismatch"]
+
+
+def test_fetch_account_rejects_conflicting_profile_owner_aliases() -> None:
+    fake_runner = FakeRunner(
+        [
+            _completed(["xhs"], {"user": {"id": "user-1", "userId": "user-2"}}),
+            _completed(["xhs"], {"notes": []}),
+        ]
+    )
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.fetch_account(
+        CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "user-1", "job_id": JOB_ID},
+            expected_count=1,
+        )
+    )
+
+    assert result.complete is False
+    assert result.status == "needs_human"
+    assert result.rejected_items[0].reason == "profile_identity_conflict"
+
+
 @pytest.mark.parametrize("field", ["keyword", "user_id"])
 @pytest.mark.parametrize("unsafe_value", ["--json", "-x", "line\nbreak", "nul\x00byte"])
 def test_positional_cli_values_reject_options_and_control_characters(

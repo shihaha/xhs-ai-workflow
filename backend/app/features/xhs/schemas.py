@@ -17,6 +17,7 @@ from backend.app.features.xhs.constants import (
     ACCOUNT_COLLECTION_JOB_TYPE,
 )
 from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
+from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
 from backend.app.models.jobs import JobArtifactRecord, JobRecord
 
 
@@ -152,7 +153,12 @@ def _exact_account_items(result: CollectionResult) -> tuple[CollectionItem, list
 
 
 def _profile_user_id(item: CollectionItem) -> str:
-    user_id = item.data.get("user_id")
+    try:
+        user_id = canonical_owner_id(
+            item.data, item.raw_evidence, include_record_id=True
+        )
+    except OwnerIdentityError as error:
+        raise AccountEvidencePersistenceError("Profile owner aliases are not exact.") from error
     if (
         not isinstance(user_id, str)
         or not user_id
@@ -165,7 +171,10 @@ def _profile_user_id(item: CollectionItem) -> str:
 
 def _note_id(item: CollectionItem, owner_id: str) -> str:
     note_id = item.data.get("note_id")
-    note_owner_id = item.data.get("user_id")
+    try:
+        note_owner_id = canonical_owner_id(item.data, item.raw_evidence)
+    except OwnerIdentityError as error:
+        raise AccountEvidencePersistenceError("Note owner aliases are not exact.") from error
     if (
         not isinstance(note_id, str)
         or not note_id

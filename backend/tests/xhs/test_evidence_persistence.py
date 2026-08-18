@@ -222,6 +222,49 @@ def test_cross_account_normalized_note_is_rejected_before_any_write(tmp_path: Pa
         assert session.scalars(select(XhsAccountNoteRecord)).all() == []
 
 
+def test_persistence_accepts_matching_user_id_aliases(tmp_path: Path) -> None:
+    database = Database(tmp_path / "user-id-alias.sqlite3")
+    binding = _reserved_binding(database)
+    result = _result()
+    result.items[0].data = {"userId": "user-1", "nickname": "Alice"}
+    result.items[1].data = {
+        key: value for key, value in result.items[1].data.items() if key != "user_id"
+    }
+    result.items[1].data["userId"] = "user-1"
+
+    with database.session() as session:
+        persisted = persist_exact_account_result(session, result=result, binding=binding)
+        session.commit()
+
+    assert persisted.profile.user_id == "user-1"
+    assert persisted.notes[0].user_id == "user-1"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda result: result.items[1].data.update({"userId": "user-2"}),
+        lambda result: result.items[1].raw_evidence["row"].update({"userId": "user-2"}),
+    ],
+)
+def test_persistence_rejects_conflicting_owner_aliases_in_data_or_raw_evidence(
+    tmp_path: Path, mutate: object
+) -> None:
+    database = Database(tmp_path / "owner-conflict.sqlite3")
+    binding = _reserved_binding(database)
+    result = _result()
+    mutate(result)  # type: ignore[operator]
+
+    with database.session() as session:
+        with pytest.raises(AccountEvidencePersistenceError, match="owner"):
+            persist_exact_account_result(session, result=result, binding=binding)
+        session.commit()
+
+    with database.session() as session:
+        assert session.scalars(select(XhsAccountProfileRecord)).all() == []
+        assert session.scalars(select(XhsAccountNoteRecord)).all() == []
+
+
 def test_direct_sql_rejects_non_object_raw_evidence_even_with_digest_shape(tmp_path: Path) -> None:
     database = Database(tmp_path / "raw-array.sqlite3")
     binding = _reserved_binding(database)

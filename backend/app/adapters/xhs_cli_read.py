@@ -19,6 +19,7 @@ from backend.app.adapters.contracts import (
     MissingCollectionItem,
     RejectedCollectionItem,
 )
+from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
 
 
 _XHS_PUBLIC_ORIGIN = "https://www.xiaohongshu.com"
@@ -200,16 +201,30 @@ def _normalize_account(
     rejected: list[RejectedCollectionItem] = []
     profile_row = _profile_row(profile)
     profile_reference = "xhs_cli:user:profile"
-    profile_user_id = _identity(profile_row, "id", "user_id", "userId") if profile_row else None
-    requested_identity = _safe_token(requested_user_id)
-    if profile_user_id is None:
+    try:
+        profile_user_id = (
+            canonical_owner_id(profile_row, include_record_id=True)
+            if profile_row else None
+        )
+    except OwnerIdentityError:
+        profile_user_id = None
         rejected.append(
             RejectedCollectionItem(
                 reference=profile_reference,
-                reason="profile_identity_missing",
+                reason="profile_identity_conflict",
                 raw_evidence={"response": profile},
             )
         )
+    requested_identity = _safe_token(requested_user_id)
+    if profile_user_id is None:
+        if not rejected:
+            rejected.append(
+                RejectedCollectionItem(
+                    reference=profile_reference,
+                    reason="profile_identity_missing",
+                    raw_evidence={"response": profile},
+                )
+            )
     elif requested_identity is None or profile_user_id != requested_identity:
         rejected.append(
             RejectedCollectionItem(
@@ -231,12 +246,23 @@ def _normalize_account(
     note_items, note_rejected = _normalize_note_rows(notes, source="user-posts")
     verified_note_items: list[CollectionItem] = []
     for note in note_items:
-        note_owner_id = note.data.get("user_id")
+        try:
+            note_owner_id = canonical_owner_id(note.data, note.raw_evidence)
+        except OwnerIdentityError:
+            note_rejected.append(
+                RejectedCollectionItem(
+                    reference=f"xhs_cli:user-posts:{note.id}",
+                    reason="note_owner_mismatch",
+                    raw_evidence=note.raw_evidence,
+                )
+            )
+            continue
         if profile_user_id is not None and requested_identity == profile_user_id:
             if note_owner_id is None:
                 note.data["user_id"] = profile_user_id
                 verified_note_items.append(note)
             elif note_owner_id == profile_user_id:
+                note.data.setdefault("user_id", profile_user_id)
                 verified_note_items.append(note)
             else:
                 note_rejected.append(
