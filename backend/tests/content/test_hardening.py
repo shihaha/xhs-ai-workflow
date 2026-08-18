@@ -1,9 +1,11 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, Event, Lock
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
 from backend.app.features.content.schemas import (
     ContentItemCreate, ExportCreate, MaterialCreate, RegenerateCreate, ReviewCreate,
@@ -207,10 +209,47 @@ def test_export_revalidates_trust_and_live_materials(tmp_path: Path) -> None:
     assert service.list_packages() == []
 
 
-def test_concurrent_export_has_one_persisted_builder_and_no_integrity_500(tmp_path: Path) -> None:
+def test_concurrent_export_has_one_persisted_builder_and_no_integrity_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service, item, image = _image_item(tmp_path)
     approved = service.review(item.id, _approval(item, image))
     request = ExportCreate(expected_revision_id=approved.current_revision.id)
+
+    # Force both reservation transactions to observe no package before either
+    # INSERT is flushed. The first transaction is then allowed to commit before
+    # the second flushes, making the UNIQUE(revision_id) arbitration repeatable.
+    flush_barrier = Barrier(2)
+    winner_committed = Event()
+    designation_lock = Lock()
+    next_designation = 0
+    original_flush = Session.flush
+    original_commit = Session.commit
+
+    def synchronized_flush(session: Session, *args, **kwargs):
+        nonlocal next_designation
+        is_initial_package_flush = any(
+            isinstance(record, ContentPackageRecord) for record in session.new
+        ) and "export_race_designation" not in session.info
+        if not is_initial_package_flush:
+            return original_flush(session, *args, **kwargs)
+        with designation_lock:
+            designation = next_designation
+            next_designation += 1
+        session.info["export_race_designation"] = designation
+        flush_barrier.wait(timeout=2)
+        if designation == 1:
+            assert winner_committed.wait(timeout=2)
+        return original_flush(session, *args, **kwargs)
+
+    def synchronized_commit(session: Session):
+        result = original_commit(session)
+        if session.info.get("export_race_designation") == 0:
+            winner_committed.set()
+        return result
+
+    monkeypatch.setattr(Session, "flush", synchronized_flush)
+    monkeypatch.setattr(Session, "commit", synchronized_commit)
 
     def export():
         try:
@@ -222,7 +261,13 @@ def test_concurrent_export_has_one_persisted_builder_and_no_integrity_500(tmp_pa
         outcomes = [future.result() for future in [pool.submit(export), pool.submit(export)]]
     ids = {value for value in outcomes if value != "conflict"}
     assert len(ids) == 1
+    assert outcomes.count("conflict") == 1
     assert len(service.list_packages()) == 1
+    with service.database.engine.connect() as connection:
+        cleanup_rows = connection.exec_driver_sql(
+            "SELECT state FROM artifact_gc_queue WHERE owner_type='content_package'"
+        ).scalars().all()
+    assert cleanup_rows == ["cancelled"]
 
 
 def test_package_and_exported_item_report_missing_file_truthfully(tmp_path: Path) -> None:

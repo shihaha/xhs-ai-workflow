@@ -880,7 +880,13 @@ class ContentService:
                     path=package_path, sha256=archive_sha, size_bytes=archive_size,
                     created_at=_now(), error_detail=None, build_token=build_token,
                 ))
-                session.flush()
+                try:
+                    session.flush()
+                except IntegrityError as error:
+                    session.rollback()
+                    raise ContentStateError(
+                        "This revision package was concurrently reserved."
+                    ) from error
             build_candidate = ArtifactCleanupCandidate(
                 owner_type="content_package", owner_id=package_id,
                 relative_path=package_path, expected_sha256=archive_sha,

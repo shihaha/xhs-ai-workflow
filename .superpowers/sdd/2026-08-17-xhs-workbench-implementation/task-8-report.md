@@ -1102,3 +1102,38 @@ The request/startup direct-delete and cleanup mutation-route scans had no matche
 `backend/app/services/jobs.py` and Task 9 were not changed. The one skipped test
 remains the opt-in Bailian live contract; Bailian, Android and seven-day UAT remain
 `not_run`.
+
+## Final branch review: first-export reservation race
+
+The final whole-branch review found one Important concurrency defect in the
+first export for a revision. Two sessions could both observe no existing package;
+the losing `INSERT` was then rejected by `UNIQUE(content_packages.revision_id)`
+at `Session.flush()`, but that raw `IntegrityError` escaped instead of becoming
+the documented business conflict / HTTP 409.
+
+A deterministic test barrier now makes both transactions observe the missing
+row, lets one exact reservation commit, and only then releases the losing flush.
+The old implementation failed at the reported line on every controlled run. The
+minimal fix rolls back only the losing reservation transaction and raises
+`ContentStateError`. It does not create a cleanup row, write a package file or
+change the existing failed/corrupt-package replacement CAS, build token, cleanup
+outbox, or commit-ack proof paths.
+
+Fresh verification and independent review:
+
+```text
+forced first-export race: 20/20 passed
+backend/tests/content: 296 passed
+full backend: 643 passed, 1 live skip
+scripts/verify.ps1: backend 643 passed/1 live skip; compile passed;
+  frontend 34 passed; build passed; controlled E2E 1/1;
+  npm audit 0; secret and boundary scans clean
+git diff --check: exit 0
+```
+
+Independent review was **CLEAN** with no Critical, Important or Minor findings.
+The reviewer independently repeated the forced race 20/20, ran 80 related tests
+and the complete content suite (296 passed), and confirmed the existing API
+translator maps the losing `ContentStateError` to HTTP 409.
+
+Live Qianfan, Android, Bailian and seven-day UAT remain `not_run`.
