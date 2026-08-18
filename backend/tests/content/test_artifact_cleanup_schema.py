@@ -773,6 +773,176 @@ def test_startup_rejects_support_identity_mutated_without_runtime_guard(
         Database(path, runtime_dir=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["owner_type", "owner_id", "expected_sha256", "expected_size_bytes"],
+)
+def test_cleanup_support_identity_cannot_mutate_away_from_live_reference(
+    tmp_path: Path, mutation: str
+) -> None:
+    database = Database(tmp_path / f"cleanup-{mutation}.sqlite3", runtime_dir=tmp_path)
+    support_id = str(uuid4())
+    cleanup_overrides: dict[str, object] = {}
+    value: object
+    if mutation == "owner_type":
+        cleanup_overrides = {"owner_type": "content_package", "owner_id": support_id}
+        value = "material"
+    elif mutation == "owner_id":
+        cleanup_overrides = {"owner_type": "material", "owner_id": str(uuid4())}
+        value = support_id
+    elif mutation == "expected_sha256":
+        value = "b" * 64
+    else:
+        value = 13
+    cleanup = _insert_cleanup(database, **cleanup_overrides)
+    quarantine_path = f"artifacts-quarantine/{cleanup.id}/Café.ZIP"
+    try:
+        _insert_live_material_support(
+            database,
+            material_id=support_id,
+            path=f"ARTIFACTS-QUARANTINE/{cleanup.id}/Cafe\u0301.zip.",
+            sha256="a" * 64,
+            size_bytes=12,
+        )
+        _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
+
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        f"UPDATE artifact_gc_queue SET {mutation}=:value WHERE id=:id"
+                    ),
+                    {"value": value, "id": cleanup.id},
+                )
+    finally:
+        database.close()
+
+
+def test_cleanup_original_path_identity_cannot_mutate_away_from_live_reference(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "cleanup-original-path.sqlite3", runtime_dir=tmp_path)
+    original_path = "content-packages/item/Café.ZIP"
+    cleanup = _insert_cleanup(
+        database,
+        relative_path=original_path,
+        path_key=original_path.lower(),
+    )
+    quarantine_path = f"artifacts-quarantine/{cleanup.id}/file.zip"
+    try:
+        _insert_live_material_support(
+            database,
+            material_id=str(uuid4()),
+            path="CONTENT-PACKAGES/item/Cafe\u0301.zip.",
+            sha256="a" * 64,
+            size_bytes=12,
+        )
+        _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
+
+        replacement = "content-packages/item/other.zip"
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE artifact_gc_queue SET relative_path=:path, "
+                        "path_key=:key WHERE id=:id"
+                    ),
+                    {"path": replacement, "key": replacement, "id": cleanup.id},
+                )
+    finally:
+        database.close()
+
+
+def test_cleanup_owner_may_change_when_another_valid_support_remains(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "cleanup-owner-second-support.sqlite3", runtime_dir=tmp_path)
+    first_id = str(uuid4())
+    cleanup = _insert_cleanup(
+        database, owner_type="material", owner_id=str(uuid4())
+    )
+    quarantine_path = f"artifacts-quarantine/{cleanup.id}/file.zip"
+    try:
+        for support_id in (first_id, str(uuid4())):
+            _insert_live_material_support(
+                database,
+                material_id=support_id,
+                path=quarantine_path,
+                sha256="a" * 64,
+                size_bytes=12,
+            )
+        _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
+
+        with database.engine.begin() as connection:
+            result = connection.execute(
+                text("UPDATE artifact_gc_queue SET owner_id=:owner_id WHERE id=:id"),
+                {"owner_id": first_id, "id": cleanup.id},
+            )
+            assert result.rowcount == 1
+    finally:
+        database.close()
+
+
+def test_startup_rejects_cleanup_identity_mutated_without_runtime_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "mutated-cleanup-support.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    cleanup = _insert_cleanup(database)
+    quarantine_path = f"artifacts-quarantine/{cleanup.id}/file.zip"
+    _insert_live_material_support(
+        database,
+        material_id=str(uuid4()),
+        path=quarantine_path,
+        sha256="a" * 64,
+        size_bytes=12,
+    )
+    _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
+    with database.engine.begin() as connection:
+        trigger_sql = connection.scalar(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='ck_gc_cleanup_reference_update'"
+            )
+        )
+        connection.execute(text("DROP TRIGGER ck_gc_cleanup_reference_update"))
+        connection.execute(
+            text(
+                "UPDATE artifact_gc_queue SET expected_sha256=:sha256 WHERE id=:id"
+            ),
+            {"sha256": "c" * 64, "id": cleanup.id},
+        )
+        connection.execute(text(trigger_sql))
+    database.close()
+
+    with pytest.raises(SchemaMigrationError, match="reference guard"):
+        Database(path, runtime_dir=tmp_path)
+
+
+def test_reference_guard_marker_rejects_old_cleanup_update_trigger(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "old-cleanup-update-trigger.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='ck_gc_cleanup_reference_update'"
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER ck_gc_cleanup_reference_update")
+        connection.execute(
+            trigger_sql.replace(
+                "BEFORE UPDATE OF owner_type, owner_id, relative_path, path_key, "
+                "expected_sha256, expected_size_bytes, quarantine_path, state,",
+                "BEFORE UPDATE OF quarantine_path, state,",
+            )
+        )
+
+    with pytest.raises(SchemaMigrationError, match="reference guard"):
+        Database(path, runtime_dir=tmp_path)
+
+
 def test_startup_rejects_fabricated_live_reference_exception(tmp_path: Path) -> None:
     path = tmp_path / "fabricated-live-reference.sqlite3"
     database = Database(path, runtime_dir=tmp_path)

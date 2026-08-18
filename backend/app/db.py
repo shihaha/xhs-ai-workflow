@@ -1231,7 +1231,7 @@ END
 
 _CLEANUP_REFERENCE_UPDATE_TRIGGER = f"""
 CREATE TRIGGER ck_gc_cleanup_reference_update
-BEFORE UPDATE OF quarantine_path, state, last_error_category,
+BEFORE UPDATE OF owner_type, owner_id, relative_path, path_key, expected_sha256, expected_size_bytes, quarantine_path, state, last_error_category,
 quarantine_volume_id, quarantine_file_id, quarantine_size_bytes,
 quarantine_mtime_ns ON artifact_gc_queue
 WHEN {_CLEANUP_CAPTURES_REFERENCE_WHEN}
