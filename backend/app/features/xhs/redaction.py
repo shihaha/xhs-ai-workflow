@@ -6,8 +6,7 @@ import re
 from typing import Any
 
 
-_CREDENTIAL_TERMS = frozenset({
-    "access",
+_SINGLE_TOKEN_CREDENTIAL_CORES = frozenset({
     "apikey",
     "auth",
     "authorization",
@@ -20,32 +19,34 @@ _CREDENTIAL_TERMS = frozenset({
     "jwt",
     "passwd",
     "password",
-    "refresh",
     "secret",
-    "session",
     "token",
     "xsrf",
 })
-_CREDENTIAL_COMBINATIONS = frozenset({
-    ("api", "key"),
-    ("client", "secret"),
-    ("cookie", "string"),
-    ("proxy", "authorization"),
-    ("set", "cookie"),
-})
 _TOKEN_QUALIFIERS = frozenset({
     "access",
+    "api",
     "auth",
     "authorization",
     "bearer",
     "csrf",
     "id",
     "jwt",
+    "oauth",
     "refresh",
     "session",
     "xsrf",
 })
-_COOKIE_QUALIFIERS = frozenset({"auth", "csrf", "session", "xsrf"})
+_TOKEN_QUALIFIER_CHAINS = frozenset({("personal", "access")})
+_CARRIER_QUALIFIERS = {
+    "authorization": frozenset({"proxy"}),
+    "cookie": frozenset({"auth", "csrf", "session", "set", "xsrf"}),
+    "id": frozenset({"session"}),
+    "key": frozenset({"api"}),
+    "secret": frozenset({"api", "client"}),
+    "session": frozenset({"web"}),
+    "string": frozenset({"cookie"}),
+}
 _STRUCTURED_VALUE_KEYS = frozenset({"value", "values"})
 _ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
@@ -82,17 +83,16 @@ def _is_credential_name(value: str) -> bool:
     tokens = _credential_name_tokens(value)
     if tokens[:1] == ("x",):
         tokens = tokens[1:]
-    if len(tokens) == 1 and tokens[0] in _CREDENTIAL_TERMS:
-        return True
-    if tokens in _CREDENTIAL_COMBINATIONS:
-        return True
-    if len(tokens) != 2:
-        return False
-    qualifier, carrier = tokens
+    if len(tokens) == 1:
+        return tokens[0] in _SINGLE_TOKEN_CREDENTIAL_CORES
+    qualifiers, carrier = tokens[:-1], tokens[-1]
+    if carrier == "token":
+        return (
+            len(qualifiers) == 1 and qualifiers[0] in _TOKEN_QUALIFIERS
+        ) or qualifiers in _TOKEN_QUALIFIER_CHAINS
     return (
-        carrier == "token" and qualifier in _TOKEN_QUALIFIERS
-    ) or (
-        carrier == "cookie" and qualifier in _COOKIE_QUALIFIERS
+        len(qualifiers) == 1
+        and qualifiers[0] in _CARRIER_QUALIFIERS.get(carrier, frozenset())
     )
 
 

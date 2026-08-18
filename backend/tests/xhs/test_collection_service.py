@@ -278,7 +278,10 @@ def test_structured_header_credentials_are_redacted_before_artifact_and_facts(tm
 def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
     tmp_path: Path,
 ) -> None:
-    secrets = [f"real-account-alias-secret-sentinel-{index}" for index in range(10)]
+    secrets = [
+        f"real-account-alias-secret-sentinel-{index:02d}-end"
+        for index in range(20)
+    ]
     responses = iter([
         subprocess.CompletedProcess(
             ["xhs"], 0,
@@ -288,9 +291,17 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
                 "accessToken": secrets[0],
                 "csrfToken": secrets[1],
                 "bearerToken": secrets[2],
+                "apiToken": secrets[3],
+                "oauthToken": secrets[4],
+                "sessionId": secrets[5],
+                "web_session": secrets[6],
+                "personalAccessToken": secrets[7],
                 "headers": [
-                    {"name": "xsrfToken", "value": secrets[3]},
-                    {"name": "jwtToken", "value": secrets[4]},
+                    {"name": "xsrfToken", "value": secrets[8]},
+                    {"name": "jwtToken", "value": secrets[9]},
+                    {"name": "x-api-token", "value": secrets[10]},
+                    {"name": "x-oauth-token", "value": secrets[11]},
+                    {"name": "x-session-id", "value": secrets[12]},
                 ],
             }}).encode(),
             stderr=b"",
@@ -300,12 +311,14 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
             stdout=json.dumps({"notes": [{
                 "id": "note-1",
                 "user_id": "user-1",
-                "refreshToken": secrets[5],
-                "xsrfToken": secrets[6],
-                "jwtToken": secrets[7],
+                "refreshToken": secrets[13],
+                "xsrfToken": secrets[14],
+                "jwtToken": secrets[15],
+                "apiToken": secrets[16],
                 "headers": [
-                    {"name": "csrfToken", "value": secrets[8]},
-                    {"name": "bearerToken", "value": secrets[9]},
+                    {"name": "csrfToken", "value": secrets[17]},
+                    {"name": "bearerToken", "value": secrets[18]},
+                    {"name": "personalAccessToken", "value": secrets[19]},
                 ],
             }]}).encode(),
             stderr=b"",
@@ -340,7 +353,10 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
 def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_facts(
     tmp_path: Path,
 ) -> None:
-    secrets = [f"real-search-alias-secret-sentinel-{index}" for index in range(10)]
+    secrets = [
+        f"real-search-alias-secret-sentinel-{index:02d}-end"
+        for index in range(18)
+    ]
     response = subprocess.CompletedProcess(
         ["xhs"], 0,
         stdout=json.dumps({"notes": [{
@@ -351,12 +367,20 @@ def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_fact
             "xsrfToken": secrets[2],
             "bearerToken": secrets[3],
             "jwtToken": secrets[4],
+            "apiToken": secrets[5],
+            "oauthToken": secrets[6],
+            "sessionId": secrets[7],
+            "web_session": secrets[8],
+            "personalAccessToken": secrets[9],
             "headers": [
-                {"name": "cookie_string", "value": secrets[5]},
-                {"name": "csrfToken", "value": secrets[6]},
-                {"name": "xsrfToken", "value": secrets[7]},
-                {"name": "bearerToken", "value": secrets[8]},
-                {"name": "jwtToken", "value": secrets[9]},
+                {"name": "cookie_string", "value": secrets[10]},
+                {"name": "csrfToken", "value": secrets[11]},
+                {"name": "x-api-token", "value": secrets[12]},
+                {"name": "x-oauth-token", "value": secrets[13]},
+                {"name": "x-session-id", "value": secrets[14]},
+                {"name": "xsrfToken", "value": secrets[15]},
+                {"name": "bearerToken", "value": secrets[16]},
+                {"name": "jwtToken", "value": secrets[17]},
             ],
         }]}).encode(),
         stderr=b"",

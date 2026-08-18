@@ -413,3 +413,97 @@ backend/app` and `git diff --check` exited 0.
 
 No authenticated live `xhs-cli` command was run. Task 5 still owns that
 explicit opt-in gate, so the live boundary remains `not_run`.
+
+## Fix round 5/5 — finite credential grammar
+
+Commit: `HEAD` (`fix: define xhs credential grammar`; one fix-round commit).
+
+### RED
+
+The new positive/negative matrix exercises each name as both a direct mapping
+key and a structured `{"name": ..., "value": ...}` entry through the real
+adapter. The account and search cases then carry the reported names across the
+real adapter-to-service persistence boundary:
+
+```text
+python -m pytest backend/tests/xhs/test_cli_adapter.py::test_direct_and_structured_credential_aliases_are_redacted backend/tests/xhs/test_cli_adapter.py::test_noncredential_full_token_sequences_are_preserved backend/tests/xhs/test_collection_service.py::test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts backend/tests/xhs/test_collection_service.py::test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_facts -q --tb=short
+17 failed, 51 passed in 0.87s
+```
+
+The failures proved both sides of the classifier defect:
+
+- `apiToken`, `oauthToken`, `personalAccessToken`, `apiSecret`, `sessionId`,
+  `webSession`/`web_session`, `x-api-token`, `x-oauth-token` and
+  `x-session-id` survived direct and structured redaction;
+- ordinary single-token `access`, `refresh` and `session` fields were removed;
+- the new aliases reached the real account artifact/profile/note facts and the
+  real search artifact/read boundary.
+
+### GREEN
+
+Targeted grammar and real persistence regression:
+
+```text
+68 passed in 0.62s
+```
+
+Lifecycle lock order, shutdown fence, commit acknowledgement and owner
+conflict regression:
+
+```text
+python -m pytest backend/tests/xhs/test_collection_service.py -q -k "lifecycle_lock_while_waiting or close_fences_a_submit or shutdown_fence_wins or commit_ack or conflicting_search_owner or historical_search_artifact or two_normal_submits"
+8 passed, 14 deselected in 1.48s
+```
+
+Fresh Task 3 focused suite, including the adapter registry:
+
+```text
+python -m pytest backend/tests/xhs/test_collection_service.py backend/tests/xhs/test_collection_api.py backend/tests/xhs/test_cli_adapter.py backend/tests/test_adapter_registry.py backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+180 passed in 9.44s
+```
+
+Fresh required XHS/jobs suite:
+
+```text
+python -m pytest backend/tests/xhs backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+193 passed in 11.37s
+```
+
+Fresh full backend regression:
+
+```text
+python -m pytest backend/tests -q
+815 passed, 1 skipped, 32 warnings in 86.36s
+```
+
+The first two full-suite attempts each had only the existing shop asynchronous
+POST wall-clock assertion above its 0.2 second threshold (0.25 and 0.235
+seconds). That test passed alone (`1 passed in 0.69s`), no shop code changed,
+and the fresh third full run above passed every non-live test. The skip remains
+the opt-in live gate and the warnings remain the existing Python 3.12 sqlite
+datetime adapter deprecations. `python -m compileall -q backend/app` and
+`git diff --check` exited 0.
+
+### Fixes and self-review
+
+- Credential names still normalize camelCase, acronym boundaries and separator
+  runs into complete, case-folded token tuples.
+- Single-token recognition is limited to explicit credential cores such as
+  token, cookie, authorization, JWT, CSRF/XSRF, password and secret. `access`,
+  `refresh` and `session` are no longer sensitive without a credential carrier.
+- Multi-token recognition is a finite grammar: approved qualifier sequences
+  can terminate in `token`, while a carrier-to-qualifier map covers session ID,
+  web session, API key/secret, client secret, cookie forms and proxy
+  authorization. `personal access token` is the one approved multi-qualifier
+  token chain.
+- One optional canonical `x` prefix is removed before applying the same grammar.
+  Direct dictionary keys and structured semantic names call the same predicate.
+- The complete token sequence must match, so ordinary `tokenCount`,
+  `session title`, `secret garden`, `api key note`, and related controls remain
+  intact. No adapter command, service transaction, lifecycle or owner-binding
+  control flow changed.
+
+### Remaining live boundary
+
+No authenticated live `xhs-cli` command was run. Task 5 still owns that
+explicit opt-in gate, so the live boundary remains `not_run`.
