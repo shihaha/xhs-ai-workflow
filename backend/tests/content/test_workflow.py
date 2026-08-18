@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from backend.app.adapters.contracts import ModelResult
 from backend.app.db import Database
 from backend.app.features.analysis.models import AnalysisRecord, OpportunityRecord
+from backend.app.features.content.models import ProductRecord
 from backend.app.features.content.schemas import (
     ContentItemCreate,
     MaterialCreate,
@@ -74,6 +75,17 @@ class UnconfiguredNoCallModel:
         raise AssertionError("An unconfigured model must never be invoked.")
 
 
+class CallbackModel(FakeModel):
+    def __init__(self, evidence_id: str, callback: object) -> None:
+        super().__init__(evidence_id)
+        self.callback = callback
+
+    def generate_structured(self, request: object, schema: object) -> ModelResult:
+        result = super().generate_structured(request, schema)
+        self.callback()
+        return result
+
+
 def seed_database(database: Database) -> tuple[str, str]:
     now = datetime.now(UTC).replace(tzinfo=None)
     with database.session() as session:
@@ -127,6 +139,29 @@ def create_product(service: ContentService, opportunity_id: str) -> str:
     return service.create_product(
         ProductCreate(name="测试产品", target_user="需要清单的人", opportunity_id=opportunity_id)
     ).id
+
+
+def rebind_product_to_another_valid_opportunity(
+    service: ContentService, product_id: str, opportunity_id: str,
+) -> str:
+    with service.database.session() as session:
+        original = session.get(OpportunityRecord, opportunity_id)
+        replacement = OpportunityRecord(
+            analysis_id=original.analysis_id,
+            title=original.title,
+            status=original.status,
+            summary=original.summary,
+            evidence_ids_json=list(original.evidence_ids_json),
+            next_action=original.next_action,
+            created_at=original.created_at,
+        )
+        session.add(replacement)
+        session.flush()
+        product = session.get(ProductRecord, product_id)
+        product.opportunity_id = replacement.id
+        replacement_id = replacement.id
+        session.commit()
+    return replacement_id
 
 
 def add_output_image(service: ContentService, product_id: str, tmp_path: Path, name: str = "cover.png"):
@@ -270,3 +305,96 @@ def test_regenerate_validates_business_state_before_model_readiness_without_rese
     assert unavailable.calls == 0
     assert unchanged.status == "rejected"
     assert [review.decision for review in unchanged.reviews] == ["reject"]
+
+
+def test_regenerate_rejects_product_rebound_before_model_readiness(tmp_path: Path) -> None:
+    service, opportunity_id, evidence_id = seeded_service(tmp_path)
+    product_id = create_product(service, opportunity_id)
+    image = add_output_image(service, product_id, tmp_path)
+    item = service.create_content_item(ContentItemCreate(
+        product_id=product_id,
+        opportunity_id=opportunity_id,
+        template_key="list-v1",
+        evidence_ids=[evidence_id],
+        image_material_ids=[image.id],
+        cover_material_id=image.id,
+        research_facts=[{"fact": "用户需要清单", "evidence_ids": [evidence_id]}],
+    ))
+    rejected = service.review(item.id, ReviewCreate(
+        decision="reject",
+        actor="operator",
+        note="需要重写",
+        expected_revision_id=item.current_revision.id,
+        visual_checks=[],
+    ))
+    rebind_product_to_another_valid_opportunity(service, product_id, opportunity_id)
+    unavailable = UnconfiguredNoCallModel()
+    service.model_adapter = unavailable
+
+    with pytest.raises(ContentValidationError, match="product.*opportunity"):
+        service.regenerate(
+            item.id,
+            RegenerateCreate(expected_revision_id=rejected.current_revision.id),
+        )
+
+    unchanged = service.get_content_item(item.id)
+    assert unavailable.calls == 0
+    assert unchanged.status == "rejected"
+    assert [review.decision for review in unchanged.reviews] == ["reject"]
+    assert len(unchanged.revisions) == 1
+
+
+def test_create_rechecks_product_opportunity_after_model_call(tmp_path: Path) -> None:
+    service, opportunity_id, evidence_id = seeded_service(tmp_path)
+    product_id = create_product(service, opportunity_id)
+    image = add_output_image(service, product_id, tmp_path)
+    service.model_adapter = CallbackModel(
+        evidence_id,
+        lambda: rebind_product_to_another_valid_opportunity(
+            service, product_id, opportunity_id,
+        ),
+    )
+
+    with pytest.raises(ContentValidationError, match="product.*opportunity"):
+        service.create_content_item(ContentItemCreate(
+            product_id=product_id,
+            opportunity_id=opportunity_id,
+            template_key="list-v1",
+            evidence_ids=[evidence_id],
+            image_material_ids=[image.id],
+            cover_material_id=image.id,
+            research_facts=[{"fact": "用户需要清单", "evidence_ids": [evidence_id]}],
+        ))
+
+    assert service.list_content_items() == []
+
+
+def test_review_rechecks_product_opportunity_binding(tmp_path: Path) -> None:
+    service, opportunity_id, evidence_id = seeded_service(tmp_path)
+    product_id = create_product(service, opportunity_id)
+    image = add_output_image(service, product_id, tmp_path)
+    item = service.create_content_item(ContentItemCreate(
+        product_id=product_id,
+        opportunity_id=opportunity_id,
+        template_key="list-v1",
+        evidence_ids=[evidence_id],
+        image_material_ids=[image.id],
+        cover_material_id=image.id,
+        research_facts=[{"fact": "用户需要清单", "evidence_ids": [evidence_id]}],
+    ))
+    rebind_product_to_another_valid_opportunity(service, product_id, opportunity_id)
+
+    with pytest.raises(ContentValidationError, match="product.*opportunity"):
+        service.review(item.id, ReviewCreate(
+            decision="approve",
+            actor="operator",
+            note="checked",
+            expected_revision_id=item.current_revision.id,
+            visual_checks=[{
+                "material_id": image.id,
+                "passed": True,
+                "observation": "清晰一致",
+            }],
+        ))
+
+    assert service.get_content_item(item.id).status == "review"

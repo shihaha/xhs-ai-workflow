@@ -26,7 +26,8 @@ from backend.app.features.analysis.models import OpportunityRecord
 from backend.app.features.radar.models import RankItemRecord
 from backend.app.models.jobs import JobArtifactRecord
 from backend.app.features.content.export import (
-    MAX_PACKAGE_BYTES, UnsafeContentPath, deterministic_zip, entry_manifest,
+    MAX_MATERIAL_BYTES, MAX_PACKAGE_BYTES, MAX_UNCOMPRESSED_PACKAGE_BYTES,
+    MAX_ZIP_ENTRIES, UnsafeContentPath, deterministic_zip, entry_manifest,
     read_contained_regular, write_contained_atomic,
 )
 from backend.app.features.content.models import (
@@ -329,6 +330,11 @@ class ContentService:
         self._validate_output(output, allowed=set(payload.evidence_ids), image_ids=payload.image_material_ids)
         now = _now()
         with self.database.session() as session:
+            product = session.get(ProductRecord, payload.product_id)
+            self._validate_product_opportunity_binding(
+                product, product_id=payload.product_id,
+                opportunity_id=payload.opportunity_id,
+            )
             record = ContentItemRecord(
                 product_id=payload.product_id, opportunity_id=payload.opportunity_id,
                 template_key=payload.template_key, status="research",
@@ -475,7 +481,9 @@ class ContentService:
         # the durable cleanup outbox can bind the exact hash and size.
         with self.database.session() as session:
             item = _load_item(session, item_id)
-            self._validate_item_trust(item, session=session)
+            self._validate_item_trust(
+                item, session=session, validate_material_bytes=False,
+            )
             if item.current_revision_id != payload.expected_revision_id:
                 raise ContentStateError("The expected revision is stale.")
             if item.status not in {"approved", "exported"} or not item.current_revision_id:
@@ -507,31 +515,12 @@ class ContentService:
                         "Approved material is missing or foreign to the product."
                     )
                 materials.append(material)
-        entries = self._package_entries(item, revision, product, materials)
-        manifest = {
-            "schema_version": 1, "content_item_id": item.id,
-            "revision_id": revision.id, "product_id": product.id,
-            "opportunity_id": item.opportunity_id, "entries": entry_manifest(entries),
-            "materials": [
-                {
-                    "id": material.id, "logical_name": material.logical_name,
-                    "version": material.version, "media_type": material.media_type,
-                    "sha256": material.sha256,
-                    "entry_path": (
-                        f"images/{item.image_material_ids_json.index(material.id) + 1:02d}{Path(material.logical_name).suffix.lower()}"
-                        if material.kind == "output_image"
-                        else f"materials/{material.id}/{material.logical_name}"
-                    ),
-                }
-                for material in sorted(materials, key=lambda value: value.id)
-            ],
-            "images": {
-                "count": len(item.image_material_ids_json),
-                "cover_material_id": item.cover_material_id,
-                "ordered_material_ids": list(item.image_material_ids_json),
-            },
-            "automatic_publish": False,
-        }
+            fixed_entries, material_plan, manifest = self._package_preflight(
+                item, revision, product, materials,
+            )
+        entries = self._read_package_entries(
+            fixed_entries, material_plan, manifest=manifest,
+        )
         archive = deterministic_zip(entries, manifest)
         archive_sha = sha256(archive).hexdigest()
         archive_size = len(archive)
@@ -971,7 +960,10 @@ class ContentService:
             projected.export_availability = "missing" if package is None else self._package_read(package).availability
         return projected
 
-    def _validate_request_scope(self, payload: ContentItemCreate, *, allowed: set[str], session: Any) -> None:
+    def _validate_request_scope(
+        self, payload: ContentItemCreate, *, allowed: set[str], session: Any,
+        validate_material_bytes: bool = True,
+    ) -> None:
         if not set(payload.evidence_ids).issubset(allowed):
             raise ContentValidationError("Every content source must belong to the product opportunity.")
         for fact in payload.research_facts:
@@ -986,12 +978,14 @@ class ContentService:
             material = session.get(ProductMaterialRecord, material_id)
             if material is None or material.product_id != payload.product_id or material.kind != "source":
                 raise ContentValidationError("Every material must belong to this product.")
-            self._require_material_available(material)
+            if validate_material_bytes:
+                self._require_material_available(material)
         for material_id in payload.image_material_ids:
             material = session.get(ProductMaterialRecord, material_id)
             if material is None or material.product_id != payload.product_id or material.kind != "output_image":
                 raise ContentValidationError("Every output image must belong to this product and be typed as output_image.")
-            self._require_material_available(material)
+            if validate_material_bytes:
+                self._require_material_available(material)
 
     def _require_material_available(self, material: ProductMaterialRecord) -> None:
         status = self._material_availability(material)
@@ -1147,7 +1141,15 @@ class ContentService:
                 if checker._trusted_shop_result(record) is None:
                     raise ContentValidationError("Product opportunity artifact is no longer trusted.")
 
-    def _validate_item_trust(self, item: ContentItemRecord, *, session: Any) -> None:
+    def _validate_item_trust(
+        self, item: ContentItemRecord, *, session: Any,
+        validate_material_bytes: bool = True,
+    ) -> None:
+        product = session.get(ProductRecord, item.product_id)
+        self._validate_product_opportunity_binding(
+            product, product_id=item.product_id,
+            opportunity_id=item.opportunity_id,
+        )
         opportunity = session.get(OpportunityRecord, item.opportunity_id)
         self._validate_opportunity(opportunity, session=session)
         payload = ContentItemCreate(
@@ -1157,7 +1159,23 @@ class ContentService:
             image_material_ids=list(item.image_material_ids_json), cover_material_id=item.cover_material_id,
             research_facts=list(item.research_facts_json),
         )
-        self._validate_request_scope(payload, allowed=set(opportunity.evidence_ids_json), session=session)
+        self._validate_request_scope(
+            payload, allowed=set(opportunity.evidence_ids_json), session=session,
+            validate_material_bytes=validate_material_bytes,
+        )
+
+    @staticmethod
+    def _validate_product_opportunity_binding(
+        product: ProductRecord | None, *, product_id: str, opportunity_id: str,
+    ) -> None:
+        if (
+            product is None
+            or product.id != product_id
+            or product.opportunity_id != opportunity_id
+        ):
+            raise ContentValidationError(
+                "Content product no longer belongs to its opportunity."
+            )
 
     @staticmethod
     def _validate_visual_checks(item: ContentItemRecord, payload: ReviewCreate) -> None:
@@ -1168,8 +1186,13 @@ class ContentService:
             if ids != list(item.image_material_ids_json) or any(not check.passed for check in payload.visual_checks):
                 raise ContentValidationError("Approval requires one passing visual check per ordered image.")
 
-    def _package_entries(self, item: ContentItemRecord, revision: ContentRevisionRecord, product: ProductRecord, materials: list[ProductMaterialRecord]) -> dict[str, bytes]:
-        entries: dict[str, bytes] = {
+    def _package_preflight(
+        self, item: ContentItemRecord, revision: ContentRevisionRecord,
+        product: ProductRecord, materials: list[ProductMaterialRecord],
+    ) -> tuple[
+        dict[str, bytes], list[tuple[str, ProductMaterialRecord]], dict[str, object],
+    ]:
+        fixed_entries: dict[str, bytes] = {
             "content/final.md": f"# {revision.title}\n\n{revision.body}\n".encode("utf-8"),
             "content/image-plan.json": _json_bytes(list(revision.image_plan_json)),
             "sources/evidence.json": _json_bytes({
@@ -1189,21 +1212,106 @@ class ContentService:
                 "opportunity_id": product.opportunity_id,
             }),
         }
+        material_plan: list[tuple[str, ProductMaterialRecord]] = []
+        planned_keys = {name.casefold() for name in fixed_entries}
         for material in sorted(materials, key=lambda value: value.id):
-            try:
-                content = read_contained_regular(self.runtime_dir, material.path)
-            except UnsafeContentPath as error:
-                raise ContentValidationError("An approved material is unavailable or unsafe.") from error
-            if sha256(content).hexdigest() != material.sha256 or len(content) != material.size_bytes:
-                raise ContentValidationError("An approved material changed after its immutable version was recorded.")
+            if material.size_bytes > MAX_MATERIAL_BYTES:
+                raise ContentValidationError(
+                    "Approved material size exceeds its owner limit."
+                )
             if material.kind == "output_image":
                 position = item.image_material_ids_json.index(material.id) + 1
                 name = f"images/{position:02d}{Path(material.logical_name).suffix.lower()}"
             else:
                 name = f"materials/{material.id}/{material.logical_name}"
-            if name in entries or name.casefold() in {value.casefold() for value in entries}:
+            if name.casefold() in planned_keys:
                 raise ContentValidationError("Approved material export path collision.")
+            planned_keys.add(name.casefold())
+            material_plan.append((name, material))
+
+        if len(fixed_entries) + len(material_plan) + 1 > MAX_ZIP_ENTRIES:
+            raise ContentValidationError("Content package ZIP entry count limit exceeded.")
+
+        declared_entries = entry_manifest(fixed_entries) + [
+            {
+                "path": name,
+                "sha256": material.sha256,
+                "size_bytes": material.size_bytes,
+            }
+            for name, material in material_plan
+        ]
+        declared_entries.sort(key=lambda value: str(value["path"]))
+        manifest: dict[str, object] = {
+            "schema_version": 1, "content_item_id": item.id,
+            "revision_id": revision.id, "product_id": product.id,
+            "opportunity_id": item.opportunity_id, "entries": declared_entries,
+            "materials": [
+                {
+                    "id": material.id, "logical_name": material.logical_name,
+                    "version": material.version, "media_type": material.media_type,
+                    "sha256": material.sha256, "entry_path": name,
+                }
+                for name, material in material_plan
+            ],
+            "images": {
+                "count": len(item.image_material_ids_json),
+                "cover_material_id": item.cover_material_id,
+                "ordered_material_ids": list(item.image_material_ids_json),
+            },
+            "automatic_publish": False,
+        }
+        declared_total = (
+            sum(len(value) for value in fixed_entries.values())
+            + sum(material.size_bytes for _, material in material_plan)
+            + len(_json_bytes(manifest))
+        )
+        if declared_total > MAX_UNCOMPRESSED_PACKAGE_BYTES:
+            raise ContentValidationError(
+                "Content package declared uncompressed size limit exceeded."
+            )
+        return fixed_entries, material_plan, manifest
+
+    def _read_package_entries(
+        self, fixed_entries: dict[str, bytes],
+        material_plan: list[tuple[str, ProductMaterialRecord]], *,
+        manifest: dict[str, object],
+    ) -> dict[str, bytes]:
+        entries = dict(fixed_entries)
+        actual_total = sum(len(value) for value in entries.values()) + len(
+            _json_bytes(manifest)
+        )
+        for name, material in material_plan:
+            remaining = MAX_UNCOMPRESSED_PACKAGE_BYTES - actual_total
+            if remaining <= 0:
+                raise ContentValidationError(
+                    "Content package uncompressed size limit exceeded."
+                )
+            try:
+                content = read_contained_regular(
+                    self.runtime_dir, material.path,
+                    limit=min(MAX_MATERIAL_BYTES, remaining),
+                )
+            except UnsafeContentPath as error:
+                raise ContentValidationError(
+                    "An approved material is unavailable or unsafe."
+                ) from error
+            actual_total += len(content)
+            if actual_total > MAX_UNCOMPRESSED_PACKAGE_BYTES:
+                raise ContentValidationError(
+                    "Content package uncompressed size limit exceeded."
+                )
+            if (
+                sha256(content).hexdigest() != material.sha256
+                or len(content) != material.size_bytes
+            ):
+                raise ContentValidationError(
+                    "An approved material changed after its immutable version was recorded."
+                )
             entries[name] = content
+        if entry_manifest(entries) != manifest["entries"]:
+            raise ContentValidationError(
+                "Content package entry manifest changed during bounded reads."
+            )
         return entries
 
 

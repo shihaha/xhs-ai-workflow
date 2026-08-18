@@ -10,7 +10,11 @@ import httpx
 import backend.app.features.content.export as content_export
 import backend.app.features.content.service as content_service_module
 from backend.app.features.content.export import UnsafeContentPath, deterministic_zip
-from backend.app.features.content.models import ContentPackageRecord
+from backend.app.features.content.models import (
+    ContentItemRecord,
+    ContentPackageRecord,
+    ProductMaterialRecord,
+)
 from backend.app.features.content.schemas import ContentItemCreate, ExportCreate, MaterialCreate, ReviewCreate
 from backend.app.features.content.service import ContentStateError, ContentValidationError
 from backend.app.main import create_app
@@ -20,6 +24,7 @@ from backend.tests.content.test_workflow import (
     FakeModel,
     UnconfiguredNoCallModel,
     create_product,
+    rebind_product_to_another_valid_opportunity,
     seed_database,
     seeded_service,
 )
@@ -41,6 +46,49 @@ def _item_with_material(tmp_path: Path):
         research_facts=[{"fact": "真实事实", "evidence_ids": [evidence_id]}],
     ))
     return service, item, source
+
+
+def _approved_item(tmp_path: Path):
+    service, item, source = _item_with_material(tmp_path)
+    approved = service.review(item.id, ReviewCreate(
+        decision="approve",
+        actor="operator",
+        note="人工核对通过",
+        expected_revision_id=item.current_revision.id,
+        visual_checks=[{
+            "material_id": item.image_material_ids[0],
+            "passed": True,
+            "observation": "图文清晰一致",
+        }],
+    ))
+    return service, approved, source
+
+
+def _attach_virtual_sources(
+    service: object, item_id: str, product_id: str, *, count: int, size_bytes: int,
+) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    with service.database.session() as session:
+        rows = [
+            ProductMaterialRecord(
+                product_id=product_id,
+                logical_name=f"virtual-{index:03d}.bin",
+                logical_key=f"virtual-{index:03d}.bin",
+                version=1,
+                path=f"virtual/virtual-{index:03d}.bin",
+                sha256=f"{index % 16:x}" * 64,
+                size_bytes=size_bytes,
+                media_type="application/octet-stream",
+                kind="source",
+                created_at=now,
+            )
+            for index in range(count)
+        ]
+        session.add_all(rows)
+        session.flush()
+        record = session.get(ContentItemRecord, item_id)
+        record.material_ids_json = [row.id for row in rows]
+        session.commit()
 
 
 def test_export_is_blocked_before_approved_current_revision(tmp_path: Path) -> None:
@@ -165,6 +213,128 @@ def test_near_limit_valid_archive_remains_available(
         session.commit()
 
     assert service.list_packages()[0].availability == "available"
+
+
+def test_export_entry_count_preflight_reads_no_material_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, _ = _approved_item(tmp_path)
+    _attach_virtual_sources(
+        service, item.id, item.product_id, count=122, size_bytes=1,
+    )
+    reads = 0
+
+    def forbidden_read(*args: object, **kwargs: object) -> bytes:
+        nonlocal reads
+        reads += 1
+        raise AssertionError("Entry-count preflight must run before material reads.")
+
+    monkeypatch.setattr(content_service_module, "read_contained_regular", forbidden_read)
+
+    with pytest.raises(ContentValidationError, match="entry count"):
+        service.export_package(
+            item.id,
+            ExportCreate(expected_revision_id=item.current_revision.id),
+        )
+
+    assert reads == 0
+
+
+def test_export_declared_aggregate_preflight_reads_no_500_large_materials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, _ = _approved_item(tmp_path)
+    _attach_virtual_sources(
+        service,
+        item.id,
+        item.product_id,
+        count=500,
+        size_bytes=50 * 1024 * 1024,
+    )
+    monkeypatch.setattr(content_service_module, "MAX_ZIP_ENTRIES", 1000, raising=False)
+    reads = 0
+
+    def forbidden_read(*args: object, **kwargs: object) -> bytes:
+        nonlocal reads
+        reads += 1
+        raise AssertionError("Aggregate preflight must run before material reads.")
+
+    monkeypatch.setattr(content_service_module, "read_contained_regular", forbidden_read)
+
+    with pytest.raises(ContentValidationError, match="uncompressed size"):
+        service.export_package(
+            item.id,
+            ExportCreate(expected_revision_id=item.current_revision.id),
+        )
+
+    assert reads == 0
+
+
+def test_export_actual_size_mismatch_uses_bounded_incremental_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, _ = _approved_item(tmp_path)
+    limits: list[int | None] = []
+
+    def mismatched_read(root: Path, relative: str, *, limit: int | None = None) -> bytes:
+        limits.append(limit)
+        return PNG_1X1 + b"changed"
+
+    monkeypatch.setattr(content_service_module, "read_contained_regular", mismatched_read)
+
+    with pytest.raises(ContentValidationError, match="changed"):
+        service.export_package(
+            item.id,
+            ExportCreate(expected_revision_id=item.current_revision.id),
+        )
+
+    assert len(limits) == 1
+    assert limits[0] is not None
+    assert limits[0] <= content_export.MAX_MATERIAL_BYTES
+
+
+def test_export_declared_material_over_owner_limit_reads_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, _ = _approved_item(tmp_path)
+    _attach_virtual_sources(
+        service,
+        item.id,
+        item.product_id,
+        count=1,
+        size_bytes=content_export.MAX_MATERIAL_BYTES + 1,
+    )
+    reads = 0
+
+    def forbidden_read(*args: object, **kwargs: object) -> bytes:
+        nonlocal reads
+        reads += 1
+        raise AssertionError("Owner-size preflight must run before material reads.")
+
+    monkeypatch.setattr(content_service_module, "read_contained_regular", forbidden_read)
+
+    with pytest.raises(ContentValidationError, match="material size"):
+        service.export_package(
+            item.id,
+            ExportCreate(expected_revision_id=item.current_revision.id),
+        )
+
+    assert reads == 0
+
+
+def test_export_rechecks_product_opportunity_binding(tmp_path: Path) -> None:
+    service, item, _ = _approved_item(tmp_path)
+    rebind_product_to_another_valid_opportunity(
+        service, item.product_id, item.opportunity_id,
+    )
+
+    with pytest.raises(ContentValidationError, match="product.*opportunity"):
+        service.export_package(
+            item.id,
+            ExportCreate(expected_revision_id=item.current_revision.id),
+        )
+
+    assert service.list_packages() == []
 
 
 @pytest.mark.anyio

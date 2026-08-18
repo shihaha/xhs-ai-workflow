@@ -887,3 +887,55 @@ findings.
 Live Bailian remains `not_run: BAILIAN_API_KEY unavailable`; Android remains
 `not_run: device unavailable`; seven-day UAT remains `not_run`. None is inferred
 from the automated suite.
+
+## Task 8R-5 fix round 1/5
+
+The final independent review of `89bb237..9d1f9b3` was **NOT CLEAN**: zero
+Critical, two Important and zero Minor. It reproduced a product/opportunity rebind
+that reached model readiness before business rejection, and proved that ZIP count
+and aggregate limits ran only after all approved material bytes had been retained.
+
+Strict RED coverage then reproduced six exact review behaviors plus one bounded
+actual-read boundary:
+
+- regenerate after a product is rebound to another valid opportunity;
+- create-time product rebinding during the model call;
+- review and export against the same rebound product;
+- entry-count overflow with zero material-reader calls;
+- 500 declared 50 MiB sources with the entry limit raised, still rejected by the
+  independent aggregate preflight with zero material-reader calls;
+- a declared-under-budget material whose actual bytes differ, read once with an
+  explicit owner/remaining-budget bound;
+- a material whose declared size already exceeds its 50 MiB owner bound, rejected
+  with zero material-reader calls.
+
+Implemented fixes:
+
+- Shared item trust now reloads the exact `ProductRecord`, verifies its ID and
+  requires `product.opportunity_id == item.opportunity_id` before opportunity,
+  analysis, evidence, material or model work continues. Review, regenerate and
+  export all consume this check. Create repeats the same relation check in its
+  post-model persistence transaction, so trust drift cannot create a revision.
+- Export separates planning from reading. It serializes the five fixed metadata
+  entries, derives every source/image entry name, includes `manifest.json` in the
+  total entry count, constructs the declared entry manifest from persisted hashes
+  and sizes, and includes the actual serialized manifest bytes in the declared
+  aggregate before any material reader is called.
+- Accepted plans read one material at a time with
+  `min(MAX_MATERIAL_BYTES, remaining_uncompressed_budget)`, update the actual byte
+  total immediately, and reject size/hash drift before retaining the next entry.
+  The deterministic ZIP independently repeats entry, final archive, uncompressed
+  aggregate and compression-ratio checks.
+
+Fresh implementation verification before independent re-review:
+
+```text
+new high-risk subset: 8 passed
+backend/tests/content/test_export.py + test_workflow.py: 27 passed
+backend/tests/content: 275 passed
+backend/tests: 588 passed, 1 skipped
+```
+
+Task 8 remains blocked pending independent re-review. Bailian remains
+`not_run: BAILIAN_API_KEY unavailable`, Android remains `not_run: device
+unavailable`, and seven-day UAT remains `not_run`.

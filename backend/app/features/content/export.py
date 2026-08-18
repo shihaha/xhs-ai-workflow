@@ -18,6 +18,7 @@ from typing import Callable, Iterator, Literal
 MAX_MATERIAL_BYTES = 50 * 1024 * 1024
 MAX_PACKAGE_BYTES = 250 * 1024 * 1024
 MAX_UNCOMPRESSED_PACKAGE_BYTES = 250 * 1024 * 1024
+MAX_ZIP_ENTRIES = 128
 
 
 class UnsafeContentPath(ValueError):
@@ -676,7 +677,7 @@ def _windows_component_key(value: str) -> str:
 
 def deterministic_zip(entries: dict[str, bytes], manifest: dict[str, object]) -> bytes:
     if (
-        len(entries) > 127
+        len(entries) + 1 > MAX_ZIP_ENTRIES
         or sum(len(value) for value in entries.values()) > MAX_UNCOMPRESSED_PACKAGE_BYTES
     ):
         raise UnsafeContentPath("ZIP entry count or uncompressed size limit exceeded.")
