@@ -46,8 +46,24 @@ OPEN_STATES = ("pending", "claimed", "quarantined", "needs_human")
 CLAIMABLE_STATES = ("pending", "quarantined")
 
 
+def _never_cancelled() -> bool:
+    return False
+
+
+def _is_cancelled(cancelled: Callable[[], bool]) -> bool:
+    try:
+        return bool(cancelled())
+    except Exception:
+        return True
+
+
 class _CleanupBatchService(Protocol):
-    def run_due_once(self, *, limit: int = 10) -> int: ...
+    def run_due_once(
+        self,
+        *,
+        limit: int = 10,
+        cancelled: Callable[[], bool] = _never_cancelled,
+    ) -> int: ...
 
 
 class ArtifactCleanupWorker:
@@ -59,16 +75,23 @@ class ArtifactCleanupWorker:
         *,
         poll_seconds: float,
         batch_size: int,
+        on_stopped: Callable[[], None] | None = None,
     ) -> None:
         if poll_seconds <= 0 or batch_size < 1:
             raise ValueError("Cleanup worker settings must be positive.")
         self.service = service
         self.poll_seconds = poll_seconds
         self.batch_size = batch_size
+        self.on_stopped = on_stopped
         self.last_error_category: str | None = None
         self._stop_event = Event()
+        self._stopped_event = Event()
         self._lifecycle_lock = Lock()
+        self._finalizer_lock = Lock()
         self._thread: Thread | None = None
+        self._admission_closed = False
+        self._generation = 0
+        self._finalized = False
 
     @property
     def is_alive(self) -> bool:
@@ -77,30 +100,65 @@ class ArtifactCleanupWorker:
 
     def start(self) -> None:
         with self._lifecycle_lock:
-            if self._thread is not None:
+            if self._thread is not None or self._admission_closed:
                 return
+            self._generation += 1
+            generation = self._generation
             self._thread = Thread(
                 target=self._run,
+                args=(generation,),
                 name="artifact-cleanup",
-                daemon=True,
+                daemon=False,
             )
             self._thread.start()
 
-    def close(self) -> None:
-        self._stop_event.set()
-        thread = self._thread
+    def close(self) -> bool:
+        with self._lifecycle_lock:
+            self._admission_closed = True
+            self._generation += 1
+            self._stop_event.set()
+            thread = self._thread
+        if thread is None:
+            self._finalize_once()
+            return True
         if thread is not None:
             thread.join(timeout=0.25)
+        return not thread.is_alive()
 
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self.service.run_due_once(limit=self.batch_size)
-            except Exception:
-                # The worker must keep polling without retaining sensitive exception text.
-                self.last_error_category = "cleanup_worker_error"
-            if self._stop_event.wait(self.poll_seconds):
+    def wait_stopped(self, timeout: float | None = None) -> bool:
+        return self._stopped_event.wait(timeout)
+
+    def _run(self, generation: int) -> None:
+        cancelled = lambda: (
+            self._stop_event.is_set() or self._generation != generation
+        )
+        try:
+            while not cancelled():
+                try:
+                    self.service.run_due_once(
+                        limit=self.batch_size,
+                        cancelled=cancelled,
+                    )
+                except Exception:
+                    # The worker must continue without retaining sensitive exception text.
+                    self.last_error_category = "cleanup_worker_error"
+                if self._stop_event.wait(self.poll_seconds):
+                    return
+        finally:
+            self._finalize_once()
+
+    def _finalize_once(self) -> None:
+        with self._finalizer_lock:
+            if self._finalized:
                 return
+            self._finalized = True
+            try:
+                if self.on_stopped is not None:
+                    self.on_stopped()
+            except Exception:
+                self.last_error_category = "cleanup_worker_finalizer_error"
+            finally:
+                self._stopped_event.set()
 
 
 def _utc_now() -> datetime:
@@ -315,8 +373,13 @@ class ArtifactCleanupService:
         ).rowcount
         return won == 1
 
-    def claim_due(self, *, limit: int = 10) -> list[str]:
-        if limit < 1:
+    def claim_due(
+        self,
+        *,
+        limit: int = 10,
+        cancelled: Callable[[], bool] = _never_cancelled,
+    ) -> list[str]:
+        if limit < 1 or _is_cancelled(cancelled):
             return []
         now = _naive_utc(self.clock())
         with self.database.session() as session:
@@ -334,34 +397,75 @@ class ArtifactCleanupService:
                     .limit(limit)
                 )
             )
+        if _is_cancelled(cancelled):
+            return []
         claimed: list[str] = []
         for cleanup_id in due_ids:
-            token = self._claim_specific(cleanup_id, now=now)
+            if _is_cancelled(cancelled):
+                break
+            token = self._claim_specific(
+                cleanup_id,
+                now=now,
+                cancelled=cancelled,
+            )
             if token is not None:
                 claimed.append(cleanup_id)
         return claimed
 
-    def process_one(self, cleanup_id: str) -> ArtifactCleanupRead:
+    def process_one(
+        self,
+        cleanup_id: str,
+        *,
+        cancelled: Callable[[], bool] = _never_cancelled,
+    ) -> ArtifactCleanupRead:
         record = self.get_record(cleanup_id)
         if record is None:
             raise KeyError(cleanup_id)
+        if _is_cancelled(cancelled):
+            return record
         now = _naive_utc(self.clock())
         with self._lease_lock:
             token = self._owned_leases.get(cleanup_id)
         if token is None and record.state in CLAIMABLE_STATES and record.not_before <= now:
-            token = self._claim_specific(cleanup_id, now=now)
+            token = self._claim_specific(
+                cleanup_id,
+                now=now,
+                cancelled=cancelled,
+            )
+        if _is_cancelled(cancelled):
+            return record
         if token is None:
             return self.get_record(cleanup_id) or record
         try:
             claimed = self._load_claimed(cleanup_id, token)
+            if _is_cancelled(cancelled):
+                return claimed or record
             if claimed is None:
                 return self.get_record(cleanup_id) or record
             try:
                 if claimed.quarantine_path is None:
-                    return self._quarantine(claimed, token, now)
-                return self._delete_quarantined(claimed, token, now)
+                    return self._quarantine(
+                        claimed,
+                        token,
+                        now,
+                        cancelled=cancelled,
+                    )
+                return self._delete_quarantined(
+                    claimed,
+                    token,
+                    now,
+                    cancelled=cancelled,
+                )
             except (OSError, OverflowError, ValidationError, ValueError):
-                return self._needs_human(cleanup_id, token, "cleanup_processing_error")
+                if _is_cancelled(cancelled):
+                    return claimed
+                return self._needs_human(
+                    cleanup_id,
+                    token,
+                    "cleanup_processing_error",
+                    cancelled=cancelled,
+                    fallback=claimed,
+                )
         finally:
             with self._lease_lock:
                 self._owned_leases.pop(cleanup_id, None)
@@ -411,10 +515,17 @@ class ArtifactCleanupService:
                     self._owned_leases.pop(cleanup_id, None)
         return len(recovered_ids)
 
-    def run_due_once(self, *, limit: int = 10) -> int:
-        cleanup_ids = self.claim_due(limit=limit)
+    def run_due_once(
+        self,
+        *,
+        limit: int = 10,
+        cancelled: Callable[[], bool] = _never_cancelled,
+    ) -> int:
+        cleanup_ids = self.claim_due(limit=limit, cancelled=cancelled)
         for cleanup_id in cleanup_ids:
-            self.process_one(cleanup_id)
+            if _is_cancelled(cancelled):
+                break
+            self.process_one(cleanup_id, cancelled=cancelled)
         return len(cleanup_ids)
 
     def list_records(self) -> list[ArtifactCleanupRead]:
@@ -434,9 +545,19 @@ class ArtifactCleanupService:
             record = session.get(ArtifactCleanupRecord, cleanup_id)
             return _read(record) if record is not None else None
 
-    def _claim_specific(self, cleanup_id: str, *, now: datetime) -> str | None:
+    def _claim_specific(
+        self,
+        cleanup_id: str,
+        *,
+        now: datetime,
+        cancelled: Callable[[], bool] = _never_cancelled,
+    ) -> str | None:
+        if _is_cancelled(cancelled):
+            return None
         token = str(uuid4())
         with self.database.session() as session:
+            if _is_cancelled(cancelled):
+                return None
             result = session.execute(
                 update(ArtifactCleanupRecord)
                 .where(
@@ -451,7 +572,12 @@ class ArtifactCleanupService:
                     updated_at=now,
                 )
             )
+            if _is_cancelled(cancelled):
+                session.rollback()
+                return None
             session.commit()
+            if _is_cancelled(cancelled):
+                return None
             if result.rowcount != 1:
                 return None
         with self._lease_lock:
@@ -481,10 +607,25 @@ class ArtifactCleanupService:
             ) is not None
 
     def _quarantine(
-        self, record: ArtifactCleanupRead, token: str, now: datetime
+        self,
+        record: ArtifactCleanupRead,
+        token: str,
+        now: datetime,
+        *,
+        cancelled: Callable[[], bool] = _never_cancelled,
     ) -> ArtifactCleanupRead:
+        if _is_cancelled(cancelled):
+            return record
         raw_inspection = inspect_contained_artifact(self.runtime_dir, record.relative_path)
-        inspection = self._verified_file(record.relative_path, record)
+        if _is_cancelled(cancelled):
+            return record
+        inspection = self._verified_file(
+            record.relative_path,
+            record,
+            cancelled=cancelled,
+        )
+        if _is_cancelled(cancelled):
+            return record
         quarantine_relative = (
             PurePosixPath("artifacts-quarantine")
             / record.id
@@ -493,13 +634,21 @@ class ArtifactCleanupService:
         quarantine_existing = inspect_contained_artifact(
             self.runtime_dir, quarantine_relative
         )
+        if _is_cancelled(cancelled):
+            return record
         if quarantine_existing.status != "missing":
             if (
                 quarantine_existing.status == "trusted"
                 and inspection.status == "missing"
                 and self._lease_owned(record.id, token)
             ):
-                recovered = self._verified_file(quarantine_relative, record)
+                recovered = self._verified_file(
+                    quarantine_relative,
+                    record,
+                    cancelled=cancelled,
+                )
+                if _is_cancelled(cancelled):
+                    return record
                 if recovered.status == "trusted" and recovered.identity is not None:
                     reference_issue = self._reference_issue(record, recovered)
                     return self._mark_moved_needs_human(
@@ -508,51 +657,117 @@ class ArtifactCleanupService:
                         reference_issue or "quarantine_move_recovered",
                         quarantine_relative,
                         recovered.identity,
+                        cancelled=cancelled,
+                        fallback=record,
                     )
-            return self._needs_human(record.id, token, "quarantine_target_ambiguous")
+            return self._needs_human(
+                record.id,
+                token,
+                "quarantine_target_ambiguous",
+                cancelled=cancelled,
+                fallback=record,
+            )
         if inspection.status == "ambiguous":
             category = (
                 "identity_mismatch"
                 if raw_inspection.status == "trusted"
                 else "ambiguous_path"
             )
-            return self._needs_human(record.id, token, category)
+            return self._needs_human(
+                record.id,
+                token,
+                category,
+                cancelled=cancelled,
+                fallback=record,
+            )
         if not self._lease_owned(record.id, token):
             return self.get_record(record.id) or record
         reference_issue = self._reference_issue(record, inspection)
+        if _is_cancelled(cancelled):
+            return record
         if reference_issue is not None:
-            return self._needs_human(record.id, token, reference_issue)
+            return self._needs_human(
+                record.id,
+                token,
+                reference_issue,
+                cancelled=cancelled,
+                fallback=record,
+            )
         if inspection.status == "missing":
-            return self._mark_deleted(record.id, token, "already_missing")
+            return self._mark_deleted(
+                record.id,
+                token,
+                "already_missing",
+                cancelled=cancelled,
+                fallback=record,
+            )
         if not self._lease_owned(record.id, token):
             return self.get_record(record.id) or record
 
-        target = self._prepare_quarantine_target(record.id, quarantine_relative)
+        target = self._prepare_quarantine_target(
+            record.id,
+            quarantine_relative,
+            cancelled=cancelled,
+        )
+        if _is_cancelled(cancelled):
+            return record
         if target is None or inspection.path is None or inspection.identity is None:
-            return self._needs_human(record.id, token, "ambiguous_quarantine_path")
-        second = self._verified_file(record.relative_path, record)
+            return self._needs_human(
+                record.id,
+                token,
+                "ambiguous_quarantine_path",
+                cancelled=cancelled,
+                fallback=record,
+            )
+        second = self._verified_file(
+            record.relative_path,
+            record,
+            cancelled=cancelled,
+        )
+        if _is_cancelled(cancelled):
+            return record
         if (
             second.status != "trusted"
             or second.identity != inspection.identity
             or second.path is None
             or not self._lease_owned(record.id, token)
         ):
-            return self._needs_human(record.id, token, "identity_changed_before_move")
+            return self._needs_human(
+                record.id,
+                token,
+                "identity_changed_before_move",
+                cancelled=cancelled,
+                fallback=record,
+            )
+        if _is_cancelled(cancelled):
+            return record
         rename_result = rename_contained_regular_to_directory(
             self.runtime_dir,
             record.relative_path,
             quarantine_relative,
             expected_identity=second.identity,
         )
+        if _is_cancelled(cancelled):
+            return record
         if rename_result.status != "trusted":
             return self._needs_human(
                 record.id,
                 token,
                 f"quarantine_move_{rename_result.absolute_key or 'failed'}",
+                cancelled=cancelled,
+                fallback=record,
             )
         moved_identity = rename_result.identity or second.identity
-        moved = self._verified_file(quarantine_relative, record)
+        moved = self._verified_file(
+            quarantine_relative,
+            record,
+            cancelled=cancelled,
+        )
+        if _is_cancelled(cancelled):
+            return record
         post_reference_issue = self._reference_issue(record, moved)
+        if _is_cancelled(cancelled):
+            return record
         if (
             moved.status != "trusted"
             or moved.identity != moved_identity
@@ -566,6 +781,8 @@ class ArtifactCleanupService:
                 category,
                 quarantine_relative,
                 moved_identity,
+                cancelled=cancelled,
+                fallback=record,
             )
         if moved.identity is None:
             return self._mark_moved_needs_human(
@@ -574,10 +791,16 @@ class ArtifactCleanupService:
                 "quarantine_identity_missing",
                 quarantine_relative,
                 moved_identity,
+                cancelled=cancelled,
+                fallback=record,
             )
         quarantined_at = _naive_utc(self.clock())
+        if _is_cancelled(cancelled):
+            return record
         try:
             with self.database.session() as session:
+                if _is_cancelled(cancelled):
+                    return record
                 result = session.execute(
                     update(ArtifactCleanupRecord)
                     .where(
@@ -600,6 +823,9 @@ class ArtifactCleanupService:
                         updated_at=quarantined_at,
                     )
                 )
+                if _is_cancelled(cancelled):
+                    session.rollback()
+                    return record
                 session.commit()
                 if result.rowcount != 1:
                     latest = self.get_record(record.id)
@@ -616,6 +842,8 @@ class ArtifactCleanupService:
                         "quarantine_commit_ambiguous",
                         quarantine_relative,
                         moved_identity,
+                        cancelled=cancelled,
+                        fallback=record,
                     )
         except SQLAlchemyError:
             latest = self.get_record(record.id)
@@ -632,6 +860,8 @@ class ArtifactCleanupService:
                 "quarantine_commit_ambiguous",
                 quarantine_relative,
                 moved_identity,
+                cancelled=cancelled,
+                fallback=record,
             )
         return self.get_record(record.id) or record
 
@@ -642,10 +872,17 @@ class ArtifactCleanupService:
         category: str,
         quarantine_path: str,
         identity: tuple[int, int, int, int],
+        *,
+        cancelled: Callable[[], bool] = _never_cancelled,
+        fallback: ArtifactCleanupRead | None = None,
     ) -> ArtifactCleanupRead:
+        if _is_cancelled(cancelled):
+            return fallback or self.get_record(cleanup_id)  # type: ignore[return-value]
         fresh_now = _naive_utc(self.clock())
         try:
             with self.database.session() as session:
+                if _is_cancelled(cancelled):
+                    return fallback or self.get_record(cleanup_id)  # type: ignore[return-value]
                 result = session.execute(
                     update(ArtifactCleanupRecord)
                     .where(
@@ -667,6 +904,9 @@ class ArtifactCleanupService:
                         updated_at=fresh_now,
                     )
                 )
+                if _is_cancelled(cancelled):
+                    session.rollback()
+                    return fallback or self.get_record(cleanup_id)  # type: ignore[return-value]
                 session.commit()
                 if result.rowcount != 1:
                     latest = self.get_record(cleanup_id)
@@ -705,26 +945,61 @@ class ArtifactCleanupService:
         )
 
     def _delete_quarantined(
-        self, record: ArtifactCleanupRead, token: str, now: datetime
+        self,
+        record: ArtifactCleanupRead,
+        token: str,
+        now: datetime,
+        *,
+        cancelled: Callable[[], bool] = _never_cancelled,
     ) -> ArtifactCleanupRead:
+        if _is_cancelled(cancelled):
+            return record
         if record.quarantine_path is None:
-            return self._needs_human(record.id, token, "missing_quarantine_identity")
+            return self._needs_human(
+                record.id,
+                token,
+                "missing_quarantine_identity",
+                cancelled=cancelled,
+                fallback=record,
+            )
         if not self._lease_owned(record.id, token):
             return self.get_record(record.id) or record
         original = inspect_contained_artifact(self.runtime_dir, record.relative_path)
+        if _is_cancelled(cancelled):
+            return record
         if original.status != "missing":
-            return self._needs_human(record.id, token, "original_path_reappeared")
+            return self._needs_human(
+                record.id,
+                token,
+                "original_path_reappeared",
+                cancelled=cancelled,
+                fallback=record,
+            )
         raw_inspection = inspect_contained_artifact(
             self.runtime_dir, record.quarantine_path
         )
-        inspection = self._verified_file(record.quarantine_path, record)
+        if _is_cancelled(cancelled):
+            return record
+        inspection = self._verified_file(
+            record.quarantine_path,
+            record,
+            cancelled=cancelled,
+        )
+        if _is_cancelled(cancelled):
+            return record
         if inspection.status == "ambiguous":
             category = (
                 "identity_mismatch"
                 if raw_inspection.status == "trusted"
                 else "ambiguous_quarantine_path"
             )
-            return self._needs_human(record.id, token, category)
+            return self._needs_human(
+                record.id,
+                token,
+                category,
+                cancelled=cancelled,
+                fallback=record,
+            )
         persisted_identity = (
             record.quarantine_volume_id,
             record.quarantine_file_id,
@@ -733,18 +1008,42 @@ class ArtifactCleanupService:
         )
         if inspection.status == "trusted" and inspection.identity != persisted_identity:
             return self._needs_human(
-                record.id, token, "quarantine_identity_changed"
+                record.id,
+                token,
+                "quarantine_identity_changed",
+                cancelled=cancelled,
+                fallback=record,
             )
         reference_snapshot = self._reference_snapshot(record.id)
+        if _is_cancelled(cancelled):
+            return record
         if reference_snapshot is None:
-            return self._needs_human(record.id, token, "reference_check_failed")
+            return self._needs_human(
+                record.id,
+                token,
+                "reference_check_failed",
+                cancelled=cancelled,
+                fallback=record,
+            )
         reference_issue = self._reference_issue_from_snapshot(
             record, inspection, reference_snapshot
         )
         if reference_issue is not None:
-            return self._needs_human(record.id, token, reference_issue)
+            return self._needs_human(
+                record.id,
+                token,
+                reference_issue,
+                cancelled=cancelled,
+                fallback=record,
+            )
         if inspection.status == "missing":
-            return self._mark_deleted(record.id, token, "already_missing")
+            return self._mark_deleted(
+                record.id,
+                token,
+                "already_missing",
+                cancelled=cancelled,
+                fallback=record,
+            )
         if inspection.identity is None or not self._lease_owned(record.id, token):
             return self.get_record(record.id) or record
         expected_identity = inspection.identity
@@ -752,20 +1051,39 @@ class ArtifactCleanupService:
         safely_disarmed = False
         ambiguous_persisted = False
         authorization_issue: str | None = None
-        with open_contained_delete_handle(
+        if _is_cancelled(cancelled):
+            return record
+        delete_handle = open_contained_delete_handle(
             self.runtime_dir,
             record.quarantine_path,
             limit=max(record.expected_size_bytes, 1),
             expected_identity=expected_identity,
-        ) as descriptor:
+        )
+        if _is_cancelled(cancelled):
+            return record
+        with delete_handle as descriptor:
+            if _is_cancelled(cancelled):
+                return record
             if descriptor is None:
-                return self._needs_human(record.id, token, "delete_handle_failed")
+                return self._needs_human(
+                    record.id,
+                    token,
+                    "delete_handle_failed",
+                    cancelled=cancelled,
+                    fallback=record,
+                )
             if inspect_contained_artifact(
                 self.runtime_dir, record.relative_path
             ).status != "missing":
                 return self._needs_human(
-                    record.id, token, "original_path_reappeared"
+                    record.id,
+                    token,
+                    "original_path_reappeared",
+                    cancelled=cancelled,
+                    fallback=record,
                 )
+            if _is_cancelled(cancelled):
+                return record
             connection = self.database.engine.connect()
             armed = False
             delete_time: datetime | None = None
@@ -831,7 +1149,12 @@ class ArtifactCleanupService:
                 ambiguous_persisted = True
 
             try:
+                if _is_cancelled(cancelled):
+                    return record
                 connection.exec_driver_sql("BEGIN IMMEDIATE")
+                if _is_cancelled(cancelled):
+                    connection.rollback()
+                    return record
                 delete_time = _naive_utc(self.clock())
                 current = connection.execute(
                     select(
@@ -848,6 +1171,9 @@ class ArtifactCleanupService:
                         ArtifactCleanupRecord.lease_expires_at > delete_time,
                     )
                 ).first()
+                if _is_cancelled(cancelled):
+                    connection.rollback()
+                    return record
                 if current is None or (
                     current.quarantine_path,
                     current.quarantine_volume_id,
@@ -861,15 +1187,24 @@ class ArtifactCleanupService:
                     locked_snapshot = self._reference_snapshot(
                         record.id, executor=connection
                     )
+                    if _is_cancelled(cancelled):
+                        connection.rollback()
+                        return record
                     if locked_snapshot is None or locked_snapshot != reference_snapshot:
                         authorization_issue = "reference_set_changed"
                         connection.rollback()
+                    elif _is_cancelled(cancelled):
+                        connection.rollback()
+                        return record
                     elif not content_export._delete_open_file(descriptor):
                         authorization_issue = "delete_failed"
                         connection.rollback()
                     else:
                         armed = True
                         try:
+                            if _is_cancelled(cancelled):
+                                recover_armed_failure()
+                                return record
                             result = connection.execute(
                                 update(ArtifactCleanupRecord)
                                 .where(
@@ -887,6 +1222,9 @@ class ArtifactCleanupService:
                                     completed_at=delete_time,
                                 )
                             )
+                            if _is_cancelled(cancelled):
+                                recover_armed_failure()
+                                return record
                             if result.rowcount != 1:
                                 raise RuntimeError("Final cleanup lease CAS failed.")
                             connection.commit()
@@ -906,6 +1244,8 @@ class ArtifactCleanupService:
 
         if delete_committed or ambiguous_persisted:
             return self.get_record(record.id) or record
+        if _is_cancelled(cancelled):
+            return record
         if safely_disarmed:
             retained = inspect_contained_artifact(
                 self.runtime_dir, record.quarantine_path
@@ -913,7 +1253,11 @@ class ArtifactCleanupService:
             if retained.status == "trusted" and retained.identity == expected_identity:
                 return self.get_record(record.id) or record
             return self._needs_human(
-                record.id, token, "delete_outcome_ambiguous"
+                record.id,
+                token,
+                "delete_outcome_ambiguous",
+                cancelled=cancelled,
+                fallback=record,
             )
         if authorization_issue == "reference_set_changed":
             refreshed_snapshot = self._reference_snapshot(record.id)
@@ -921,12 +1265,26 @@ class ArtifactCleanupService:
                 authorization_issue = self._reference_issue_from_snapshot(
                     record, inspection, refreshed_snapshot
                 ) or authorization_issue
-        return self._needs_human(record.id, token, authorization_issue or "delete_failed")
+        return self._needs_human(
+            record.id,
+            token,
+            authorization_issue or "delete_failed",
+            cancelled=cancelled,
+            fallback=record,
+        )
 
     def _verified_file(
-        self, relative_path: str, record: ArtifactCleanupRead
+        self,
+        relative_path: str,
+        record: ArtifactCleanupRead,
+        *,
+        cancelled: Callable[[], bool] = _never_cancelled,
     ) -> ArtifactPathInspection:
+        if _is_cancelled(cancelled):
+            return ArtifactPathInspection("ambiguous")
         first = inspect_contained_artifact(self.runtime_dir, relative_path)
+        if _is_cancelled(cancelled):
+            return ArtifactPathInspection("ambiguous")
         if first.status != "trusted":
             return first
         try:
@@ -937,7 +1295,11 @@ class ArtifactCleanupService:
             )
         except ValueError:
             return ArtifactPathInspection("ambiguous")
+        if _is_cancelled(cancelled):
+            return ArtifactPathInspection("ambiguous")
         second = inspect_contained_artifact(self.runtime_dir, relative_path)
+        if _is_cancelled(cancelled):
+            return ArtifactPathInspection("ambiguous")
         if (
             second.status != "trusted"
             or first.identity != second.identity
@@ -1136,12 +1498,20 @@ class ArtifactCleanupService:
         return None
 
     def _prepare_quarantine_target(
-        self, cleanup_id: str, relative_path: str
+        self,
+        cleanup_id: str,
+        relative_path: str,
+        *,
+        cancelled: Callable[[], bool] = _never_cancelled,
     ) -> Path | None:
+        if _is_cancelled(cancelled):
+            return None
         target = self.runtime_dir.joinpath(*PurePosixPath(relative_path).parts)
         try:
             current = self.runtime_dir
             for part in PurePosixPath(relative_path).parts[:-1]:
+                if _is_cancelled(cancelled):
+                    return None
                 current = current / part
                 if current.exists():
                     if current.is_symlink() or (
@@ -1149,7 +1519,11 @@ class ArtifactCleanupService:
                     ):
                         return None
                 else:
+                    if _is_cancelled(cancelled):
+                        return None
                     current.mkdir()
+                if _is_cancelled(cancelled):
+                    return None
                 current.resolve(strict=True).relative_to(self.runtime_dir)
                 if not stat.S_ISDIR(current.stat().st_mode):
                     return None
@@ -1163,11 +1537,26 @@ class ArtifactCleanupService:
             return None
 
     def _needs_human(
-        self, cleanup_id: str, token: str, category: str
+        self,
+        cleanup_id: str,
+        token: str,
+        category: str,
+        *,
+        cancelled: Callable[[], bool] = _never_cancelled,
+        fallback: ArtifactCleanupRead | None = None,
     ) -> ArtifactCleanupRead:
+        if _is_cancelled(cancelled):
+            if fallback is not None:
+                return fallback
+            record = self.get_record(cleanup_id)
+            if record is None:
+                raise RuntimeError("Cleanup record disappeared.")
+            return record
         now = _naive_utc(self.clock())
         try:
             with self.database.session() as session:
+                if _is_cancelled(cancelled):
+                    return fallback or self.get_record(cleanup_id)  # type: ignore[return-value]
                 session.execute(
                     update(ArtifactCleanupRecord)
                     .where(
@@ -1184,6 +1573,9 @@ class ArtifactCleanupService:
                         updated_at=now,
                     )
                 )
+                if _is_cancelled(cancelled):
+                    session.rollback()
+                    return fallback or self.get_record(cleanup_id)  # type: ignore[return-value]
                 session.commit()
         except SQLAlchemyError:
             pass
@@ -1197,9 +1589,21 @@ class ArtifactCleanupService:
         cleanup_id: str,
         token: str,
         category: str | None,
+        *,
+        cancelled: Callable[[], bool] = _never_cancelled,
+        fallback: ArtifactCleanupRead | None = None,
     ) -> ArtifactCleanupRead:
+        if _is_cancelled(cancelled):
+            if fallback is not None:
+                return fallback
+            record = self.get_record(cleanup_id)
+            if record is None:
+                raise RuntimeError("Cleanup record disappeared.")
+            return record
         fresh_now = _naive_utc(self.clock())
         with self.database.session() as session:
+            if _is_cancelled(cancelled):
+                return fallback or self.get_record(cleanup_id)  # type: ignore[return-value]
             session.execute(
                 update(ArtifactCleanupRecord)
                 .where(
@@ -1217,6 +1621,9 @@ class ArtifactCleanupService:
                     completed_at=fresh_now,
                 )
             )
+            if _is_cancelled(cancelled):
+                session.rollback()
+                return fallback or self.get_record(cleanup_id)  # type: ignore[return-value]
             session.commit()
         record = self.get_record(cleanup_id)
         if record is None:

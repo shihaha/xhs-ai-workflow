@@ -61,3 +61,52 @@ deprecations. Live Bailian remains `not_run: BAILIAN_API_KEY unavailable`, live
 Android remains `not_run: device unavailable`, and seven-day UAT remains
 `not_run`. Compile and diff checks exited 0; Git emitted only the repository's
 Windows LF/CRLF notices. Independent review is still required before acceptance.
+
+## Fix round 1/5: shutdown fence and database lifetime
+
+Independent review found that the original bounded join returned while a daemon
+worker could still resume filesystem/database mutation, after which lifespan
+immediately disposed the shared SQLite engine.
+
+RED evidence:
+
+- Five lifecycle regressions failed: no exact stopped finalizer/boolean close,
+  stop-before-claim still claimed, stop-after-claim still moved bytes,
+  pre-delete stop still deleted, and app lifespan closed SQLite before a blocked
+  worker exited.
+
+Implementation:
+
+- The worker now owns a stop Event plus generation fence, closes admission before
+  its bounded join, passes a fail-closed cancellation callback into every batch,
+  returns whether it stopped, and exposes bounded `wait_stopped`. It is non-daemon
+  and executes one sanitized `on_stopped` finalizer exactly once.
+- Cleanup service direct calls remain backward compatible through a default
+  never-cancelled callback. Worker calls checkpoint before claim, after blocking
+  identity/reference/handle calls, around target and move/delete boundaries, and
+  before/after database state CAS. Cancellation leaves an already claimed lease
+  durable for expiry/restart recovery; it does not invent a terminal state.
+- If shutdown arrives after an identity-bound delete was already armed, the
+  existing safety rollback/disarm path still completes; otherwise no new file or
+  database mutation begins after the fence closes.
+- Lifespan closes shop admission first, then cleanup admission. The cleanup
+  worker owns `Database.close` as its exact-once finalizer. If bounded close
+  returns while a batch remains blocked, lifespan does not dispose SQLite; the
+  worker closes it only after the cancelled batch has returned and can no longer
+  mutate.
+
+Verification:
+
+```text
+python -m pytest backend/tests/content/test_cleanup_worker.py backend/tests/content/test_cleanup_api.py backend/tests/content/test_artifact_cleanup_service.py backend/tests/test_health.py backend/tests/test_jobs_hardening.py -q
+68 passed in 8.77s
+
+python -m pytest backend/tests/content -q
+251 passed in 34.74s
+
+python -m pytest backend/tests -q
+564 passed, 1 skipped in 52.89s
+```
+
+Live Bailian, Android and seven-day UAT remain `not_run`. This fix remains
+limited to Task 8R-4; Task 8R-5 has not started.

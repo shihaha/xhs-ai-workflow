@@ -39,13 +39,13 @@ async def _lifespan(app: FastAPI):
             cleanup_worker.start()
         yield
     finally:
-        if cleanup_worker is not None:
-            cleanup_worker.close()
         shop_service: ShopCollectionService | None = app.state.shop_service
         if shop_service is not None:
             shop_service.close()
         database: Database | None = app.state.database
-        if database is not None:
+        if cleanup_worker is not None:
+            cleanup_worker.close()
+        elif database is not None:
             database.close()
 
 
@@ -104,6 +104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.artifact_cleanup_service,
             poll_seconds=app.state.settings.artifact_cleanup_poll_seconds,
             batch_size=app.state.settings.artifact_cleanup_batch_size,
+            on_stopped=app.state.database.close,
         )
         app.state.job_service.recover_expired_running(
             worker_job_types=ANDROID_SHOP_JOB_TYPES

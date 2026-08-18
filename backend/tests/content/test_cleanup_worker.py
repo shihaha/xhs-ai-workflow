@@ -12,6 +12,8 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import update
 
+from backend.app.db import Database
+import backend.app.features.content.cleanup as cleanup_module
 from backend.app.features.content.cleanup import (
     ArtifactCleanupCandidate,
     ArtifactCleanupService,
@@ -32,7 +34,7 @@ class _ProbeService:
         self.called = Event()
         self.calls: list[int] = []
 
-    def run_due_once(self, *, limit: int = 10) -> int:
+    def run_due_once(self, *, limit: int = 10, cancelled=lambda: False) -> int:
         self.calls.append(limit)
         self.called.set()
         return 0
@@ -94,7 +96,7 @@ def test_worker_shutdown_is_bounded_when_processing_is_blocked() -> None:
     release = Event()
 
     class BlockedService:
-        def run_due_once(self, *, limit: int = 10) -> int:
+        def run_due_once(self, *, limit: int = 10, cancelled=lambda: False) -> int:
             entered.set()
             release.wait()
             return 0
@@ -120,7 +122,7 @@ def test_worker_sanitizes_fault_and_continues_next_poll() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        def run_due_once(self, *, limit: int = 10) -> int:
+        def run_due_once(self, *, limit: int = 10, cancelled=lambda: False) -> int:
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("secret path and token")
@@ -235,3 +237,217 @@ def test_create_app_recovers_expired_leases_and_uses_configured_grace(
         )
     finally:
         restarted.state.database.close()
+
+
+def _real_cleanup(tmp_path: Path, *, grace_hours: int = 24):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    database = Database(tmp_path / "cleanup.sqlite3", runtime_dir=runtime)
+    service = ArtifactCleanupService(
+        database,
+        runtime_dir=runtime,
+        grace_period=timedelta(hours=grace_hours),
+    )
+    payload = b"shutdown-fence"
+    relative = "orphaned/shutdown.bin"
+    artifact = runtime / relative
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(payload)
+    record = service.enqueue(
+        ArtifactCleanupCandidate(
+            owner_type="material",
+            owner_id=str(uuid4()),
+            relative_path=relative,
+            expected_sha256=sha256(payload).hexdigest(),
+            expected_size_bytes=len(payload),
+            reason="shutdown_fence_test",
+            not_before=datetime.now(UTC) - timedelta(seconds=1),
+        )
+    )
+    return database, runtime, service, artifact, record
+
+
+def test_blocked_worker_aborts_after_close_and_finalizes_once() -> None:
+    """A batch released after bounded close must not mutate and must finalize once."""
+    entered = Event()
+    release = Event()
+    finalized = Event()
+    mutations: list[str] = []
+    finalizer_calls: list[str] = []
+
+    class BlockedService:
+        def run_due_once(self, *, limit: int = 10, cancelled=lambda: False) -> int:
+            entered.set()
+            release.wait()
+            if not cancelled():
+                mutations.append("late")
+            return 0
+
+    def finalize() -> None:
+        finalizer_calls.append("closed")
+        finalized.set()
+
+    worker = ArtifactCleanupWorker(
+        BlockedService(),
+        poll_seconds=30,
+        batch_size=1,
+        on_stopped=finalize,
+    )
+    worker.start()
+    assert entered.wait(timeout=0.5)
+
+    started = time.monotonic()
+    try:
+        assert worker.close() is False
+        assert time.monotonic() - started < 1
+        assert finalizer_calls == []
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+    assert mutations == []
+    assert finalizer_calls == ["closed"]
+    assert finalized.is_set()
+
+
+def test_stop_before_claim_does_not_claim_or_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop racing the claim boundary must leave the due row pending and bytes put."""
+    database, _, service, artifact, record = _real_cleanup(tmp_path)
+    entered = Event()
+    release = Event()
+    real_claim = service._claim_specific
+
+    def blocked_claim(cleanup_id, *, now, cancelled=lambda: False):
+        entered.set()
+        release.wait()
+        return real_claim(cleanup_id, now=now, cancelled=cancelled)
+
+    monkeypatch.setattr(service, "_claim_specific", blocked_claim)
+    worker = ArtifactCleanupWorker(service, poll_seconds=30, batch_size=1)
+    worker.start()
+    assert entered.wait(timeout=0.5)
+    try:
+        assert worker.close() is False
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    current = service.get_record(record.id)
+    assert current is not None and current.state == "pending"
+    assert artifact.exists()
+    database.close()
+
+
+def test_stop_after_claim_before_move_retains_claim_and_original_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow identity read returning after stop must not proceed to rename or terminal CAS."""
+    database, _, service, artifact, record = _real_cleanup(tmp_path)
+    entered = Event()
+    release = Event()
+    real_verified = service._verified_file
+
+    def blocked_verified(relative_path, cleanup, *, cancelled=lambda: False):
+        entered.set()
+        release.wait()
+        return real_verified(relative_path, cleanup, cancelled=cancelled)
+
+    monkeypatch.setattr(service, "_verified_file", blocked_verified)
+    worker = ArtifactCleanupWorker(service, poll_seconds=30, batch_size=1)
+    worker.start()
+    assert entered.wait(timeout=0.5)
+    assert service.get_record(record.id).state == "claimed"  # type: ignore[union-attr]
+    try:
+        assert worker.close() is False
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    current = service.get_record(record.id)
+    assert current is not None and current.state == "claimed"
+    assert artifact.exists()
+    database.close()
+
+
+def test_stop_during_pre_delete_retains_quarantine_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delete-handle preparation returning after stop must never arm deletion."""
+    database, _, service, _, record = _real_cleanup(tmp_path, grace_hours=0)
+    quarantined = service.process_one(record.id)
+    assert quarantined.state == "quarantined"
+    quarantine_file = service.runtime_dir / str(quarantined.quarantine_path)
+    entered = Event()
+    release = Event()
+    real_open = cleanup_module.open_contained_delete_handle
+
+    def blocked_open(*args, **kwargs):
+        entered.set()
+        release.wait()
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(cleanup_module, "open_contained_delete_handle", blocked_open)
+    worker = ArtifactCleanupWorker(service, poll_seconds=30, batch_size=1)
+    worker.start()
+    assert entered.wait(timeout=0.5)
+    try:
+        assert worker.close() is False
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    current = service.get_record(record.id)
+    assert current is not None and current.state == "claimed"
+    assert quarantine_file.exists()
+    database.close()
+
+
+@pytest.mark.anyio
+async def test_app_lifespan_defers_database_close_until_blocked_worker_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lifespan must not dispose SQLite while a released cleanup can still touch it."""
+    runtime = tmp_path / "runtime"
+    app = create_app(
+        Settings(runtime_dir=runtime, database_path=runtime / "workbench.sqlite3")
+    )
+    if app.state.shop_service is not None:
+        app.state.shop_service.close()
+        app.state.shop_service = None
+    entered = Event()
+    release = Event()
+    close_calls: list[str] = []
+    database = app.state.database
+    real_close = database.close
+
+    def blocked_batch(*, limit: int = 10, cancelled=lambda: False) -> int:
+        entered.set()
+        release.wait()
+        assert cancelled()
+        return 0
+
+    def close_database() -> None:
+        close_calls.append("closed")
+        real_close()
+
+    monkeypatch.setattr(app.state.artifact_cleanup_service, "run_due_once", blocked_batch)
+    monkeypatch.setattr(database, "close", close_database)
+    app.state.artifact_cleanup_worker = ArtifactCleanupWorker(
+        app.state.artifact_cleanup_service,
+        poll_seconds=30,
+        batch_size=1,
+        on_stopped=database.close,
+    )
+
+    started = 0.0
+    async with app.router.lifespan_context(app):
+        assert entered.wait(timeout=0.5)
+        started = time.monotonic()
+    try:
+        assert time.monotonic() - started < 1
+        assert close_calls == []
+    finally:
+        release.set()
+    assert app.state.artifact_cleanup_worker.wait_stopped(timeout=1)
+    assert close_calls == ["closed"]
