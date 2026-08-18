@@ -267,3 +267,86 @@ not_run
 
 `XHS_LIVE_TEST=1` and external authenticated state were not supplied. No real
 account/search result, identity or persisted fact is claimed.
+
+# Stabilization S2A report — fix round 3/5
+
+Date: 2026-08-19
+
+## Scope and decisions
+
+This round closes the review finding about commit uncertainty and crash
+recovery without changing S2B evidence semantics, Bailian integration, or the
+untracked `research/` tree.
+
+- Every XHS artifact attempt now has one durable
+  `xhs_artifact_promotion_journal` row binding the job, artifact kind,
+  producer, exact staging/final names, digest, size, physical file identity,
+  target job state, and recovery state. The physical schema, checks, indexes,
+  foreign keys, and binding/no-delete triggers are independently validated by
+  migration marker `xhs_artifact_promotion_journal_v1`. A present marker is
+  validation-only; malformed populated or half-migrated state fails closed.
+- The normal state machine is `prepared -> promoted -> completed`. Prepared
+  identity is committed before promotion. After promotion, the artifact row,
+  normalized account-note facts, terminal job transition, and journal
+  `completed/committed` transition are committed in one database transaction.
+- Commit acknowledgement is classified as `committed`, `rolled_back`, or
+  `unknown`. An unknown result never removes or moves formal evidence. It is
+  left journal-owned for bounded startup reconciliation.
+- Startup reconciliation enumerates journal rows only. It confirms exact
+  committed files, restores a committed exact stage when the formal file is
+  missing, safely demotes/discards an exact uncommitted identity, and marks
+  contradictions or replacements `needs_human` without touching the replaced
+  file. Arbitrary/unjournaled JSON is never scanned or deleted.
+- `TrustedXhsArtifactStore` pins the private runtime evidence parents. Windows
+  creates and opens descendants relative to held directory handles and uses
+  handle-relative `NtSetInformationFile` rename; POSIX uses `dir_fd`,
+  `O_NOFOLLOW`, and relative rename/unlink. Creation, bounded writes, fsync,
+  reads, promotion, recovery, demotion, and staging cleanup all revalidate the
+  same single-link regular-file identity. Reparse points, added hardlinks,
+  name swaps, oversized files, and ambiguous identities fail closed.
+
+## TDD evidence
+
+The findings were reproduced before implementation:
+
+- fresh journal schema/marker: `1 failed` while the table did not exist;
+- handle-bound artifact store: `2 failed` before the trusted store existed;
+- Windows handle-relative promotion: RED with `WinError 87` before switching
+  from the incompatible rename API to `NtSetInformationFile`;
+- promotion crash recovery: `1 failed` before the persistent state machine;
+- physical binding/no-delete triggers: `2 failed` before trigger enforcement;
+- restart restore and exact-identity recovery: `2 failed` before writable
+  handle-bound recovery was completed.
+
+The final dedicated round-3 hardening suite is `18 passed`. It covers marker
+validation-only behavior, half migrations, physical trigger mutation, reparse,
+hardlink and identity-swap rejection, promotion crash, prepared and final
+commit acknowledgement loss, commit-not-landed rollback, restart restore,
+replacement preservation, repeat/concurrent reconciliation, and survival of
+unjournaled JSON.
+
+## Final controlled verification
+
+- Focused XHS, Settings, and health suites: `413 passed, 1 skipped`.
+- Analysis regression: `90 passed, 1 skipped`.
+- Guarded live contract: `2 passed, 1 skipped`; the skip is exactly
+  `not_run: XHS_LIVE_TEST=1 was not supplied`.
+- Controlled frontend E2E repeat gate: `5 passed` with `--repeat-each=5`.
+- `scripts/verify.ps1`: exit 0; full backend `1090 passed, 2 skipped`; Python
+  compile passed; frontend `47 passed`; production build passed; controlled
+  E2E `1 passed`; npm audit found `0 vulnerabilities`; tracked-secret and
+  release-boundary scans passed.
+- Independent diff, compile, journal-mutation, fixed-scope, and staged-file
+  audits passed. No S2B/Bailian implementation or `research/` file is included.
+
+## Live status
+
+Real authenticated XHS execution remains exactly:
+
+```text
+not_run
+```
+
+No external authenticated state was supplied and `XHS_LIVE_TEST=1` was not
+enabled. This round makes no claim about a real account, search result, identity,
+or live persisted fact.

@@ -14,7 +14,11 @@ from sqlalchemy import select
 from backend.app.adapters.contracts import CollectionItem, CollectionRequest, CollectionResult
 from backend.app.adapters.xhs_cli_read import XhsCliReadAdapter
 from backend.app.db import Database
-from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
+from backend.app.features.xhs.models import (
+    XhsAccountNoteRecord,
+    XhsAccountProfileRecord,
+    XhsArtifactPromotionJournalRecord,
+)
 import backend.app.features.xhs.service as xhs_service_module
 from backend.app.features.xhs.service import CollectionServiceClosed, XhsCollectionService
 from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
@@ -515,7 +519,7 @@ def test_commit_acknowledgement_error_reads_back_committed_success(tmp_path: Pat
     ]
 
 
-def test_precommit_rollback_cleans_uncommitted_success_before_failure_artifact(
+def test_precommit_rollback_demotes_uncommitted_success_and_requires_human(
     tmp_path: Path,
 ) -> None:
     service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
@@ -548,15 +552,17 @@ def test_precommit_rollback_cleans_uncommitted_success_before_failure_artifact(
     completed = service.execute(queued.id)
 
     assert injected is True
-    assert completed is not None and completed.state is JobState.failed
-    assert len(completed.artifacts) == 1
+    assert completed is not None and completed.state is JobState.needs_human
+    assert completed.error_category == "artifact_commit_rolled_back"
+    assert completed.artifacts == []
     evidence_root = service.runtime_dir / "evidence" / "xhs"
-    assert list(evidence_root.rglob("*.json")) == [
-        service.runtime_dir / completed.artifacts[0].path
-    ]
+    assert list(evidence_root.rglob("*.json")) == []
     with original_session() as session:
         assert session.scalars(select(XhsAccountProfileRecord)).all() == []
         assert session.scalars(select(XhsAccountNoteRecord)).all() == []
+        journal = session.scalar(select(XhsArtifactPromotionJournalRecord))
+        assert journal is not None
+        assert (journal.state, journal.resolution) == ("completed", "rolled_back")
     service.database.close()
 
 
@@ -581,43 +587,44 @@ def test_finalizer_cas_loss_cleans_staging_and_never_creates_formal_evidence(
     service.database.close()
 
 
-def test_promotion_side_effect_error_is_detected_and_cleans_formal_orphan(
+def test_promotion_acknowledgement_loss_is_bound_to_exact_identity_and_commits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
     queued = service.submit_account("user-1", 1)
     service.job_service.claim(queued.id)
     claimed = service.job_service.get(queued.id)
-    real_link = os.link
     injected = False
 
-    def uncertain_link(source: Path, destination: Path) -> None:
+    def uncertain_promotion() -> None:
         nonlocal injected
-        real_link(source, destination)
         if not injected:
             injected = True
             raise OSError("controlled promotion acknowledgement loss")
 
-    monkeypatch.setattr(os, "link", uncertain_link)
+    monkeypatch.setattr(
+        xhs_service_module,
+        "_artifact_promotion_after_atomic_hook",
+        uncertain_promotion,
+    )
 
-    with pytest.raises(OSError, match="controlled promotion acknowledgement loss"):
-        service._finalize_result(claimed, _account_result())
+    completed = service._finalize_result(claimed, _account_result())
 
     assert injected is True
-    durable = service.job_service.get(queued.id)
-    assert durable.state is JobState.running
-    assert durable.artifacts == []
+    assert completed is not None and completed.state is JobState.succeeded
+    assert len(completed.artifacts) == 1
     evidence_root = service.runtime_dir / "evidence" / "xhs"
-    assert not evidence_root.exists() or [
-        path for path in evidence_root.rglob("*") if path.is_file()
-    ] == []
+    assert list(evidence_root.glob("*.json")) == [
+        service.runtime_dir / completed.artifacts[0].path
+    ]
     with service.database.session() as session:
-        assert session.scalars(select(XhsAccountProfileRecord)).all() == []
-        assert session.scalars(select(XhsAccountNoteRecord)).all() == []
+        journal = session.scalar(select(XhsArtifactPromotionJournalRecord))
+        assert journal is not None
+        assert (journal.state, journal.resolution) == ("completed", "committed")
     service.database.close()
 
 
-def test_failure_finalizer_rollback_leaves_no_failure_or_staging_orphan(
+def test_failure_finalizer_rollback_requires_human_without_any_artifact_or_orphan(
     tmp_path: Path,
 ) -> None:
     service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
@@ -648,21 +655,24 @@ def test_failure_finalizer_rollback_leaves_no_failure_or_staging_orphan(
 
     service.database.session = failing_session
 
-    with pytest.raises(RuntimeError, match="controlled failure-artifact rollback"):
-        service._finalize_failure(
-            queued.id,
-            category="controlled_failure",
-            error_type="ControlledError",
-        )
+    completed = service._finalize_failure(
+        queued.id,
+        category="controlled_failure",
+        error_type="ControlledError",
+    )
 
     assert injected is True
-    durable = service.job_service.get(queued.id)
-    assert durable.state is JobState.running
-    assert durable.artifacts == []
+    assert completed is not None and completed.state is JobState.needs_human
+    assert completed.error_category == "artifact_commit_rolled_back"
+    assert completed.artifacts == []
     evidence_root = service.runtime_dir / "evidence" / "xhs"
     assert not evidence_root.exists() or [
         path for path in evidence_root.rglob("*") if path.is_file()
     ] == []
+    with original_session() as session:
+        journal = session.scalar(select(XhsArtifactPromotionJournalRecord))
+        assert journal is not None
+        assert (journal.state, journal.resolution) == ("completed", "rolled_back")
     service.database.close()
 
 

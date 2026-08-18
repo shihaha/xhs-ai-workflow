@@ -10,6 +10,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Condition, RLock, Thread
@@ -27,11 +28,20 @@ from backend.app.features.xhs.constants import (
     ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
     ACCOUNT_COLLECTION_JOB_TYPE,
 )
-from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
+from backend.app.features.xhs.models import (
+    XhsAccountNoteRecord,
+    XhsAccountProfileRecord,
+    XhsArtifactPromotionJournalRecord,
+)
 from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
 from backend.app.features.xhs.redaction import redact_credentials
 from backend.app.features.xhs.schemas import AccountEvidenceBinding, persist_exact_account_result
-from backend.app.features.xhs.staging_cleanup import discard_xhs_staging_file
+from backend.app.features.xhs.staging_cleanup import (
+    TrustedXhsArtifactStore,
+    UnsafeXhsArtifactStore,
+    XhsArtifactIdentity,
+    discard_xhs_staging_file,
+)
 from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 from backend.app.services.jobs import InvalidJobTransition, Job, JobService
 
@@ -46,6 +56,11 @@ XHS_RESERVED_ARTIFACT_KINDS = (
 _SAFE_SUBJECT = re.compile(r"^[A-Za-z0-9_-]{1,500}$")
 DEFAULT_XHS_ARTIFACT_MAX_BYTES = 5 * 1024 * 1024
 _CLOSE_BUDGET_SECONDS = 0.25
+_JOURNAL_READ_BUDGET_SECONDS = 0.05
+_JOURNAL_RECONCILE_LOCK = RLock()
+
+# Narrow crash-injection hook used only by local lifecycle tests.
+_artifact_promotion_after_atomic_hook: Callable[[], None] | None = None
 
 
 class CollectionServiceClosed(RuntimeError):
@@ -60,13 +75,26 @@ class CollectionResultTooLarge(ValueError):
     """The transformed collection artifact crossed its configured hard cap."""
 
 
+class ArtifactCommitUnknown(RuntimeError):
+    """The final commit acknowledgement cannot be classified safely yet."""
+
+
+class _CommitOutcome(str, Enum):
+    committed = "committed"
+    rolled_back = "rolled_back"
+    unknown = "unknown"
+
+
 @dataclass
 class _StagedArtifact:
-    staging_path: Path
-    final_path: Path
+    journal_id: str
+    store: TrustedXhsArtifactStore
+    stage_name: str
+    final_name: str
     relative_path: Path
     digest: str
     size_bytes: int
+    identity: XhsArtifactIdentity
     promoted: bool = False
 
 
@@ -189,14 +217,15 @@ class XhsCollectionService:
         clock: Callable[[], datetime] | None = None,
         max_artifact_bytes: int = DEFAULT_XHS_ARTIFACT_MAX_BYTES,
     ) -> None:
-        if max_artifact_bytes < 1024:
-            raise ValueError("XHS artifact cap must be at least 1024 bytes.")
+        if not 1024 <= max_artifact_bytes <= 20 * 1024 * 1024:
+            raise ValueError("XHS artifact cap must be between 1024 and 20 MiB.")
         self.database = database
         self.job_service = job_service
         self.adapter = adapter
-        self.runtime_dir = runtime_dir.resolve()
+        self.runtime_dir = Path(os.path.abspath(runtime_dir))
         self.clock = clock or (lambda: datetime.now(UTC).replace(tzinfo=None))
         self._max_artifact_bytes = max_artifact_bytes
+        self._reconcile_artifact_promotions()
         for job_type in XHS_RESERVED_JOB_TYPES:
             self.job_service.recover_interrupted_workers(job_type=job_type)
         self._worker = _DaemonSerialWorker() if submitter is None else None
@@ -301,7 +330,14 @@ class XhsCollectionService:
         except Exception as error:
             if self._shutdown_requested():
                 return None
-            return self._finalize_failure(job_id, category="xhs_collection_failed", error_type=type(error).__name__)
+            try:
+                return self._finalize_failure(
+                    job_id,
+                    category="xhs_collection_failed",
+                    error_type=type(error).__name__,
+                )
+            except ArtifactCommitUnknown:
+                return None
         if self._shutdown_requested() or self.job_service.get(job_id).state is not JobState.running:
             return None
         try:
@@ -312,6 +348,8 @@ class XhsCollectionService:
                 category="xhs_collection_result_too_large",
                 error_type=type(error).__name__,
             )
+        except ArtifactCommitUnknown:
+            return None
         except Exception as error:
             if self._committed_result(job.id):
                 return self._read_committed_job(job.id)
@@ -360,16 +398,7 @@ class XhsCollectionService:
             raise CollectionFactNotFound(f"Search results for job {job_id} do not exist.")
         artifact = artifacts[0]
         try:
-            absolute = (self.runtime_dir / artifact.path).resolve()
-            absolute.relative_to(self.runtime_dir)
-            with absolute.open("rb") as artifact_stream:
-                encoded = artifact_stream.read(self._max_artifact_bytes + 1)
-            if (
-                len(encoded) > self._max_artifact_bytes
-                or len(encoded) != artifact.metadata["size_bytes"]
-                or hashlib.sha256(encoded).hexdigest() != artifact.metadata["sha256"]
-            ):
-                raise ValueError("artifact identity mismatch")
+            encoded = self._read_committed_artifact(job_id, artifact)
             payload = json.loads(encoded.decode("utf-8"))
             if payload["job_id"] != job.id or payload["job_type"] != SEARCH_COLLECTION_JOB_TYPE:
                 raise ValueError("artifact binding mismatch")
@@ -442,8 +471,6 @@ class XhsCollectionService:
             collected_at,
             max_bytes=self._max_artifact_bytes,
         )
-        staged = self._stage_artifact(job.id, encoded)
-        commit_confirmed = False
         artifact_kind = (
             ACCOUNT_COLLECTION_ARTIFACT_KIND
             if job.type == ACCOUNT_COLLECTION_JOB_TYPE
@@ -454,6 +481,12 @@ class XhsCollectionService:
             JobState.failed if result.status == "failed" else JobState.needs_human
         )
         progress = _note_success_count(result, account=job.type == ACCOUNT_COLLECTION_JOB_TYPE)
+        staged = self._stage_artifact(
+            job.id,
+            encoded,
+            artifact_kind=artifact_kind,
+            target_state=target_state,
+        )
         metadata = {
             "sha256": staged.digest, "size_bytes": staged.size_bytes,
             "source": "xhs-cli", "job_id": job.id,
@@ -474,84 +507,42 @@ class XhsCollectionService:
             metadata["user_id"] = job.input["user_id"]
         else:
             metadata["keyword"] = job.input["keyword"]
+
+        def persist_facts(session: Any, artifact_id: int) -> None:
+            if job.type == ACCOUNT_COLLECTION_JOB_TYPE and exact:
+                persist_exact_account_result(
+                    session,
+                    result=result,
+                    binding=AccountEvidenceBinding(
+                        collection_job_id=job.id,
+                        collection_artifact_id=artifact_id,
+                        collected_at=collected_at,
+                    ),
+                )
+
         try:
-            try:
-                with self.database.session() as session:
-                    record = session.get(JobRecord, job.id)
-                    if record is None or JobState(record.state) is not JobState.running:
-                        session.rollback()
-                        return None
-                    artifact = JobArtifactRecord(
-                        job_id=job.id, kind=artifact_kind,
-                        producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
-                        path=staged.relative_path.as_posix(),
-                        metadata_json=metadata, created_at=collected_at,
-                    )
-                    session.add(artifact)
-                    session.flush()
-                    artifact.metadata_json = {**metadata, "artifact_id": artifact.id}
-                    if job.type == ACCOUNT_COLLECTION_JOB_TYPE and exact:
-                        persist_exact_account_result(
-                            session, result=result,
-                            binding=AccountEvidenceBinding(
-                                collection_job_id=job.id,
-                                collection_artifact_id=artifact.id,
-                                collected_at=collected_at,
-                            ),
-                        )
-                    now = self.clock()
-                    with self._lock:
-                        if not self._accepting:
-                            session.rollback()
-                            return None
-                        changed = session.execute(
-                            update(JobRecord)
-                            .where(
-                                JobRecord.id == job.id,
-                                JobRecord.state == JobState.running.value,
-                            )
-                            .values(
-                                state=target_state.value,
-                                progress_current=progress,
-                                progress_total=job.progress_total,
-                                current_stage=(
-                                    "xhs_collection_complete"
-                                    if target_state is JobState.succeeded
-                                    else "xhs_collection_incomplete"
-                                ),
-                                error_category=(
-                                    None
-                                    if target_state is JobState.succeeded
-                                    else (result.detail or result.status)
-                                ),
-                                lease_expires_at=None,
-                                completed_at=(
-                                    now
-                                    if target_state in {JobState.succeeded, JobState.failed}
-                                    else None
-                                ),
-                                updated_at=now,
-                            )
-                        )
-                        if changed.rowcount != 1:
-                            session.rollback()
-                            return None
-                        self._promote_staged_artifact(staged)
-                        session.commit()
-                        commit_confirmed = True
-            except Exception:
-                if self._artifact_commit_matches(
-                    job.id,
-                    expected_state=target_state,
-                    digest=staged.digest,
-                ):
-                    commit_confirmed = True
-                    return self._read_committed_job(job.id)
-                raise
-            return self._read_committed_job(job.id)
+            return self._commit_staged_artifact(
+                job=job,
+                staged=staged,
+                artifact_kind=artifact_kind,
+                metadata=metadata,
+                created_at=collected_at,
+                target_state=target_state,
+                progress=progress,
+                current_stage=(
+                    "xhs_collection_complete"
+                    if target_state is JobState.succeeded
+                    else "xhs_collection_incomplete"
+                ),
+                error_category=(
+                    None
+                    if target_state is JobState.succeeded
+                    else (result.detail or result.status)
+                ),
+                persist_facts=persist_facts,
+            )
         finally:
-            if not commit_confirmed:
-                self._cleanup_uncommitted_artifact(staged)
+            staged.store.close()
 
     def _finalize_failure(self, job_id: str, *, category: str, error_type: str) -> Job | None:
         job = self.job_service.get(job_id)
@@ -565,139 +556,648 @@ class XhsCollectionService:
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        staged = self._stage_artifact(job_id, encoded, suffix="-failure")
-        commit_confirmed = False
         kind = (
             ACCOUNT_COLLECTION_ARTIFACT_KIND
             if job.type == ACCOUNT_COLLECTION_JOB_TYPE
             else SEARCH_COLLECTION_ARTIFACT_KIND
         )
         now = self.clock()
+        staged = self._stage_artifact(
+            job_id,
+            encoded,
+            suffix="-failure",
+            artifact_kind=kind,
+            target_state=JobState.failed,
+        )
         try:
-            try:
-                with self.database.session() as session:
-                    record = session.get(JobRecord, job_id)
-                    if record is None or JobState(record.state) is not JobState.running:
-                        session.rollback()
-                        return None
-                    artifact = JobArtifactRecord(
-                        job_id=job_id, kind=kind,
-                        producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
-                        path=staged.relative_path.as_posix(),
-                        metadata_json={
-                            "sha256": staged.digest,
-                            "size_bytes": staged.size_bytes,
-                            "source": "xhs-cli", "job_id": job_id,
-                            "capability": (
-                                "fetch_account"
-                                if job.type == ACCOUNT_COLLECTION_JOB_TYPE
-                                else "search_notes"
-                            ),
-                            "error_category": category,
-                        },
-                        created_at=now,
-                    )
-                    session.add(artifact)
-                    session.flush()
-                    artifact.metadata_json = {
-                        **artifact.metadata_json,
-                        "artifact_id": artifact.id,
-                    }
-                    with self._lock:
-                        if not self._accepting:
-                            session.rollback()
-                            return None
-                        changed = session.execute(
-                            update(JobRecord)
-                            .where(
-                                JobRecord.id == job_id,
-                                JobRecord.state == JobState.running.value,
-                            )
-                            .values(
-                                state=JobState.failed.value,
-                                current_stage="xhs_collection_failed",
-                                error_category=category,
-                                lease_expires_at=None,
-                                completed_at=now,
-                                updated_at=now,
-                            )
-                        )
-                        if changed.rowcount != 1:
-                            session.rollback()
-                            return None
-                        self._promote_staged_artifact(staged)
-                        session.commit()
-                        commit_confirmed = True
-            except Exception:
-                if self._artifact_commit_matches(
-                    job_id,
-                    expected_state=JobState.failed,
-                    digest=staged.digest,
-                ):
-                    commit_confirmed = True
-                    return self._read_committed_job(job_id)
-                raise
-            return self._read_committed_job(job_id)
+            return self._commit_staged_artifact(
+                job=job,
+                staged=staged,
+                artifact_kind=kind,
+                metadata={
+                    "sha256": staged.digest,
+                    "size_bytes": staged.size_bytes,
+                    "source": "xhs-cli",
+                    "job_id": job_id,
+                    "capability": (
+                        "fetch_account"
+                        if job.type == ACCOUNT_COLLECTION_JOB_TYPE
+                        else "search_notes"
+                    ),
+                    "error_category": category,
+                },
+                created_at=now,
+                target_state=JobState.failed,
+                progress=job.progress_current,
+                current_stage="xhs_collection_failed",
+                error_category=category,
+                persist_facts=None,
+            )
         finally:
-            if not commit_confirmed:
-                self._cleanup_uncommitted_artifact(staged)
+            staged.store.close()
 
     def _stage_artifact(
-        self, job_id: str, encoded: bytes, *, suffix: str = ""
+        self,
+        job_id: str,
+        encoded: bytes,
+        *,
+        artifact_kind: str,
+        target_state: JobState,
+        suffix: str = "",
     ) -> _StagedArtifact:
-        artifact_root = (self.runtime_dir / "evidence" / "xhs").resolve()
-        artifact_root.relative_to(self.runtime_dir)
-        staging_root = artifact_root / ".staging"
-        staging_root.mkdir(parents=True, exist_ok=True)
+        journal_id = str(uuid4())
+        journal_token = journal_id.replace("-", "")
+        stage_name = f"{job_id}-{journal_token}{suffix}.stage"
+        final_name = f"{job_id}{suffix}.json"
         relative = Path("evidence") / "xhs" / f"{job_id}{suffix}.json"
-        final_path = self.runtime_dir / relative
-        staging_path = staging_root / f"{job_id}-{uuid4().hex}{suffix}.stage"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        descriptor: int | None = None
-        try:
-            descriptor = os.open(staging_path, flags, 0o600)
-            with os.fdopen(descriptor, "wb", closefd=True) as stream:
-                descriptor = None
-                stream.write(encoded)
-                stream.flush()
-                os.fsync(stream.fileno())
-        except BaseException:
-            if descriptor is not None:
-                os.close(descriptor)
-            self._discard_staging_path(staging_path)
-            raise
-        return _StagedArtifact(
-            staging_path=staging_path,
-            final_path=final_path,
-            relative_path=relative,
-            digest=hashlib.sha256(encoded).hexdigest(),
-            size_bytes=len(encoded),
+        stage_relative = Path("evidence") / "xhs" / ".staging" / stage_name
+        store = TrustedXhsArtifactStore(
+            self.runtime_dir,
+            max_bytes=self._max_artifact_bytes,
         )
+        preserve_stage = False
+        try:
+            identity = store.create_stage(stage_name, encoded)
+            now = self.clock()
+            staged = _StagedArtifact(
+                journal_id=journal_id,
+                store=store,
+                stage_name=stage_name,
+                final_name=final_name,
+                relative_path=relative,
+                digest=hashlib.sha256(encoded).hexdigest(),
+                size_bytes=len(encoded),
+                identity=identity,
+            )
+            try:
+                with self.database.session() as session:
+                    session.add(XhsArtifactPromotionJournalRecord(
+                        id=journal_id,
+                        job_id=job_id,
+                        artifact_kind=artifact_kind,
+                        producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+                        stage_path=stage_relative.as_posix(),
+                        final_path=relative.as_posix(),
+                        sha256=staged.digest,
+                        size_bytes=staged.size_bytes,
+                        file_dev=identity.file_dev,
+                        file_ino=identity.file_ino,
+                        file_mtime_ns=identity.file_mtime_ns,
+                        target_state=target_state.value,
+                        state="prepared",
+                        resolution=None,
+                        artifact_id=None,
+                        created_at=now,
+                        updated_at=now,
+                        completed_at=None,
+                    ))
+                    session.commit()
+            except Exception as error:
+                outcome = self._prepared_journal_outcome(staged)
+                if outcome is _CommitOutcome.committed:
+                    return staged
+                if outcome is _CommitOutcome.unknown:
+                    preserve_stage = True
+                    raise ArtifactCommitUnknown(
+                        "artifact_journal_prepare_unknown"
+                    ) from error
+                raise
+            return staged
+        except Exception:
+            try:
+                inspection = store.inspect_stage(stage_name)
+                if (
+                    not preserve_stage
+                    and inspection.status == "trusted"
+                    and inspection.identity == locals().get("identity")
+                ):
+                    store.discard_stage(stage_name, inspection.identity)
+            finally:
+                store.close()
+            raise
+        except BaseException:
+            store.close()
+            raise
+
+    def _probe_prepared_journal_outcome(
+        self,
+        staged: _StagedArtifact,
+    ) -> _CommitOutcome:
+        with self.database.session() as session:
+            journal = session.get(
+                XhsArtifactPromotionJournalRecord,
+                staged.journal_id,
+            )
+            if journal is None:
+                return _CommitOutcome.rolled_back
+            if (
+                journal.state == "prepared"
+                and journal.job_id == staged.relative_path.stem.removesuffix("-failure")
+                and journal.stage_path.endswith("/" + staged.stage_name)
+                and journal.final_path == staged.relative_path.as_posix()
+                and journal.sha256 == staged.digest
+                and journal.size_bytes == staged.size_bytes
+                and journal.file_dev == staged.identity.file_dev
+                and journal.file_ino == staged.identity.file_ino
+                and journal.file_mtime_ns == staged.identity.file_mtime_ns
+            ):
+                return _CommitOutcome.committed
+            return _CommitOutcome.unknown
+
+    def _prepared_journal_outcome(
+        self,
+        staged: _StagedArtifact,
+    ) -> _CommitOutcome:
+        deadline = monotonic() + _JOURNAL_READ_BUDGET_SECONDS
+        while True:
+            try:
+                return self._probe_prepared_journal_outcome(staged)
+            except Exception:
+                if monotonic() >= deadline:
+                    return _CommitOutcome.unknown
+                sleep(0.002)
 
     def _promote_staged_artifact(self, staged: _StagedArtifact) -> None:
-        staged.final_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.link(staged.staging_path, staged.final_path)
-        except BaseException:
-            try:
-                staged.promoted = os.path.samefile(
-                    staged.staging_path, staged.final_path
-                )
-            except OSError:
-                staged.promoted = False
-            raise
-        staged.promoted = True
-        self._discard_staging_path(staged.staging_path)
-
-    def _cleanup_uncommitted_artifact(self, staged: _StagedArtifact) -> None:
-        if staged.promoted and staged.final_path.exists():
-            quarantine = staged.staging_path.with_name(
-                f"rollback-{uuid4().hex}.stage"
+            staged.store.promote(
+                staged.stage_name,
+                staged.final_name,
+                staged.identity,
             )
-            os.replace(staged.final_path, quarantine)
-            staged.promoted = False
-            self._discard_staging_path(quarantine)
-        self._discard_staging_path(staged.staging_path)
+            staged.promoted = True
+            if _artifact_promotion_after_atomic_hook is not None:
+                _artifact_promotion_after_atomic_hook()
+        except Exception:
+            final = staged.store.inspect_final(staged.final_name)
+            stage = staged.store.inspect_stage(staged.stage_name)
+            if (
+                final.status == "trusted"
+                and final.identity == staged.identity
+                and stage.status == "missing"
+            ):
+                staged.promoted = True
+            else:
+                raise
+
+    def _persist_promoted_journal(self, staged: _StagedArtifact) -> None:
+        now = self.clock()
+        try:
+            with self.database.session() as session:
+                changed = session.execute(
+                    update(XhsArtifactPromotionJournalRecord)
+                    .where(
+                        XhsArtifactPromotionJournalRecord.id == staged.journal_id,
+                        XhsArtifactPromotionJournalRecord.state == "prepared",
+                    )
+                    .values(state="promoted", updated_at=now)
+                )
+                if changed.rowcount != 1:
+                    session.rollback()
+                    if self._read_journal_state(staged.journal_id) == "promoted":
+                        return
+                    raise ArtifactCommitUnknown("artifact_journal_state_unknown")
+                session.commit()
+        except ArtifactCommitUnknown:
+            raise
+        except Exception as error:
+            state = self._read_journal_state(staged.journal_id)
+            if state == "promoted":
+                return
+            raise ArtifactCommitUnknown("artifact_journal_promotion_unknown") from error
+
+    def _read_journal_state(self, journal_id: str) -> str | None:
+        deadline = monotonic() + _JOURNAL_READ_BUDGET_SECONDS
+        while True:
+            try:
+                with self.database.session() as session:
+                    row = session.get(XhsArtifactPromotionJournalRecord, journal_id)
+                    return None if row is None else row.state
+            except Exception:
+                if monotonic() >= deadline:
+                    return None
+                sleep(0.002)
+
+    def _commit_staged_artifact(
+        self,
+        *,
+        job: Job,
+        staged: _StagedArtifact,
+        artifact_kind: str,
+        metadata: dict[str, Any],
+        created_at: datetime,
+        target_state: JobState,
+        progress: int,
+        current_stage: str,
+        error_category: str | None,
+        persist_facts: Callable[[Any, int], None] | None,
+    ) -> Job | None:
+        with self.database.session() as authorization:
+            record = authorization.get(JobRecord, job.id)
+            authorized = record is not None and JobState(record.state) is JobState.running
+        if not authorized:
+            self._resolve_rolled_back(staged)
+            return None
+        with self._lock:
+            if not self._accepting:
+                self._cancel_running(job.id)
+                self._resolve_rolled_back(staged)
+                return None
+            try:
+                self._promote_staged_artifact(staged)
+            except Exception:
+                return self._resolve_rolled_back(staged)
+        self._persist_promoted_journal(staged)
+
+        try:
+            with self.database.session() as session:
+                record = session.get(JobRecord, job.id)
+                journal = session.get(
+                    XhsArtifactPromotionJournalRecord,
+                    staged.journal_id,
+                )
+                if (
+                    record is None
+                    or JobState(record.state) is not JobState.running
+                    or journal is None
+                    or journal.state != "promoted"
+                ):
+                    session.rollback()
+                    self._resolve_rolled_back(staged)
+                    return None
+                artifact = JobArtifactRecord(
+                    job_id=job.id,
+                    kind=artifact_kind,
+                    producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+                    path=staged.relative_path.as_posix(),
+                    metadata_json=metadata,
+                    created_at=created_at,
+                )
+                session.add(artifact)
+                session.flush()
+                artifact.metadata_json = {**metadata, "artifact_id": artifact.id}
+                if persist_facts is not None:
+                    persist_facts(session, artifact.id)
+                now = self.clock()
+                with self._lock:
+                    if not self._accepting:
+                        session.rollback()
+                        self._cancel_running(job.id)
+                        self._resolve_rolled_back(staged)
+                        return None
+                    changed = session.execute(
+                        update(JobRecord)
+                        .where(
+                            JobRecord.id == job.id,
+                            JobRecord.state == JobState.running.value,
+                        )
+                        .values(
+                            state=target_state.value,
+                            progress_current=progress,
+                            progress_total=job.progress_total,
+                            current_stage=current_stage,
+                            error_category=error_category,
+                            lease_expires_at=None,
+                            completed_at=(
+                                now
+                                if target_state in {JobState.succeeded, JobState.failed}
+                                else None
+                            ),
+                            updated_at=now,
+                        )
+                    )
+                    if changed.rowcount != 1:
+                        session.rollback()
+                        self._resolve_rolled_back(staged)
+                        return None
+                    journal.state = "completed"
+                    journal.resolution = "committed"
+                    journal.artifact_id = artifact.id
+                    journal.updated_at = now
+                    journal.completed_at = now
+                    session.commit()
+        except Exception as error:
+            outcome = self._commit_outcome(
+                staged,
+                expected_state=target_state,
+            )
+            if outcome is _CommitOutcome.committed:
+                return self._read_committed_job(job.id)
+            if outcome is _CommitOutcome.rolled_back:
+                return self._resolve_rolled_back(staged)
+            raise ArtifactCommitUnknown("artifact_commit_unknown") from error
+        try:
+            return self._read_committed_job(job.id)
+        except Exception as error:
+            raise ArtifactCommitUnknown("artifact_commit_unknown") from error
+
+    def _probe_commit_outcome(
+        self,
+        staged: _StagedArtifact,
+        *,
+        expected_state: JobState,
+    ) -> _CommitOutcome:
+        with self.database.session() as session:
+            journal = session.get(
+                XhsArtifactPromotionJournalRecord,
+                staged.journal_id,
+            )
+            job = session.get(JobRecord, staged.relative_path.stem.removesuffix("-failure"))
+            artifacts = session.scalars(
+                select(JobArtifactRecord).where(
+                    JobArtifactRecord.job_id
+                    == staged.relative_path.stem.removesuffix("-failure")
+                )
+            ).all()
+        if journal is None or job is None:
+            return _CommitOutcome.unknown
+        if (
+            journal.state == "completed"
+            and journal.resolution == "committed"
+            and journal.artifact_id is not None
+            and JobState(job.state) is expected_state
+            and len(artifacts) == 1
+            and artifacts[0].id == journal.artifact_id
+            and artifacts[0].path == journal.final_path
+            and dict(artifacts[0].metadata_json).get("sha256") == staged.digest
+            and dict(artifacts[0].metadata_json).get("size_bytes") == staged.size_bytes
+        ):
+            encoded = staged.store.read_final(staged.final_name, staged.identity)
+            return (
+                _CommitOutcome.committed
+                if hashlib.sha256(encoded).hexdigest() == staged.digest
+                else _CommitOutcome.unknown
+            )
+        if (
+            journal.state in {"prepared", "promoted"}
+            and not artifacts
+            and JobState(job.state) is not expected_state
+        ) or (
+            journal.state in {"prepared", "promoted"}
+            and not artifacts
+            and JobState(job.state) is JobState.running
+        ):
+            return _CommitOutcome.rolled_back
+        return _CommitOutcome.unknown
+
+    def _commit_outcome(
+        self,
+        staged: _StagedArtifact,
+        *,
+        expected_state: JobState,
+    ) -> _CommitOutcome:
+        deadline = monotonic() + _JOURNAL_READ_BUDGET_SECONDS
+        while True:
+            try:
+                return self._probe_commit_outcome(
+                    staged,
+                    expected_state=expected_state,
+                )
+            except Exception:
+                if monotonic() >= deadline:
+                    return _CommitOutcome.unknown
+                sleep(0.002)
+
+    def _resolve_rolled_back(self, staged: _StagedArtifact) -> Job | None:
+        if not staged.store.demote_and_discard(
+            staged.final_name,
+            staged.stage_name,
+            staged.identity,
+        ):
+            return self._mark_artifact_inconsistent(staged.journal_id)
+        now = self.clock()
+        with self.database.session() as session:
+            journal = session.get(XhsArtifactPromotionJournalRecord, staged.journal_id)
+            if journal is None:
+                return None
+            if journal.state == "completed" and journal.resolution == "committed":
+                session.rollback()
+                return self._read_committed_job(journal.job_id)
+            journal.state = "completed"
+            journal.resolution = "rolled_back"
+            journal.artifact_id = None
+            journal.updated_at = now
+            journal.completed_at = now
+            session.execute(
+                update(JobRecord)
+                .where(
+                    JobRecord.id == journal.job_id,
+                    JobRecord.state.in_((
+                        JobState.queued.value,
+                        JobState.running.value,
+                    )),
+                )
+                .values(
+                    state=JobState.needs_human.value,
+                    current_stage="xhs_artifact_recovery_required",
+                    error_category="artifact_commit_rolled_back",
+                    lease_expires_at=None,
+                    completed_at=None,
+                    updated_at=now,
+                )
+            )
+            job_id = journal.job_id
+            session.commit()
+        return self._read_committed_job(job_id)
+
+    def _mark_artifact_inconsistent(self, journal_id: str) -> Job | None:
+        now = self.clock()
+        with self.database.session() as session:
+            journal = session.get(XhsArtifactPromotionJournalRecord, journal_id)
+            if journal is None:
+                return None
+            journal.state = "completed"
+            journal.resolution = "inconsistent"
+            journal.updated_at = now
+            journal.completed_at = now
+            session.execute(
+                update(JobRecord)
+                .where(
+                    JobRecord.id == journal.job_id,
+                    JobRecord.state != JobState.cancelled.value,
+                )
+                .values(
+                    state=JobState.needs_human.value,
+                    current_stage="xhs_artifact_evidence_inconsistent",
+                    error_category="artifact_evidence_inconsistent",
+                    lease_expires_at=None,
+                    completed_at=None,
+                    updated_at=now,
+                )
+            )
+            job_id = journal.job_id
+            session.commit()
+        return self._read_committed_job(job_id)
+
+    def _reconcile_artifact_promotions(self) -> None:
+        """Resolve only durable journal entries; never scan arbitrary JSON files."""
+        with _JOURNAL_RECONCILE_LOCK:
+            with self.database.session() as session:
+                journal_ids = session.scalars(
+                    select(XhsArtifactPromotionJournalRecord.id).order_by(
+                        XhsArtifactPromotionJournalRecord.created_at,
+                        XhsArtifactPromotionJournalRecord.id,
+                    )
+                ).all()
+            for journal_id in journal_ids:
+                try:
+                    self._reconcile_artifact_promotion(journal_id)
+                except Exception:
+                    self._mark_artifact_inconsistent(journal_id)
+
+    def _reconcile_artifact_promotion(self, journal_id: str) -> None:
+        with self.database.session() as session:
+            journal = session.get(XhsArtifactPromotionJournalRecord, journal_id)
+            if journal is None or (
+                journal.state == "completed"
+                and journal.resolution == "inconsistent"
+            ):
+                return
+            snapshot = {
+                "id": journal.id,
+                "job_id": journal.job_id,
+                "artifact_kind": journal.artifact_kind,
+                "producer": journal.producer,
+                "stage_path": journal.stage_path,
+                "final_path": journal.final_path,
+                "sha256": journal.sha256,
+                "size_bytes": journal.size_bytes,
+                "file_dev": journal.file_dev,
+                "file_ino": journal.file_ino,
+                "file_mtime_ns": journal.file_mtime_ns,
+                "target_state": journal.target_state,
+                "state": journal.state,
+                "resolution": journal.resolution,
+                "artifact_id": journal.artifact_id,
+            }
+            job = session.get(JobRecord, journal.job_id)
+            artifacts = session.scalars(
+                select(JobArtifactRecord).where(
+                    JobArtifactRecord.job_id == journal.job_id
+                )
+            ).all()
+
+        store = TrustedXhsArtifactStore(
+            self.runtime_dir,
+            max_bytes=self._max_artifact_bytes,
+        )
+        staged = _StagedArtifact(
+            journal_id=str(snapshot["id"]),
+            store=store,
+            stage_name=Path(str(snapshot["stage_path"])).name,
+            final_name=Path(str(snapshot["final_path"])).name,
+            relative_path=Path(str(snapshot["final_path"])),
+            digest=str(snapshot["sha256"]),
+            size_bytes=int(snapshot["size_bytes"]),
+            identity=XhsArtifactIdentity(
+                int(snapshot["file_dev"]),
+                int(snapshot["file_ino"]),
+                int(snapshot["size_bytes"]),
+                int(snapshot["file_mtime_ns"]),
+            ),
+            promoted=snapshot["state"] in {"promoted", "completed"},
+        )
+        try:
+            matching_artifact = None
+            if len(artifacts) == 1:
+                candidate = artifacts[0]
+                metadata = dict(candidate.metadata_json)
+                if (
+                    candidate.id == snapshot["artifact_id"]
+                    or snapshot["artifact_id"] is None
+                ) and (
+                    candidate.kind == snapshot["artifact_kind"]
+                    and candidate.producer == snapshot["producer"]
+                    and candidate.path == snapshot["final_path"]
+                    and metadata.get("sha256") == snapshot["sha256"]
+                    and metadata.get("size_bytes") == snapshot["size_bytes"]
+                ):
+                    matching_artifact = candidate
+            database_committed = bool(
+                job is not None
+                and JobState(job.state).value == snapshot["target_state"]
+                and matching_artifact is not None
+            )
+            journal_committed = (
+                snapshot["state"] == "completed"
+                and snapshot["resolution"] == "committed"
+            )
+            if database_committed or journal_committed:
+                if not database_committed or matching_artifact is None:
+                    self._mark_artifact_inconsistent(journal_id)
+                    return
+                final = store.inspect_final(staged.final_name)
+                stage = store.inspect_stage(staged.stage_name)
+                if final.status == "missing" and stage.status == "trusted":
+                    if not self._journal_file_matches(
+                        store,
+                        "stage",
+                        staged,
+                    ):
+                        self._mark_artifact_inconsistent(journal_id)
+                        return
+                    store.recover_promote(
+                        staged.stage_name,
+                        staged.final_name,
+                        staged.identity,
+                    )
+                    final = store.inspect_final(staged.final_name)
+                    stage = store.inspect_stage(staged.stage_name)
+                if (
+                    final.status != "trusted"
+                    or final.identity != staged.identity
+                    or not self._journal_file_matches(store, "final", staged)
+                    or stage.status not in {"missing"}
+                ):
+                    self._mark_artifact_inconsistent(journal_id)
+                    return
+                self._confirm_reconciled_commit(
+                    journal_id,
+                    artifact_id=matching_artifact.id,
+                )
+                return
+            if artifacts:
+                self._mark_artifact_inconsistent(journal_id)
+                return
+            self._resolve_rolled_back(staged)
+        finally:
+            store.close()
+
+    def _journal_file_matches(
+        self,
+        store: TrustedXhsArtifactStore,
+        area: str,
+        staged: _StagedArtifact,
+    ) -> bool:
+        try:
+            encoded = (
+                store.read_stage(staged.stage_name, staged.identity)
+                if area == "stage"
+                else store.read_final(staged.final_name, staged.identity)
+            )
+            return (
+                len(encoded) == staged.size_bytes
+                and hashlib.sha256(encoded).hexdigest() == staged.digest
+            )
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _confirm_reconciled_commit(
+        self,
+        journal_id: str,
+        *,
+        artifact_id: int,
+    ) -> None:
+        now = self.clock()
+        with self.database.session() as session:
+            journal = session.get(XhsArtifactPromotionJournalRecord, journal_id)
+            if journal is None:
+                return
+            journal.state = "completed"
+            journal.resolution = "committed"
+            journal.artifact_id = artifact_id
+            journal.updated_at = now
+            journal.completed_at = journal.completed_at or now
+            session.commit()
 
     def _discard_staging_path(self, path: Path) -> None:
         if not discard_xhs_staging_file(
@@ -707,49 +1207,64 @@ class XhsCollectionService:
         ):
             raise OSError("XHS staging cleanup was not safely authorized.")
 
-    def _artifact_commit_matches(
-        self,
-        job_id: str,
-        *,
-        expected_state: JobState,
-        digest: str | None,
-    ) -> bool:
+    def _committed_result(self, job_id: str, *, digest: str | None = None) -> bool:
         try:
+            job = self.job_service.get(job_id)
+            if len(job.artifacts) != 1:
+                return False
+            artifact = job.artifacts[0]
             with self.database.session() as session:
-                record = session.get(JobRecord, job_id)
-                artifacts = session.scalars(
-                    select(JobArtifactRecord).where(JobArtifactRecord.job_id == job_id)
-                ).all()
-            if (
-                record is None
-                or JobState(record.state) is not expected_state
-                or len(artifacts) != 1
-            ):
+                journal = session.scalar(
+                    select(XhsArtifactPromotionJournalRecord).where(
+                        XhsArtifactPromotionJournalRecord.job_id == job_id,
+                        XhsArtifactPromotionJournalRecord.state == "completed",
+                        XhsArtifactPromotionJournalRecord.resolution == "committed",
+                    )
+                )
+            if journal is None or (digest is not None and journal.sha256 != digest):
                 return False
-            artifact = artifacts[0]
-            metadata = dict(artifact.metadata_json)
-            expected_digest = digest or metadata.get("sha256")
-            expected_size = metadata.get("size_bytes")
-            if not isinstance(expected_digest, str) or not isinstance(expected_size, int):
-                return False
-            absolute = (self.runtime_dir / artifact.path).resolve()
-            absolute.relative_to(self.runtime_dir)
-            with absolute.open("rb") as stream:
-                encoded = stream.read(self._max_artifact_bytes + 1)
-            return (
-                len(encoded) <= self._max_artifact_bytes
-                and len(encoded) == expected_size
-                and hashlib.sha256(encoded).hexdigest() == expected_digest
-            )
+            self._read_committed_artifact(job_id, artifact)
+            return True
         except Exception:
             return False
 
-    def _committed_result(self, job_id: str, *, digest: str | None = None) -> bool:
-        return self._artifact_commit_matches(
-            job_id,
-            expected_state=JobState.succeeded,
-            digest=digest,
-        )
+    def _read_committed_artifact(self, job_id: str, artifact: Any) -> bytes:
+        with self.database.session() as session:
+            journal = session.scalar(
+                select(XhsArtifactPromotionJournalRecord).where(
+                    XhsArtifactPromotionJournalRecord.job_id == job_id,
+                    XhsArtifactPromotionJournalRecord.artifact_id
+                    == artifact.metadata.get("artifact_id"),
+                    XhsArtifactPromotionJournalRecord.state == "completed",
+                    XhsArtifactPromotionJournalRecord.resolution == "committed",
+                )
+            )
+            if journal is None:
+                raise UnsafeXhsArtifactStore("XHS artifact has no committed journal.")
+            snapshot = (
+                journal.final_path,
+                journal.sha256,
+                journal.size_bytes,
+                journal.file_dev,
+                journal.file_ino,
+                journal.file_mtime_ns,
+            )
+        final_path, digest, size, file_dev, file_ino, file_mtime_ns = snapshot
+        if (
+            artifact.path != final_path
+            or artifact.metadata.get("sha256") != digest
+            or artifact.metadata.get("size_bytes") != size
+        ):
+            raise UnsafeXhsArtifactStore("XHS artifact metadata changed.")
+        identity = XhsArtifactIdentity(file_dev, file_ino, size, file_mtime_ns)
+        with TrustedXhsArtifactStore(
+            self.runtime_dir,
+            max_bytes=self._max_artifact_bytes,
+        ) as store:
+            encoded = store.read_final(Path(final_path).name, identity)
+        if len(encoded) != size or hashlib.sha256(encoded).hexdigest() != digest:
+            raise UnsafeXhsArtifactStore("XHS artifact evidence changed.")
+        return encoded
 
     def _read_committed_job(self, job_id: str) -> Job:
         deadline = monotonic() + 0.05
