@@ -1054,3 +1054,51 @@ cleanup mutation-route scans had no matches; the export manifest still states
 
 Live Bailian, Android and seven-day UAT remain `not_run`. The deferred Task 10
 jobs evidence unlink was not changed.
+
+## Task 8R-5 fix round 5/5
+
+The round-4 independent re-review was **NOT CLEAN** with zero Critical and two
+Important findings. If regeneration failure restoration did not land, the prior
+code reported transaction uncertainty but accepted a durable `draft + pending`
+deadlock. Contradictory reservation normalization also ignored whether its own
+commit freshly classified as landed, not landed or unknown, and an exact initial
+reservation non-landing re-raised a provider-specific SQLAlchemy exception.
+
+Four regressions first failed while thirteen existing review tests passed. The
+tests removed the old expectation that `draft + pending` was an acceptable final
+state and covered exact restoration non-landing, provider-neutral initial
+non-landing, normalization landed/not-landed/unknown classification, unreadable
+fresh facts, and restart recovery.
+
+The uncertain SQLAlchemy session is now rolled back before any fresh proof. An
+exact initial non-landing raises the stable business error
+`regeneration_reservation_not_landed`. Restoration and contradictory reservation
+paths use a new transaction that matches the original item, current revision and
+regeneration attempt before changing any row. Eligible stranded facts converge to
+`rejected + failed`; pending audits receive `transaction_unknown`, while an
+already-failed audit retains its existing allowlisted category. Every convergence
+commit is then classified from a fresh session. A proven non-landing receives one
+bounded exact retry; landed, not-landed and unknown are all consumed and the caller
+never receives raw provider/database exception text.
+
+Database startup now performs a narrow recovery after the Task 8 schema is fully
+validated: a `draft` item is restored only when its current revision has a matching
+`regenerate` audit. A pending exact audit becomes `failed/transaction_unknown`,
+and an already failed safe audit is retained while the item returns to `rejected`.
+No revision or review note is synthesized.
+
+Fresh verification before final independent re-review:
+
+```text
+RED backend/tests/content/test_review.py: 4 failed, 13 passed
+focused review + audit migration: 23 passed
+backend/tests/content: 296 passed
+backend/tests: 609 passed, 1 skipped
+python -m compileall -q backend/app backend/tests: exit 0
+git diff --check: exit 0
+```
+
+The request/startup direct-delete and cleanup mutation-route scans had no matches.
+`backend/app/services/jobs.py` and Task 9 were not changed. The one skipped test
+remains the opt-in Bailian live contract; Bailian, Android and seven-day UAT remain
+`not_run`.

@@ -192,6 +192,7 @@ class Database:
         self._migrate_artifact_quarantine_reference_guards(
             marker_present=quarantine_reference_guard_marker_present
         )
+        self._recover_stranded_content_regenerations()
 
     def _migration_marker_exists(self, name: str) -> bool:
         inspector = inspect(self.engine)
@@ -204,6 +205,30 @@ class Database:
                 ),
                 {"name": name},
             ) is not None
+
+    def _recover_stranded_content_regenerations(self) -> None:
+        """Fail closed exact regeneration reservations left by a stopped process."""
+        with self.engine.begin() as connection:
+            tables = set(inspect(connection).get_table_names())
+            if not {"content_items", "content_reviews"}.issubset(tables):
+                return
+            connection.execute(text(
+                "UPDATE content_reviews SET outcome='failed', "
+                "error_category='transaction_unknown' "
+                "WHERE decision='regenerate' AND outcome='pending' "
+                "AND error_category IS NULL AND EXISTS ("
+                "SELECT 1 FROM content_items i WHERE i.id=content_reviews.content_item_id "
+                "AND i.status='draft' AND i.current_revision_id=content_reviews.revision_id)"
+            ))
+            connection.execute(text(
+                "UPDATE content_items SET status='rejected', updated_at=CURRENT_TIMESTAMP "
+                "WHERE status='draft' AND current_revision_id IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM content_reviews r WHERE r.content_item_id=content_items.id "
+                "AND r.revision_id=content_items.current_revision_id "
+                "AND r.decision='regenerate' AND r.outcome='failed' "
+                "AND r.error_category IN ('model_failure','validation_failed','trust_changed',"
+                "'transaction_unknown','state_changed'))"
+            ))
 
     def _require_artifact_quarantine_schema(
         self, *, require_identity: bool = True, require_source_token: bool = True

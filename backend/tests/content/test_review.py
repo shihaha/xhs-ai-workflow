@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -180,7 +181,7 @@ def test_regenerate_trust_error_restore_commit_ack_landed_preserves_original_err
     assert failed.reviews[-1].error_category == "trust_changed"
 
 
-def test_regenerate_restore_commit_not_landed_is_explicitly_transaction_unknown(
+def test_regenerate_restore_commit_not_landed_is_normalized_without_pending_deadlock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service, item, image = _draft(tmp_path)
@@ -210,8 +211,9 @@ def test_regenerate_restore_commit_not_landed_is_explicitly_transaction_unknown(
         service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
 
     unresolved = service.get_content_item(item.id)
-    assert unresolved.status == "draft"
-    assert unresolved.reviews[-1].outcome == "pending"
+    assert unresolved.status == "rejected"
+    assert unresolved.reviews[-1].outcome == "failed"
+    assert unresolved.reviews[-1].error_category == "transaction_unknown"
 
 
 def test_regenerate_restore_commit_contradiction_is_explicitly_transaction_unknown(
@@ -338,13 +340,189 @@ def test_regenerate_reservation_commit_not_landed_preserves_rejected_state(
 
     monkeypatch.setattr(Session, "commit", reject_once)
 
-    with pytest.raises(SQLAlchemyError, match="did not land"):
+    with pytest.raises(ContentStateError, match="regeneration_reservation_not_landed"):
         service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
 
     result = service.get_content_item(item.id)
     assert result.status == "rejected"
     assert len(result.revisions) == 1
     assert [review.decision for review in result.reviews] == ["reject"]
+
+
+def test_regenerate_contradictory_normalization_commit_not_landed_retries_exact_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    real_commit = Session.commit
+    commit_count = 0
+
+    def ambiguous_then_not_landed_then_commit(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 1:
+            real_commit(session)
+            with service.database.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE content_reviews SET outcome='failed', "
+                    "error_category='transaction_unknown' WHERE decision='regenerate'"
+                )
+            raise SQLAlchemyError("contradictory reservation acknowledgement")
+        if commit_count == 2:
+            raise SQLAlchemyError("normalization did not land")
+        real_commit(session)
+
+    monkeypatch.setattr(Session, "commit", ambiguous_then_not_landed_then_commit)
+
+    with pytest.raises(ContentStateError, match="reservation_transaction_unknown"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    result = service.get_content_item(item.id)
+    assert result.status == "rejected"
+    assert result.reviews[-1].outcome == "failed"
+    assert result.reviews[-1].error_category == "transaction_unknown"
+
+
+def test_startup_recovers_repeated_not_landed_normalization_without_pending_deadlock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    real_commit = Session.commit
+    commit_count = 0
+
+    def unreadable_normalization(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 1:
+            real_commit(session)
+            with service.database.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE content_reviews SET outcome='failed', "
+                    "error_category='state_changed' WHERE decision='regenerate'"
+                )
+            raise SQLAlchemyError("contradictory reservation acknowledgement")
+        raise SQLAlchemyError("normalization database unreadable")
+
+    monkeypatch.setattr(Session, "commit", unreadable_normalization)
+    with pytest.raises(ContentStateError, match="reservation_transaction_unknown"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    path = service.database.database_path
+    service.database.close()
+    monkeypatch.setattr(Session, "commit", real_commit)
+
+    from backend.app.db import Database
+    recovered = Database(path, runtime_dir=tmp_path / "runtime")
+    with recovered.engine.connect() as connection:
+        row = connection.execute(text(
+            "SELECT i.status,r.outcome,r.error_category FROM content_items i "
+            "JOIN content_reviews r ON r.content_item_id=i.id "
+            "WHERE i.id=:item_id AND r.decision='regenerate'"
+        ), {"item_id": item.id}).one()
+    recovered.close()
+
+    assert row == ("rejected", "failed", "state_changed")
+
+
+def test_startup_recovers_unreadable_contradictory_reservation_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    real_commit = Session.commit
+    real_get = Session.get
+    make_reads_unavailable = False
+
+    def commit_contradiction_then_raise(session: Session) -> None:
+        nonlocal make_reads_unavailable
+        real_commit(session)
+        with service.database.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "UPDATE content_reviews SET outcome='failed', "
+                "error_category='transaction_unknown' WHERE decision='regenerate'"
+            )
+        make_reads_unavailable = True
+        raise SQLAlchemyError("contradictory reservation acknowledgement")
+
+    def unreadable_get(session: Session, entity: object, ident: object, **kwargs: object):
+        if make_reads_unavailable:
+            raise SQLAlchemyError("fresh reservation facts unreadable")
+        return real_get(session, entity, ident, **kwargs)
+
+    monkeypatch.setattr(Session, "commit", commit_contradiction_then_raise)
+    monkeypatch.setattr(Session, "get", unreadable_get)
+    with pytest.raises(ContentStateError, match="regeneration_reservation_transaction_unknown"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    path = service.database.database_path
+    service.database.close()
+    monkeypatch.setattr(Session, "commit", real_commit)
+    monkeypatch.setattr(Session, "get", real_get)
+
+    from backend.app.db import Database
+    recovered = Database(path, runtime_dir=tmp_path / "runtime")
+    with recovered.engine.connect() as connection:
+        row = connection.execute(text(
+            "SELECT i.status,r.outcome,r.error_category FROM content_items i "
+            "JOIN content_reviews r ON r.content_item_id=i.id "
+            "WHERE i.id=:item_id AND r.decision='regenerate'"
+        ), {"item_id": item.id}).one()
+    recovered.close()
+
+    assert row == ("rejected", "failed", "transaction_unknown")
+
+
+def test_regenerate_contradictory_normalization_unknown_is_provider_neutral(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    real_commit = Session.commit
+    raised = False
+
+    def commit_unknown_facts_then_raise(session: Session) -> None:
+        nonlocal raised
+        if not raised:
+            raised = True
+            real_commit(session)
+            with service.database.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE content_items SET status='review' WHERE id=?",
+                    (item.id,),
+                )
+                connection.exec_driver_sql(
+                    "UPDATE content_reviews SET outcome='failed', "
+                    "error_category='transaction_unknown' WHERE decision='regenerate'"
+                )
+            raise SQLAlchemyError("contradictory reservation acknowledgement")
+        real_commit(session)
+
+    monkeypatch.setattr(Session, "commit", commit_unknown_facts_then_raise)
+
+    with pytest.raises(ContentStateError, match="regeneration_reservation_transaction_unknown"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    result = service.get_content_item(item.id)
+    assert result.status == "review"
+    assert result.reviews[-1].outcome == "failed"
+    assert result.reviews[-1].error_category == "transaction_unknown"
 
 
 def test_regenerate_reservation_commit_unknown_restores_without_pending_deadlock(

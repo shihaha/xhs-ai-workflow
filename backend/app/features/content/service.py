@@ -442,6 +442,7 @@ class ContentService:
             try:
                 session.commit()
             except SQLAlchemyError as error:
+                session.rollback()
                 resolution = self._resolve_regeneration_reservation_commit(
                     item_id, payload_request.expected_revision_id,
                     attempt_id=attempt_id,
@@ -449,7 +450,17 @@ class ContentService:
                 if resolution == "landed":
                     pass
                 elif resolution == "not_landed":
-                    raise
+                    raise ContentStateError(
+                        "regeneration_reservation_not_landed"
+                    ) from error
+                elif resolution == "normalized":
+                    raise ContentStateError(
+                        "regeneration_reservation_transaction_unknown"
+                    ) from error
+                elif resolution == "normalization_not_landed":
+                    raise ContentStateError(
+                        "regeneration_reservation_transaction_unknown"
+                    ) from error
                 else:
                     raise ContentStateError(
                         "regeneration_reservation_transaction_unknown"
@@ -524,12 +535,25 @@ class ContentService:
             try:
                 session.commit()
             except SQLAlchemyError as error:
+                session.rollback()
                 outcome = self._regeneration_failure_after_unknown(
                     item_id, revision_id, attempt_id=attempt_id,
                     error_category=error_category,
                 )
                 if outcome is _ReservationOutcome.LANDED:
                     return
+                normalized = self._normalize_regeneration_failure(
+                    item_id, revision_id, attempt_id=attempt_id,
+                    error_category="transaction_unknown",
+                )
+                if normalized is _ReservationOutcome.LANDED:
+                    raise ContentStateError(
+                        "regeneration_failure_transaction_unknown"
+                    ) from error
+                if normalized is _ReservationOutcome.NOT_LANDED:
+                    raise ContentStateError(
+                        "regeneration_failure_transaction_unknown"
+                    ) from error
                 raise ContentStateError(
                     "regeneration_failure_transaction_unknown"
                 ) from error
@@ -575,55 +599,156 @@ class ContentService:
         the original rejected item untouched. Contradictory landed facts are
         conservatively finalized so no draft/pending deadlock survives.
         """
-        with self.database.session() as session:
-            item = session.get(ContentItemRecord, item_id)
-            attempt = session.get(ContentReviewRecord, attempt_id)
-            exact_attempt = attempt is not None and (
-                attempt.content_item_id == item_id
-                and attempt.revision_id == revision_id
-                and attempt.decision == "regenerate"
-            )
-            if (
-                item is not None and item.status == "draft"
-                and item.current_revision_id == revision_id
-                and exact_attempt and attempt.outcome == "pending"
-                and attempt.error_category is None
-            ):
-                return "landed"
-            if (
-                item is not None and item.status == "rejected"
-                and item.current_revision_id == revision_id
-                and attempt is None
-            ):
-                return "not_landed"
-
-            item_won = 0
-            audit_won = 0
-            if item is not None and item.current_revision_id == revision_id:
-                item_won = session.execute(update(ContentItemRecord).where(
-                    ContentItemRecord.id == item_id,
-                    ContentItemRecord.status == "draft",
-                    ContentItemRecord.current_revision_id == revision_id,
-                ).values(status="rejected", updated_at=_now())).rowcount
-            if exact_attempt:
-                audit_won = session.execute(update(ContentReviewRecord).where(
-                    ContentReviewRecord.id == attempt_id,
-                    ContentReviewRecord.content_item_id == item_id,
-                    ContentReviewRecord.revision_id == revision_id,
-                    ContentReviewRecord.decision == "regenerate",
-                    ContentReviewRecord.outcome == "pending",
-                ).values(
-                    outcome="failed", error_category="transaction_unknown",
-                )).rowcount
-            if item_won or audit_won:
-                try:
-                    session.commit()
-                except SQLAlchemyError:
-                    self._regeneration_failure_after_unknown(
-                        item_id, revision_id, attempt_id=attempt_id,
-                        error_category="transaction_unknown",
-                    )
+        try:
+            with self.database.session() as session:
+                item = session.get(ContentItemRecord, item_id)
+                attempt = session.get(ContentReviewRecord, attempt_id)
+                exact_attempt = attempt is not None and (
+                    attempt.content_item_id == item_id
+                    and attempt.revision_id == revision_id
+                    and attempt.decision == "regenerate"
+                )
+                if (
+                    item is not None and item.status == "draft"
+                    and item.current_revision_id == revision_id
+                    and exact_attempt and attempt.outcome == "pending"
+                    and attempt.error_category is None
+                ):
+                    return "landed"
+                if (
+                    item is not None and item.status == "rejected"
+                    and item.current_revision_id == revision_id
+                    and attempt is None
+                ):
+                    return "not_landed"
+        except SQLAlchemyError:
             return "unknown"
+
+        normalization = self._normalize_regeneration_failure(
+            item_id, revision_id, attempt_id=attempt_id,
+            error_category="transaction_unknown",
+        )
+        if normalization is _ReservationOutcome.LANDED:
+            return "normalized"
+        if normalization is _ReservationOutcome.NOT_LANDED:
+            return "normalization_not_landed"
+        return "unknown"
+
+    def _normalize_regeneration_failure(
+        self, item_id: str, revision_id: str, *,
+        attempt_id: int, error_category: str,
+    ) -> _ReservationOutcome:
+        """Converge one exact stranded regeneration and prove the commit freshly."""
+        for _ in range(2):
+            try:
+                with self.database.session() as session:
+                    item = session.get(ContentItemRecord, item_id)
+                    attempt = session.get(ContentReviewRecord, attempt_id)
+                    exact_attempt = attempt is not None and (
+                        attempt.content_item_id == item_id
+                        and attempt.revision_id == revision_id
+                        and attempt.decision == "regenerate"
+                    )
+                    if not (
+                        item is not None
+                        and item.current_revision_id == revision_id
+                        and item.status in {"draft", "rejected"}
+                        and exact_attempt
+                        and (
+                            (attempt.outcome == "pending" and attempt.error_category is None)
+                            or (
+                                attempt.outcome == "failed"
+                                and attempt.error_category in {
+                                    "model_failure", "validation_failed", "trust_changed",
+                                    "transaction_unknown", "state_changed",
+                                }
+                            )
+                        )
+                    ):
+                        return _ReservationOutcome.UNKNOWN
+                    if item.status == "rejected" and attempt.outcome == "failed":
+                        return _ReservationOutcome.LANDED
+
+                    if item.status == "draft":
+                        item_won = session.execute(update(ContentItemRecord).where(
+                            ContentItemRecord.id == item_id,
+                            ContentItemRecord.status == "draft",
+                            ContentItemRecord.current_revision_id == revision_id,
+                        ).values(status="rejected", updated_at=_now())).rowcount
+                        if item_won != 1:
+                            session.rollback()
+                            return _ReservationOutcome.UNKNOWN
+                    if attempt.outcome == "pending":
+                        audit_won = session.execute(update(ContentReviewRecord).where(
+                            ContentReviewRecord.id == attempt_id,
+                            ContentReviewRecord.content_item_id == item_id,
+                            ContentReviewRecord.revision_id == revision_id,
+                            ContentReviewRecord.decision == "regenerate",
+                            ContentReviewRecord.outcome == "pending",
+                            ContentReviewRecord.error_category.is_(None),
+                        ).values(
+                            outcome="failed", error_category=error_category,
+                        )).rowcount
+                        if audit_won != 1:
+                            session.rollback()
+                            return _ReservationOutcome.UNKNOWN
+                    try:
+                        session.commit()
+                    except SQLAlchemyError:
+                        pass
+            except SQLAlchemyError:
+                return _ReservationOutcome.UNKNOWN
+
+            outcome = self._regeneration_terminal_after_unknown(
+                item_id, revision_id, attempt_id=attempt_id,
+            )
+            if outcome is not _ReservationOutcome.NOT_LANDED:
+                return outcome
+        return _ReservationOutcome.NOT_LANDED
+
+    def _regeneration_terminal_after_unknown(
+        self, item_id: str, revision_id: str, *, attempt_id: int,
+    ) -> _ReservationOutcome:
+        """Classify only the exact reserved regeneration from a fresh session."""
+        try:
+            with self.database.session() as session:
+                item = session.get(ContentItemRecord, item_id)
+                attempt = session.get(ContentReviewRecord, attempt_id)
+                exact_attempt = attempt is not None and (
+                    attempt.content_item_id == item_id
+                    and attempt.revision_id == revision_id
+                    and attempt.decision == "regenerate"
+                )
+                if not (
+                    item is not None and item.current_revision_id == revision_id
+                    and exact_attempt
+                ):
+                    return _ReservationOutcome.UNKNOWN
+                if (
+                    item.status == "rejected" and attempt.outcome == "failed"
+                    and attempt.error_category in {
+                        "model_failure", "validation_failed", "trust_changed",
+                        "transaction_unknown", "state_changed",
+                    }
+                ):
+                    return _ReservationOutcome.LANDED
+                if (
+                    item.status in {"draft", "rejected"}
+                    and (
+                        (attempt.outcome == "pending" and attempt.error_category is None)
+                        or (
+                            item.status == "draft" and attempt.outcome == "failed"
+                            and attempt.error_category in {
+                                "model_failure", "validation_failed", "trust_changed",
+                                "transaction_unknown", "state_changed",
+                            }
+                        )
+                    )
+                ):
+                    return _ReservationOutcome.NOT_LANDED
+                return _ReservationOutcome.UNKNOWN
+        except SQLAlchemyError:
+            return _ReservationOutcome.UNKNOWN
 
     @staticmethod
     def _regeneration_error_category(error: Exception, *, trust_phase: bool) -> str:
