@@ -229,7 +229,26 @@ def _normalize_account(
             )
         )
     note_items, note_rejected = _normalize_note_rows(notes, source="user-posts")
-    items.extend(note_items)
+    verified_note_items: list[CollectionItem] = []
+    for note in note_items:
+        note_owner_id = note.data.get("user_id")
+        if profile_user_id is not None and requested_identity == profile_user_id:
+            if note_owner_id is None:
+                note.data["user_id"] = profile_user_id
+                verified_note_items.append(note)
+            elif note_owner_id == profile_user_id:
+                verified_note_items.append(note)
+            else:
+                note_rejected.append(
+                    RejectedCollectionItem(
+                        reference=f"xhs_cli:user-posts:{note.id}",
+                        reason="note_owner_mismatch",
+                        raw_evidence=note.raw_evidence,
+                    )
+                )
+        else:
+            verified_note_items.append(note)
+    items.extend(verified_note_items)
     rejected.extend(note_rejected)
     return _accounted_result(request=request, items=items, rejected_items=rejected)
 

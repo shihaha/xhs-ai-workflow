@@ -119,6 +119,27 @@ def test_fetch_account_returns_one_profile_and_requested_notes() -> None:
     ]
 
 
+def test_fetch_account_binds_each_note_to_the_verified_profile_owner() -> None:
+    fake_runner = FakeRunner(
+        [
+            _completed(["xhs"], {"user": {"id": "user-1"}}),
+            _completed(["xhs"], {"notes": [{"id": "note-1", "title": "First"}]}),
+        ]
+    )
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.fetch_account(
+        CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "user-1", "job_id": JOB_ID},
+            expected_count=2,
+        )
+    )
+
+    assert result.complete is True
+    assert result.items[1].data["user_id"] == "user-1"
+
+
 @pytest.mark.parametrize("field", ["keyword", "user_id"])
 @pytest.mark.parametrize("unsafe_value", ["--json", "-x", "line\nbreak", "nul\x00byte"])
 def test_positional_cli_values_reject_options_and_control_characters(

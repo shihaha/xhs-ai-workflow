@@ -52,7 +52,15 @@ def test_fresh_schema_has_bound_account_note_evidence_and_marker(tmp_path: Path)
                 "raw_digest",
                 "collected_at",
             } <= set(columns)
-            assert all(columns[name]["nullable"] is False for name in columns)
+            nullable_public_text = {
+                "xhs_account_profiles": {"nickname", "bio"},
+                "xhs_account_notes": {"title", "summary", "published_at"},
+            }[table]
+            assert all(
+                columns[name]["nullable"] is False
+                for name in set(columns) - nullable_public_text
+            )
+            assert all(columns[name]["nullable"] is True for name in nullable_public_text)
         with database.engine.connect() as connection:
             assert connection.scalar(
                 text(
@@ -86,6 +94,32 @@ def test_marker_present_with_missing_constraint_fails_closed(tmp_path: Path) -> 
               collected_at DATETIME NOT NULL
             );
             DROP TABLE xhs_account_notes_old;
+            """
+        )
+
+    with pytest.raises(SchemaMigrationError, match="account note evidence"):
+        Database(path)
+
+
+def test_marker_present_without_public_fact_columns_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "old-marker.sqlite3"
+    database = Database(path)
+    database.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            ALTER TABLE xhs_account_profiles RENAME TO xhs_account_profiles_old;
+            CREATE TABLE xhs_account_profiles (
+              user_id VARCHAR(500) PRIMARY KEY,
+              source_url TEXT NOT NULL,
+              raw_evidence JSON NOT NULL,
+              raw_digest VARCHAR(64) NOT NULL,
+              collection_job_id VARCHAR(36) NOT NULL,
+              collection_artifact_id INTEGER NOT NULL,
+              collected_at DATETIME NOT NULL
+            );
+            DROP TABLE xhs_account_profiles_old;
             """
         )
 

@@ -13,6 +13,12 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
+from backend.app.features.xhs.constants import (
+    ACCOUNT_COLLECTION_ARTIFACT_KIND,
+    ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+    ACCOUNT_COLLECTION_JOB_TYPE,
+)
+
 
 class Base(DeclarativeBase):
     """Base class for all persisted workbench records."""
@@ -1268,46 +1274,55 @@ def _compact_sql(value: object) -> str:
     return "".join(compact)
 
 
+_XHS_TRUSTED_ARTIFACT_WHERE = f"""
+    artifact.id=NEW.collection_artifact_id
+    AND artifact.job_id=NEW.collection_job_id
+    AND job.type='{ACCOUNT_COLLECTION_JOB_TYPE}'
+    AND artifact.kind='{ACCOUNT_COLLECTION_ARTIFACT_KIND}'
+    AND artifact.producer='{ACCOUNT_COLLECTION_ARTIFACT_PRODUCER}'
+"""
+
+
 _XHS_ACCOUNT_NOTE_EVIDENCE_TRIGGER_SQL = {
-    "ck_xhs_profile_artifact_job_insert": """
+    "ck_xhs_profile_artifact_job_insert": f"""
         CREATE TRIGGER ck_xhs_profile_artifact_job_insert
         BEFORE INSERT ON xhs_account_profiles
         WHEN NOT EXISTS (
-            SELECT 1 FROM job_artifacts
-            WHERE id=NEW.collection_artifact_id AND job_id=NEW.collection_job_id
+            SELECT 1 FROM job_artifacts AS artifact JOIN jobs AS job ON job.id=artifact.job_id
+            WHERE {_XHS_TRUSTED_ARTIFACT_WHERE}
         )
         BEGIN
             SELECT RAISE(ABORT, 'XHS profile artifact must belong to its collection job');
         END
     """,
-    "ck_xhs_profile_artifact_job_update": """
+    "ck_xhs_profile_artifact_job_update": f"""
         CREATE TRIGGER ck_xhs_profile_artifact_job_update
         BEFORE UPDATE OF collection_job_id, collection_artifact_id ON xhs_account_profiles
         WHEN NOT EXISTS (
-            SELECT 1 FROM job_artifacts
-            WHERE id=NEW.collection_artifact_id AND job_id=NEW.collection_job_id
+            SELECT 1 FROM job_artifacts AS artifact JOIN jobs AS job ON job.id=artifact.job_id
+            WHERE {_XHS_TRUSTED_ARTIFACT_WHERE}
         )
         BEGIN
             SELECT RAISE(ABORT, 'XHS profile artifact must belong to its collection job');
         END
     """,
-    "ck_xhs_note_artifact_job_insert": """
+    "ck_xhs_note_artifact_job_insert": f"""
         CREATE TRIGGER ck_xhs_note_artifact_job_insert
         BEFORE INSERT ON xhs_account_notes
         WHEN NOT EXISTS (
-            SELECT 1 FROM job_artifacts
-            WHERE id=NEW.collection_artifact_id AND job_id=NEW.collection_job_id
+            SELECT 1 FROM job_artifacts AS artifact JOIN jobs AS job ON job.id=artifact.job_id
+            WHERE {_XHS_TRUSTED_ARTIFACT_WHERE}
         )
         BEGIN
             SELECT RAISE(ABORT, 'XHS note artifact must belong to its collection job');
         END
     """,
-    "ck_xhs_note_artifact_job_update": """
+    "ck_xhs_note_artifact_job_update": f"""
         CREATE TRIGGER ck_xhs_note_artifact_job_update
         BEFORE UPDATE OF collection_job_id, collection_artifact_id ON xhs_account_notes
         WHEN NOT EXISTS (
-            SELECT 1 FROM job_artifacts
-            WHERE id=NEW.collection_artifact_id AND job_id=NEW.collection_job_id
+            SELECT 1 FROM job_artifacts AS artifact JOIN jobs AS job ON job.id=artifact.job_id
+            WHERE {_XHS_TRUSTED_ARTIFACT_WHERE}
         )
         BEGIN
             SELECT RAISE(ABORT, 'XHS note artifact must belong to its collection job');
@@ -1331,6 +1346,9 @@ def _xhs_account_note_evidence_schema_valid(
         "xhs_account_profiles": {
             "user_id": "VARCHAR(500)",
             "source_url": "TEXT",
+            "nickname": "TEXT",
+            "bio": "TEXT",
+            "public_stats_json": "JSON",
             "raw_evidence": "JSON",
             "raw_digest": "VARCHAR(64)",
             "collection_job_id": "VARCHAR(36)",
@@ -1342,6 +1360,10 @@ def _xhs_account_note_evidence_schema_valid(
             "note_id": "VARCHAR(500)",
             "user_id": "VARCHAR(500)",
             "source_url": "TEXT",
+            "title": "TEXT",
+            "summary": "TEXT",
+            "published_at": "VARCHAR(100)",
+            "public_interactions_json": "JSON",
             "raw_evidence": "JSON",
             "raw_digest": "VARCHAR(64)",
             "collection_job_id": "VARCHAR(36)",
@@ -1354,6 +1376,8 @@ def _xhs_account_note_evidence_schema_valid(
             "ck_xhs_profile_user_id": "length(user_id)between1and500",
             "ck_xhs_profile_source_url": "length(source_url)<=2000andsource_urlglob'https://*'",
             "ck_xhs_profile_raw_digest": (
+                "json_valid(raw_evidence)=1andjson_type(raw_evidence)='object'and"
+                "raw_evidence_digest(raw_evidence)isnotnulland"
                 "length(raw_digest)=64andraw_digestnotglob'*[^0-9a-f]*'and"
                 "raw_evidence_digest(raw_evidence)=raw_digest"
             ),
@@ -1362,6 +1386,8 @@ def _xhs_account_note_evidence_schema_valid(
             "ck_xhs_note_id": "length(note_id)between1and500",
             "ck_xhs_note_source_url": "length(source_url)<=2000andsource_urlglob'https://*'",
             "ck_xhs_note_raw_digest": (
+                "json_valid(raw_evidence)=1andjson_type(raw_evidence)='object'and"
+                "raw_evidence_digest(raw_evidence)isnotnulland"
                 "length(raw_digest)=64andraw_digestnotglob'*[^0-9a-f]*'and"
                 "raw_evidence_digest(raw_evidence)=raw_digest"
             ),
@@ -1396,7 +1422,16 @@ def _xhs_account_note_evidence_schema_valid(
             columns = {item["name"]: item for item in inspector.get_columns(table)}
             if set(columns) != set(expected):
                 return False
-            if any(columns[name].get("nullable") is not False for name in expected):
+            nullable_columns = {
+                "xhs_account_profiles": {"nickname", "bio"},
+                "xhs_account_notes": {"title", "summary", "published_at"},
+            }[table]
+            if any(
+                columns[name].get("nullable") is not False
+                for name in set(expected) - nullable_columns
+            ) or any(
+                columns[name].get("nullable") is not True for name in nullable_columns
+            ):
                 return False
             if {
                 name: str(column.get("type") or "").upper()
@@ -1469,9 +1504,19 @@ def _xhs_account_note_evidence_data_valid(connection: Connection) -> bool:
                 "LEFT JOIN job_artifacts AS artifact "
                 "ON artifact.id=fact.collection_artifact_id "
                 "AND artifact.job_id=fact.collection_job_id "
-                "WHERE artifact.id IS NULL OR raw_evidence_digest(fact.raw_evidence) "
-                "IS NOT fact.raw_digest OR datetime(fact.collected_at) IS NULL LIMIT 1"
-            ))
+                "LEFT JOIN jobs AS job ON job.id=artifact.job_id "
+                "WHERE artifact.id IS NULL OR job.type!=:job_type "
+                "OR artifact.kind!=:artifact_kind OR artifact.producer!=:producer "
+                "OR json_valid(fact.raw_evidence)!=1 "
+                "OR json_type(fact.raw_evidence)!='object' "
+                "OR raw_evidence_digest(fact.raw_evidence) IS NULL "
+                "OR raw_evidence_digest(fact.raw_evidence) IS NOT fact.raw_digest "
+                "OR datetime(fact.collected_at) IS NULL LIMIT 1"
+            ), {
+                "job_type": ACCOUNT_COLLECTION_JOB_TYPE,
+                "artifact_kind": ACCOUNT_COLLECTION_ARTIFACT_KIND,
+                "producer": ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+            })
             if invalid is not None:
                 return False
         return connection.scalar(text(
