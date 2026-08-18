@@ -18,6 +18,8 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [ ] Select a real account and collect its store on the real phone.
 - [ ] From that ranked account's UI, run read-only account collection and verify one public profile plus exact note N/N, source links, reserved job, raw artifact hash and database rows agree.
 - [ ] Run one public-note keyword search and verify expected N, returned N, source links and the hash-bound search artifact agree.
+- [ ] If account/search polling reaches its UI bound, confirm the old non-terminal job remains visible, the new-job action is released, and “continue refreshing” reads only that job's returned ID.
+- [ ] Confirm any `account-note:*` entry marked ineligible is labelled stale/untrusted, disabled for analysis selection and retained for human audit.
 - [ ] Select the new account's canonical `account-note:*` IDs together with its trusted shop evidence for analysis; confirm notes enrich claims but do not replace the exact shop N/N opportunity gate.
 - [ ] Confirm declared N, discovered N, verified N, missing list and image manifests agree.
 - [ ] Generate a grounded analysis and opportunity; every claim cites persisted evidence.
@@ -49,6 +51,7 @@ real UAT”, not “same effect as the tutorial proven”.
 
 ## Controlled Task 5 evidence
 
-- Frontend unit tests cover account/search empty, queued, terminal, needs-human, stale-read, single-flight, bounded polling and unmount cancellation behavior.
+- Frontend unit tests cover account/search empty, queued, terminal, needs-human, stale-read, single-flight, bounded polling, explicit same-job resume, lock release and unmount cancellation behavior.
+- A fake authenticated CLI contract executes `status` without `--json`, validates identity through `whoami --json`, and then reaches the exact `user`, `user-posts` and `search` read path. A fake unauthenticated session remains `not_run` and creates no database.
 - The Playwright fixture starts with no account profile/note rows. Each run creates a unique ranked account, starts the real Task 3 account collection route from the UI, persists its profile/note through the reserved job/artifact/database path, selects the resulting `account-note:*` evidence for analysis, then completes the existing shop N/N, opportunity, product, content review and available ZIP path.
 - The controlled E2E passed once and with `--repeat-each=5`; this is software evidence only and does not satisfy the live gates above.

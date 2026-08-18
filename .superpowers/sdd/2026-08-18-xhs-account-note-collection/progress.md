@@ -30,3 +30,4 @@ Task 3: complete (independent S1 review CLEAN; backend 935 passed/1 live skip; a
 Task 4: fix rounds 1-5 completed (commits 87d640c..bb5ea11)
 Task 4: complete (final independent review CLEAN; backend 1020 passed/1 live skip; account-note evidence enriches analysis but exact shop N/N gate remains required)
 Task 5: complete pending final single commit (frontend 44 passed; controlled E2E 1/1 and repeat-5 5/5; backend 1020 passed/2 live skips; repository verify and npm audit clean; authenticated xhs-cli remains not_run)
+Task 5: fix round 1/5 complete pending single commit (3 Important addressed; frontend focused 23/full 47 passed; live fake 2 passed/1 real-session skip; xhs+analysis 430 passed/2 skips; controlled E2E repeat-5 5/5; repository verify 1022 passed/2 skips and audit clean; authenticated real xhs-cli remains not_run)

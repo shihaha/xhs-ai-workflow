@@ -16,6 +16,13 @@ persistence, hash-bound evidence, account-note analysis grounding, and truthful
 Account/Radar operator states. Account notes can ground analysis claims; they do
 not replace the existing exact shop N/N gate for opportunity creation.
 
+Account/search polling now allows 60 checks by default. Reaching that bound
+releases the page-level single-flight lock without inventing a terminal job
+state: the prior job stays visible for audit and can be resumed by its exact
+returned ID or superseded by a newly submitted job. Account-note evidence is
+selectable and labelled trusted only when the API returns its trust eligibility
+flag as true; false entries are disabled and require human verification.
+
 The controlled Playwright flow begins with a fresh temporary SQLite database and
 runs ranking collection through an available ZIP using deterministic test-only
 Qianfan/XHS/device/model adapters. It creates a unique ranked account on every
@@ -49,9 +56,9 @@ environment-only.
 | Job evidence commit ambiguity | `backend/tests/test_release_hardening.py` |
 | Traversal/containment and Windows-equivalent artifact paths | jobs/content hardening and quarantine suites |
 | Reserved worker APIs and read-only cleanup API | `backend/tests/test_jobs_api.py`, `backend/tests/content/test_cleanup_api.py` |
-| Account/note collection states, polling and audit history | `frontend/src/pages/AccountPage.test.tsx`, `frontend/src/pages/RadarPage.test.tsx` |
+| Account/note collection states, polling release/resume and audit history | `frontend/src/pages/AccountPage.test.tsx`, `frontend/src/pages/RadarPage.test.tsx` |
 | Account-note trust through fresh empty runtime and ZIP | `backend/tests/analysis/test_account_note_grounding.py`, `frontend/e2e/empty-to-package.spec.ts` |
-| Guarded local XHS CLI contract | `backend/tests/xhs/test_live_cli_contract.py` (explicit opt-in; default `not_run`) |
+| Guarded local XHS CLI contract | `backend/tests/xhs/test_live_cli_contract.py` (real `status` text shape, JSON `whoami` identity, exact read-only commands, explicit opt-in; default `not_run`) |
 | Fresh empty runtime through ZIP | recovery-matrix empty-state test and `frontend/e2e/empty-to-package.spec.ts` |
 
 ## Not verified live

@@ -23,7 +23,7 @@ const defaultLoad = async (): Promise<RadarData> => {
 
 const terminal = new Set(["needs_human", "succeeded", "failed", "cancelled"]);
 
-export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapshot, startCollection = postCollection, loadCollectionJobs = fetchJobs, startNoteSearch = postNoteSearch, loadSearchJob = fetchJob, loadSearchResults = fetchNoteSearchResults, pollIntervalMs = 1000, searchMaxPolls = 10 }: RadarPageProps) {
+export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapshot, startCollection = postCollection, loadCollectionJobs = fetchJobs, startNoteSearch = postNoteSearch, loadSearchJob = fetchJob, loadSearchResults = fetchNoteSearchResults, pollIntervalMs = 1000, searchMaxPolls = 60 }: RadarPageProps) {
   const [state, setState] = useState<{ kind: "loading" } | { kind: "error" } | { kind: "ready"; data: RadarData }>({ kind: "loading" });
   const [snapshotJson, setSnapshotJson] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
@@ -60,7 +60,11 @@ export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapsh
 
   const activeSearch = searches.find(item => item.job_id === activeSearchId);
   useEffect(() => {
-    if (!activeSearchId || !activeSearch || terminal.has(activeSearch.status) || activeSearch.polls >= searchMaxPolls) return;
+    if (!activeSearchId || !activeSearch || terminal.has(activeSearch.status)) return;
+    if (activeSearch.polls >= searchMaxPolls) {
+      setActiveSearchId(current => current === activeSearchId ? null : current);
+      return;
+    }
     let cancelled = false;
     const timer = window.setTimeout(() => {
       void loadSearchJob(activeSearchId).then(async job => {
@@ -122,7 +126,7 @@ export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapsh
         <header><strong>{item.status === "needs_human" ? "Human attention required" : item.status}</strong><code>{item.job_id}</code></header>
         <p>{item.job ? `${item.job.progress_current} / ${item.job.progress_total ?? "unknown"} public notes · ${item.job.current_stage ?? "stage not reported"}` : "Waiting for the first persisted job read."}{item.job?.error_category ? ` · ${item.job.error_category}` : ""}</p>
         {item.staleError ? <p className="action-error" role="alert">Search job read failed: {item.staleError}. The last displayed state is stale.</p> : null}
-        {item.polls >= searchMaxPolls && !terminal.has(item.status) ? <p>Automatic search refresh stopped after {searchMaxPolls} checks.</p> : null}
+        {item.polls >= searchMaxPolls && !terminal.has(item.status) ? <><p>Automatic search refresh stopped after {searchMaxPolls} checks.</p><p className="field-help">The persisted job remains non-terminal. Continue refreshing this job or start a new search; no terminal state is inferred.</p><button disabled={pending || activeSearchId !== null} type="button" onClick={() => { setSearches(current => current.map(currentItem => currentItem.job_id === item.job_id ? { ...currentItem, polls: 0 } : currentItem)); setActiveSearchId(item.job_id); }}>Continue refreshing {item.job_id}</button></> : null}
         {item.status === "needs_human" || item.status === "failed" ? <p className="field-help">Resolve the local xhs-cli session, captcha, rate-limit, or visibility issue outside the application, then create a new search job. This job remains unchanged for audit.</p> : null}
         {item.results ? <div><p>{item.results.succeeded_count} / {item.results.expected_count} public notes returned</p>{item.results.items.length === 0 ? <p className="panel-empty">The exact search completed with no public notes.</p> : <ol className="fact-list">{item.results.items.map(note => <li key={note.note_id}><strong>{note.title ?? note.note_id}</strong>{note.summary ? <span>{note.summary}</span> : null}{note.user_id ? <span>Account {note.user_id}</span> : null}<a href={note.source_url} rel="noreferrer" target="_blank">Open search result</a></li>)}</ol>}</div> : null}
       </li>)}</ol>}

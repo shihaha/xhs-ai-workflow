@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { RadarPage } from "./RadarPage";
@@ -12,6 +12,18 @@ const job = (index: number, state: "queued" | "running" | "needs_human" | "succe
   progress_current: state === "succeeded" ? 1 : 0, progress_total: 1, current_stage: state, error_category: state === "needs_human" ? "selector_profile_unverified" : null,
   retry_count: 0, created_at: "2026-08-18T00:00:00Z", updated_at: "2026-08-18T00:00:00Z", started_at: null, completed_at: null, lease_expires_at: null, logs: [], artifacts: [],
 });
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+const searchJob = (id: string, state: "queued" | "running" | "needs_human" | "succeeded" | "failed" | "cancelled") => ({
+  id, type: "xhs_note_search", input: { keyword: "收纳", expected_count: 1 }, state,
+  progress_current: state === "succeeded" ? 1 : 0, progress_total: 1, current_stage: "xhs_collection_result", error_category: null,
+  retry_count: 0, created_at: "2026-08-18T00:00:00Z", updated_at: "2026-08-18T00:00:01Z", started_at: null, completed_at: null, lease_expires_at: null, logs: [], artifacts: [],
+} as const);
 
 describe("RadarPage", () => {
   it("shows loading and then a truthful empty radar", async () => {
@@ -133,6 +145,40 @@ describe("RadarPage", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(/search job read offline.*stale/i);
     expect(screen.getByText("search-old")).toBeVisible();
     expect(screen.getByText("search-new")).toBeVisible();
+  });
+
+  it("releases an exhausted search poll and can resume only that returned job", async () => {
+    const firstRead = deferred<ReturnType<typeof searchJob>>();
+    const startNoteSearch = vi.fn().mockResolvedValue({ job_id: "search-bounded", status: "queued" });
+    const loadSearchJob = vi.fn()
+      .mockImplementationOnce(() => firstRead.promise)
+      .mockResolvedValue(searchJob("search-bounded", "running"));
+    render(<RadarPage loadRadar={vi.fn().mockResolvedValue({ snapshots: [], accounts: [] })} startNoteSearch={startNoteSearch} loadSearchJob={loadSearchJob} pollIntervalMs={100} searchMaxPolls={2} />);
+    await screen.findByText("No ranking evidence recorded");
+    fireEvent.change(screen.getByLabelText("Note search keyword"), { target: { value: "收纳" } });
+    vi.useFakeTimers();
+    try {
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Search public notes" })); await Promise.resolve(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      expect(loadSearchJob).toHaveBeenCalledWith("search-bounded");
+      firstRead.resolve(searchJob("search-bounded", "running"));
+      await act(async () => { await Promise.resolve(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+
+      expect(screen.getByText("Automatic search refresh stopped after 2 checks.")).toBeVisible();
+      expect(screen.getByText("search-bounded")).toBeVisible();
+      expect(screen.getByRole("button", { name: "Search public notes" })).toBeEnabled();
+      const resume = screen.getByRole("button", { name: "Continue refreshing search-bounded" });
+      expect(resume).toBeEnabled();
+
+      await act(async () => { fireEvent.click(resume); await Promise.resolve(); });
+      expect(screen.getByRole("button", { name: "Search public notes" })).toBeDisabled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      expect(loadSearchJob).toHaveBeenCalledTimes(3);
+      expect(loadSearchJob.mock.calls.every(([jobId]) => jobId === "search-bounded")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("cancels scheduled search polling when the page unmounts", async () => {

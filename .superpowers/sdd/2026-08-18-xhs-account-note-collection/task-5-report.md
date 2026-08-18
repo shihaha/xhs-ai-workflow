@@ -96,3 +96,41 @@ truthfully `not_run`.
 
 Commit: the single Task 5 commit containing this report is recorded in the final
 handoff because a commit cannot contain its own resulting hash.
+
+## Review fix round 1/5
+
+Three Important findings were reproduced before implementation:
+
+```text
+npm test --prefix frontend -- --run src/pages/AccountPage.test.tsx src/pages/RadarPage.test.tsx
+3 failed, 20 passed
+
+python -m pytest backend/tests/xhs/test_live_cli_contract.py -q
+2 failed, 1 skipped
+```
+
+- Account and Radar now use 60 default checks, release their active ID at the
+  bound, retain the non-terminal job/audit record, and offer an explicit
+  same-returned-job resume action. Deferred fake timers prove the lock releases
+  and resumed reads never switch IDs.
+- The live gate uses the supported `xhs status` text command without `--json`,
+  then validates a real identity shape from `xhs whoami --json`. The
+  authenticated fake runs the complete fixed `user`, `user-posts`, `search`
+  path; the unauthenticated fake stays `not_run` with no database facts.
+- Only account-note evidence with `eligible_for_opportunity=true` is presented as
+  trusted/selectable. False entries remain visible as stale or untrusted,
+  require human verification, and are disabled. Notes still do not satisfy the
+  separate exact shop N/N gate.
+
+Focused GREEN evidence:
+
+```text
+Account/Radar: 23 passed
+Live contract: 2 passed, 1 skipped
+Frontend full: 47 passed
+Backend xhs + analysis: 430 passed, 2 skipped
+Controlled E2E repeat-5: 5 passed
+Repository verify: 1022 backend passed, 2 skipped; 47 frontend passed;
+build, controlled E2E, dependency audit, secret scan and boundary scan passed
+npm audit: 0 vulnerabilities
+```

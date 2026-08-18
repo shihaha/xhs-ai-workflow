@@ -1,9 +1,15 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { AccountPage } from "./AccountPage";
 
 const account = { user_id: "author-1", account_name: "真实账号", score: 4.25, evidence: 2.5, credibility: 1.25, accessibility: 1.36, fans: 400, gmv: "1万-10万", pay: "5%-10%", read: "1万-10万", nday: 3, nboard: 2 };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
 
 describe("AccountPage", () => {
   it("shows missing account facts without inventing a profile", async () => {
@@ -146,6 +152,59 @@ describe("AccountPage", () => {
     expect(await screen.findByText(/Automatic account refresh stopped after 2 checks/)).toBeVisible();
   });
 
+  it("releases an exhausted account poll and can resume only that returned job", async () => {
+    const firstRead = deferred<ReturnType<typeof accountJob>>();
+    const startAccountCollection = vi.fn().mockResolvedValue({ job_id: "xhs-job-bounded", status: "queued" });
+    const loadCollectionJob = vi.fn()
+      .mockImplementationOnce(() => firstRead.promise)
+      .mockResolvedValue(accountJob("xhs-job-bounded", "running"));
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({ account, profile: null, notes: [], evidence: [], analyses: [], jobs: [], devices: [] })} startAccountCollection={startAccountCollection} loadCollectionJob={loadCollectionJob} pollIntervalMs={100} maxPolls={2} />);
+    await screen.findByRole("heading", { name: "真实账号" });
+    vi.useFakeTimers();
+    try {
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Collect account and notes" })); await Promise.resolve(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      expect(loadCollectionJob).toHaveBeenCalledWith("xhs-job-bounded");
+      firstRead.resolve(accountJob("xhs-job-bounded", "running"));
+      await act(async () => { await Promise.resolve(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+
+      expect(screen.getByText("Automatic account refresh stopped after 2 checks.")).toBeVisible();
+      expect(screen.getByText("xhs-job-bounded")).toBeVisible();
+      expect(screen.getByRole("button", { name: "Collect account and notes" })).toBeEnabled();
+      const resume = screen.getByRole("button", { name: "Continue refreshing xhs-job-bounded" });
+      expect(resume).toBeEnabled();
+
+      await act(async () => { fireEvent.click(resume); await Promise.resolve(); });
+      expect(screen.getByRole("button", { name: "Collect account and notes" })).toBeDisabled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      expect(loadCollectionJob).toHaveBeenCalledTimes(3);
+      expect(loadCollectionJob.mock.calls.every(([jobId]) => jobId === "xhs-job-bounded")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("marks an ineligible account note as untrusted and prevents selecting it", async () => {
+    const createAnalysis = vi.fn();
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({
+      account,
+      profile: null,
+      notes: [],
+      evidence: [{ evidence_id: "account-note:99", kind: "account_note", account_user_id: "author-1", eligible_for_opportunity: false }],
+      analyses: [], jobs: [], devices: [],
+    })} createAnalysis={createAnalysis} />);
+
+    await screen.findByRole("heading", { name: "真实账号" });
+    expect(screen.getByRole("heading", { name: "Notes requiring human verification" }).parentElement).toHaveTextContent(/account-note:99.*stale or untrusted.*human verification/i);
+    expect(screen.queryByText(/account-note:99.*trusted account-note input/i)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("account-note:99")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Generate account report" })).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("account-note:99"));
+    fireEvent.click(screen.getByRole("button", { name: "Generate account report" }));
+    expect(createAnalysis).not.toHaveBeenCalled();
+  });
+
   it("cancels scheduled account polling when the page unmounts", async () => {
     const startAccountCollection = vi.fn().mockResolvedValue({ job_id: "xhs-job-unmount", status: "queued" });
     const loadCollectionJob = vi.fn();
@@ -158,3 +217,11 @@ describe("AccountPage", () => {
     expect(loadCollectionJob).not.toHaveBeenCalled();
   });
 });
+
+function accountJob(id: string, state: "queued" | "running" | "needs_human" | "succeeded" | "failed" | "cancelled") {
+  return {
+    id, type: "xhs_account_collection", input: { user_id: "author-1", expected_note_count: 1 }, state,
+    progress_current: state === "succeeded" ? 1 : 0, progress_total: 1, current_stage: "xhs_collection_result", error_category: null,
+    retry_count: 0, created_at: "2026-08-18T00:00:00Z", updated_at: "2026-08-18T00:00:01Z", started_at: null, completed_at: null, lease_expires_at: null, logs: [], artifacts: [],
+  } as const;
+}
