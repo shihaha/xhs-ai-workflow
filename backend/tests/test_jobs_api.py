@@ -87,7 +87,7 @@ async def test_job_progress_logs_and_evidence_survive_a_new_app_instance(
 
 
 @pytest.mark.parametrize(
-    "reserved_job_type", ["android_shop_collection", "shop_collection", "qianfan_ranking_scope"]
+    "reserved_job_type", ["android_shop_collection", "shop_collection", "qianfan_ranking_scope", "xhs_account_collection", "xhs_note_search"]
 )
 @pytest.mark.anyio
 async def test_reserved_worker_jobs_are_readable_but_reject_public_claim_logs_and_artifacts(
@@ -141,7 +141,7 @@ async def test_reserved_worker_jobs_are_readable_but_reject_public_claim_logs_an
 
 
 @pytest.mark.parametrize(
-    "reserved_job_type", ["android_shop_collection", "shop_collection", "qianfan_ranking_scope"]
+    "reserved_job_type", ["android_shop_collection", "shop_collection", "qianfan_ranking_scope", "xhs_account_collection", "xhs_note_search"]
 )
 @pytest.mark.anyio
 async def test_reserved_worker_public_transition_rejects_fake_success_and_cancel_field_injection(
@@ -198,7 +198,7 @@ async def test_reserved_worker_public_transition_rejects_fake_success_and_cancel
     ("reserved_job_type", "initial_state"),
     [
         (reserved_job_type, initial_state)
-        for reserved_job_type in ("android_shop_collection", "shop_collection", "qianfan_ranking_scope")
+        for reserved_job_type in ("android_shop_collection", "shop_collection", "qianfan_ranking_scope", "xhs_account_collection", "xhs_note_search")
         for initial_state in (JobState.queued, JobState.running)
     ],
 )
@@ -240,7 +240,7 @@ async def test_reserved_worker_public_pure_cancellation_sets_server_facts(
 
 
 @pytest.mark.parametrize(
-    "reserved_job_type", ["android_shop_collection", "shop_collection", "qianfan_ranking_scope"]
+    "reserved_job_type", ["android_shop_collection", "shop_collection", "qianfan_ranking_scope", "xhs_account_collection", "xhs_note_search"]
 )
 @pytest.mark.anyio
 async def test_reserved_worker_public_cancellation_rejects_unknown_fields(

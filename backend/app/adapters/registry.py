@@ -58,3 +58,18 @@ class AdapterRegistry:
 
     def registrations(self) -> tuple[AdapterRegistration, ...]:
         return tuple(self._registrations)
+
+
+def build_default_registry(settings: Any) -> AdapterRegistry:
+    """Register production adapters from trusted application settings only."""
+    from backend.app.adapters.xhs_cli_read import XhsCliReadAdapter
+
+    registry = AdapterRegistry()
+    adapter = XhsCliReadAdapter.from_settings(settings)
+    registry.register(
+        name="xhs-cli-read",
+        adapter=adapter,
+        capabilities=adapter.capabilities,
+        priority=100,
+    )
+    return registry

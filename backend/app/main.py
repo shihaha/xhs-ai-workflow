@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from backend.app.api.health import router as health_router
 from backend.app.api.jobs import router as jobs_router
 from backend.app.adapters.android_device import AndroidDeviceAdapter
+from backend.app.adapters.registry import build_default_registry
 from backend.app.adapters.bailian import BailianModelAdapter
 from backend.app.adapters.qianfan_playwright import (
     QianfanPlaywrightAdapter,
@@ -32,6 +33,8 @@ from backend.app.features.shops.service import (
     ANDROID_SHOP_JOB_TYPES,
     ShopCollectionService,
 )
+from backend.app.features.xhs.api import router as xhs_router
+from backend.app.features.xhs.service import XhsCollectionService
 from backend.app.settings import Settings
 from backend.app.services.jobs import JobService
 
@@ -44,6 +47,9 @@ async def _lifespan(app: FastAPI):
             cleanup_worker.start()
         yield
     finally:
+        xhs_service: XhsCollectionService | None = app.state.xhs_collection_service
+        if xhs_service is not None:
+            xhs_service.close()
         qianfan_service: QianfanCollectionService | None = (
             app.state.qianfan_collection_service
         )
@@ -67,6 +73,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = None
     app.state.job_service = None
     app.state.radar_service = None
+    app.state.adapter_registry = None
+    app.state.xhs_collection_service = None
     app.state.qianfan_collection_service = None
     app.state.android_adapter = None
     app.state.shop_service = None
@@ -90,6 +98,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         app.state.job_service = JobService(
             app.state.database, runtime_dir=app.state.settings.runtime_dir
+        )
+        app.state.adapter_registry = build_default_registry(app.state.settings)
+        app.state.xhs_collection_service = XhsCollectionService(
+            database=app.state.database,
+            job_service=app.state.job_service,
+            adapter=app.state.adapter_registry.resolve("fetch_account"),
+            runtime_dir=app.state.settings.runtime_dir,
         )
         app.state.radar_service = RadarService(app.state.database)
         page_factory = persistent_qianfan_page_factory(
@@ -142,6 +157,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.qianfan_collection_service.close()
         app.state.database = None
         app.state.job_service = None
+        app.state.adapter_registry = None
+        app.state.xhs_collection_service = None
         app.state.radar_service = None
         app.state.qianfan_collection_service = None
         app.state.analysis_service = None
@@ -165,6 +182,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(shops_router)
     app.include_router(analysis_router)
     app.include_router(content_router)
+    app.include_router(xhs_router)
 
     @app.exception_handler(SQLAlchemyError)
     async def database_failure(request: Request, _: SQLAlchemyError) -> JSONResponse:

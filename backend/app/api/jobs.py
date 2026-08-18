@@ -21,6 +21,7 @@ from backend.app.services.jobs import (
     JobNotFound,
     JobService,
 )
+from backend.app.features.xhs.service import XHS_RESERVED_ARTIFACT_KINDS, XHS_RESERVED_JOB_TYPES
 
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
@@ -28,8 +29,11 @@ _RESERVED_JOB_TYPES = {
     "android_shop_collection",
     "shop_collection",
     "qianfan_ranking_scope",
+    *XHS_RESERVED_JOB_TYPES,
 }
-_RESERVED_ARTIFACT_KINDS = {"shop_collection_result", "qianfan_raw_capture"}
+_RESERVED_ARTIFACT_KINDS = {
+    "shop_collection_result", "qianfan_raw_capture", *XHS_RESERVED_ARTIFACT_KINDS
+}
 
 
 def _service(request: Request) -> JobService:
