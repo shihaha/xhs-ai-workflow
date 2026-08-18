@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from typing import Any, Literal, Protocol
+from urllib.parse import urlsplit
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class CollectionRequest(BaseModel):
@@ -23,6 +31,18 @@ class CollectionItem(BaseModel):
     source_url: AnyHttpUrl
     raw_evidence: dict[str, Any] = Field(min_length=1)
     data: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def reject_ambiguous_source_url_literal(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                path = urlsplit(value).path
+            except (TypeError, ValueError, UnicodeError):
+                return value
+            if value.endswith(("?", "#")) or path.startswith("//"):
+                raise ValueError("source_url uses an ambiguous URL literal")
+        return value
 
 
 class MissingCollectionItem(BaseModel):

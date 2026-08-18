@@ -262,7 +262,13 @@ class JobService:
         path: str,
         metadata: dict[str, Any],
     ) -> Job | None:
-        """Atomically let either cancellation or one running result own final state."""
+        """Let one running result own final state while retaining uncertain bytes.
+
+        File/database atomicity is not available across SQLite and NTFS. If the
+        state CAS loses or a commit acknowledgement is uncertain, the generated
+        file is deliberately retained for operator recovery instead of being
+        permanently deleted.
+        """
         if state not in {
             JobState.succeeded,
             JobState.failed,
@@ -288,7 +294,6 @@ class JobService:
         if state in _TERMINAL_STATES:
             values["completed_at"] = now
 
-        moved = False
         try:
             with self.database.session() as session:
                 result = session.execute(
@@ -301,10 +306,8 @@ class JobService:
                 )
                 if result.rowcount != 1:
                     session.rollback()
-                    temp_absolute.unlink(missing_ok=True)
                     return None
                 temp_absolute.replace(final_absolute)
-                moved = True
                 session.add(
                     JobArtifactRecord(
                         job_id=job_id,
@@ -317,10 +320,8 @@ class JobService:
                 )
                 session.commit()
         except Exception:
-            if moved:
-                final_absolute.unlink(missing_ok=True)
-            else:
-                temp_absolute.unlink(missing_ok=True)
+            # Fail safe: a rollback and a lost commit acknowledgement are not
+            # distinguishable here. Keep whichever path owns the bytes.
             raise
         return self.get(job_id)
 
@@ -385,6 +386,7 @@ class JobService:
                         "was not resumed automatically."
                     )
                 else:
+                    record.error_category = "worker_interrupted"
                     message = "Running lease expired; human recovery required."
                 session.add(
                     JobLogRecord(

@@ -4,6 +4,9 @@ Windows-local workbench for evidence-backed Xiaohongshu research and analysis.
 
 ## Local development
 
+Prerequisites: Python 3.12+ and Node 20.19+. The repository's verified Node
+toolchain is pinned in `.node-version` (24.18.0).
+
 ```powershell
 python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
@@ -39,3 +42,8 @@ npm run test:e2e
 ```
 
 The Playwright test starts a test-only FastAPI application with a fresh temporary SQLite database and controlled Qianfan/device/model adapters. It is not a live Qianfan, Android, or Bailian verification.
+
+For normal local operation and the complete release checks, use
+`scripts/run-local.ps1` and `scripts/verify.ps1`. Operational recovery and the
+remaining live gates are documented in `docs/RUNBOOK.md` and
+`docs/UAT_CHECKLIST.md`.

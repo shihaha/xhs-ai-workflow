@@ -138,6 +138,25 @@ def test_collection_item_rejects_missing_source_or_raw_evidence(
         )
 
 
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "https://www.xiaohongshu.com/explore/example?",
+        "https://www.xiaohongshu.com/explore/example#",
+        "https://www.xiaohongshu.com//explore/example",
+    ],
+)
+def test_collection_item_rejects_ambiguous_source_url_literals(source_url: str) -> None:
+    """Evidence identity must not silently normalize ambiguous URL spellings."""
+    with pytest.raises(ValidationError):
+        CollectionItem(
+            id="note-1",
+            kind="note",
+            source_url=source_url,
+            raw_evidence={"source_url": source_url},
+        )
+
+
 def test_collection_result_rejects_claimed_nn_completion_with_missing_successes() -> None:
     """Treating one successful item as 2/2 would falsely close an incomplete collection."""
     with pytest.raises(ValidationError):

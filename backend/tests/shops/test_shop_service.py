@@ -568,7 +568,9 @@ def test_service_checks_cancellation_before_persisting_a_final_success(
     )
     result_dir = runtime_dir / "evidence" / "shops" / queued.job_id
     assert not list(result_dir.glob("*.json"))
-    assert not list(result_dir.glob("*.tmp"))
+    retained = list(result_dir.glob("*.tmp"))
+    assert len(retained) == 1
+    assert retained[0].read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("race_boundary", ["persist", "finalize"])
@@ -640,7 +642,9 @@ def test_cancellation_wins_atomically_against_shop_result_finalization(
     )
     result_dir = runtime_dir / "evidence" / "shops" / queued.job_id
     assert not list(result_dir.glob("*.json"))
-    assert not list(result_dir.glob("*.tmp"))
+    retained = list(result_dir.glob("*.tmp"))
+    assert len(retained) == 1
+    assert retained[0].read_text(encoding="utf-8")
 
 
 def test_atomic_finalization_cannot_be_overwritten_by_a_stale_cancellation(
@@ -841,7 +845,7 @@ def test_app_startup_classifies_expired_shop_workers_before_generic_lease_recove
         generic = app.state.job_service.get(non_shop.id)
         assert generic.state is JobState.needs_human
         assert generic.current_stage == "radar_running"
-        assert generic.error_category is None
+        assert generic.error_category == "worker_interrupted"
         assert generic.logs[-1].message == (
             "Running lease expired; human recovery required."
         )
