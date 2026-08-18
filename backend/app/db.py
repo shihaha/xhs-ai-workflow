@@ -1062,14 +1062,8 @@ END
 _MATERIAL_PATH_INSERT_TRIGGER = _reference_guard_trigger(
     "ck_gc_material_path_insert", "content_product_materials", "INSERT"
 )
-_MATERIAL_PATH_UPDATE_TRIGGER = _reference_guard_trigger(
-    "ck_gc_material_path_update", "content_product_materials", "UPDATE OF path"
-)
 _PACKAGE_PATH_INSERT_TRIGGER = _reference_guard_trigger(
     "ck_gc_package_path_insert", "content_packages", "INSERT"
-)
-_PACKAGE_PATH_UPDATE_TRIGGER = _reference_guard_trigger(
-    "ck_gc_package_path_update", "content_packages", "UPDATE OF path"
 )
 
 _ARTIFACT_REFERENCE_ROWS = """
@@ -1133,69 +1127,98 @@ EXISTS (
 """
 
 
-_CLEANUP_QUARANTINE_REFERENCE_EXISTS = _cleanup_reference_exists(
-    "NEW",
-    target_path="NEW.quarantine_path",
-    require_expected_identity=False,
-    exclude_material_owner=False,
-    exclude_exact_failed_package_owner=False,
-)
-
-_CLEANUP_QUARANTINE_LIVE_REFERENCE_EXISTS = _cleanup_reference_exists(
-    "NEW",
-    target_path="NEW.quarantine_path",
-    require_expected_identity=True,
-    exclude_material_owner=True,
-    exclude_exact_failed_package_owner=True,
-)
-
-_CLEANUP_ORIGINAL_EXTERNAL_LIVE_REFERENCE_EXISTS = _cleanup_reference_exists(
-    "NEW",
-    target_path="NEW.relative_path",
-    require_expected_identity=True,
-    exclude_material_owner=True,
-    exclude_exact_failed_package_owner=True,
-    exclude_package_owner=True,
-)
-
-_CLEANUP_LIVE_REFERENCE_EXCEPTION = f"""
-NEW.state = 'needs_human'
-AND COALESCE(NEW.last_error_category, '') = 'live_reference'
-AND NEW.quarantine_path IS NOT NULL
-AND NEW.quarantine_volume_id IS NOT NULL
-AND NEW.quarantine_file_id IS NOT NULL
-AND NEW.quarantine_size_bytes IS NOT NULL
-AND NEW.quarantine_mtime_ns IS NOT NULL
-AND {_CLEANUP_QUARANTINE_LIVE_REFERENCE_EXISTS}
+def _cleanup_reference_conflict_when(cleanup: str) -> str:
+    quarantine_reference_exists = _cleanup_reference_exists(
+        cleanup,
+        target_path=f"{cleanup}.quarantine_path",
+        require_expected_identity=False,
+        exclude_material_owner=False,
+        exclude_exact_failed_package_owner=False,
+    )
+    quarantine_live_reference_exists = _cleanup_reference_exists(
+        cleanup,
+        target_path=f"{cleanup}.quarantine_path",
+        require_expected_identity=True,
+        exclude_material_owner=True,
+        exclude_exact_failed_package_owner=True,
+    )
+    original_external_live_reference_exists = _cleanup_reference_exists(
+        cleanup,
+        target_path=f"{cleanup}.relative_path",
+        require_expected_identity=True,
+        exclude_material_owner=True,
+        exclude_exact_failed_package_owner=True,
+        exclude_package_owner=True,
+    )
+    live_reference_exception = f"""
+{cleanup}.state = 'needs_human'
+AND COALESCE({cleanup}.last_error_category, '') = 'live_reference'
+AND {cleanup}.quarantine_path IS NOT NULL
+AND {cleanup}.quarantine_volume_id IS NOT NULL
+AND {cleanup}.quarantine_file_id IS NOT NULL
+AND {cleanup}.quarantine_size_bytes IS NOT NULL
+AND {cleanup}.quarantine_mtime_ns IS NOT NULL
+AND {quarantine_live_reference_exists}
 """
-
-_CLEANUP_MOVED_LIVE_REFERENCE_FACT = f"""
-NEW.state = 'needs_human'
-AND COALESCE(NEW.last_error_category, '') = 'live_reference'
-AND NEW.quarantine_path IS NOT NULL
-AND NEW.quarantine_volume_id IS NOT NULL
-AND NEW.quarantine_file_id IS NOT NULL
-AND NEW.quarantine_size_bytes IS NOT NULL
-AND NEW.quarantine_mtime_ns IS NOT NULL
+    moved_live_reference_fact = f"""
+{cleanup}.state = 'needs_human'
+AND COALESCE({cleanup}.last_error_category, '') = 'live_reference'
+AND {cleanup}.quarantine_path IS NOT NULL
+AND {cleanup}.quarantine_volume_id IS NOT NULL
+AND {cleanup}.quarantine_file_id IS NOT NULL
+AND {cleanup}.quarantine_size_bytes IS NOT NULL
+AND {cleanup}.quarantine_mtime_ns IS NOT NULL
 AND (
-    {_CLEANUP_QUARANTINE_LIVE_REFERENCE_EXISTS}
-    OR {_CLEANUP_ORIGINAL_EXTERNAL_LIVE_REFERENCE_EXISTS}
+    {quarantine_live_reference_exists}
+    OR {original_external_live_reference_exists}
 )
 """
-
-_CLEANUP_CAPTURES_REFERENCE_WHEN = f"""
+    return f"""
 (
-    NEW.quarantine_path IS NOT NULL
-    AND NEW.state IN ('claimed','quarantined','deleted','needs_human')
-    AND {_CLEANUP_QUARANTINE_REFERENCE_EXISTS}
-    AND NOT ({_CLEANUP_LIVE_REFERENCE_EXCEPTION})
+    {cleanup}.quarantine_path IS NOT NULL
+    AND {cleanup}.state IN ('claimed','quarantined','deleted','needs_human')
+    AND {quarantine_reference_exists}
+    AND NOT ({live_reference_exception})
 )
 OR (
-    NEW.quarantine_path IS NOT NULL
-    AND COALESCE(NEW.last_error_category, '') = 'live_reference'
-    AND NOT ({_CLEANUP_MOVED_LIVE_REFERENCE_FACT})
+    {cleanup}.quarantine_path IS NOT NULL
+    AND COALESCE({cleanup}.last_error_category, '') = 'live_reference'
+    AND NOT ({moved_live_reference_fact})
 )
 """
+
+
+_CLEANUP_CAPTURES_REFERENCE_WHEN = _cleanup_reference_conflict_when("NEW")
+
+
+def _reference_guard_update_trigger(
+    name: str, table: str, mutable_columns: str
+) -> str:
+    cleanup_conflict = _cleanup_reference_conflict_when("cleanup")
+    return f"""
+CREATE TRIGGER {name}
+AFTER UPDATE OF {mutable_columns} ON {table}
+WHEN (OLD.path IS NOT NEW.path AND ({_QUARANTINE_REFERENCE_WHEN}))
+OR EXISTS (
+    SELECT 1 FROM artifact_gc_queue AS cleanup
+    WHERE {cleanup_conflict}
+)
+BEGIN
+    SELECT RAISE(ABORT, 'quarantine path conflicts with an existing artifact reference');
+END
+"""
+
+
+_MATERIAL_PATH_UPDATE_TRIGGER = _reference_guard_update_trigger(
+    "ck_gc_material_path_update",
+    "content_product_materials",
+    "id, path, sha256, size_bytes",
+)
+_PACKAGE_PATH_UPDATE_TRIGGER = _reference_guard_update_trigger(
+    "ck_gc_package_path_update",
+    "content_packages",
+    "id, status, path, sha256, size_bytes",
+)
 
 _CLEANUP_REFERENCE_INSERT_TRIGGER = f"""
 CREATE TRIGGER ck_gc_cleanup_reference_insert
@@ -1264,52 +1287,12 @@ def _artifact_reference_guard_triggers_valid(connection: Connection) -> bool:
 
 
 def _artifact_reference_guard_data_valid(connection: Connection) -> bool:
-    quarantine_reference_exists = _cleanup_reference_exists(
-        "cleanup",
-        target_path="cleanup.quarantine_path",
-        require_expected_identity=False,
-        exclude_material_owner=False,
-        exclude_exact_failed_package_owner=False,
-    )
-    quarantine_live_reference_exists = _cleanup_reference_exists(
-        "cleanup",
-        target_path="cleanup.quarantine_path",
-        require_expected_identity=True,
-        exclude_material_owner=True,
-        exclude_exact_failed_package_owner=True,
-    )
-    original_external_live_reference_exists = _cleanup_reference_exists(
-        "cleanup",
-        target_path="cleanup.relative_path",
-        require_expected_identity=True,
-        exclude_material_owner=True,
-        exclude_exact_failed_package_owner=True,
-        exclude_package_owner=True,
-    )
+    cleanup_conflict = _cleanup_reference_conflict_when("cleanup")
     try:
         return connection.scalar(
             text(
-                "SELECT 1 FROM artifact_gc_queue AS cleanup WHERE ("
-                "cleanup.quarantine_path IS NOT NULL "
-                "AND cleanup.state IN ('claimed','quarantined','deleted','needs_human') "
-                f"AND {quarantine_reference_exists} "
-                "AND NOT (cleanup.state='needs_human' "
-                "AND COALESCE(cleanup.last_error_category,'')='live_reference' "
-                "AND cleanup.quarantine_volume_id IS NOT NULL "
-                "AND cleanup.quarantine_file_id IS NOT NULL "
-                "AND cleanup.quarantine_size_bytes IS NOT NULL "
-                "AND cleanup.quarantine_mtime_ns IS NOT NULL "
-                f"AND {quarantine_live_reference_exists})) OR ("
-                "cleanup.quarantine_path IS NOT NULL "
-                "AND COALESCE(cleanup.last_error_category,'')='live_reference' "
-                "AND NOT ("
-                "cleanup.state='needs_human' AND cleanup.quarantine_path IS NOT NULL "
-                "AND cleanup.quarantine_volume_id IS NOT NULL "
-                "AND cleanup.quarantine_file_id IS NOT NULL "
-                "AND cleanup.quarantine_size_bytes IS NOT NULL "
-                "AND cleanup.quarantine_mtime_ns IS NOT NULL "
-                f"AND ({quarantine_live_reference_exists} "
-                f"OR {original_external_live_reference_exists}))) "
+                "SELECT 1 FROM artifact_gc_queue AS cleanup WHERE "
+                f"{cleanup_conflict} "
                 "LIMIT 1"
             )
         ) is None

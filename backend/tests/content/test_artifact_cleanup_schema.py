@@ -489,6 +489,290 @@ def test_same_package_owner_with_nonoriginal_quarantine_reference_is_live(
         database.close()
 
 
+def _persist_moved_live_reference(
+    database: Database, cleanup_id: str, quarantine_path: str, *, size: int
+) -> None:
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE artifact_gc_queue SET state='needs_human', "
+                "last_error_category='live_reference', quarantine_path=:path, "
+                "quarantine_volume_id=1, quarantine_file_id=2, "
+                "quarantine_size_bytes=:size, quarantine_mtime_ns=3 WHERE id=:id"
+            ),
+            {"path": quarantine_path, "size": size, "id": cleanup_id},
+        )
+
+
+def _insert_live_material_support(
+    database: Database,
+    *,
+    material_id: str,
+    path: str,
+    sha256: str,
+    size_bytes: int,
+) -> None:
+    with database.engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            text(
+                "INSERT INTO content_product_materials "
+                "(id,product_id,logical_name,logical_key,version,path,sha256,"
+                "size_bytes,media_type,kind,created_at) VALUES "
+                "(:id,:product_id,:name,:key,1,:path,:sha256,:size,"
+                "'text/plain','source',CURRENT_TIMESTAMP)"
+            ),
+            {
+                "id": material_id,
+                "product_id": str(uuid4()),
+                "name": f"{material_id}.txt",
+                "key": f"{material_id}.txt",
+                "path": path,
+                "sha256": sha256,
+                "size": size_bytes,
+            },
+        )
+        connection.commit()
+
+
+@pytest.mark.parametrize(
+    ("assignment", "value"),
+    [
+        ("path=:value", "elsewhere/material.txt"),
+        ("sha256=:value", "b" * 64),
+        ("size_bytes=:value", 13),
+    ],
+)
+def test_material_support_identity_cannot_mutate_away_from_live_reference(
+    tmp_path: Path, assignment: str, value: object
+) -> None:
+    database = Database(tmp_path / f"material-support-{uuid4()}.sqlite3", runtime_dir=tmp_path)
+    cleanup = _insert_cleanup(database)
+    material_id = str(uuid4())
+    quarantine_path = f"artifacts-quarantine/{cleanup.id}/Café.ZIP"
+    try:
+        _insert_live_material_support(
+            database,
+            material_id=material_id,
+            path=f"ARTIFACTS-QUARANTINE/{cleanup.id}/Cafe\u0301.zip.",
+            sha256="a" * 64,
+            size_bytes=12,
+        )
+        _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
+
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        f"UPDATE content_product_materials SET {assignment} WHERE id=:id"
+                    ),
+                    {"value": value, "id": material_id},
+                )
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("assignment", "value"),
+    [
+        ("path=:value", "elsewhere/package.zip"),
+        ("sha256=:value", "c" * 64),
+        ("size_bytes=:value", 18),
+        ("status=:value", "failed"),
+    ],
+)
+def test_package_support_identity_cannot_mutate_away_from_live_reference(
+    tmp_path: Path, assignment: str, value: object
+) -> None:
+    database = Database(tmp_path / f"package-support-{uuid4()}.sqlite3", runtime_dir=tmp_path)
+    package_id = str(uuid4())
+    quarantine_path = f"artifacts-quarantine/{uuid4()}/Café.ZIP"
+    cleanup = _insert_cleanup(
+        database,
+        owner_type="content_package",
+        owner_id=package_id,
+        relative_path=quarantine_path,
+        path_key=quarantine_path.lower(),
+        expected_sha256="a" * 64,
+        expected_size_bytes=17,
+    )
+    try:
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                text(
+                    "INSERT INTO content_packages "
+                    "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                    "build_token,created_at,error_detail) VALUES "
+                    "(:id,:item_id,:revision_id,'ready',:path,:sha256,:size,NULL,"
+                    "CURRENT_TIMESTAMP,NULL)"
+                ),
+                {
+                    "id": package_id,
+                    "item_id": str(uuid4()),
+                    "revision_id": str(uuid4()),
+                    "path": quarantine_path.swapcase() + ".",
+                    "sha256": "a" * 64,
+                    "size": 17,
+                },
+            )
+            connection.commit()
+        _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=17)
+
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text(f"UPDATE content_packages SET {assignment} WHERE id=:id"),
+                    {"value": value, "id": package_id},
+                )
+    finally:
+        database.close()
+
+
+def test_one_support_reference_may_change_when_another_valid_support_remains(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "remaining-support.sqlite3", runtime_dir=tmp_path)
+    cleanup = _insert_cleanup(database)
+    quarantine_path = f"artifacts-quarantine/{cleanup.id}/Café.ZIP"
+    first_id = str(uuid4())
+    second_id = str(uuid4())
+    try:
+        for material_id in (first_id, second_id):
+            _insert_live_material_support(
+                database,
+                material_id=material_id,
+                path=f"ARTIFACTS-QUARANTINE/{cleanup.id}/Cafe\u0301.zip.",
+                sha256="a" * 64,
+                size_bytes=12,
+            )
+        _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
+
+        with database.engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    "UPDATE content_product_materials SET sha256=:sha256 WHERE id=:id"
+                ),
+                {"sha256": "d" * 64, "id": first_id},
+            )
+            assert result.rowcount == 1
+    finally:
+        database.close()
+
+
+def test_material_support_cannot_change_id_into_excluded_cleanup_owner(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "material-support-id.sqlite3", runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    cleanup = _insert_cleanup(
+        database, owner_type="material", owner_id=owner_id
+    )
+    support_id = str(uuid4())
+    quarantine_path = f"artifacts-quarantine/{cleanup.id}/file.zip"
+    try:
+        _insert_live_material_support(
+            database,
+            material_id=support_id,
+            path=quarantine_path,
+            sha256="a" * 64,
+            size_bytes=12,
+        )
+        _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
+
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE content_product_materials SET id=:new_id WHERE id=:id"),
+                    {"new_id": owner_id, "id": support_id},
+                )
+    finally:
+        database.close()
+
+
+def test_package_support_cannot_change_id_into_exact_failed_cleanup_owner(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "package-support-id.sqlite3", runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    support_id = str(uuid4())
+    quarantine_path = f"artifacts-quarantine/{uuid4()}/package.zip"
+    cleanup = _insert_cleanup(
+        database,
+        owner_type="content_package",
+        owner_id=owner_id,
+        relative_path=quarantine_path,
+        path_key=quarantine_path.lower(),
+        expected_sha256="a" * 64,
+        expected_size_bytes=12,
+    )
+    try:
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                text(
+                    "INSERT INTO content_packages "
+                    "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                    "build_token,created_at,error_detail) VALUES "
+                    "(:id,:item_id,:revision_id,'failed',:path,:sha256,12,NULL,"
+                    "CURRENT_TIMESTAMP,'worker_restart_required')"
+                ),
+                {
+                    "id": support_id,
+                    "item_id": str(uuid4()),
+                    "revision_id": str(uuid4()),
+                    "path": quarantine_path,
+                    "sha256": "a" * 64,
+                },
+            )
+            connection.commit()
+        _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
+
+        with pytest.raises(IntegrityError, match="existing artifact reference"):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE content_packages SET id=:new_id WHERE id=:id"),
+                    {"new_id": owner_id, "id": support_id},
+                )
+    finally:
+        database.close()
+
+
+def test_startup_rejects_support_identity_mutated_without_runtime_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "mutated-support.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    cleanup = _insert_cleanup(database)
+    material_id = str(uuid4())
+    quarantine_path = f"artifacts-quarantine/{cleanup.id}/file.zip"
+    _insert_live_material_support(
+        database,
+        material_id=material_id,
+        path=quarantine_path,
+        sha256="a" * 64,
+        size_bytes=12,
+    )
+    _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
+    with database.engine.begin() as connection:
+        trigger_sql = connection.scalar(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='ck_gc_material_path_update'"
+            )
+        )
+        connection.execute(text("DROP TRIGGER ck_gc_material_path_update"))
+        connection.execute(
+            text("UPDATE content_product_materials SET sha256=:sha256 WHERE id=:id"),
+            {"sha256": "e" * 64, "id": material_id},
+        )
+        connection.execute(text(trigger_sql))
+    database.close()
+
+    with pytest.raises(SchemaMigrationError, match="reference guard"):
+        Database(path, runtime_dir=tmp_path)
+
+
 def test_startup_rejects_fabricated_live_reference_exception(tmp_path: Path) -> None:
     path = tmp_path / "fabricated-live-reference.sqlite3"
     database = Database(path, runtime_dir=tmp_path)
@@ -769,6 +1053,29 @@ def test_reference_guard_marker_rejects_weak_trigger(tmp_path: Path) -> None:
             "CREATE TRIGGER ck_gc_material_path_insert "
             "BEFORE INSERT ON content_product_materials WHEN 0 BEGIN "
             "SELECT RAISE(ABORT, 'disabled'); END"
+        )
+
+    with pytest.raises(SchemaMigrationError, match="reference guard"):
+        Database(path, runtime_dir=tmp_path)
+
+
+def test_reference_guard_marker_rejects_path_only_update_trigger(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "path-only-update-trigger.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='ck_gc_material_path_update'"
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER ck_gc_material_path_update")
+        connection.execute(
+            trigger_sql.replace(
+                "AFTER UPDATE OF id, path, sha256, size_bytes",
+                "AFTER UPDATE OF path",
+            )
         )
 
     with pytest.raises(SchemaMigrationError, match="reference guard"):

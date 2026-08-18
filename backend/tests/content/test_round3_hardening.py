@@ -3,6 +3,7 @@ import sqlite3
 import warnings
 
 import pytest
+from sqlalchemy import text
 
 from backend.app.db import Database, SchemaMigrationError
 from backend.app.features.content.export import (
@@ -29,16 +30,17 @@ def test_startup_recovery_retains_configured_runtime_and_database_parent_files(
         item.id, ExportCreate(expected_revision_id=approved.current_revision.id)
     )
     database_path = database_dir / "workbench.sqlite3"
+    with service.database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE content_packages SET status='building' WHERE id=:id"),
+            {"id": package.id},
+        )
     service.database.close()
     runtime_database = runtime_dir / "db.sqlite3"
     runtime_database.replace(database_path)
     unrelated = database_dir / package.path
     unrelated.parent.mkdir(parents=True)
     unrelated.write_bytes(b"unrelated")
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "UPDATE content_packages SET status='building' WHERE id=?", (package.id,)
-        )
 
     reopened = Database(database_path, runtime_dir=runtime_dir)
     try:
