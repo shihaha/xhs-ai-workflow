@@ -6,7 +6,9 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.db import Database, SchemaMigrationError
-from backend.app.features.content.schemas import ContentItemCreate, ReviewCreate
+from backend.app.adapters.contracts import ModelAdapterError
+from backend.app.features.content.schemas import ContentItemCreate, RegenerateCreate, ReviewCreate
+from backend.app.features.content.service import ContentModelFailure
 from backend.tests.content.test_workflow import (
     add_output_image,
     create_product,
@@ -112,6 +114,57 @@ def test_legacy_reviews_backfill_succeeded_and_migration_is_repeatable(tmp_path:
     migrated.close()
     repeated = Database(path)
     repeated.close()
+
+
+def test_legacy_regenerate_backfill_requires_a_proving_successor_revision(
+    tmp_path: Path,
+) -> None:
+    service, opportunity_id, evidence_id = seeded_service(tmp_path)
+    product_id = create_product(service, opportunity_id)
+    image = add_output_image(service, product_id, tmp_path)
+
+    def rejected_item() -> object:
+        item = service.create_content_item(ContentItemCreate(
+            product_id=product_id, opportunity_id=opportunity_id,
+            template_key="list-v1", evidence_ids=[evidence_id],
+            image_material_ids=[image.id], cover_material_id=image.id,
+            research_facts=[{"fact": "真实事实", "evidence_ids": [evidence_id]}],
+        ))
+        return service.review(item.id, ReviewCreate(
+            decision="reject", actor="operator", note="需要修改",
+            expected_revision_id=item.current_revision.id, visual_checks=[],
+        ))
+
+    successful = rejected_item()
+    service.regenerate(successful.id, RegenerateCreate(
+        expected_revision_id=successful.current_revision.id,
+    ))
+    failed = rejected_item()
+
+    def model_error(request: object, schema: object):
+        raise ModelAdapterError("legacy provider failure", category="network")
+
+    service.model_adapter.generate_structured = model_error  # type: ignore[attr-defined,method-assign]
+    with pytest.raises(ContentModelFailure):
+        service.regenerate(failed.id, RegenerateCreate(
+            expected_revision_id=failed.current_revision.id,
+        ))
+
+    path = service.database.database_path
+    service.database.close()
+    _replace_reviews_with_legacy_table(path, include_audit_columns=False)
+
+    migrated = Database(path)
+    with migrated.engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT content_item_id,outcome,error_category FROM content_reviews "
+            "WHERE decision='regenerate' ORDER BY content_item_id"
+        )).all()
+    migrated.close()
+
+    outcomes = {row.content_item_id: (row.outcome, row.error_category) for row in rows}
+    assert outcomes[successful.id] == ("succeeded", None)
+    assert outcomes[failed.id] == ("failed", "state_changed")
 
 
 def test_present_review_audit_marker_with_weak_schema_fails_closed(tmp_path: Path) -> None:

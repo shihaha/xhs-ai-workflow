@@ -140,6 +140,105 @@ def test_regenerate_success_transaction_failure_records_failed_attempt(
     assert result.reviews[-1].error_category == "transaction_unknown"
 
 
+def test_regenerate_reservation_commit_ack_landed_continues_exact_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    real_commit = Session.commit
+    raised = False
+
+    def commit_then_raise(session: Session) -> None:
+        nonlocal raised
+        if not raised:
+            raised = True
+            real_commit(session)
+            raise SQLAlchemyError("ambiguous reservation acknowledgement")
+        real_commit(session)
+
+    monkeypatch.setattr(Session, "commit", commit_then_raise)
+
+    regenerated = service.regenerate(
+        item.id, RegenerateCreate(expected_revision_id=r1),
+    )
+
+    assert regenerated.status == "review"
+    assert len(regenerated.revisions) == 2
+    assert regenerated.reviews[-1].decision == "regenerate"
+    assert regenerated.reviews[-1].outcome == "succeeded"
+
+
+def test_regenerate_reservation_commit_not_landed_preserves_rejected_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    real_commit = Session.commit
+    raised = False
+
+    def reject_once(session: Session) -> None:
+        nonlocal raised
+        if not raised:
+            raised = True
+            raise SQLAlchemyError("reservation did not land")
+        real_commit(session)
+
+    monkeypatch.setattr(Session, "commit", reject_once)
+
+    with pytest.raises(SQLAlchemyError, match="did not land"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    result = service.get_content_item(item.id)
+    assert result.status == "rejected"
+    assert len(result.revisions) == 1
+    assert [review.decision for review in result.reviews] == ["reject"]
+
+
+def test_regenerate_reservation_commit_unknown_restores_without_pending_deadlock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    real_commit = Session.commit
+    raised = False
+
+    def commit_mutate_attempt_then_raise(session: Session) -> None:
+        nonlocal raised
+        if not raised:
+            raised = True
+            real_commit(session)
+            with service.database.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE content_reviews SET outcome='failed', "
+                    "error_category='transaction_unknown' WHERE decision='regenerate'"
+                )
+            raise SQLAlchemyError("contradictory reservation acknowledgement")
+        real_commit(session)
+
+    monkeypatch.setattr(Session, "commit", commit_mutate_attempt_then_raise)
+
+    with pytest.raises(ContentStateError, match="reservation_transaction_unknown"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    result = service.get_content_item(item.id)
+    assert result.status == "rejected"
+    assert len(result.revisions) == 1
+    assert result.reviews[-1].outcome == "failed"
+    assert result.reviews[-1].error_category == "transaction_unknown"
+
+
 def test_illegal_transitions_are_rejected(tmp_path: Path) -> None:
     service, item, image = _draft(tmp_path)
     service.review(item.id, ReviewCreate(

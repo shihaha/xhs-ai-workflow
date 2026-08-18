@@ -439,7 +439,21 @@ class ContentService:
             session.add(attempt)
             session.flush()
             attempt_id = attempt.id
-            session.commit()
+            try:
+                session.commit()
+            except SQLAlchemyError as error:
+                resolution = self._resolve_regeneration_reservation_commit(
+                    item_id, payload_request.expected_revision_id,
+                    attempt_id=attempt_id,
+                )
+                if resolution == "landed":
+                    pass
+                elif resolution == "not_landed":
+                    raise
+                else:
+                    raise ContentStateError(
+                        "regeneration_reservation_transaction_unknown"
+                    ) from error
         try:
             output, model_meta = self._generate(payload, revision_number=number, prior=prior_snapshot, review_notes=notes, generation_context=context)
             self._validate_output(output, allowed=set(payload.evidence_ids), image_ids=payload.image_material_ids)
@@ -508,6 +522,59 @@ class ContentService:
                     "Regeneration failure could not finalize its exact audit attempt."
                 )
             session.commit()
+
+    def _resolve_regeneration_reservation_commit(
+        self, item_id: str, revision_id: str, *, attempt_id: int,
+    ) -> str:
+        """Classify an ambiguous reservation acknowledgement from fresh facts.
+
+        Exact landed reservations may continue. Exact non-landed attempts leave
+        the original rejected item untouched. Contradictory landed facts are
+        conservatively finalized so no draft/pending deadlock survives.
+        """
+        with self.database.session() as session:
+            item = session.get(ContentItemRecord, item_id)
+            attempt = session.get(ContentReviewRecord, attempt_id)
+            exact_attempt = attempt is not None and (
+                attempt.content_item_id == item_id
+                and attempt.revision_id == revision_id
+                and attempt.decision == "regenerate"
+            )
+            if (
+                item is not None and item.status == "draft"
+                and item.current_revision_id == revision_id
+                and exact_attempt and attempt.outcome == "pending"
+                and attempt.error_category is None
+            ):
+                return "landed"
+            if (
+                item is not None and item.status == "rejected"
+                and item.current_revision_id == revision_id
+                and attempt is None
+            ):
+                return "not_landed"
+
+            item_won = 0
+            audit_won = 0
+            if item is not None and item.current_revision_id == revision_id:
+                item_won = session.execute(update(ContentItemRecord).where(
+                    ContentItemRecord.id == item_id,
+                    ContentItemRecord.status == "draft",
+                    ContentItemRecord.current_revision_id == revision_id,
+                ).values(status="rejected", updated_at=_now())).rowcount
+            if exact_attempt:
+                audit_won = session.execute(update(ContentReviewRecord).where(
+                    ContentReviewRecord.id == attempt_id,
+                    ContentReviewRecord.content_item_id == item_id,
+                    ContentReviewRecord.revision_id == revision_id,
+                    ContentReviewRecord.decision == "regenerate",
+                    ContentReviewRecord.outcome == "pending",
+                ).values(
+                    outcome="failed", error_category="transaction_unknown",
+                )).rowcount
+            if item_won or audit_won:
+                session.commit()
+            return "unknown"
 
     @staticmethod
     def _regeneration_error_category(error: Exception, *, trust_phase: bool) -> str:

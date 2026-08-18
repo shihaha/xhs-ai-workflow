@@ -979,3 +979,40 @@ this round does not add a new jobs owner type or alter jobs cleanup behavior.
 Task 8 remains pending independent re-review. Bailian remains
 `not_run: BAILIAN_API_KEY unavailable`, Android remains `not_run: device
 unavailable`, and seven-day UAT remains `not_run`.
+
+## Task 8R-5 fix round 3/5
+
+The round-2 independent re-review was **NOT CLEAN** with zero Critical and two
+Important findings. It reproduced an acknowledged reservation commit that still
+raised to the caller and left `draft + pending`, and showed that the first audit
+migration labeled an unproven failed legacy regeneration as successful.
+
+Strict fault-injection and migration RED coverage was added for exact landed,
+exact not-landed and contradictory reservation acknowledgements, plus proven and
+unproven legacy regenerations. The implementation now:
+
+- classifies an ambiguous reservation commit from a fresh database session;
+- continues only an exact `draft` item plus its exact `pending` audit attempt;
+- preserves the original rejected state when neither reservation fact landed;
+- finalizes owned contradictory draft/pending facts as transaction-unknown failure
+  so retry is not permanently blocked; and
+- backfills legacy approve/reject reviews as successful, but backfills a legacy
+  regenerate review as successful only when it is the unique attempt for that
+  prior revision and the exact next revision exists. All other unproven legacy
+  regenerate reviews become `failed/state_changed` rather than invented success.
+
+Fresh verification before independent re-review:
+
+```text
+focused review/audit/export/workflow: 43 passed
+backend/tests/content: 287 passed
+backend/tests: 600 passed, 1 skipped
+```
+
+Compilation and diff checks exited zero. The request/startup scan found no direct
+physical deletion, cleanup endpoints remain GET-only and the export manifest
+still states `automatic_publish=false`. The existing
+`backend/app/services/jobs.py` unlink issue remains deferred to
+Task 10 and was not modified. Bailian remains
+`not_run: BAILIAN_API_KEY unavailable`, Android remains `not_run: device
+unavailable`, and seven-day UAT remains `not_run`.
