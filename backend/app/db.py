@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 import unicodedata
@@ -175,6 +176,9 @@ class Database:
         xhs_account_note_marker_present = self._migration_marker_exists(
             "xhs_account_note_evidence_v1"
         )
+        xhs_account_note_identity_marker_present = self._migration_marker_exists(
+            "xhs_account_note_identity_v2"
+        )
         quarantine_marker_present = self._migration_marker_exists(
             "task8_artifact_quarantine_v1"
         )
@@ -201,6 +205,8 @@ class Database:
             self._require_artifact_quarantine_reference_guards()
         if xhs_account_note_marker_present:
             self._require_xhs_account_note_evidence_schema()
+        if xhs_account_note_identity_marker_present:
+            self._require_xhs_account_note_identity_schema()
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
@@ -227,6 +233,9 @@ class Database:
         )
         self._migrate_xhs_account_note_evidence(
             marker_present=xhs_account_note_marker_present
+        )
+        self._migrate_xhs_account_note_identity(
+            marker_present=xhs_account_note_identity_marker_present
         )
         self._recover_stranded_content_regenerations()
 
@@ -296,6 +305,13 @@ class Database:
                     "XHS account note evidence schema validation failed."
                 )
 
+    def _require_xhs_account_note_identity_schema(self) -> None:
+        with self.engine.connect() as connection:
+            if not _xhs_account_note_identity_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "XHS account note identity schema validation failed."
+                )
+
     def _migrate_xhs_account_note_evidence(self, *, marker_present: bool) -> None:
         """Install only an empty or fully-valid evidence schema; never guess history."""
         from backend.app.features.xhs.models import (
@@ -343,6 +359,66 @@ class Database:
                 "VALUES ('xhs_account_note_evidence_v1', CURRENT_TIMESTAMP)"
             ))
         self._require_xhs_account_note_evidence_schema()
+
+    def _migrate_xhs_account_note_identity(self, *, marker_present: bool) -> None:
+        """Install permanent note-row identities without reassigning existing IDs."""
+        from backend.app.features.xhs.models import XhsAccountNoteRecord
+
+        if marker_present:
+            self._require_xhs_account_note_identity_schema()
+            return
+        # A missing marker authorizes no write until the complete v1 evidence
+        # schema and its rows have passed a read-only preflight. Recheck inside
+        # the migration transaction below so a concurrent initializer cannot
+        # turn this preflight into a time-of-check/time-of-use gap.
+        with self.engine.connect() as connection:
+            if (
+                not _xhs_account_note_evidence_schema_valid(
+                    inspect(connection), connection
+                )
+                or not _xhs_account_note_evidence_data_valid(connection)
+            ):
+                raise SchemaMigrationError(
+                    "XHS account note identity requires a valid evidence schema."
+                )
+            _xhs_account_note_reference_floor(connection)
+        with self.engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE IF NOT EXISTS workbench_schema_migrations ("
+                "name VARCHAR(200) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL)"
+            ))
+            if connection.scalar(text(
+                "SELECT 1 FROM workbench_schema_migrations "
+                "WHERE name='xhs_account_note_identity_v2'"
+            )) is not None:
+                if not _xhs_account_note_identity_schema_valid(connection):
+                    raise SchemaMigrationError(
+                        "XHS account note identity schema validation failed."
+                    )
+                return
+            if (
+                not _xhs_account_note_evidence_schema_valid(
+                    inspect(connection), connection
+                )
+                or not _xhs_account_note_evidence_data_valid(connection)
+            ):
+                raise SchemaMigrationError(
+                    "XHS account note identity requires a valid evidence schema."
+                )
+            if not _xhs_account_note_autoincrement_ddl_valid(connection):
+                _rebuild_xhs_account_notes_with_permanent_ids(
+                    connection, XhsAccountNoteRecord
+                )
+            _advance_xhs_account_note_identity_sequence(connection)
+            if not _xhs_account_note_identity_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "XHS account note identity schema validation failed."
+                )
+            connection.execute(text(
+                "INSERT INTO workbench_schema_migrations(name, applied_at) "
+                "VALUES ('xhs_account_note_identity_v2', CURRENT_TIMESTAMP)"
+            ))
+        self._require_xhs_account_note_identity_schema()
 
     def _migrate_content_schema(self) -> None:
         inspector = inspect(self.engine)
@@ -1335,6 +1411,150 @@ def _create_xhs_account_note_evidence_triggers(connection: Connection) -> None:
     for name, sql in _XHS_ACCOUNT_NOTE_EVIDENCE_TRIGGER_SQL.items():
         connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
         connection.execute(text(sql))
+
+
+_ACCOUNT_NOTE_EVIDENCE_ID = re.compile(r"^account-note:([1-9][0-9]*)$", re.ASCII)
+
+
+def _xhs_account_note_autoincrement_ddl_valid(connection: Connection) -> bool:
+    try:
+        table_sql = connection.scalar(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='xhs_account_notes'"
+        ))
+    except SQLAlchemyError:
+        return False
+    compact = _compact_sql(table_sql)
+    return "idintegernotnullprimarykeyautoincrement" in compact
+
+
+def _xhs_account_note_reference_floor(connection: Connection) -> int:
+    floor = connection.scalar(
+        text("SELECT COALESCE(MAX(id), 0) FROM xhs_account_notes")
+    )
+    if isinstance(floor, bool) or not isinstance(floor, int) or floor < 0:
+        raise SchemaMigrationError("XHS account note identity sequence is invalid.")
+    tables = set(inspect(connection).get_table_names())
+    for table in ("analyses", "opportunities"):
+        if table not in tables:
+            continue
+        columns = {item["name"] for item in inspect(connection).get_columns(table)}
+        if "evidence_ids_json" not in columns:
+            continue
+        for raw_value, in connection.execute(
+            text(f"SELECT evidence_ids_json FROM {table}")
+        ):
+            try:
+                values = (
+                    json.loads(raw_value)
+                    if isinstance(raw_value, str)
+                    else raw_value
+                )
+            except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                raise SchemaMigrationError(
+                    "XHS account note reference history is invalid."
+                ) from None
+            if not isinstance(values, list) or any(
+                not isinstance(value, str) for value in values
+            ):
+                raise SchemaMigrationError(
+                    "XHS account note reference history is invalid."
+                )
+            for value in values:
+                match = _ACCOUNT_NOTE_EVIDENCE_ID.fullmatch(value)
+                if match is not None:
+                    floor = max(floor, int(match.group(1)))
+    return floor
+
+
+def _advance_xhs_account_note_identity_sequence(connection: Connection) -> None:
+    if not _xhs_account_note_autoincrement_ddl_valid(connection):
+        raise SchemaMigrationError("XHS account note identity DDL is invalid.")
+    floor = _xhs_account_note_reference_floor(connection)
+    rows = connection.execute(text(
+        "SELECT rowid, seq FROM sqlite_sequence WHERE name='xhs_account_notes'"
+    )).all()
+    if len(rows) > 1:
+        raise SchemaMigrationError("XHS account note identity sequence is ambiguous.")
+    if not rows:
+        connection.execute(
+            text(
+                "INSERT INTO sqlite_sequence(name, seq) "
+                "VALUES ('xhs_account_notes', :seq)"
+            ),
+            {"seq": floor},
+        )
+        return
+    sequence = rows[0][1]
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise SchemaMigrationError("XHS account note identity sequence is invalid.")
+    if sequence < floor:
+        connection.execute(
+            text("UPDATE sqlite_sequence SET seq=:seq WHERE rowid=:rowid"),
+            {"seq": floor, "rowid": rows[0][0]},
+        )
+
+
+def _xhs_account_note_identity_schema_valid(connection: Connection) -> bool:
+    try:
+        if (
+            not _xhs_account_note_evidence_schema_valid(
+                inspect(connection), connection
+            )
+            or not _xhs_account_note_evidence_data_valid(connection)
+            or not _xhs_account_note_autoincrement_ddl_valid(connection)
+            or connection.scalar(text(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                "AND name='sqlite_sequence'"
+            )) != 1
+        ):
+            return False
+        rows = connection.execute(text(
+            "SELECT seq FROM sqlite_sequence WHERE name='xhs_account_notes'"
+        )).all()
+        if len(rows) != 1:
+            return False
+        sequence = rows[0][0]
+        return (
+            not isinstance(sequence, bool)
+            and isinstance(sequence, int)
+            and sequence >= _xhs_account_note_reference_floor(connection)
+        )
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError, SchemaMigrationError):
+        return False
+
+
+def _rebuild_xhs_account_notes_with_permanent_ids(
+    connection: Connection, note_record: object
+) -> None:
+    temporary_table = "xhs_account_notes_identity_v1"
+    if temporary_table in inspect(connection).get_table_names():
+        raise SchemaMigrationError(
+            "Interrupted XHS account note identity migration requires isolated manual migration."
+        )
+    for name in (
+        "ck_xhs_note_artifact_job_insert",
+        "ck_xhs_note_artifact_job_update",
+    ):
+        connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+    explicit_indexes = connection.execute(text(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND tbl_name='xhs_account_notes' AND sql IS NOT NULL"
+    )).all()
+    for name, in explicit_indexes:
+        connection.execute(text(f'DROP INDEX "{name}"'))
+    connection.execute(text(
+        f"ALTER TABLE xhs_account_notes RENAME TO {temporary_table}"
+    ))
+    note_record.__table__.create(connection)
+    columns = [column.name for column in note_record.__table__.columns]
+    rendered_columns = ", ".join(f'"{column}"' for column in columns)
+    connection.execute(text(
+        f"INSERT INTO xhs_account_notes ({rendered_columns}) "
+        f"SELECT {rendered_columns} FROM {temporary_table}"
+    ))
+    connection.execute(text(f"DROP TABLE {temporary_table}"))
+    _create_xhs_account_note_evidence_triggers(connection)
 
 
 def _xhs_account_note_evidence_schema_valid(

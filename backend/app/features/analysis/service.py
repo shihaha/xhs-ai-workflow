@@ -46,6 +46,9 @@ from backend.app.models.jobs import JobState
 PROMPT_VERSION = "tutorial-demand-radar-grounded-v1"
 MAX_TRUSTED_RESULT_BYTES = 5 * 1024 * 1024
 MAX_TRUSTED_ACCOUNT_RESULT_BYTES = 20 * 1024 * 1024
+XHS_RAW_TRUST_ANCHOR_KINDS = frozenset(
+    {ACCOUNT_COLLECTION_ARTIFACT_KIND, "xhs_note_search_raw"}
+)
 
 
 class EvidenceNotFound(ValueError):
@@ -212,7 +215,7 @@ class AnalysisService:
                 .order_by(JobArtifactRecord.id)
             ).all()
             for artifact in artifacts:
-                if artifact.kind == ACCOUNT_COLLECTION_ARTIFACT_KIND:
+                if artifact.kind in XHS_RAW_TRUST_ANCHOR_KINDS:
                     # The raw snapshot is a trust anchor, not a selectable model
                     # fact. Its public notes are exposed through account-note IDs.
                     continue
@@ -410,7 +413,7 @@ class AnalysisService:
             or job.id != note.collection_job_id
             or job.id != profile.collection_job_id
             or job.type != ACCOUNT_COLLECTION_JOB_TYPE
-            or JobState(job.state) is not JobState.succeeded
+            or _safe_job_state(job.state) is not JobState.succeeded
             or artifact.job_id != job.id
             or artifact.id != profile.collection_artifact_id
             or artifact.kind != ACCOUNT_COLLECTION_ARTIFACT_KIND
@@ -614,6 +617,13 @@ class AnalysisService:
 
 def _strict_value(actual: object, expected: object) -> bool:
     return type(actual) is type(expected) and actual == expected
+
+
+def _safe_job_state(value: object) -> JobState | None:
+    try:
+        return JobState(value)
+    except (ValueError, TypeError):
+        return None
 
 
 def _exact_account_result(

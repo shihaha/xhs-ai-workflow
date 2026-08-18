@@ -1,10 +1,11 @@
 import json
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from backend.app.adapters.contracts import (
     CollectionItem,
@@ -27,9 +28,12 @@ from backend.app.services.jobs import JobService
 
 
 class _AccountAdapter:
+    def note_id_for(self, user_id: str) -> str:
+        return f"note-{user_id}"
+
     def fetch_account(self, request: CollectionRequest) -> CollectionResult:
         user_id = str(request.parameters["user_id"])
-        note_id = f"note-{user_id}"
+        note_id = self.note_id_for(user_id)
         return CollectionResult(
             status="succeeded",
             items=[
@@ -74,6 +78,26 @@ class _AccountAdapter:
             complete=True,
         )
 
+    def search_notes(self, request: CollectionRequest) -> CollectionResult:
+        return CollectionResult(
+            status="succeeded",
+            items=[],
+            expected_count_known=True,
+            expected_count=0,
+            succeeded_count=0,
+            observed_count=0,
+            overflow_count=0,
+            complete=True,
+        )
+
+
+class _RotatingAccountAdapter(_AccountAdapter):
+    def __init__(self, note_ids: list[str]) -> None:
+        self.note_ids = iter(note_ids)
+
+    def note_id_for(self, user_id: str) -> str:
+        return next(self.note_ids)
+
 
 class _ModelSpy:
     provider = "provider-neutral-spy"
@@ -108,7 +132,7 @@ class _ModelSpy:
 
 
 class _Fixture:
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, *, adapter: object | None = None) -> None:
         self.runtime_dir = tmp_path / "runtime"
         self.database = Database(
             self.runtime_dir / "workbench.sqlite3", runtime_dir=self.runtime_dir
@@ -117,7 +141,7 @@ class _Fixture:
         self.collection = XhsCollectionService(
             database=self.database,
             job_service=self.jobs,
-            adapter=_AccountAdapter(),
+            adapter=adapter or _AccountAdapter(),
             runtime_dir=self.runtime_dir,
             submitter=lambda *_args: None,
         )
@@ -179,6 +203,49 @@ def test_discovery_returns_only_account_notes_owned_by_requested_account(
     # A trusted note may enrich an opportunity request, but the service still
     # requires a separate exact-complete shop artifact before calling the model.
     assert rows[0].eligible_for_opportunity is True
+
+
+def test_unfiltered_discovery_hides_account_and_search_raw_trust_anchors(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    _, note_id = fixture.collect("u1")
+    queued = fixture.collection.submit_search("safe", 0)
+    completed = fixture.collection.execute(queued.id)
+    assert completed is not None and completed.state is JobState.succeeded
+
+    rows = fixture.analysis(_ModelSpy()).list_evidence()
+
+    assert [row.evidence_id for row in rows] == [f"account-note:{note_id}"]
+    assert all(
+        row.kind not in {"xhs_account_collection_raw", "xhs_note_search_raw"}
+        for row in rows
+    )
+
+
+def test_unknown_job_state_fails_closed_in_filtered_and_unfiltered_discovery(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    job_id, note_id = fixture.collect("u1")
+    with fixture.database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE jobs SET state='retired_legacy_state' WHERE id=:job_id"),
+            {"job_id": job_id},
+        )
+    model = _ModelSpy()
+    service = fixture.analysis(model)
+
+    filtered = service.list_evidence(account_user_id="u1")
+    unfiltered = service.list_evidence()
+    with pytest.raises(EvidenceNotFound):
+        service.create(_account_payload("u1", f"account-note:{note_id}"))
+
+    assert [row.evidence_id for row in filtered] == [f"account-note:{note_id}"]
+    assert filtered[0].eligible_for_opportunity is False
+    assert [row.evidence_id for row in unfiltered] == [f"account-note:{note_id}"]
+    assert unfiltered[0].eligible_for_opportunity is False
+    assert model.calls == []
 
 
 def test_cross_account_note_reference_is_rejected_before_model_call(
@@ -418,6 +485,84 @@ def test_unknown_and_stale_account_note_ids_fail_before_model(tmp_path: Path) ->
         service.create(payload)
 
     assert model.calls == []
+
+
+def test_recollection_never_rebinds_a_historical_account_note_citation(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(
+        tmp_path,
+        adapter=_RotatingAccountAdapter(["old-note", "new-note"]),
+    )
+    _, old_note_row_id = fixture.collect("u1")
+    old_evidence_id = f"account-note:{old_note_row_id}"
+    historical = fixture.analysis(_ModelSpy()).create(
+        _account_payload("u1", old_evidence_id)
+    )
+
+    _, new_note_row_id = fixture.collect("u1")
+    new_evidence_id = f"account-note:{new_note_row_id}"
+    stale_model = _ModelSpy()
+    service = fixture.analysis(stale_model)
+
+    with pytest.raises(EvidenceNotFound):
+        service.create(_account_payload("u1", old_evidence_id))
+
+    assert new_note_row_id > old_note_row_id
+    assert new_evidence_id != old_evidence_id
+    assert [row.evidence_id for row in service.list_evidence(account_user_id="u1")] == [
+        new_evidence_id
+    ]
+    assert service.get(historical.id).evidence_ids == [old_evidence_id]
+    assert stale_model.calls == []
+
+
+def test_concurrent_recollection_cannot_rebind_an_inflight_analysis_citation(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(
+        tmp_path,
+        adapter=_RotatingAccountAdapter(["old-note", "new-note"]),
+    )
+    _, old_note_row_id = fixture.collect("u1")
+    old_evidence_id = f"account-note:{old_note_row_id}"
+    entered_model = Event()
+    release_model = Event()
+
+    class BlockingModel(_ModelSpy):
+        def generate_structured(
+            self, request: StructuredModelRequest, schema: object
+        ) -> ModelResult:
+            entered_model.set()
+            assert release_model.wait(2)
+            return super().generate_structured(request, schema)
+
+    model = BlockingModel()
+    service = fixture.analysis(model)
+    result: dict[str, object] = {}
+
+    def create_analysis() -> None:
+        result["analysis"] = service.create(
+            _account_payload("u1", old_evidence_id)
+        )
+
+    thread = Thread(target=create_analysis)
+    thread.start()
+    assert entered_model.wait(1)
+    _, new_note_row_id = fixture.collect("u1")
+    release_model.set()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert new_note_row_id > old_note_row_id
+    created = result["analysis"]
+    assert getattr(created, "status") == "succeeded"
+    assert getattr(created, "evidence_ids") == [old_evidence_id]
+    with pytest.raises(EvidenceNotFound):
+        service.create(_account_payload("u1", old_evidence_id))
+    assert [row.evidence_id for row in service.list_evidence(account_user_id="u1")] == [
+        f"account-note:{new_note_row_id}"
+    ]
 
 
 @pytest.mark.parametrize("evidence_id", ["account-note:0", "account-note:01", "account-note:+1"])

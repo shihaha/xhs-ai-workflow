@@ -99,3 +99,90 @@ Python 3.12 SQLite datetime-adapter deprecations in content tests.
 No authenticated live `xhs-cli` command was run. The explicit Task 5 live gate
 remains truthfully `not_run`; this task is verified with controlled persisted
 account collections and backend tests only.
+
+## Fix round 1/5 — permanent identities and fail-closed discovery
+
+### Review findings closed
+
+- `xhs_account_notes.id` is now a physical SQLite `AUTOINCREMENT` identity. A
+  separate `xhs_account_note_identity_v2` migration validates the actual table
+  DDL and `sqlite_sequence`, preserves every existing row ID during a v1 rebuild,
+  and advances the sequence beyond both current rows and canonical historical
+  `account-note:*` citations persisted in analyses or opportunities.
+- The identity migration is retry-safe and fail-closed. With the marker present it
+  is validation-only; with the marker absent it first validates the complete v1
+  evidence schema and data, then runs the rebuild and marker write under one
+  migration transaction. A present marker paired with old DDL or a stale or
+  ambiguous sequence is rejected without repair; marker tampering and an
+  interrupted temporary table also fail closed.
+  Malformed persisted reference history is also rejected during the read-only
+  preflight so it cannot hide a previously cited note ID.
+- Recollection can no longer bind an old evidence ID to a new note. Tests cover a
+  stale historical citation and an analysis that is concurrently inside the model
+  call while recollection replaces the account snapshot.
+- Unfiltered discovery now hides both `xhs_account_collection_raw` and
+  `xhs_note_search_raw`. These remain trust anchors and are never exposed as
+  unusable selectable `artifact:*` evidence; an empty successful search does not
+  synthesize note evidence.
+- Unknown or retired job-state strings are parsed safely. Filtered and unfiltered
+  discovery mark the poisoned note ineligible, while selection fails before the
+  model instead of raising an uncaught enum `ValueError`.
+
+### Fix-round RED evidence
+
+Before the fixes, the new migration regression group produced:
+
+```text
+5 failed, 4 passed
+```
+
+The failures demonstrated missing `AUTOINCREMENT`, identity marker and sequence
+semantics, and unsafe legacy migration. A separate mutation run with the
+historical-reference floor disabled produced `1 failed` because the next ID was
+`1` even though a persisted historical citation referenced `account-note:41`.
+A further fail-closed regression initially produced `1 failed` because malformed
+historical `evidence_ids_json` was skipped and the migration wrote new DDL instead
+of rejecting the unreadable identity history before writes.
+
+Before the discovery/state/identity production changes, the selected analysis
+regressions produced:
+
+```text
+4 failed, 21 deselected
+```
+
+They reproduced search-raw discovery exposure, the uncaught unknown-state error,
+old-ID rebinding after recollection and concurrent reuse of the same row ID.
+
+### Fix-round GREEN evidence
+
+```text
+python -m pytest backend/tests/xhs/test_schema_migration.py -q
+11 passed
+
+python -m pytest backend/tests/analysis/test_account_note_grounding.py -q
+25 passed in 3.53s
+
+python -m pytest backend/tests/analysis backend/tests/xhs -q
+373 passed, 1 skipped in 17.00s
+
+python -m pytest backend/tests -q
+966 passed, 1 skipped, 32 warnings in 105.74s
+```
+
+The skip remains the explicit opt-in live gate. The 32 warnings remain the
+pre-existing Python 3.12 SQLite datetime-adapter deprecations in content tests.
+`python -m compileall -q backend/app backend/tests` and `git diff --check` exited
+0 after the fix-round changes.
+
+### Fix-round self-review and boundary
+
+- The identity floor deliberately recognizes only canonical positive decimal
+  `account-note:<id>` values. Malformed stored evidence values do not gain trust.
+- Historical citations outside this database cannot be discovered by a local
+  migration. Within the workbench database, current rows plus persisted analysis
+  and opportunity citations are protected, and all future deletes retain the
+  SQLite high-water mark.
+- No model-provider behavior, exact shop N/N opportunity gate, Task 5 UI/E2E,
+  Bailian media code, platform writes or untracked research files changed.
+- The authenticated live boundary is unchanged: `not_run`.

@@ -62,6 +62,7 @@ class XhsAccountNoteRecord(Base):
         Index("ix_xhs_account_notes_user_id", "user_id"),
         Index("ix_xhs_account_notes_collection_job_id", "collection_job_id"),
         Index("ix_xhs_account_notes_collection_artifact_id", "collection_artifact_id"),
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
