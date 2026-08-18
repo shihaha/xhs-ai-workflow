@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import update
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.db import Database
 import backend.app.features.content.cleanup as cleanup_module
@@ -240,7 +241,23 @@ def test_create_app_recovers_expired_leases_and_uses_configured_grace(
         restarted.state.database.close()
 
 
-def _real_cleanup(tmp_path: Path, *, grace_hours: int = 24):
+class _MutableClock:
+    def __init__(self) -> None:
+        self.value = datetime(2026, 8, 18, 12, 0, 0)
+
+    def now(self) -> datetime:
+        return self.value
+
+    def advance(self, delta: timedelta) -> None:
+        self.value += delta
+
+
+def _real_cleanup(
+    tmp_path: Path,
+    *,
+    grace_hours: int = 24,
+    clock: _MutableClock | None = None,
+):
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     database = Database(tmp_path / "cleanup.sqlite3", runtime_dir=runtime)
@@ -248,6 +265,7 @@ def _real_cleanup(tmp_path: Path, *, grace_hours: int = 24):
         database,
         runtime_dir=runtime,
         grace_period=timedelta(hours=grace_hours),
+        **({"clock": clock.now} if clock is not None else {}),
     )
     payload = b"shutdown-fence"
     relative = "orphaned/shutdown.bin"
@@ -262,7 +280,8 @@ def _real_cleanup(tmp_path: Path, *, grace_hours: int = 24):
             expected_sha256=sha256(payload).hexdigest(),
             expected_size_bytes=len(payload),
             reason="shutdown_fence_test",
-            not_before=datetime.now(UTC) - timedelta(seconds=1),
+            not_before=(clock.now() if clock is not None else datetime.now(UTC))
+            - timedelta(seconds=1),
         )
     )
     return database, runtime, service, artifact, record
@@ -571,3 +590,271 @@ def test_stop_after_atomic_rename_persists_moved_fact_before_database_close(
     assert artifact.exists() is False
     assert quarantine.exists()
     assert close_calls == ["closed"]
+
+
+def test_post_atomic_shutdown_records_fact_even_after_original_lease_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lease expiry cannot erase the already-completed physical move fact."""
+    clock = _MutableClock()
+    database, runtime, service, artifact, record = _real_cleanup(
+        tmp_path, clock=clock
+    )
+    entered = Event()
+    release = Event()
+    close_calls: list[str] = []
+    real_close = database.close
+
+    def after_atomic_hook() -> None:
+        entered.set()
+        release.wait()
+
+    def close_database() -> None:
+        close_calls.append("closed")
+        real_close()
+
+    monkeypatch.setattr(export_module, "_rename_after_atomic_hook", after_atomic_hook)
+    worker = ArtifactCleanupWorker(
+        service,
+        poll_seconds=30,
+        batch_size=1,
+        on_stopped=close_database,
+    )
+    worker.start()
+    assert entered.wait(timeout=1)
+    try:
+        assert worker.close() is False
+        clock.advance(timedelta(minutes=10))
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    current = service.get_record(record.id)
+    assert current is not None
+    assert current.state == "needs_human"
+    assert current.last_error_category == "shutdown_after_quarantine_move"
+    assert current.quarantine_path == (
+        f"artifacts-quarantine/{record.id}/{artifact.name}"
+    )
+    assert (runtime / str(current.quarantine_path)).exists()
+    assert close_calls == ["closed"]
+
+
+def test_post_atomic_shutdown_overrides_concurrent_expired_lease_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pending recovery row must yield to the already-moved physical identity."""
+    clock = _MutableClock()
+    database, _, service, _, record = _real_cleanup(tmp_path, clock=clock)
+    entered = Event()
+    release = Event()
+
+    def after_atomic_hook() -> None:
+        entered.set()
+        release.wait()
+
+    monkeypatch.setattr(export_module, "_rename_after_atomic_hook", after_atomic_hook)
+    worker = ArtifactCleanupWorker(service, poll_seconds=30, batch_size=1)
+    worker.start()
+    assert entered.wait(timeout=1)
+    try:
+        assert worker.close() is False
+        clock.advance(timedelta(minutes=10))
+        assert service.recover_expired_leases() == 1
+        assert service.get_record(record.id).state == "pending"  # type: ignore[union-attr]
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    current = service.get_record(record.id)
+    assert current is not None and current.state == "needs_human"
+    assert current.last_error_category == "shutdown_after_quarantine_move"
+    database.close()
+
+
+def test_post_atomic_shutdown_overrides_concurrent_new_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newer lease cannot authorize work against bytes already moved by the old lease."""
+    clock = _MutableClock()
+    database, runtime, service, _, record = _real_cleanup(tmp_path, clock=clock)
+    entered = Event()
+    release = Event()
+
+    def after_atomic_hook() -> None:
+        entered.set()
+        release.wait()
+
+    monkeypatch.setattr(export_module, "_rename_after_atomic_hook", after_atomic_hook)
+    worker = ArtifactCleanupWorker(service, poll_seconds=30, batch_size=1)
+    worker.start()
+    assert entered.wait(timeout=1)
+    try:
+        assert worker.close() is False
+        clock.advance(timedelta(minutes=10))
+        assert service.recover_expired_leases() == 1
+        second = ArtifactCleanupService(
+            database, runtime_dir=runtime, clock=clock.now
+        )
+        assert second.claim_due(limit=1) == [record.id]
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    current = service.get_record(record.id)
+    assert current is not None and current.state == "needs_human"
+    assert current.lease_token is None
+    assert current.last_error_category == "shutdown_after_quarantine_move"
+    database.close()
+
+
+def _persist_moved_fact(
+    service: ArtifactCleanupService,
+    cleanup_id: str,
+    quarantine_path: str,
+    identity: tuple[int, int, int, int],
+    *,
+    file_id_offset: int = 0,
+) -> None:
+    with service.database.session() as session:
+        session.execute(
+            update(ArtifactCleanupRecord)
+            .where(ArtifactCleanupRecord.id == cleanup_id)
+            .values(
+                state="needs_human",
+                quarantine_path=quarantine_path,
+                quarantine_volume_id=identity[0],
+                quarantine_file_id=identity[1] + file_id_offset,
+                quarantine_size_bytes=identity[2],
+                quarantine_mtime_ns=identity[3],
+                lease_token=None,
+                lease_expires_at=None,
+                last_error_category="external_shutdown_reconcile",
+            )
+        )
+        session.commit()
+
+
+def test_post_atomic_shutdown_accepts_an_existing_identical_durable_fact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An identical concurrent acknowledgement is success, not a conflict."""
+    database, runtime, service, artifact, record = _real_cleanup(tmp_path)
+    entered = Event()
+    release = Event()
+    qpath = f"artifacts-quarantine/{record.id}/{artifact.name}"
+
+    def after_atomic_hook() -> None:
+        entered.set()
+        release.wait()
+
+    monkeypatch.setattr(export_module, "_rename_after_atomic_hook", after_atomic_hook)
+    worker = ArtifactCleanupWorker(service, poll_seconds=30, batch_size=1)
+    worker.start()
+    assert entered.wait(timeout=1)
+    try:
+        assert worker.close() is False
+        inspection = export_module.inspect_contained_artifact(runtime, qpath)
+        assert inspection.identity is not None
+        _persist_moved_fact(service, record.id, qpath, inspection.identity)
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+    current = service.get_record(record.id)
+    assert current is not None and current.quarantine_path == qpath
+    database.close()
+
+
+def test_post_atomic_shutdown_conflict_keeps_database_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A contradictory durable identity must block silent database finalization."""
+    database, runtime, service, artifact, record = _real_cleanup(tmp_path)
+    entered = Event()
+    release = Event()
+    close_calls: list[str] = []
+    real_close = database.close
+    qpath = f"artifacts-quarantine/{record.id}/{artifact.name}"
+
+    def after_atomic_hook() -> None:
+        entered.set()
+        release.wait()
+
+    def close_database() -> None:
+        close_calls.append("closed")
+        real_close()
+
+    monkeypatch.setattr(export_module, "_rename_after_atomic_hook", after_atomic_hook)
+    worker = ArtifactCleanupWorker(
+        service,
+        poll_seconds=30,
+        batch_size=1,
+        on_stopped=close_database,
+    )
+    worker.start()
+    assert entered.wait(timeout=1)
+    try:
+        assert worker.close() is False
+        inspection = export_module.inspect_contained_artifact(runtime, qpath)
+        assert inspection.identity is not None
+        _persist_moved_fact(
+            service,
+            record.id,
+            qpath,
+            inspection.identity,
+            file_id_offset=1,
+        )
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    assert close_calls == []
+    assert worker.last_error_category == "cleanup_shutdown_fact_unresolved"
+    with database.session() as session:
+        assert session.get(ArtifactCleanupRecord, record.id) is not None
+    real_close()
+
+
+def test_post_atomic_shutdown_read_fault_keeps_database_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unverifiable move fact must not be hidden by database finalization."""
+    database, _, service, _, record = _real_cleanup(tmp_path)
+    entered = Event()
+    release = Event()
+    close_calls: list[str] = []
+    real_close = database.close
+
+    def after_atomic_hook() -> None:
+        entered.set()
+        release.wait()
+
+    def close_database() -> None:
+        close_calls.append("closed")
+        real_close()
+
+    monkeypatch.setattr(export_module, "_rename_after_atomic_hook", after_atomic_hook)
+    worker = ArtifactCleanupWorker(
+        service,
+        poll_seconds=30,
+        batch_size=1,
+        on_stopped=close_database,
+    )
+    worker.start()
+    assert entered.wait(timeout=1)
+    try:
+        assert worker.close() is False
+
+        def unavailable_read(_cleanup_id: str):
+            raise SQLAlchemyError("database read unavailable")
+
+        monkeypatch.setattr(service, "get_record", unavailable_read)
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    assert close_calls == []
+    assert worker.last_error_category == "cleanup_shutdown_fact_unresolved"
+    with database.session() as session:
+        assert session.get(ArtifactCleanupRecord, record.id) is not None
+    real_close()

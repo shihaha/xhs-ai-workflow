@@ -155,3 +155,54 @@ python -m pytest backend/tests -q
 The focused suite also verifies the uncancelled callback path still performs the
 normal quarantine rename and cancellation closes handles. Live Bailian, Android
 and seven-day UAT remain `not_run`; Task 8R-5 has not started.
+
+## Fix round 3/5: post-atomic move fact reconciliation
+
+Independent review found that the post-atomic shutdown acknowledgement still
+used the ordinary lease CAS. If the original lease expired while the rename
+boundary was blocked, recovery or a new worker could replace that lease before
+the old worker persisted the physical move, leaving the database behind the
+filesystem.
+
+RED evidence:
+
+- Five post-atomic cases reproduced the gap: expired original lease, concurrent
+  expired-lease recovery, concurrent new claim, an already-identical durable
+  fact, and a contradictory durable identity. A sixth fault-injection case
+  proved that an unverifiable database read incorrectly allowed finalization.
+
+Implementation:
+
+- `_record_shutdown_after_atomic_move` is a dedicated irreversible-fact path.
+  Its first CAS binds the original cleanup identity and exact original token but
+  deliberately does not require an unexpired lease. It persists the trusted
+  quarantine path/physical identity as
+  `needs_human/shutdown_after_quarantine_move` and clears the lease.
+- If the first CAS loses, a fresh reconciliation accepts an identical durable
+  fact. A bounded `BEGIN IMMEDIATE` fallback may conservatively override only a
+  fully matching `pending` or newly `claimed` row whose quarantine fact is still
+  empty. This serializes with recovery/claim and prevents another worker from
+  acting on bytes that have already moved.
+- Contradictory terminal/path/identity state or an unverifiable database read
+  raises a dedicated shutdown-unsafe signal. The worker stops without running
+  the database finalizer, so the already-performed physical fact is not hidden
+  by premature SQLite disposal.
+
+Verification:
+
+```text
+python -m pytest backend/tests/content/test_cleanup_worker.py -q
+20 passed in 5.74s
+
+python -m pytest backend/tests/content/test_cleanup_worker.py backend/tests/content/test_artifact_cleanup_service.py backend/tests/content/test_cleanup_api.py backend/tests/test_health.py backend/tests/test_jobs_hardening.py -q
+76 passed in 11.75s
+
+python -m pytest backend/tests/content -q
+259 passed in 37.96s
+
+python -m pytest backend/tests -q
+572 passed, 1 skipped in 56.53s
+```
+
+Live Bailian, Android and seven-day UAT remain `not_run`. This change is limited
+to Task 8R-4; Task 8R-5 has not started.

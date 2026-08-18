@@ -58,6 +58,10 @@ def _is_cancelled(cancelled: Callable[[], bool]) -> bool:
         return True
 
 
+class ArtifactCleanupShutdownUnsafe(RuntimeError):
+    """Raised when an already-moved artifact cannot be durably reconciled."""
+
+
 class _CleanupBatchService(Protocol):
     def run_due_once(
         self,
@@ -93,6 +97,7 @@ class ArtifactCleanupWorker:
         self._admission_closed = False
         self._generation = 0
         self._finalized = False
+        self._finalizer_allowed = True
 
     @property
     def is_alive(self) -> bool:
@@ -140,6 +145,10 @@ class ArtifactCleanupWorker:
                         limit=self.batch_size,
                         cancelled=cancelled,
                     )
+                except ArtifactCleanupShutdownUnsafe:
+                    self.last_error_category = "cleanup_shutdown_fact_unresolved"
+                    self._finalizer_allowed = False
+                    self._stop_event.set()
                 except Exception:
                     # The worker must continue without retaining sensitive exception text.
                     self.last_error_category = "cleanup_worker_error"
@@ -154,7 +163,7 @@ class ArtifactCleanupWorker:
                 return
             self._finalized = True
             try:
-                if self.on_stopped is not None:
+                if self.on_stopped is not None and self._finalizer_allowed:
                     self.on_stopped()
             except Exception:
                 self.last_error_category = "cleanup_worker_finalizer_error"
@@ -754,16 +763,11 @@ class ArtifactCleanupService:
             return record
         if _is_cancelled(cancelled):
             if rename_result.status == "trusted" and rename_result.identity is not None:
-                return self._mark_moved_needs_human(
-                    record.id,
+                return self._record_shutdown_after_atomic_move(
+                    record,
                     token,
-                    "shutdown_after_quarantine_move",
                     quarantine_relative,
                     rename_result.identity,
-                    # The OS mutation already completed. Persisting its exact identity
-                    # is the required shutdown acknowledgement, not new cleanup work.
-                    cancelled=_never_cancelled,
-                    fallback=record,
                 )
             return record
         if rename_result.status != "trusted":
@@ -881,6 +885,173 @@ class ArtifactCleanupService:
                 fallback=record,
             )
         return self.get_record(record.id) or record
+
+    def _record_shutdown_after_atomic_move(
+        self,
+        record: ArtifactCleanupRead,
+        original_token: str,
+        quarantine_path: str,
+        identity: tuple[int, int, int, int],
+    ) -> ArtifactCleanupRead:
+        """Persist an irreversible OS move even when the worker lease has changed."""
+
+        expected_path = (
+            PurePosixPath("artifacts-quarantine")
+            / record.id
+            / PurePosixPath(record.relative_path).name
+        ).as_posix()
+        if (
+            quarantine_path != expected_path
+            or identity[2] != record.expected_size_bytes
+        ):
+            raise ArtifactCleanupShutdownUnsafe(
+                "Shutdown move identity could not be reconciled."
+            )
+        now = _naive_utc(self.clock())
+        immutable = (
+            ArtifactCleanupRecord.id == record.id,
+            ArtifactCleanupRecord.owner_type == record.owner_type,
+            ArtifactCleanupRecord.owner_id == record.owner_id,
+            ArtifactCleanupRecord.source_build_token == record.source_build_token,
+            ArtifactCleanupRecord.relative_path == record.relative_path,
+            ArtifactCleanupRecord.path_key == record.path_key,
+            ArtifactCleanupRecord.expected_sha256 == record.expected_sha256,
+            ArtifactCleanupRecord.expected_size_bytes == record.expected_size_bytes,
+        )
+        values = {
+            "state": "needs_human",
+            "quarantine_path": quarantine_path,
+            "quarantine_volume_id": identity[0],
+            "quarantine_file_id": identity[1],
+            "quarantine_size_bytes": identity[2],
+            "quarantine_mtime_ns": identity[3],
+            "lease_token": None,
+            "lease_expires_at": None,
+            "last_error_category": "shutdown_after_quarantine_move",
+            "updated_at": now,
+            "completed_at": None,
+        }
+
+        try:
+            with self.database.session() as session:
+                won = session.execute(
+                    update(ArtifactCleanupRecord)
+                    .where(
+                        *immutable,
+                        ArtifactCleanupRecord.state == "claimed",
+                        ArtifactCleanupRecord.lease_token == original_token,
+                        ArtifactCleanupRecord.quarantine_path.is_(None),
+                        ArtifactCleanupRecord.quarantine_volume_id.is_(None),
+                        ArtifactCleanupRecord.quarantine_file_id.is_(None),
+                        ArtifactCleanupRecord.quarantine_size_bytes.is_(None),
+                        ArtifactCleanupRecord.quarantine_mtime_ns.is_(None),
+                    )
+                    .values(**values)
+                ).rowcount
+                session.commit()
+            if won == 1:
+                durable = self.get_record(record.id)
+                if self._moved_fact_matches(
+                    durable,
+                    quarantine_path,
+                    identity,
+                    states={"needs_human"},
+                ):
+                    return durable  # type: ignore[return-value]
+        except SQLAlchemyError:
+            pass
+
+        for _attempt in range(3):
+            try:
+                current = self.get_record(record.id)
+            except SQLAlchemyError:
+                continue
+            if self._shutdown_move_fact_matches(
+                current,
+                record,
+                quarantine_path,
+                identity,
+            ):
+                return current  # type: ignore[return-value]
+            if not self._shutdown_move_can_reconcile(current, record):
+                raise ArtifactCleanupShutdownUnsafe(
+                    "Shutdown move fact conflicts with durable cleanup state."
+                )
+            try:
+                with self.database.engine.connect() as connection:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    won = connection.execute(
+                        update(ArtifactCleanupRecord)
+                        .where(
+                            *immutable,
+                            ArtifactCleanupRecord.state.in_(("pending", "claimed")),
+                            ArtifactCleanupRecord.quarantine_path.is_(None),
+                            ArtifactCleanupRecord.quarantine_volume_id.is_(None),
+                            ArtifactCleanupRecord.quarantine_file_id.is_(None),
+                            ArtifactCleanupRecord.quarantine_size_bytes.is_(None),
+                            ArtifactCleanupRecord.quarantine_mtime_ns.is_(None),
+                        )
+                        .values(**values)
+                    ).rowcount
+                    connection.commit()
+                if won == 1:
+                    durable = self.get_record(record.id)
+                    if self._shutdown_move_fact_matches(
+                        durable,
+                        record,
+                        quarantine_path,
+                        identity,
+                    ):
+                        return durable  # type: ignore[return-value]
+            except SQLAlchemyError:
+                continue
+        raise ArtifactCleanupShutdownUnsafe(
+            "Shutdown move fact could not be durably persisted."
+        )
+
+    @staticmethod
+    def _shutdown_move_can_reconcile(
+        current: ArtifactCleanupRead | None,
+        source: ArtifactCleanupRead,
+    ) -> bool:
+        return current is not None and (
+            current.owner_type == source.owner_type
+            and current.owner_id == source.owner_id
+            and current.source_build_token == source.source_build_token
+            and current.relative_path == source.relative_path
+            and current.path_key == source.path_key
+            and current.expected_sha256 == source.expected_sha256
+            and current.expected_size_bytes == source.expected_size_bytes
+            and current.state in {"pending", "claimed"}
+            and current.quarantine_path is None
+            and current.quarantine_volume_id is None
+            and current.quarantine_file_id is None
+            and current.quarantine_size_bytes is None
+            and current.quarantine_mtime_ns is None
+        )
+
+    def _shutdown_move_fact_matches(
+        self,
+        current: ArtifactCleanupRead | None,
+        source: ArtifactCleanupRead,
+        quarantine_path: str,
+        identity: tuple[int, int, int, int],
+    ) -> bool:
+        return current is not None and (
+            current.owner_type == source.owner_type
+            and current.owner_id == source.owner_id
+            and current.source_build_token == source.source_build_token
+            and current.relative_path == source.relative_path
+            and current.path_key == source.path_key
+            and current.expected_sha256 == source.expected_sha256
+            and current.expected_size_bytes == source.expected_size_bytes
+            and self._moved_fact_matches(
+                current,
+                quarantine_path,
+                identity,
+                states={"needs_human", "quarantined"},
+            )
+        )
 
     def _mark_moved_needs_human(
         self,
