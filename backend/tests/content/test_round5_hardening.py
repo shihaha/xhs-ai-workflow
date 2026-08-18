@@ -43,14 +43,17 @@ def test_generic_database_failure_after_material_write_enqueues_and_retains_file
 
     monkeypatch.setattr(Session, "commit", fail_commit)
 
-    with pytest.raises(SQLAlchemyError, match="generic commit failure"):
+    with pytest.raises(ContentStateError, match="transaction_unknown"):
         service.add_material(item.product_id, payload)
 
     with service.database.session() as session:
         assert session.scalar(select(func.count(ProductMaterialRecord.id)).where(
             ProductMaterialRecord.logical_name == "facts.txt"
         )) == 0
-        cleanup = session.scalar(select(ArtifactCleanupRecord))
+        cleanup = session.scalar(select(ArtifactCleanupRecord).where(
+            ArtifactCleanupRecord.reason == "material_write_reserved",
+            ArtifactCleanupRecord.state == "pending",
+        ))
         assert cleanup is not None
         assert cleanup.state == "pending"
         assert (tmp_path / cleanup.relative_path).exists()
@@ -63,23 +66,32 @@ def test_commit_then_raise_retains_material_and_persists_cleanup_fact(
     payload = _new_source(tmp_path)
     real_commit = Session.commit
 
+    raised = False
+
     def commit_then_raise(session: Session) -> None:
+        nonlocal raised
+        if not raised and any(
+            isinstance(value, ProductMaterialRecord)
+            for value in session.identity_map.values()
+        ):
+            raised = True
+            real_commit(session)
+            raise SQLAlchemyError("ambiguous commit acknowledgement")
         real_commit(session)
-        raise SQLAlchemyError("ambiguous commit acknowledgement")
 
     monkeypatch.setattr(Session, "commit", commit_then_raise)
 
-    with pytest.raises(SQLAlchemyError, match="ambiguous commit acknowledgement"):
-        service.add_material(item.product_id, payload)
+    material = service.add_material(item.product_id, payload)
 
     with service.database.engine.connect() as connection:
         assert connection.exec_driver_sql(
             "SELECT COUNT(*) FROM content_product_materials WHERE logical_name='facts.txt'"
         ).scalar_one() == 1
         cleanup = connection.exec_driver_sql(
-            "SELECT relative_path, state FROM artifact_gc_queue"
+            "SELECT relative_path, state FROM artifact_gc_queue WHERE owner_id=?",
+            (material.id,),
         ).mappings().one()
-        assert cleanup["state"] == "pending"
+        assert cleanup["state"] == "cancelled"
         assert (tmp_path / cleanup["relative_path"]).exists()
 
 
@@ -102,7 +114,10 @@ def test_path_validation_failure_after_material_creation_enqueues_and_retains_fi
         service.add_material(item.product_id, payload)
 
     with service.database.session() as session:
-        cleanup = session.scalar(select(ArtifactCleanupRecord))
+        cleanup = session.scalar(select(ArtifactCleanupRecord).where(
+            ArtifactCleanupRecord.reason == "material_write_reserved",
+            ArtifactCleanupRecord.state == "pending",
+        ))
         assert cleanup is not None
         assert cleanup.state == "pending"
         assert (tmp_path / cleanup.relative_path).exists()

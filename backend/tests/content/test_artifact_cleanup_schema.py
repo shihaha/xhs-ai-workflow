@@ -1452,7 +1452,8 @@ def test_legacy_building_package_is_failed_and_enqueued_without_deleting_file(
         with upgraded.session() as session:
             recovered = session.get(ContentPackageRecord, package.id)
             cleanup = session.query(content_models.ArtifactCleanupRecord).filter_by(
-                owner_type="content_package", owner_id=package.id, relative_path=package.path
+                owner_type="content_package", owner_id=package.id,
+                relative_path=package.path, state="pending"
             ).one()
             assert recovered.status == "failed"
             assert recovered.error_detail == "worker_restart_required"
@@ -1482,7 +1483,7 @@ def test_repeated_startup_does_not_duplicate_recovery_cleanup(tmp_path: Path) ->
     try:
         with second.session() as session:
             assert session.query(content_models.ArtifactCleanupRecord).filter_by(
-                owner_id=package.id
+                owner_id=package.id, state="pending"
             ).count() == 1
     finally:
         second.close()

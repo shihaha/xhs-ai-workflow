@@ -14,6 +14,7 @@ from uuid import uuid4
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 from pydantic import ValidationError
 
 from backend.app.db import (
@@ -103,6 +104,15 @@ class ArtifactCleanupService:
         self._lease_lock = Lock()
 
     def enqueue(self, candidate: ArtifactCleanupCandidate) -> ArtifactCleanupRead:
+        with self.database.session() as session:
+            record = self.enqueue_in_session(session, candidate)
+            session.commit()
+            return record
+
+    def enqueue_in_session(
+        self, session: Session, candidate: ArtifactCleanupCandidate
+    ) -> ArtifactCleanupRead:
+        """Insert or obtain one cleanup fact without committing the caller's transaction."""
         path_key = canonical_artifact_path_key(candidate.relative_path)
         if (
             candidate.owner_type not in {"material", "content_package"}
@@ -142,31 +152,69 @@ class ArtifactCleanupService:
             "updated_at": now,
             "completed_at": None,
         }
-        with self.database.session() as session:
-            statement = sqlite_insert(ArtifactCleanupRecord).values(**values)
-            statement = statement.on_conflict_do_nothing(
-                index_elements=["owner_type", "owner_id", "path_key"],
-                index_where=ArtifactCleanupRecord.state.in_(OPEN_STATES),
+        statement = sqlite_insert(ArtifactCleanupRecord).values(**values)
+        statement = statement.on_conflict_do_nothing(
+            index_elements=["owner_type", "owner_id", "path_key"],
+            index_where=ArtifactCleanupRecord.state.in_(OPEN_STATES),
+        )
+        session.execute(statement)
+        record = session.scalar(
+            select(ArtifactCleanupRecord).where(
+                ArtifactCleanupRecord.owner_type == candidate.owner_type,
+                ArtifactCleanupRecord.owner_id == candidate.owner_id,
+                ArtifactCleanupRecord.path_key == path_key,
+                ArtifactCleanupRecord.state.in_(OPEN_STATES),
             )
-            session.execute(statement)
-            session.commit()
-            record = session.scalar(
-                select(ArtifactCleanupRecord).where(
-                    ArtifactCleanupRecord.owner_type == candidate.owner_type,
-                    ArtifactCleanupRecord.owner_id == candidate.owner_id,
-                    ArtifactCleanupRecord.path_key == path_key,
-                    ArtifactCleanupRecord.state.in_(OPEN_STATES),
-                )
+        )
+        if record is None:
+            raise RuntimeError("Cleanup enqueue produced no open record.")
+        if (
+            record.relative_path != candidate.relative_path
+            or record.expected_sha256 != candidate.expected_sha256
+            or record.expected_size_bytes != candidate.expected_size_bytes
+        ):
+            raise ValueError("Open cleanup identity conflicts with the candidate.")
+        return _read(record)
+
+    def cancel_in_session(
+        self,
+        session: Session,
+        cleanup_id: str,
+        *,
+        candidate: ArtifactCleanupCandidate,
+    ) -> bool:
+        """Cancel one exact pending reservation without committing the transaction."""
+        path_key = canonical_artifact_path_key(candidate.relative_path)
+        if path_key is None or not is_canonical_uuid_text(cleanup_id):
+            raise ValueError("Cleanup cancellation identity is not canonical.")
+        now = _naive_utc(self.clock())
+        exact = (
+            ArtifactCleanupRecord.id == cleanup_id,
+            ArtifactCleanupRecord.owner_type == candidate.owner_type,
+            ArtifactCleanupRecord.owner_id == candidate.owner_id,
+            ArtifactCleanupRecord.relative_path == candidate.relative_path,
+            ArtifactCleanupRecord.path_key == path_key,
+            ArtifactCleanupRecord.expected_sha256 == candidate.expected_sha256,
+            ArtifactCleanupRecord.expected_size_bytes == candidate.expected_size_bytes,
+        )
+        won = session.execute(
+            update(ArtifactCleanupRecord)
+            .where(*exact, ArtifactCleanupRecord.state == "pending")
+            .values(
+                state="cancelled",
+                completed_at=now,
+                updated_at=now,
+                lease_token=None,
+                lease_expires_at=None,
             )
-            if record is None:
-                raise RuntimeError("Cleanup enqueue committed without an open record.")
-            if (
-                record.relative_path != candidate.relative_path
-                or record.expected_sha256 != candidate.expected_sha256
-                or record.expected_size_bytes != candidate.expected_size_bytes
-            ):
-                raise ValueError("Open cleanup identity conflicts with the candidate.")
-            return _read(record)
+        ).rowcount
+        if won == 1:
+            return True
+        return session.scalar(
+            select(ArtifactCleanupRecord.id).where(
+                *exact, ArtifactCleanupRecord.state == "cancelled"
+            )
+        ) is not None
 
     def claim_due(self, *, limit: int = 10) -> list[str]:
         if limit < 1:

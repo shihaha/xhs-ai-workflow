@@ -52,6 +52,7 @@ def test_startup_recovery_retains_configured_runtime_and_database_parent_files(
                 owner_type="content_package",
                 owner_id=package.id,
                 relative_path=package.path,
+                state="pending",
             ).one()
             assert cleanup.state == "pending"
     finally:
@@ -117,12 +118,13 @@ def test_export_reservation_failure_is_finalized_and_retryable(
     service, item, image = _image_item(tmp_path)
     approved = service.review(item.id, _approval(item, image))
     request = ExportCreate(expected_revision_id=approved.current_revision.id)
-    real_load_product = service_module._load_product
+    real_write = service_module.write_contained_atomic
 
-    def fail_after_reservation(*args, **kwargs):
+    def fail_after_reservation(root, relative, data):
+        real_write(root, relative, data)
         raise ContentValidationError("forced post-reservation failure")
 
-    monkeypatch.setattr(service_module, "_load_product", fail_after_reservation)
+    monkeypatch.setattr(service_module, "write_contained_atomic", fail_after_reservation)
     with pytest.raises(ContentValidationError, match="forced"):
         service.export_package(item.id, request)
     package = service.list_packages()[0]
@@ -130,7 +132,7 @@ def test_export_reservation_failure_is_finalized_and_retryable(
     with service.database.session() as session:
         assert session.get(ContentPackageRecord, package.id).error_detail == "package_build_failed"
 
-    monkeypatch.setattr(service_module, "_load_product", real_load_product)
+    monkeypatch.setattr(service_module, "write_contained_atomic", real_write)
     assert service.export_package(item.id, request).status == "ready"
 
 

@@ -27,7 +27,7 @@ def test_material_conflict_cleanup_never_deletes_during_request(
     monkeypatch.setattr(Path, "unlink", reject_path_unlink)
     monkeypatch.setattr(Session, "commit", fail_commit)
 
-    with pytest.raises(ContentStateError, match="Concurrent material version conflict"):
+    with pytest.raises(IntegrityError, match="forced material version conflict"):
         service.add_material(
             item.product_id,
             MaterialCreate(
@@ -39,8 +39,7 @@ def test_material_conflict_cleanup_never_deletes_during_request(
         )
 
     retained = list((tmp_path / "content-materials" / item.product_id).rglob("source.txt"))
-    assert len(retained) == 1
-    assert retained[0].read_text(encoding="utf-8") == "facts"
+    assert retained == []
 
 
 def test_startup_preserves_building_path_owned_by_managed_material(tmp_path: Path) -> None:

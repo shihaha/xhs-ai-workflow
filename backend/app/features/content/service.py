@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -29,7 +29,7 @@ from backend.app.features.content.export import (
     read_contained_regular, write_contained_atomic,
 )
 from backend.app.features.content.models import (
-    ContentItemRecord, ContentPackageRecord, ContentReviewRecord, ContentRevisionRecord,
+    ArtifactCleanupRecord, ContentItemRecord, ContentPackageRecord, ContentReviewRecord, ContentRevisionRecord,
     ProductMaterialRecord, ProductRecord,
 )
 from backend.app.features.content.schemas import (
@@ -115,7 +115,6 @@ class ContentService:
         except UnsafeContentPath as error:
             raise ContentValidationError(str(error)) from error
         detected = _validate_material_bytes(data, declared=payload.media_type, kind=payload.kind)
-        managed_path: str | None = None
         with self.database.session() as session:
             if session.get(ProductRecord, product_id) is None:
                 raise ContentNotFound(f"Product {product_id} does not exist.")
@@ -147,43 +146,83 @@ class ContentService:
                 sha256=sha256(data).hexdigest(), size_bytes=len(data),
                 media_type=detected, kind=payload.kind, created_at=_now(),
             )
-            session.add(record)
-            session.flush()
-            try:
-                write_contained_atomic(self.runtime_dir, record.path, data)
-                session.commit()
-            except UnsafeContentPath as error:
-                session.rollback()
-                self._enqueue_material_cleanup(record)
-                raise ContentValidationError(str(error)) from error
-            except IntegrityError as error:
-                session.rollback()
-                self._enqueue_material_cleanup(record)
-                raise ContentStateError("Concurrent material version conflict; retry the request.") from error
-            except Exception:
-                session.rollback()
-                self._enqueue_material_cleanup(record)
-                raise
-            return self._material_read(record)
-
-    def _enqueue_material_cleanup(self, record: ProductMaterialRecord) -> None:
-        """Persist a cleanup fact after a failed or ambiguous material transaction."""
-        try:
-            self.cleanup_service.enqueue(
-                ArtifactCleanupCandidate(
-                    owner_type="material",
-                    owner_id=record.id,
-                    relative_path=record.path,
-                    expected_sha256=record.sha256,
-                    expected_size_bytes=record.size_bytes,
-                    reason="material_persistence_failed",
-                    not_before=_now(),
-                )
+            candidate = ArtifactCleanupCandidate(
+                owner_type="material",
+                owner_id=record.id,
+                relative_path=record.path,
+                expected_sha256=record.sha256,
+                expected_size_bytes=record.size_bytes,
+                reason="material_write_reserved",
+                not_before=_now() + timedelta(hours=24),
             )
-        except (SQLAlchemyError, OSError, RuntimeError, ValueError, TypeError):
-            # A second database failure makes the transaction outcome unknowable.
-            # Retaining the file is the only safe request-time behavior.
-            return
+            cleanup = self.cleanup_service.enqueue_in_session(session, candidate)
+            session.commit()
+        try:
+            write_contained_atomic(self.runtime_dir, record.path, data)
+        except UnsafeContentPath as error:
+            raise ContentValidationError(str(error)) from error
+        try:
+            with self.database.session() as session:
+                session.add(record)
+                if not self.cleanup_service.cancel_in_session(
+                    session, cleanup.id, candidate=candidate
+                ):
+                    raise ContentStateError(
+                        "Material cleanup reservation changed before persistence."
+                    )
+                session.commit()
+                return self._material_read(
+                    session.get(ProductMaterialRecord, record.id)
+                )
+        except IntegrityError as error:
+            proven = self._material_after_unknown(record, cleanup.id, candidate)
+            if proven is not None:
+                return proven
+            raise ContentStateError(
+                "Concurrent material version conflict; retry the request."
+            ) from error
+        except SQLAlchemyError as error:
+            proven = self._material_after_unknown(record, cleanup.id, candidate)
+            if proven is not None:
+                return proven
+            raise ContentStateError(
+                "transaction_unknown: material persistence could not be proven."
+            ) from error
+
+    def _material_after_unknown(
+        self,
+        expected: ProductMaterialRecord,
+        cleanup_id: str,
+        candidate: ArtifactCleanupCandidate,
+    ) -> MaterialRead | None:
+        """Return success only when a fresh exact read proves the commit completed."""
+        try:
+            with self.database.session() as session:
+                record = session.get(ProductMaterialRecord, expected.id)
+                cleanup = session.get(ArtifactCleanupRecord, cleanup_id)
+                if (
+                    record is None
+                    or record.product_id != expected.product_id
+                    or record.logical_name != expected.logical_name
+                    or record.logical_key != expected.logical_key
+                    or record.version != expected.version
+                    or record.path != candidate.relative_path
+                    or record.sha256 != candidate.expected_sha256
+                    or record.size_bytes != candidate.expected_size_bytes
+                    or record.media_type != expected.media_type
+                    or record.kind != expected.kind
+                    or cleanup is None
+                    or cleanup.state != "cancelled"
+                    or cleanup.owner_type != candidate.owner_type
+                    or cleanup.owner_id != candidate.owner_id
+                    or cleanup.relative_path != candidate.relative_path
+                    or cleanup.expected_sha256 != candidate.expected_sha256
+                    or cleanup.expected_size_bytes != candidate.expected_size_bytes
+                ):
+                    return None
+                return self._material_read(record)
+        except SQLAlchemyError:
+            return None
 
     def create_content_item(self, payload: ContentItemCreate) -> ContentItemRead:
         with self.database.session() as session:
@@ -343,6 +382,8 @@ class ContentService:
             session.commit()
 
     def export_package(self, item_id: str, payload: ExportCreate) -> ContentPackageRead:
+        # Build the deterministic bytes before reserving their filesystem path so
+        # the durable cleanup outbox can bind the exact hash and size.
         with self.database.session() as session:
             item = _load_item(session, item_id)
             self._validate_item_trust(item, session=session)
@@ -358,8 +399,6 @@ class ContentService:
             if approval is None:
                 raise ContentStateError("The current revision has no approval decision.")
             existing = session.scalar(select(ContentPackageRecord).where(ContentPackageRecord.revision_id == item.current_revision_id))
-            replaced_candidate: ArtifactCleanupCandidate | None = None
-            build_token = str(uuid4())
             if existing is not None:
                 self._assert_path_not_quarantined(session, existing.path)
                 projected = self._package_read(existing)
@@ -367,124 +406,114 @@ class ContentService:
                     return projected
                 if existing.status == "building":
                     raise ContentStateError("This revision package is already building.")
+            revision = next(
+                value for value in item.revisions if value.id == item.current_revision_id
+            )
+            product = _load_product(session, item.product_id)
+            materials = []
+            for material_id in list(item.material_ids_json) + list(item.image_material_ids_json):
+                material = session.get(ProductMaterialRecord, material_id)
+                if material is None or material.product_id != item.product_id:
+                    raise ContentValidationError(
+                        "Approved material is missing or foreign to the product."
+                    )
+                materials.append(material)
+        entries = self._package_entries(item, revision, product, materials)
+        manifest = {
+            "schema_version": 1, "content_item_id": item.id,
+            "revision_id": revision.id, "product_id": product.id,
+            "opportunity_id": item.opportunity_id, "entries": entry_manifest(entries),
+            "materials": [
+                {
+                    "id": material.id, "logical_name": material.logical_name,
+                    "version": material.version, "media_type": material.media_type,
+                    "sha256": material.sha256,
+                    "entry_path": (
+                        f"images/{item.image_material_ids_json.index(material.id) + 1:02d}{Path(material.logical_name).suffix.lower()}"
+                        if material.kind == "output_image"
+                        else f"materials/{material.id}/{material.logical_name}"
+                    ),
+                }
+                for material in sorted(materials, key=lambda value: value.id)
+            ],
+            "images": {
+                "count": len(item.image_material_ids_json),
+                "cover_material_id": item.cover_material_id,
+                "ordered_material_ids": list(item.image_material_ids_json),
+            },
+            "automatic_publish": False,
+        }
+        archive = deterministic_zip(entries, manifest)
+        archive_sha = sha256(archive).hexdigest()
+        archive_size = len(archive)
+        build_token = str(uuid4())
+
+        with self.database.session() as session:
+            current_item = _load_item(session, item_id)
+            self._validate_item_trust(current_item, session=session)
+            if (
+                current_item.current_revision_id != payload.expected_revision_id
+                or current_item.status not in {"approved", "exported"}
+            ):
+                raise ContentStateError("Package or content state changed before reservation.")
+            existing = session.scalar(select(ContentPackageRecord).where(
+                ContentPackageRecord.revision_id == payload.expected_revision_id
+            ))
+            if existing is not None and existing.status == "ready" and self._package_read(existing).availability == "available":
+                return self._package_read(existing)
+            if existing is not None and existing.status == "building":
+                raise ContentStateError("This revision package is already building.")
+            replaced_candidate: ArtifactCleanupCandidate | None = None
+            if existing is not None:
+                package_id = existing.id
                 old_path = existing.path
                 previous_status = existing.status
-                previous_sha256 = existing.sha256
-                previous_size_bytes = existing.size_bytes
-                replacement_path = f"content-packages/{item.id}/{existing.id}-{uuid4().hex}.zip"
-                self._assert_path_not_quarantined(session, replacement_path)
+                package_path = f"content-packages/{item_id}/{package_id}-{uuid4().hex}.zip"
+                self._assert_path_not_quarantined(session, package_path)
+                replaced_candidate = ArtifactCleanupCandidate(
+                    owner_type="content_package", owner_id=package_id,
+                    relative_path=old_path, expected_sha256=existing.sha256,
+                    expected_size_bytes=existing.size_bytes, reason="package_replaced",
+                    not_before=_now(),
+                )
                 won = session.execute(update(ContentPackageRecord).where(
-                    ContentPackageRecord.id == existing.id,
-                    ContentPackageRecord.content_item_id == item.id,
-                    ContentPackageRecord.revision_id == item.current_revision_id,
+                    ContentPackageRecord.id == package_id,
+                    ContentPackageRecord.content_item_id == item_id,
+                    ContentPackageRecord.revision_id == payload.expected_revision_id,
                     ContentPackageRecord.status == previous_status,
                     ContentPackageRecord.path == old_path,
                 ).values(
-                    status="building", error_detail=None, sha256="0" * 64,
-                    size_bytes=0, path=replacement_path, build_token=build_token,
+                    status="building", path=package_path, sha256=archive_sha,
+                    size_bytes=archive_size, error_detail=None, build_token=build_token,
                 )).rowcount
                 if won != 1:
-                    session.rollback()
                     raise ContentStateError("This revision package was concurrently reserved.")
-                session.commit()
-                package_id = existing.id
-                package_path = replacement_path
-                replaced_candidate = ArtifactCleanupCandidate(
-                    owner_type="content_package",
-                    owner_id=existing.id,
-                    relative_path=old_path,
-                    expected_sha256=previous_sha256,
-                    expected_size_bytes=previous_size_bytes,
-                    reason="package_replaced",
-                    not_before=_now(),
-                )
+                self.cleanup_service.enqueue_in_session(session, replaced_candidate)
             else:
-                package_id_value = str(uuid4())
-                package_path_value = (
-                    f"content-packages/{item.id}/{package_id_value}.zip"
-                )
-                self._assert_path_not_quarantined(session, package_path_value)
-                package = ContentPackageRecord(
-                    id=package_id_value,
-                    content_item_id=item.id, revision_id=item.current_revision_id,
-                    status="building", path=package_path_value,
-                    sha256="0" * 64, size_bytes=0, created_at=_now(), error_detail=None,
-                    build_token=build_token,
-                )
-                session.add(package)
-                try:
-                    session.commit()
-                except IntegrityError as error:
-                    session.rollback()
-                    raise ContentStateError("This revision package was concurrently reserved.") from error
-                package_id = package.id
-                package_path = package.path
-            reserved_item_id = item.id
-            reserved_revision_id = item.current_revision_id
-        try:
-            if replaced_candidate is not None:
-                self._enqueue_cleanup(replaced_candidate)
-            with self.database.session() as session:
-                item = _load_item(session, item_id)
-                self._validate_item_trust(item, session=session)
-                package = session.get(ContentPackageRecord, package_id)
+                package_id = str(uuid4())
+                package_path = f"content-packages/{item_id}/{package_id}.zip"
                 self._assert_path_not_quarantined(session, package_path)
-                approval = session.scalar(select(ContentReviewRecord).where(
-                    ContentReviewRecord.content_item_id == item.id,
-                    ContentReviewRecord.revision_id == item.current_revision_id,
-                    ContentReviewRecord.decision == "approve",
+                session.add(ContentPackageRecord(
+                    id=package_id, content_item_id=item_id,
+                    revision_id=payload.expected_revision_id, status="building",
+                    path=package_path, sha256=archive_sha, size_bytes=archive_size,
+                    created_at=_now(), error_detail=None, build_token=build_token,
                 ))
-                if (
-                    package is None or package.status != "building"
-                    or package.path != package_path
-                    or package.content_item_id != reserved_item_id
-                    or package.revision_id != reserved_revision_id
-                    or package.build_token != build_token
-                    or item.current_revision_id != payload.expected_revision_id
-                    or item.status not in {"approved", "exported"}
-                    or approval is None
-                ):
-                    raise ContentStateError("Package or content state changed after reservation.")
-                revision = next(
-                    value for value in item.revisions if value.id == item.current_revision_id
-                )
-                product = _load_product(session, item.product_id)
-                materials = []
-                for material_id in list(item.material_ids_json) + list(item.image_material_ids_json):
-                    material = session.get(ProductMaterialRecord, material_id)
-                    if material is None or material.product_id != item.product_id:
-                        raise ContentValidationError(
-                            "Approved material is missing or foreign to the product."
-                        )
-                    materials.append(material)
-            entries = self._package_entries(item, revision, product, materials)
-            manifest = {
-                "schema_version": 1, "content_item_id": item.id,
-                "revision_id": revision.id, "product_id": product.id,
-                "opportunity_id": item.opportunity_id, "entries": entry_manifest(entries),
-                "materials": [
-                    {
-                        "id": material.id,
-                        "logical_name": material.logical_name,
-                        "version": material.version,
-                        "media_type": material.media_type,
-                        "sha256": material.sha256,
-                        "entry_path": (
-                            f"images/{item.image_material_ids_json.index(material.id) + 1:02d}{Path(material.logical_name).suffix.lower()}"
-                            if material.kind == "output_image"
-                            else f"materials/{material.id}/{material.logical_name}"
-                        ),
-                    }
-                    for material in sorted(materials, key=lambda value: value.id)
-                ],
-                "images": {
-                    "count": len(item.image_material_ids_json),
-                    "cover_material_id": item.cover_material_id,
-                    "ordered_material_ids": list(item.image_material_ids_json),
-                },
-                "automatic_publish": False,
-            }
-            archive = deterministic_zip(entries, manifest)
+                session.flush()
+            build_candidate = ArtifactCleanupCandidate(
+                owner_type="content_package", owner_id=package_id,
+                relative_path=package_path, expected_sha256=archive_sha,
+                expected_size_bytes=archive_size, reason="package_build_reserved",
+                not_before=_now() + timedelta(hours=24),
+            )
+            build_cleanup = self.cleanup_service.enqueue_in_session(
+                session, build_candidate
+            )
+            session.commit()
+        reserved_item_id = item_id
+        reserved_revision_id = payload.expected_revision_id
+
+        try:
             write_contained_atomic(self.runtime_dir, package_path, archive)
             with self.database.session() as session:
                 current_item = _load_item(session, item_id)
@@ -497,8 +526,8 @@ class ContentService:
                     ContentPackageRecord.path == package_path,
                     ContentPackageRecord.build_token == build_token,
                 ).values(
-                    status="ready", sha256=sha256(archive).hexdigest(),
-                    size_bytes=len(archive), error_detail=None,
+                    status="ready", sha256=archive_sha,
+                    size_bytes=archive_size, error_detail=None,
                 )).rowcount
                 item_won = session.execute(update(ContentItemRecord).where(
                     ContentItemRecord.id == item_id,
@@ -508,33 +537,42 @@ class ContentService:
                 if package_won != 1 or item_won != 1:
                     session.rollback()
                     raise ContentStateError("Package or content state changed before finalization.")
-                session.commit()
+                if not self.cleanup_service.cancel_in_session(
+                    session, build_cleanup.id, candidate=build_candidate
+                ):
+                    session.rollback()
+                    raise ContentStateError(
+                        "Package cleanup reservation changed before finalization."
+                    )
+                try:
+                    session.commit()
+                except SQLAlchemyError as error:
+                    proven = self._package_after_unknown(
+                        package_id, item_id, payload.expected_revision_id,
+                        package_path, build_token, archive_sha, archive_size,
+                        build_cleanup.id, build_candidate,
+                    )
+                    if proven is not None:
+                        return proven
+                    raise ContentStateError(
+                        "transaction_unknown: package finalization could not be proven."
+                    ) from error
                 package = session.get(ContentPackageRecord, package_id)
                 if package is None:
                     raise ContentStateError("Package disappeared after finalization.")
                 return self._package_read(package)
         except UnsafeContentPath as error:
-            artifact_sha, artifact_size = self._artifact_identity(package_path)
-            failed_by_builder = self._fail_package_reservation(
+            self._fail_package_reservation(
                 package_id, reserved_item_id, reserved_revision_id, package_path,
-                build_token, artifact_sha, artifact_size,
-            )
-            self._enqueue_package_cleanup(
-                package_id, package_path, artifact_sha, artifact_size,
-                reason=self._package_cleanup_reason(failed_by_builder),
+                build_token, build_cleanup.id, build_candidate,
             )
             raise ContentValidationError(
                 "Package build failed; no ready artifact was recorded."
             ) from error
         except Exception:
-            artifact_sha, artifact_size = self._artifact_identity(package_path)
-            failed_by_builder = self._fail_package_reservation(
+            self._fail_package_reservation(
                 package_id, reserved_item_id, reserved_revision_id, package_path,
-                build_token, artifact_sha, artifact_size,
-            )
-            self._enqueue_package_cleanup(
-                package_id, package_path, artifact_sha, artifact_size,
-                reason=self._package_cleanup_reason(failed_by_builder),
+                build_token, build_cleanup.id, build_candidate,
             )
             raise
 
@@ -545,8 +583,8 @@ class ContentService:
         revision_id: str,
         package_path: str,
         build_token: str,
-        artifact_sha256: str,
-        artifact_size_bytes: int,
+        cleanup_id: str,
+        candidate: ArtifactCleanupCandidate,
     ) -> bool | None:
         try:
             with self.database.session() as session:
@@ -560,61 +598,87 @@ class ContentService:
                 ).values(
                     status="failed",
                     error_detail="package_build_failed",
-                    sha256=artifact_sha256,
-                    size_bytes=artifact_size_bytes,
                 )).rowcount
                 session.commit()
                 return won == 1
         except SQLAlchemyError:
-            # The update may or may not have committed.  Do not retry or infer
-            # ownership; the cleanup record will force a later safe re-check.
-            return None
+            return True if self._package_failed_after_unknown(
+                package_id, item_id, revision_id, package_path, build_token,
+                cleanup_id, candidate,
+            ) else None
 
-    @staticmethod
-    def _package_cleanup_reason(failed_by_builder: bool | None) -> str:
-        if failed_by_builder is True:
-            return "package_build_failed"
-        if failed_by_builder is False:
-            return "package_builder_lost"
-        return "package_transaction_unknown"
-
-    def _artifact_identity(self, relative_path: str) -> tuple[str, int]:
-        try:
-            payload = read_contained_regular(
-                self.runtime_dir, relative_path, limit=MAX_PACKAGE_BYTES
-            )
-        except (UnsafeContentPath, OSError):
-            return "0" * 64, 0
-        return sha256(payload).hexdigest(), len(payload)
-
-    def _enqueue_package_cleanup(
+    def _package_after_unknown(
         self,
         package_id: str,
-        relative_path: str,
+        item_id: str,
+        revision_id: str,
+        package_path: str,
+        build_token: str,
         expected_sha256: str,
         expected_size_bytes: int,
-        *,
-        reason: str,
-    ) -> None:
-        self._enqueue_cleanup(
-            ArtifactCleanupCandidate(
-                owner_type="content_package",
-                owner_id=package_id,
-                relative_path=relative_path,
-                expected_sha256=expected_sha256,
-                expected_size_bytes=expected_size_bytes,
-                reason=reason,
-                not_before=_now(),
-            )
-        )
-
-    def _enqueue_cleanup(self, candidate: ArtifactCleanupCandidate) -> None:
-        """Idempotently persist cleanup work; never delete in a request path."""
+        cleanup_id: str,
+        candidate: ArtifactCleanupCandidate,
+    ) -> ContentPackageRead | None:
         try:
-            self.cleanup_service.enqueue(candidate)
-        except (SQLAlchemyError, OSError, RuntimeError, ValueError, TypeError):
-            # The outcome cannot safely be inferred.  Keep the artifact in place.
-            return
+            with self.database.session() as session:
+                package = session.get(ContentPackageRecord, package_id)
+                item = session.get(ContentItemRecord, item_id)
+                cleanup = session.get(ArtifactCleanupRecord, cleanup_id)
+                if (
+                    package is None or package.content_item_id != item_id
+                    or package.revision_id != revision_id or package.status != "ready"
+                    or package.path != package_path or package.build_token != build_token
+                    or package.sha256 != expected_sha256
+                    or package.size_bytes != expected_size_bytes
+                    or item is None or item.status != "exported"
+                    or item.current_revision_id != revision_id
+                    or not self._cleanup_matches(
+                        cleanup, candidate, state="cancelled"
+                    )
+                ):
+                    return None
+                return self._package_read(package)
+        except SQLAlchemyError:
+            return None
+
+    def _package_failed_after_unknown(
+        self,
+        package_id: str,
+        item_id: str,
+        revision_id: str,
+        package_path: str,
+        build_token: str,
+        cleanup_id: str,
+        candidate: ArtifactCleanupCandidate,
+    ) -> bool:
+        try:
+            with self.database.session() as session:
+                package = session.get(ContentPackageRecord, package_id)
+                cleanup = session.get(ArtifactCleanupRecord, cleanup_id)
+                return bool(
+                    package is not None and package.content_item_id == item_id
+                    and package.revision_id == revision_id and package.status == "failed"
+                    and package.path == package_path and package.build_token == build_token
+                    and self._cleanup_matches(cleanup, candidate, state="pending")
+                )
+        except SQLAlchemyError:
+            return False
+
+    @staticmethod
+    def _cleanup_matches(
+        cleanup: ArtifactCleanupRecord | None,
+        candidate: ArtifactCleanupCandidate,
+        *,
+        state: str,
+    ) -> bool:
+        return bool(
+            cleanup is not None and cleanup.state == state
+            and cleanup.owner_type == candidate.owner_type
+            and cleanup.owner_id == candidate.owner_id
+            and cleanup.relative_path == candidate.relative_path
+            and cleanup.expected_sha256 == candidate.expected_sha256
+            and cleanup.expected_size_bytes == candidate.expected_size_bytes
+        )
 
     def _assert_path_not_quarantined(self, session, relative_path: str) -> None:
         conflict = session.scalar(

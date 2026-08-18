@@ -94,9 +94,10 @@ def test_corrupt_package_reexport_has_one_builder_and_queues_old_artifact(tmp_pa
     assert {value for value in results if value != "conflict"} == {original.id}
     assert old_path.exists()
     with service.database.engine.connect() as connection:
-        cleanup = connection.exec_driver_sql(
-            "SELECT state, relative_path, reason FROM artifact_gc_queue "
-            "WHERE owner_type='content_package' AND owner_id=?",
+            cleanup = connection.exec_driver_sql(
+                "SELECT state, relative_path, reason FROM artifact_gc_queue "
+                "WHERE owner_type='content_package' AND owner_id=? "
+                "AND reason='package_replaced' AND state='pending'",
             (original.id,),
         ).mappings().one()
     assert cleanup["state"] == "pending"
@@ -174,6 +175,7 @@ def test_startup_recovery_retains_building_artifact_and_enqueues_cleanup(tmp_pat
                 owner_type="content_package",
                 owner_id=package.id,
                 relative_path=package.path,
+                state="pending",
             ).one()
             assert cleanup.state == "pending"
     finally:
