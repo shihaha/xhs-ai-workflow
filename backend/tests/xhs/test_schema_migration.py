@@ -3,11 +3,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import create_engine, inspect, text
 
 from backend.app.db import (
     Database,
     SchemaMigrationError,
+    _xhs_account_note_autoincrement_ddl_valid,
     canonical_raw_evidence_digest,
 )
 from backend.app.features.analysis.models import AnalysisRecord
@@ -153,6 +154,35 @@ def _unique_columns(database: Database, table: str) -> set[tuple[str, ...]]:
         tuple(item.get("column_names") or ())
         for item in inspect(database.engine).get_unique_constraints(table)
     }
+
+
+def _identity_disk_state(path: Path) -> tuple[object, ...]:
+    with sqlite3.connect(path) as connection:
+        return (
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='xhs_account_notes'"
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT name, applied_at FROM workbench_schema_migrations "
+                "WHERE name=?",
+                (IDENTITY_MIGRATION,),
+            ).fetchall(),
+            connection.execute(
+                "SELECT * FROM xhs_account_notes ORDER BY id"
+            ).fetchall(),
+            connection.execute(
+                "SELECT evidence_ids_json FROM analyses ORDER BY id"
+            ).fetchall(),
+            connection.execute(
+                "SELECT rowid, name, seq FROM sqlite_sequence "
+                "WHERE name LIKE 'xhs_account_notes%' ORDER BY rowid"
+            ).fetchall(),
+            connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='table' "
+                "AND name='xhs_account_notes_identity_v1'"
+            ).fetchall(),
+        )
 
 
 def _foreign_key(
@@ -525,3 +555,151 @@ def test_identity_migration_rejects_malformed_reference_history_before_writes(
             "SELECT COUNT(*) FROM workbench_schema_migrations WHERE name=?",
             (IDENTITY_MIGRATION,),
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "spoof",
+    [
+        "note TEXT /* id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT */",
+        "note TEXT -- id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT\n",
+        "note TEXT DEFAULT 'idintegernotnullprimarykeyautoincrement'",
+        '"idintegernotnullprimarykeyautoincrement" TEXT',
+    ],
+    ids=["block-comment", "line-comment", "string-literal", "quoted-identifier"],
+)
+def test_identity_ddl_validator_ignores_non_code_autoincrement_spoofs(
+    tmp_path: Path,
+    spoof: str,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'ddl-spoof.sqlite3'}")
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE xhs_account_notes ("
+                "id INTEGER NOT NULL PRIMARY KEY, "
+                f"{spoof})"
+            ))
+            assert _xhs_account_note_autoincrement_ddl_valid(connection) is False
+    finally:
+        engine.dispose()
+
+
+def test_identity_ddl_validator_accepts_quoted_real_id_column(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'quoted-id.sqlite3'}")
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(
+                'CREATE TABLE xhs_account_notes ('
+                '"id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, note TEXT)'
+            ))
+            assert _xhs_account_note_autoincrement_ddl_valid(connection) is True
+    finally:
+        engine.dispose()
+
+
+def test_identity_marker_comment_spoof_is_validation_only_failure(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "identity-comment-spoof.sqlite3"
+    database = Database(path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='xhs_account_notes'"
+        ).fetchone()[0]
+        spoofed_sql = (
+            table_sql.replace("PRIMARY KEY AUTOINCREMENT", "PRIMARY KEY")
+            + " /* id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT */"
+        )
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='table' "
+            "AND name='xhs_account_notes'",
+            (spoofed_sql,),
+        )
+        connection.execute("PRAGMA writable_schema=OFF")
+    before = _identity_disk_state(path)
+
+    with pytest.raises(SchemaMigrationError, match="note identity"):
+        Database(path)
+
+    assert _identity_disk_state(path) == before
+
+
+@pytest.mark.parametrize(
+    "evidence_id",
+    [
+        "account-note:9223372036854775808",
+        f"account-note:{'9' * 10_000}",
+        "account-note:-1",
+        "account-note:0",
+        "account-note:01",
+        "account-note:+1",
+        "account-note:not-a-number",
+    ],
+    ids=["int64-overflow", "overlong", "negative", "zero", "leading-zero", "plus", "text"],
+)
+def test_identity_migration_rejects_invalid_historical_ids_before_writes(
+    tmp_path: Path,
+    evidence_id: str,
+) -> None:
+    path = tmp_path / "identity-invalid-history.sqlite3"
+    database = Database(path)
+    _insert_trusted_note(database, note_id="preserved")
+    now = datetime.now(UTC).replace(tzinfo=None)
+    with database.session() as session:
+        session.add(AnalysisRecord(
+            analysis_type="account_report",
+            account_user_id="u1",
+            account_user_ids_json=[],
+            status="failed",
+            prompt_version="historical-v1",
+            provider="historical",
+            model="historical",
+            input_digest="0" * 64,
+            evidence_ids_json=[evidence_id],
+            output_json=None,
+            usage_json={},
+            duration_ms=None,
+            attempts_json=[],
+            error_category="historical",
+            error_detail="historical",
+            created_at=now,
+        ))
+        session.commit()
+    database.close()
+    _downgrade_note_identity_to_v1(path, keep_marker=False)
+    before = _identity_disk_state(path)
+
+    with pytest.raises(SchemaMigrationError, match="reference history"):
+        Database(path)
+
+    assert _identity_disk_state(path) == before
+
+
+def test_identity_half_migration_with_new_ddl_and_old_table_fails_every_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "identity-half-restart.sqlite3"
+    database = Database(path)
+    _insert_trusted_note(database, note_id="preserved")
+    database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DELETE FROM workbench_schema_migrations WHERE name=?",
+            (IDENTITY_MIGRATION,),
+        )
+        connection.execute(
+            "CREATE TABLE xhs_account_notes_identity_v1 "
+            "(sentinel TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO xhs_account_notes_identity_v1(sentinel) VALUES ('old')"
+        )
+    before = _identity_disk_state(path)
+
+    for _attempt in range(2):
+        with pytest.raises(SchemaMigrationError, match="Interrupted"):
+            Database(path)
+        assert _identity_disk_state(path) == before

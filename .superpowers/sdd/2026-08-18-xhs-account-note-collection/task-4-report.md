@@ -186,3 +186,81 @@ pre-existing Python 3.12 SQLite datetime-adapter deprecations in content tests.
 - No model-provider behavior, exact shop N/N opportunity gate, Task 5 UI/E2E,
   Bailian media code, platform writes or untracked research files changed.
 - The authenticated live boundary is unchanged: `not_run`.
+
+## Fix round 2/5 — structural DDL proof and bounded identity preflight
+
+### Review findings closed
+
+- Identity validation no longer searches normalized source text for an
+  `AUTOINCREMENT` substring. A SQLite-aware tokenizer removes line and block
+  comments, isolates string literals, preserves quoted identifiers as identifiers,
+  and splits the real table body into top-level column declarations. Validation
+  now requires the actual `id` column to declare `INTEGER`, `PRIMARY KEY` and
+  `AUTOINCREMENT`; comments, literals and unrelated quoted identifiers cannot
+  authorize the marker. A genuinely quoted `"id"` column remains valid.
+- A present `xhs_account_note_identity_v2` marker remains validation-only. A
+  writable-schema test replaces the physical ID declaration with non-AUTOINCREMENT
+  DDL plus a spoofing comment and verifies initialization fails without changing
+  DDL, marker, rows or sequence state.
+- Historical `account-note:*` suffixes are parsed only after a canonical decimal
+  and explicit SQLite rowid bound check. Zero, signs, leading zeroes, non-digits,
+  values above `9223372036854775807` and overlong digit strings all raise a uniform
+  `SchemaMigrationError` during the read-only preflight; no Python integer or
+  SQLite binding exception can occur after a rebuild.
+- The read-only preflight now covers the complete evidence schema/data, all
+  persisted analysis and opportunity citation lists, unfinished migration-table
+  presence, and repairability of an existing AUTOINCREMENT sequence. It is rerun
+  before the first migration write. A database with new DDL plus the old temporary
+  table fails identically on repeated restarts and leaves the asserted DDL, marker,
+  row and sequence state exactly unchanged.
+
+### Fix-round RED evidence
+
+Before production changes, the selected new regressions produced:
+
+```text
+12 failed, 2 passed, 11 deselected
+```
+
+The failures showed block and line comments authorizing a non-AUTOINCREMENT ID,
+a real quoted `"id"` declaration being rejected, marker-present spoofed DDL being
+accepted, int64 overflow escaping as `OverflowError`, overlong digits escaping as
+Python's integer-conversion `ValueError`, malformed account-note IDs being ignored,
+and an unfinished migration being silently marked complete. The two already-safe
+spaced literal and quoted-identifier cases remained passing controls in the first
+RED run; the final suite tightens both to exact no-whitespace spoof tokens.
+
+### Fix-round GREEN evidence
+
+```text
+python -m pytest backend/tests/xhs/test_schema_migration.py -k "ddl_validator or comment_spoof or invalid_historical_ids or half_migration_with_new_ddl" -q --tb=short
+14 passed, 11 deselected in 1.98s
+
+python -m pytest backend/tests/xhs/test_schema_migration.py -q
+25 passed in 3.77s
+
+python -m pytest backend/tests/xhs/test_schema_migration.py backend/tests/analysis/test_account_note_grounding.py -q
+50 passed in 7.11s
+
+python -m pytest backend/tests/analysis backend/tests/xhs -q
+388 passed, 1 skipped in 18.72s
+
+python -m pytest backend/tests -q
+980 passed, 1 skipped, 32 warnings in 101.65s
+```
+
+The skip and 32 warnings remain the pre-existing live opt-in gate and Python 3.12
+SQLite datetime-adapter deprecations. `python -m compileall -q backend/app
+backend/tests` and `git diff --check` exited 0.
+
+### Fix-round self-review and boundary
+
+- The tokenizer is deliberately bounded to persisted SQLite `CREATE TABLE` DDL;
+  it is not a general SQL execution parser. The existing full evidence-schema
+  validator still verifies all columns, checks, foreign keys, indexes and triggers.
+- The maximum legal historical ID is accepted even though it intentionally
+  exhausts future SQLite row IDs rather than permitting identity reuse.
+- Citations outside this database remain undiscoverable by a local migration.
+- Provider-neutral analysis behavior, note trust-chain checks, the exact shop N/N
+  opportunity gate, Task 5, Bailian media, platform writes and untracked research
+  remain unchanged. The authenticated live boundary remains `not_run`.

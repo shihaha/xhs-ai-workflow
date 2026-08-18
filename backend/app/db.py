@@ -372,17 +372,9 @@ class Database:
         # the migration transaction below so a concurrent initializer cannot
         # turn this preflight into a time-of-check/time-of-use gap.
         with self.engine.connect() as connection:
-            if (
-                not _xhs_account_note_evidence_schema_valid(
-                    inspect(connection), connection
-                )
-                or not _xhs_account_note_evidence_data_valid(connection)
-            ):
-                raise SchemaMigrationError(
-                    "XHS account note identity requires a valid evidence schema."
-                )
-            _xhs_account_note_reference_floor(connection)
+            _require_xhs_account_note_identity_preconditions(connection)
         with self.engine.begin() as connection:
+            _require_xhs_account_note_identity_preconditions(connection)
             connection.execute(text(
                 "CREATE TABLE IF NOT EXISTS workbench_schema_migrations ("
                 "name VARCHAR(200) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL)"
@@ -396,15 +388,6 @@ class Database:
                         "XHS account note identity schema validation failed."
                     )
                 return
-            if (
-                not _xhs_account_note_evidence_schema_valid(
-                    inspect(connection), connection
-                )
-                or not _xhs_account_note_evidence_data_valid(connection)
-            ):
-                raise SchemaMigrationError(
-                    "XHS account note identity requires a valid evidence schema."
-                )
             if not _xhs_account_note_autoincrement_ddl_valid(connection):
                 _rebuild_xhs_account_notes_with_permanent_ids(
                     connection, XhsAccountNoteRecord
@@ -1413,7 +1396,125 @@ def _create_xhs_account_note_evidence_triggers(connection: Connection) -> None:
         connection.execute(text(sql))
 
 
+_ACCOUNT_NOTE_EVIDENCE_PREFIX = "account-note:"
 _ACCOUNT_NOTE_EVIDENCE_ID = re.compile(r"^account-note:([1-9][0-9]*)$", re.ASCII)
+_SQLITE_MAX_ROW_ID = 9_223_372_036_854_775_807
+_SQLITE_MAX_ROW_ID_TEXT = str(_SQLITE_MAX_ROW_ID)
+
+
+def _sqlite_schema_tokens(value: object) -> list[tuple[str, str]] | None:
+    """Tokenize SQLite DDL while keeping code separate from quotes/comments."""
+
+    if not isinstance(value, str):
+        return None
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char.isspace():
+            index += 1
+            continue
+        if value.startswith("--", index):
+            newline = value.find("\n", index + 2)
+            index = len(value) if newline < 0 else newline + 1
+            continue
+        if value.startswith("/*", index):
+            end = value.find("*/", index + 2)
+            if end < 0:
+                return None
+            index = end + 2
+            continue
+        if char == "'":
+            index += 1
+            while index < len(value):
+                if value[index] != "'":
+                    index += 1
+                    continue
+                index += 1
+                if index < len(value) and value[index] == "'":
+                    index += 1
+                    continue
+                tokens.append(("literal", ""))
+                break
+            else:
+                return None
+            continue
+        if char in {'"', "`", "["}:
+            delimiter = "]" if char == "[" else char
+            index += 1
+            rendered: list[str] = []
+            while index < len(value):
+                if value[index] != delimiter:
+                    rendered.append(value[index])
+                    index += 1
+                    continue
+                index += 1
+                if index < len(value) and value[index] == delimiter:
+                    rendered.append(delimiter)
+                    index += 1
+                    continue
+                tokens.append(("identifier", "".join(rendered).casefold()))
+                break
+            else:
+                return None
+            continue
+        if char in {"(", ")", ",", ".", ";"}:
+            tokens.append(("symbol", char))
+            index += 1
+            continue
+        start = index
+        while index < len(value):
+            if (
+                value[index].isspace()
+                or value[index] in "'\"`[](),.;"
+                or value.startswith("--", index)
+                or value.startswith("/*", index)
+            ):
+                break
+            index += 1
+        if start == index:
+            tokens.append(("symbol", char))
+            index += 1
+        else:
+            tokens.append(("word", value[start:index].casefold()))
+    return tokens
+
+
+def _sqlite_table_column_definitions(
+    tokens: list[tuple[str, str]],
+) -> list[list[tuple[str, str]]] | None:
+    if len(tokens) < 4 or tokens[:2] != [("word", "create"), ("word", "table")]:
+        return None
+    try:
+        body_start = tokens.index(("symbol", "("), 2)
+    except ValueError:
+        return None
+    definitions: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    depth = 1
+    for token in tokens[body_start + 1:]:
+        if token == ("symbol", "("):
+            depth += 1
+            current.append(token)
+            continue
+        if token == ("symbol", ")"):
+            depth -= 1
+            if depth == 0:
+                if current:
+                    definitions.append(current)
+                return definitions
+            if depth < 0:
+                return None
+            current.append(token)
+            continue
+        if token == ("symbol", ",") and depth == 1:
+            if not current:
+                return None
+            definitions.append(current)
+            current = []
+            continue
+        current.append(token)
+    return None
 
 
 def _xhs_account_note_autoincrement_ddl_valid(connection: Connection) -> bool:
@@ -1424,8 +1525,53 @@ def _xhs_account_note_autoincrement_ddl_valid(connection: Connection) -> bool:
         ))
     except SQLAlchemyError:
         return False
-    compact = _compact_sql(table_sql)
-    return "idintegernotnullprimarykeyautoincrement" in compact
+    tokens = _sqlite_schema_tokens(table_sql)
+    definitions = _sqlite_table_column_definitions(tokens or [])
+    if definitions is None:
+        return False
+    for definition in definitions:
+        if (
+            len(definition) < 4
+            or definition[0][0] not in {"word", "identifier"}
+            or definition[0][1] != "id"
+            or definition[1] != ("word", "integer")
+        ):
+            continue
+        top_level_words: list[str] = []
+        depth = 0
+        for kind, token_value in definition[2:]:
+            if (kind, token_value) == ("symbol", "("):
+                depth += 1
+            elif (kind, token_value) == ("symbol", ")"):
+                depth -= 1
+                if depth < 0:
+                    return False
+            elif depth == 0 and kind == "word":
+                top_level_words.append(token_value)
+        for index, word in enumerate(top_level_words[:-1]):
+            if word == "primary" and top_level_words[index + 1] == "key":
+                return "autoincrement" in top_level_words[index + 2:]
+        return False
+    return False
+
+
+def _historical_account_note_id(value: str) -> int | None:
+    if not value.startswith(_ACCOUNT_NOTE_EVIDENCE_PREFIX):
+        return None
+    match = _ACCOUNT_NOTE_EVIDENCE_ID.fullmatch(value)
+    if match is None:
+        raise SchemaMigrationError(
+            "XHS account note reference history is invalid."
+        )
+    rendered = match.group(1)
+    if len(rendered) > len(_SQLITE_MAX_ROW_ID_TEXT) or (
+        len(rendered) == len(_SQLITE_MAX_ROW_ID_TEXT)
+        and rendered > _SQLITE_MAX_ROW_ID_TEXT
+    ):
+        raise SchemaMigrationError(
+            "XHS account note reference history is invalid."
+        )
+    return int(rendered)
 
 
 def _xhs_account_note_reference_floor(connection: Connection) -> int:
@@ -1461,10 +1607,53 @@ def _xhs_account_note_reference_floor(connection: Connection) -> int:
                     "XHS account note reference history is invalid."
                 )
             for value in values:
-                match = _ACCOUNT_NOTE_EVIDENCE_ID.fullmatch(value)
-                if match is not None:
-                    floor = max(floor, int(match.group(1)))
+                referenced_id = _historical_account_note_id(value)
+                if referenced_id is not None:
+                    floor = max(floor, referenced_id)
     return floor
+
+
+def _require_xhs_account_note_identity_preconditions(
+    connection: Connection,
+) -> None:
+    try:
+        if (
+            not _xhs_account_note_evidence_schema_valid(
+                inspect(connection), connection
+            )
+            or not _xhs_account_note_evidence_data_valid(connection)
+        ):
+            raise SchemaMigrationError(
+                "XHS account note identity requires a valid evidence schema."
+            )
+        if "xhs_account_notes_identity_v1" in inspect(connection).get_table_names():
+            raise SchemaMigrationError(
+                "Interrupted XHS account note identity migration requires "
+                "isolated manual migration."
+            )
+        _xhs_account_note_reference_floor(connection)
+        if _xhs_account_note_autoincrement_ddl_valid(connection):
+            rows = connection.execute(text(
+                "SELECT seq FROM sqlite_sequence WHERE name='xhs_account_notes'"
+            )).all()
+            if len(rows) > 1:
+                raise SchemaMigrationError(
+                    "XHS account note identity sequence is ambiguous."
+                )
+            if rows and (
+                isinstance(rows[0][0], bool)
+                or not isinstance(rows[0][0], int)
+                or not 0 <= rows[0][0] <= _SQLITE_MAX_ROW_ID
+            ):
+                raise SchemaMigrationError(
+                    "XHS account note identity sequence is invalid."
+                )
+    except SchemaMigrationError:
+        raise
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError, OverflowError):
+        raise SchemaMigrationError(
+            "XHS account note identity preflight failed."
+        ) from None
 
 
 def _advance_xhs_account_note_identity_sequence(connection: Connection) -> None:
