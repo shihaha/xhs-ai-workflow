@@ -43,7 +43,7 @@ def test_generic_database_failure_after_material_write_enqueues_and_retains_file
 
     monkeypatch.setattr(Session, "commit", fail_commit)
 
-    with pytest.raises(ContentStateError, match="transaction_unknown"):
+    with pytest.raises(ContentStateError, match="material_persistence_not_landed"):
         service.add_material(item.product_id, payload)
 
     with service.database.session() as session:
@@ -51,7 +51,7 @@ def test_generic_database_failure_after_material_write_enqueues_and_retains_file
             ProductMaterialRecord.logical_name == "facts.txt"
         )) == 0
         cleanup = session.scalar(select(ArtifactCleanupRecord).where(
-            ArtifactCleanupRecord.reason == "material_write_reserved",
+            ArtifactCleanupRecord.reason == "material_persistence_failed",
             ArtifactCleanupRecord.state == "pending",
         ))
         assert cleanup is not None
@@ -249,7 +249,10 @@ def test_package_finalizer_cas_rejects_mid_build_takeover_without_overwriting_ow
 
     monkeypatch.setattr(service_module, "write_contained_atomic", mutate_reservation_after_write)
 
-    with pytest.raises(ContentStateError, match="changed before finalization"):
+    expected_error = (
+        "changed before finalization" if mutation == "item" else "package_builder_lost"
+    )
+    with pytest.raises(ContentStateError, match=expected_error):
         service.export_package(item.id, request)
 
     assert len(built_paths) == 1

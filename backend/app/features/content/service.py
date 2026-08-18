@@ -77,6 +77,12 @@ class _ReservationOutcome(str, Enum):
     UNKNOWN = "unknown"
 
 
+class _MaterialPersistenceOutcome(str, Enum):
+    LANDED = "landed"
+    NOT_LANDED = "not_landed"
+    UNKNOWN = "unknown"
+
+
 class _FailureOutcome(str, Enum):
     FAILED = "failed"
     PROVEN_FAILED = "proven_failed"
@@ -192,64 +198,96 @@ class ContentService:
                 return self._material_read(
                     session.get(ProductMaterialRecord, record.id)
                 )
-        except IntegrityError as error:
-            proven = self._material_after_unknown(record, cleanup.id, candidate)
-            if proven is not None:
-                return proven
-            raise ContentStateError(
-                "Concurrent material version conflict; retry the request."
-            ) from error
         except SQLAlchemyError as error:
-            proven = self._material_after_unknown(record, cleanup.id, candidate)
-            if proven is not None:
-                return proven
-            raise ContentStateError(
-                "transaction_unknown: material persistence could not be proven."
-            ) from error
+            return self._resolve_material_persistence_error(
+                error, record, cleanup.id, candidate
+            )
 
-    def _material_after_unknown(
+    def _resolve_material_persistence_error(
+        self,
+        error: SQLAlchemyError,
+        expected: ProductMaterialRecord,
+        cleanup_id: str,
+        candidate: ArtifactCleanupCandidate,
+    ) -> MaterialRead:
+        outcome, proven = self._material_persistence_after_unknown(
+            expected, cleanup_id, candidate
+        )
+        if outcome is _MaterialPersistenceOutcome.LANDED:
+            assert proven is not None
+            return proven
+        reason = (
+            "material_persistence_failed"
+            if outcome is _MaterialPersistenceOutcome.NOT_LANDED
+            else "material_transaction_unknown"
+        )
+        try:
+            self._make_material_cleanup_due(
+                cleanup_id, candidate, reason=reason
+            )
+        except ContentStateError as due_error:
+            raise ContentStateError(
+                "material_failure_transaction_unknown: persistence and cleanup due state could not be proven."
+            ) from due_error
+        if outcome is _MaterialPersistenceOutcome.NOT_LANDED:
+            raise ContentStateError(
+                "material_persistence_not_landed: material row did not commit; cleanup is due."
+            ) from error
+        raise ContentStateError(
+            "transaction_unknown: material persistence is unknown; cleanup is due."
+        ) from error
+
+    def _material_persistence_after_unknown(
         self,
         expected: ProductMaterialRecord,
         cleanup_id: str,
         candidate: ArtifactCleanupCandidate,
-    ) -> MaterialRead | None:
-        """Return success only when a fresh exact read proves the commit completed."""
+    ) -> tuple[_MaterialPersistenceOutcome, MaterialRead | None]:
+        """Classify an uncertain commit from fresh exact material and outbox facts."""
         try:
             with self.database.session() as session:
                 record = session.get(ProductMaterialRecord, expected.id)
                 cleanup = session.get(ArtifactCleanupRecord, cleanup_id)
-                if (
-                    record is None
-                    or record.product_id != expected.product_id
-                    or record.logical_name != expected.logical_name
-                    or record.logical_key != expected.logical_key
-                    or record.version != expected.version
-                    or record.path != candidate.relative_path
-                    or record.sha256 != candidate.expected_sha256
-                    or record.size_bytes != candidate.expected_size_bytes
-                    or record.media_type != expected.media_type
-                    or record.kind != expected.kind
-                    or cleanup is None
-                    or cleanup.state != "cancelled"
-                    or cleanup.owner_type != candidate.owner_type
-                    or cleanup.owner_id != candidate.owner_id
-                    or cleanup.relative_path != candidate.relative_path
-                    or cleanup.expected_sha256 != candidate.expected_sha256
-                    or cleanup.expected_size_bytes != candidate.expected_size_bytes
+                record_matches = bool(
+                    record is not None
+                    and record.product_id == expected.product_id
+                    and record.logical_name == expected.logical_name
+                    and record.logical_key == expected.logical_key
+                    and record.version == expected.version
+                    and record.path == candidate.relative_path
+                    and record.sha256 == candidate.expected_sha256
+                    and record.size_bytes == candidate.expected_size_bytes
+                    and record.media_type == expected.media_type
+                    and record.kind == expected.kind
+                )
+                if record_matches and self._cleanup_matches(
+                    cleanup, candidate, state="cancelled"
                 ):
-                    return None
-                return self._material_read(record)
+                    return (
+                        _MaterialPersistenceOutcome.LANDED,
+                        self._material_read(record),
+                    )
+                if record is None and self._cleanup_matches(
+                    cleanup, candidate, state="pending"
+                ):
+                    return _MaterialPersistenceOutcome.NOT_LANDED, None
+                return _MaterialPersistenceOutcome.UNKNOWN, None
         except SQLAlchemyError:
-            return None
+            return _MaterialPersistenceOutcome.UNKNOWN, None
 
     def _make_material_cleanup_due(
-        self, cleanup_id: str, candidate: ArtifactCleanupCandidate
+        self,
+        cleanup_id: str,
+        candidate: ArtifactCleanupCandidate,
+        *,
+        reason: str | None = None,
     ) -> None:
         due_at = _now()
         try:
             with self.database.session() as session:
                 if not self.cleanup_service.make_due_in_session(
-                    session, cleanup_id, candidate=candidate, due_at=due_at
+                    session, cleanup_id, candidate=candidate, due_at=due_at,
+                    reason=reason,
                 ):
                     raise ContentStateError(
                         "material_failure_transaction_unknown: cleanup reservation changed."
@@ -264,7 +302,9 @@ class ContentService:
                     cleanup = session.get(ArtifactCleanupRecord, cleanup_id)
                     proven = self._cleanup_matches(
                         cleanup, candidate, state="pending"
-                    ) and cleanup.not_before <= due_at
+                    ) and cleanup.not_before <= due_at and (
+                        reason is None or cleanup.reason == reason
+                    )
             except SQLAlchemyError:
                 proven = False
             if not proven:
@@ -644,6 +684,10 @@ class ContentService:
                 raise ContentStateError(
                     "package_failure_transaction_unknown: failed package facts could not be proven."
                 ) from error
+            if failure is _FailureOutcome.LOST:
+                raise ContentStateError(
+                    "package_builder_lost: package reservation state changed."
+                ) from error
             raise ContentValidationError(
                 "Package build failed; no ready artifact was recorded."
             ) from error
@@ -655,6 +699,10 @@ class ContentService:
             if failure is _FailureOutcome.UNKNOWN:
                 raise ContentStateError(
                     "package_failure_transaction_unknown: failed package facts could not be proven."
+                ) from error
+            if failure is _FailureOutcome.LOST:
+                raise ContentStateError(
+                    "package_builder_lost: package reservation state changed."
                 ) from error
             raise
 
@@ -677,6 +725,10 @@ class ContentService:
             with self.database.session() as session:
                 package = session.get(ContentPackageRecord, package_id)
                 cleanup = session.get(ArtifactCleanupRecord, cleanup_id)
+                replaced = (
+                    session.get(ArtifactCleanupRecord, replaced_cleanup_id)
+                    if replaced_cleanup_id is not None else None
+                )
                 landed = bool(
                     package is not None and package.content_item_id == item_id
                     and package.revision_id == revision_id
@@ -688,9 +740,6 @@ class ContentService:
                     and cleanup.not_before == _naive_datetime(candidate.not_before)
                 )
                 if landed and replaced_candidate is not None:
-                    replaced = session.get(
-                        ArtifactCleanupRecord, replaced_cleanup_id
-                    ) if replaced_cleanup_id is not None else None
                     landed = bool(
                         self._cleanup_matches(
                             replaced, replaced_candidate, state="pending"
@@ -711,6 +760,8 @@ class ContentService:
                         and package.status == old_status and package.path == old_path
                         and package.sha256 == old_sha and package.size_bytes == old_size
                         and package.build_token == old_token
+                        and replaced_cleanup_id is not None
+                        and replaced is None
                     ):
                         return _ReservationOutcome.NOT_LANDED
                 return _ReservationOutcome.UNKNOWN

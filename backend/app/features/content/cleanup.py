@@ -223,11 +223,14 @@ class ArtifactCleanupService:
         *,
         candidate: ArtifactCleanupCandidate,
         due_at: datetime | None = None,
+        reason: str | None = None,
     ) -> bool:
         """Advance one exact pending reservation without committing the transaction."""
         path_key = canonical_artifact_path_key(candidate.relative_path)
         if path_key is None or not is_canonical_uuid_text(cleanup_id):
             raise ValueError("Cleanup due identity is not canonical.")
+        if reason is not None and (not reason or len(reason) > 64):
+            raise ValueError("Cleanup due reason is invalid.")
         now = _naive_utc(due_at or self.clock())
         exact = (
             ArtifactCleanupRecord.id == cleanup_id,
@@ -239,10 +242,11 @@ class ArtifactCleanupService:
             ArtifactCleanupRecord.expected_size_bytes == candidate.expected_size_bytes,
             ArtifactCleanupRecord.state == "pending",
         )
+        values: dict[str, object] = {"not_before": now, "updated_at": now}
+        if reason is not None:
+            values["reason"] = reason
         won = session.execute(
-            update(ArtifactCleanupRecord).where(*exact).values(
-                not_before=now, updated_at=now
-            )
+            update(ArtifactCleanupRecord).where(*exact).values(**values)
         ).rowcount
         return won == 1
 
