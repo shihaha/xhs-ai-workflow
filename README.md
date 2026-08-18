@@ -23,4 +23,17 @@ npm install
 npm run dev
 ```
 
-The current screens are `/status` for API-reported prerequisites and `/jobs` for persisted job, log, and evidence facts. A fresh runtime has no sample jobs.
+The operator flow is available at `/radar`, `/accounts/<user-id>`, `/opportunities`, and `/content`. System prerequisites remain at `/status`, while `/jobs` shows persisted job, log, progress, and evidence facts. A fresh runtime has no sample business records.
+
+The ranking page reads stored snapshots; the backend does not currently expose a route that starts the Qianfan Playwright collector. Shop verification can be queued from an account using a runtime-relative evidence directory. Content export creates a local pending-publication ZIP only and never publishes to Xiaohongshu.
+
+Frontend verification:
+
+```powershell
+Set-Location frontend
+npm test -- --run
+npm run build
+npm run test:e2e
+```
+
+The Playwright test starts a test-only FastAPI application with a fresh temporary SQLite database and controlled device/model adapters. It is not a live Qianfan, Android, or Bailian verification.

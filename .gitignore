@@ -13,4 +13,6 @@ runtime/
 data/
 artifacts/
 playwright/.auth/
+frontend/playwright-report/
+frontend/test-results/
 .superpowers/
