@@ -275,6 +275,85 @@ def test_structured_header_credentials_are_redacted_before_artifact_and_facts(tm
     service.database.close()
 
 
+def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
+    tmp_path: Path,
+) -> None:
+    secret = "real-account-alias-secret-sentinel"
+    responses = iter([
+        subprocess.CompletedProcess(
+            ["xhs"], 0,
+            stdout=json.dumps({"user": {
+                "id": "user-1",
+                "nickname": "Alice",
+                "accessToken": secret,
+            }}).encode(),
+            stderr=b"",
+        ),
+        subprocess.CompletedProcess(
+            ["xhs"], 0,
+            stdout=json.dumps({"notes": [{
+                "id": "note-1",
+                "user_id": "user-1",
+                "headers": [{"name": "refreshToken", "value": secret}],
+            }]}).encode(),
+            stderr=b"",
+        ),
+    ])
+
+    def runner(_argv, **_kwargs):
+        return next(responses)
+
+    adapter = XhsCliReadAdapter(executable="xhs", runner=runner)
+    service = _service(tmp_path, adapter, submitter=lambda *_args: None)
+    queued = service.submit_account("user-1", 1)
+
+    completed = service.execute(queued.id)
+
+    assert completed is not None and completed.state is JobState.succeeded
+    artifact_text = (
+        service.runtime_dir / completed.artifacts[0].path
+    ).read_text(encoding="utf-8")
+    assert secret not in artifact_text
+    with service.database.session() as session:
+        profile = session.get(XhsAccountProfileRecord, "user-1")
+        note = session.scalar(select(XhsAccountNoteRecord))
+        assert secret not in json.dumps(profile.raw_evidence)
+        assert secret not in json.dumps(note.raw_evidence)
+    service.database.close()
+
+
+def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_facts(
+    tmp_path: Path,
+) -> None:
+    secret = "real-search-alias-secret-sentinel"
+    response = subprocess.CompletedProcess(
+        ["xhs"], 0,
+        stdout=json.dumps({"notes": [{
+            "id": "note-1",
+            "title": "收纳",
+            "auth_token": secret,
+            "headers": [{"name": "cookie_string", "value": secret}],
+        }]}).encode(),
+        stderr=b"",
+    )
+    adapter = XhsCliReadAdapter(
+        executable="xhs", runner=lambda _argv, **_kwargs: response
+    )
+    service = _service(tmp_path, adapter, submitter=lambda *_args: None)
+    queued = service.submit_search("收纳", 1)
+
+    completed = service.execute(queued.id)
+    facts = service.get_search_results(queued.id)
+
+    assert completed is not None and completed.state is JobState.succeeded
+    artifact_text = (
+        service.runtime_dir / completed.artifacts[0].path
+    ).read_text(encoding="utf-8")
+    assert secret not in artifact_text
+    assert secret not in facts.model_dump_json()
+    service.database.close()
+
+
 def test_commit_acknowledgement_error_reads_back_committed_success(tmp_path: Path) -> None:
     service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
     queued = service.submit_account("user-1", 1)

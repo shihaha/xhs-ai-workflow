@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -9,10 +10,12 @@ _SENSITIVE_NAMES = frozenset({
     "access-token",
     "api-key",
     "apikey",
+    "auth-token",
     "authorization",
     "client-secret",
     "clientsecret",
     "cookie",
+    "cookie-string",
     "credential",
     "credentials",
     "id-token",
@@ -31,6 +34,9 @@ _SENSITIVE_NAMES = frozenset({
     "x-xsrf-token",
 })
 _STRUCTURED_VALUE_KEYS = frozenset({"value", "values"})
+_ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
+_NAME_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
 
 
 def redact_credentials(value: Any) -> Any:
@@ -59,4 +65,6 @@ def redact_credentials(value: Any) -> Any:
 
 
 def _normalized_name(value: str) -> str:
-    return "-".join(value.strip().casefold().replace("_", "-").split())
+    words = _ACRONYM_BOUNDARY.sub(r"\1-\2", value.strip())
+    words = _CAMEL_BOUNDARY.sub(r"\1-\2", words)
+    return _NAME_SEPARATOR.sub("-", words).strip("-").casefold()

@@ -266,6 +266,47 @@ def test_structured_header_name_value_credentials_are_redacted_without_false_pos
     assert secret_garden in rendered
 
 
+@pytest.mark.parametrize(
+    "credential_name",
+    [
+        "accessToken",
+        "access-token",
+        "access token",
+        "refreshToken",
+        "auth_token",
+        "auth-token",
+        "auth token",
+        "cookie_string",
+        "cookieString",
+        "cookie-string",
+        "cookie string",
+        "clientSecret",
+        "apiKey",
+    ],
+)
+def test_direct_and_structured_credential_aliases_are_redacted(
+    credential_name: str,
+) -> None:
+    direct_secret = f"direct-{credential_name}-secret-sentinel"
+    structured_secret = f"structured-{credential_name}-secret-sentinel"
+    fake_runner = FakeRunner([_completed(["xhs"], {"notes": [{
+        "id": "note-1",
+        credential_name: direct_secret,
+        "headers": [{"name": credential_name, "value": structured_secret}],
+    }]})])
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.search_notes(CollectionRequest(
+        capability="search_notes",
+        parameters={"keyword": "收纳", "job_id": JOB_ID},
+        expected_count=1,
+    ))
+
+    rendered = result.model_dump_json()
+    assert direct_secret not in rendered
+    assert structured_secret not in rendered
+
+
 @pytest.mark.parametrize("field", ["keyword", "user_id"])
 @pytest.mark.parametrize("unsafe_value", ["--json", "-x", "line\nbreak", "nul\x00byte"])
 def test_positional_cli_values_reject_options_and_control_characters(

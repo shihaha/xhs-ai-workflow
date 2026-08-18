@@ -255,3 +255,76 @@ shop test or implementation was changed.
 
 No authenticated live `xhs-cli` command was run. Task 5 still owns that
 explicit opt-in gate, so the live boundary remains `not_run`.
+
+## Fix round 3/5 — credential alias canonicalization
+
+Commit: `HEAD` (`fix: redact xhs credential aliases`; one fix-round commit).
+
+### RED
+
+The new tests exercised both direct dictionary keys and structured
+`{"name": ..., "value": ...}` fields through the real CLI adapter, plus
+account/search adapter-to-service persistence:
+
+```text
+python -m pytest backend/tests/xhs/test_cli_adapter.py::test_direct_and_structured_credential_aliases_are_redacted backend/tests/xhs/test_cli_adapter.py::test_structured_header_name_value_credentials_are_redacted_without_false_positive backend/tests/xhs/test_collection_service.py::test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts backend/tests/xhs/test_collection_service.py::test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_facts -q
+11 failed, 5 passed in 0.81s
+```
+
+The failures proved that camelCase `accessToken`/`refreshToken`, canonical
+`auth_token` aliases and `cookie_string` aliases reached normalized adapter
+evidence and durable artifacts. Exact names already recognized by round 2 and
+the ordinary `session title`/`secret garden` values remained passing controls.
+
+### GREEN
+
+Targeted alias and end-to-end persistence regression:
+
+```text
+16 passed in 0.58s
+```
+
+Fresh Task 3 focused suite:
+
+```text
+python -m pytest backend/tests/xhs/test_collection_service.py backend/tests/xhs/test_collection_api.py backend/tests/xhs/test_cli_adapter.py backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+124 passed in 9.22s
+```
+
+Fresh required XHS/jobs suite:
+
+```text
+python -m pytest backend/tests/xhs backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+140 passed in 11.57s
+```
+
+Fresh full backend regression:
+
+```text
+python -m pytest backend/tests -q
+762 passed, 1 skipped, 32 warnings in 93.04s
+```
+
+The skip remains the opt-in live gate and the warnings remain the existing
+Python 3.12 sqlite datetime adapter deprecations. `python -m compileall -q
+backend/app` and `git diff --check` exited 0.
+
+### Fixes and self-review
+
+- Credential names are split at acronym/camelCase boundaries, separator runs
+  are normalized to hyphens and comparison is case-folded.
+- The normalized result is still checked only against a finite exact allowlist;
+  `auth-token` and `cookie-string` were added as deliberate credential aliases.
+  There is no substring rule, so names merely containing `session` or `secret`
+  remain ordinary content.
+- Direct and structured variants now cover camelCase, snake_case, kebab-case
+  and space-separated forms including `accessToken`, `refreshToken`,
+  `auth_token`, `cookie_string`, `clientSecret` and `apiKey`.
+- Real account collection tests prove the secret is absent from the artifact,
+  profile fact and note fact. Real search collection tests prove it is absent
+  from the independent search artifact and normalized read facts.
+
+### Remaining live boundary
+
+No authenticated live `xhs-cli` command was run. Task 5 still owns that
+explicit opt-in gate, so the live boundary remains `not_run`.
