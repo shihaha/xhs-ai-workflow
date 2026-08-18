@@ -12,6 +12,7 @@ dependencies = [
     "adbutils>=2,<3",
     "fastapi>=0.115,<1",
     "pillow>=12,<13",
+    "playwright>=1.61,<2",
     "pydantic-settings>=2.6,<3",
     "sqlalchemy>=2.0,<3",
     "uiautomator2>=3,<4",

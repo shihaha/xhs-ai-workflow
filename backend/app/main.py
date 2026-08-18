@@ -11,6 +11,10 @@ from backend.app.api.health import router as health_router
 from backend.app.api.jobs import router as jobs_router
 from backend.app.adapters.android_device import AndroidDeviceAdapter
 from backend.app.adapters.bailian import BailianModelAdapter
+from backend.app.adapters.qianfan_playwright import (
+    QianfanPlaywrightAdapter,
+    persistent_qianfan_page_factory,
+)
 from backend.app.db import Database
 from backend.app.features.analysis.api import router as analysis_router
 from backend.app.features.analysis.service import AnalysisService
@@ -22,6 +26,7 @@ from backend.app.features.content.cleanup import (
 from backend.app.features.content.service import ContentService
 from backend.app.features.radar.api import router as radar_router
 from backend.app.features.radar.service import RadarService
+from backend.app.features.radar.qianfan_service import QianfanCollectionService
 from backend.app.features.shops.api import router as shops_router
 from backend.app.features.shops.service import (
     ANDROID_SHOP_JOB_TYPES,
@@ -39,6 +44,11 @@ async def _lifespan(app: FastAPI):
             cleanup_worker.start()
         yield
     finally:
+        qianfan_service: QianfanCollectionService | None = (
+            app.state.qianfan_collection_service
+        )
+        if qianfan_service is not None:
+            qianfan_service.close()
         shop_service: ShopCollectionService | None = app.state.shop_service
         if shop_service is not None:
             shop_service.close()
@@ -57,6 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = None
     app.state.job_service = None
     app.state.radar_service = None
+    app.state.qianfan_collection_service = None
     app.state.android_adapter = None
     app.state.shop_service = None
     app.state.analysis_service = None
@@ -81,6 +92,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.database, runtime_dir=app.state.settings.runtime_dir
         )
         app.state.radar_service = RadarService(app.state.database)
+        page_factory = persistent_qianfan_page_factory(
+            browser_executable=app.state.settings.browser_executable,
+            user_data_dir=app.state.settings.qianfan_browser_profile_dir,
+        )
+        app.state.qianfan_collection_service = QianfanCollectionService(
+            job_service=app.state.job_service,
+            radar_service=app.state.radar_service,
+            runtime_dir=app.state.settings.runtime_dir,
+            adapter_factory=lambda: QianfanPlaywrightAdapter(
+                page_factory=page_factory,
+                job_service=app.state.job_service,
+                runtime_dir=app.state.settings.runtime_dir,
+                timeout_seconds=app.state.settings.qianfan_timeout_seconds,
+                owns_page=True,
+                finalize_job=False,
+            ),
+        )
         app.state.analysis_service = AnalysisService(
             app.state.database,
             app.state.bailian_adapter,
@@ -110,9 +138,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             worker_job_types=ANDROID_SHOP_JOB_TYPES
         )
     except (OSError, SQLAlchemyError):
+        if app.state.qianfan_collection_service is not None:
+            app.state.qianfan_collection_service.close()
         app.state.database = None
         app.state.job_service = None
         app.state.radar_service = None
+        app.state.qianfan_collection_service = None
         app.state.analysis_service = None
         app.state.content_service = None
         app.state.artifact_cleanup_service = None

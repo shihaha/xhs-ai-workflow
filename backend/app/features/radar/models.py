@@ -40,6 +40,17 @@ class RankSnapshotRecord(Base):
     )
 
 
+class QianfanCollectionRecord(Base):
+    __tablename__ = "radar_qianfan_collections"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    collection_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+    source_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    started_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    expected_count_per_scope: Mapped[int] = mapped_column(nullable=False)
+    selector_profile_version: Mapped[str] = mapped_column(String(100), nullable=False)
+
+
 class RankItemRecord(Base):
     __tablename__ = "radar_rank_items"
     __table_args__ = (

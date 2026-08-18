@@ -13,7 +13,7 @@ from typing import Any, Literal
 from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.app.adapters.contracts import (
     CollectionItem,
@@ -24,11 +24,114 @@ from backend.app.adapters.contracts import (
 )
 from backend.app.models.jobs import JobState
 from backend.app.services.jobs import JobService
+from backend.app.features.radar.models import BoardName, DimensionName
 
 
 QIANFAN_RANK_URL = "https://ark.xiaohongshu.com/app-datacenter/market/note-rank"
 _RANK_RESPONSE_PATH = "/api/edith/business/data/note/"
 _XHS_PUBLIC_ORIGIN = "https://www.xiaohongshu.com"
+
+
+class QianfanSelectorProfile(BaseModel):
+    """Versioned, code-owned selector and response-scope verification contract."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    version: str = Field(min_length=1, max_length=100)
+    supported: bool
+    ready_selector: str | None = None
+    login_selector: str | None = None
+    captcha_selector: str | None = None
+    board_selectors: tuple[tuple[str, str], ...] = ()
+    dimension_selectors: tuple[tuple[str, str], ...] = ()
+    active_board_selectors: tuple[tuple[str, str], ...] = ()
+    active_dimension_selectors: tuple[tuple[str, str], ...] = ()
+    response_board_path: tuple[str, ...] = ()
+    response_dimension_path: tuple[str, ...] = ()
+
+    @field_validator(
+        "board_selectors",
+        "dimension_selectors",
+        "active_board_selectors",
+        "active_dimension_selectors",
+        mode="before",
+    )
+    @classmethod
+    def freeze_selector_map(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return tuple(sorted(value.items()))
+        return value
+
+    @model_validator(mode="after")
+    def validate_supported_profile(self) -> "QianfanSelectorProfile":
+        if not self.supported:
+            return self
+        required_boards = {"阅读榜", "引流榜", "热卖榜", "成交榜"}
+        required_dimensions = {"优秀内容", "优秀账号"}
+        if (
+            not self.ready_selector
+            or not self.login_selector
+            or not self.captcha_selector
+            or {key for key, _ in self.board_selectors} != required_boards
+            or {key for key, _ in self.active_board_selectors} != required_boards
+            or {key for key, _ in self.dimension_selectors} != required_dimensions
+            or {key for key, _ in self.active_dimension_selectors}
+            != required_dimensions
+            or not self.response_board_path
+            or not self.response_dimension_path
+        ):
+            raise ValueError("Supported Qianfan selector profiles must verify every fixed scope.")
+        return self
+
+
+DEFAULT_QIANFAN_SELECTOR_PROFILE = QianfanSelectorProfile(
+    version="qianfan-note-rank-unverified-v1",
+    supported=False,
+)
+
+
+class _OwnedPersistentPage:
+    def __init__(self, page: Any, context: Any, playwright: Any) -> None:
+        self._page = page
+        self._context = context
+        self._playwright = playwright
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._page, name)
+
+    def close(self) -> None:
+        try:
+            self._context.close()
+        finally:
+            self._playwright.stop()
+
+
+def persistent_qianfan_page_factory(
+    *, browser_executable: str | None, user_data_dir: Path | None
+) -> Callable[[], Any]:
+    """Build a settings-owned persistent Playwright page factory."""
+
+    def open_page() -> Any:
+        if not browser_executable or not Path(browser_executable).is_file():
+            raise RuntimeError("Qianfan browser executable is not configured or unavailable.")
+        if user_data_dir is None or not user_data_dir.is_dir():
+            raise RuntimeError("Qianfan persistent browser profile is not configured or unavailable.")
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                executable_path=browser_executable,
+                headless=False,
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            return _OwnedPersistentPage(page, context, playwright)
+        except Exception:
+            playwright.stop()
+            raise
+
+    return open_page
 
 
 class QianfanCaptureOutcome(BaseModel):
@@ -39,6 +142,9 @@ class QianfanCaptureOutcome(BaseModel):
         "navigation_failed",
         "response_not_observed",
         "response_unusable",
+        "captcha_required",
+        "scope_unverified",
+        "selector_profile_unverified",
     ] | None = None
     raw_evidence: dict[str, Any] = Field(min_length=1)
 
@@ -56,6 +162,10 @@ class _RankItemUnusable(ValueError):
         self.reason = reason
 
 
+class QianfanCollectionCancelled(RuntimeError):
+    """Raised before persistence when service shutdown revoked adapter admission."""
+
+
 class QianfanPlaywrightAdapter:
     """Observe ranking responses without platform writes or invented completion."""
 
@@ -70,6 +180,7 @@ class QianfanPlaywrightAdapter:
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         owns_page: bool = False,
+        finalize_job: bool = True,
     ) -> None:
         self._page_factory = page_factory
         self._job_service = job_service
@@ -79,6 +190,7 @@ class QianfanPlaywrightAdapter:
         self._sleep = sleep
         self._monotonic = monotonic
         self._owns_page = owns_page
+        self._finalize_job_enabled = finalize_job
 
     def collect_rankings(self, request: CollectionRequest) -> CollectionResult:
         """Implement the normalized collector contract and link capture evidence to a job."""
@@ -122,11 +234,237 @@ class QianfanPlaywrightAdapter:
                     )
 
             stage = "job_finalization"
-            self._finalize_job(job_id, result)
+            if self._finalize_job_enabled:
+                self._finalize_job(job_id, result)
             return result
         except Exception as error:
-            self._fail_running_job(job_id, category=f"{stage}_failed", error=error)
+            if self._finalize_job_enabled:
+                self._fail_running_job(job_id, category=f"{stage}_failed", error=error)
             raise
+
+    def collect_scope(
+        self,
+        request: CollectionRequest,
+        *,
+        board: BoardName,
+        dimension: DimensionName,
+        selector_profile: QianfanSelectorProfile = DEFAULT_QIANFAN_SELECTOR_PROFILE,
+    ) -> CollectionResult:
+        """Collect one fixed scope only after UI and response scope are both proven."""
+        job_id = self._validated_job_id(request)
+        is_cancelled = request.parameters.get("is_cancelled")
+        stage = "profile_validation"
+        try:
+            if not selector_profile.supported:
+                outcome = QianfanCaptureOutcome(
+                    status="needs_human",
+                    reason="selector_profile_unverified",
+                    raw_evidence={
+                        "selector_profile_version": selector_profile.version,
+                        "requested_scope": {"board": board, "dimension": dimension},
+                        "profile_supported": False,
+                    },
+                )
+            else:
+                stage = "scope_capture"
+                outcome = self.capture_scope_page(
+                    board=board,
+                    dimension=dimension,
+                    selector_profile=selector_profile,
+                )
+            stage = "evidence_persistence"
+            if callable(is_cancelled) and is_cancelled():
+                raise QianfanCollectionCancelled("Qianfan collection was cancelled.")
+            artifact_paths = self._persist_job_evidence(
+                job_id,
+                outcome,
+                board=board,
+                dimension=dimension,
+                selector_profile_version=selector_profile.version,
+                is_cancelled=is_cancelled if callable(is_cancelled) else None,
+            )
+            if outcome.status == "needs_human":
+                result = _needs_human_result(
+                    request=request,
+                    detail=outcome.reason or "needs_human",
+                    artifact_paths=artifact_paths,
+                    raw_evidence=outcome.raw_evidence,
+                )
+            else:
+                scoped_evidence = dict(outcome.raw_evidence)
+                scoped_evidence["responses"] = list(
+                    outcome.raw_evidence.get("verified_responses", [])
+                )
+                stage = "normalization"
+                normalized = _normalized_items(scoped_evidence)
+                stage = "result_validation"
+                if not normalized.valid_response_observed:
+                    result = _needs_human_result(
+                        request=request,
+                        detail="response_unusable",
+                        artifact_paths=artifact_paths,
+                        raw_evidence=outcome.raw_evidence,
+                    )
+                else:
+                    result = _accounted_result(
+                        request=request,
+                        items=normalized.items,
+                        rejected_items=normalized.rejected_items,
+                        artifact_paths=artifact_paths,
+                        raw_evidence=outcome.raw_evidence,
+                    )
+            if self._finalize_job_enabled:
+                stage = "job_finalization"
+                self._finalize_job(job_id, result)
+            return result
+        except Exception as error:
+            if self._finalize_job_enabled:
+                self._fail_running_job(job_id, category=f"{stage}_failed", error=error)
+            raise
+
+    def capture_scope_page(
+        self,
+        *,
+        board: BoardName,
+        dimension: DimensionName,
+        selector_profile: QianfanSelectorProfile,
+    ) -> QianfanCaptureOutcome:
+        if not selector_profile.supported:
+            raise ValueError("Unsupported selector profiles cannot open a browser page.")
+        page = self._page_factory()
+        responses: list[dict[str, Any]] = []
+        capture_errors: list[dict[str, str]] = []
+        handler = lambda response: _record_response(response, responses)
+        listener_added = False
+        outcome: QianfanCaptureOutcome | None = None
+        cleanup_errors: list[dict[str, str]] = []
+        try:
+            if hasattr(page, "on"):
+                page.on("response", handler)
+                listener_added = True
+            outcome = self._observe_scope_page(
+                page,
+                responses,
+                capture_errors,
+                board=board,
+                dimension=dimension,
+                selector_profile=selector_profile,
+            )
+        finally:
+            if listener_added and hasattr(page, "remove_listener"):
+                try:
+                    page.remove_listener("response", handler)
+                except Exception as error:
+                    cleanup_errors.append(_capture_error("listener_cleanup", error))
+            if self._owns_page and hasattr(page, "close"):
+                try:
+                    page.close()
+                except Exception as error:
+                    cleanup_errors.append(_capture_error("page_close", error))
+        assert outcome is not None
+        if cleanup_errors:
+            outcome.raw_evidence["cleanup_errors"] = cleanup_errors
+        return outcome
+
+    def _observe_scope_page(
+        self,
+        page: Any,
+        responses: list[dict[str, Any]],
+        capture_errors: list[dict[str, str]],
+        *,
+        board: BoardName,
+        dimension: DimensionName,
+        selector_profile: QianfanSelectorProfile,
+    ) -> QianfanCaptureOutcome:
+        base_evidence = {
+            "selector_profile_version": selector_profile.version,
+            "requested_scope": {"board": board, "dimension": dimension},
+            "profile_supported": True,
+        }
+        try:
+            page.goto(QIANFAN_RANK_URL, wait_until="domcontentloaded")
+        except Exception as error:
+            capture_errors.append(_capture_error("navigation", error))
+            return QianfanCaptureOutcome(
+                status="needs_human",
+                reason="navigation_failed",
+                raw_evidence={
+                    **_raw_page_evidence(page, responses, capture_errors=capture_errors),
+                    **base_evidence,
+                },
+            )
+        try:
+            if page.locator(str(selector_profile.login_selector)).count() > 0:
+                reason = "login_required"
+            elif page.locator(str(selector_profile.captcha_selector)).count() > 0:
+                reason = "captcha_required"
+            elif page.locator(str(selector_profile.ready_selector)).count() <= 0:
+                reason = "layout_changed"
+            else:
+                reason = None
+            if reason is not None:
+                return QianfanCaptureOutcome(
+                    status="needs_human",
+                    reason=reason,
+                    raw_evidence={**_raw_page_evidence(page, responses), **base_evidence},
+                )
+            page.locator(dict(selector_profile.board_selectors)[board]).click()
+            page.locator(dict(selector_profile.dimension_selectors)[dimension]).click()
+        except Exception as error:
+            capture_errors.append(_capture_error("scope_selection", error))
+            return QianfanCaptureOutcome(
+                status="needs_human",
+                reason="layout_changed",
+                raw_evidence={
+                    **_raw_page_evidence(page, responses, capture_errors=capture_errors),
+                    **base_evidence,
+                },
+            )
+        deadline = self._monotonic() + self._timeout_seconds
+        while True:
+            try:
+                active = (
+                    page.locator(dict(selector_profile.active_board_selectors)[board]).count()
+                    > 0
+                    and page.locator(
+                        dict(selector_profile.active_dimension_selectors)[dimension]
+                    ).count()
+                    > 0
+                )
+            except Exception as error:
+                capture_errors.append(_capture_error("active_scope", error))
+                active = False
+            verified_responses = [
+                response
+                for response in responses
+                if _response_matches_scope(
+                    response,
+                    board=board,
+                    dimension=dimension,
+                    selector_profile=selector_profile,
+                )
+            ]
+            if active and verified_responses:
+                return QianfanCaptureOutcome(
+                    status="captured",
+                    raw_evidence={
+                        **_raw_page_evidence(page, responses, capture_errors=capture_errors),
+                        **base_evidence,
+                        "verified_scope": {"board": board, "dimension": dimension},
+                        "verified_responses": verified_responses,
+                    },
+                )
+            if self._monotonic() >= deadline:
+                return QianfanCaptureOutcome(
+                    status="needs_human",
+                    reason="scope_unverified",
+                    raw_evidence={
+                        **_raw_page_evidence(page, responses, capture_errors=capture_errors),
+                        **base_evidence,
+                        "ui_scope_active": active,
+                    },
+                )
+            self._sleep(self._poll_interval)
 
     def capture_visible_page(self) -> QianfanCaptureOutcome:
         page = self._page_factory()
@@ -235,7 +573,14 @@ class QianfanPlaywrightAdapter:
         return raw_job_id
 
     def _persist_job_evidence(
-        self, job_id: str | None, outcome: QianfanCaptureOutcome
+        self,
+        job_id: str | None,
+        outcome: QianfanCaptureOutcome,
+        *,
+        board: BoardName | None = None,
+        dimension: DimensionName | None = None,
+        selector_profile_version: str | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> list[str]:
         if not job_id:
             return []
@@ -248,19 +593,37 @@ class QianfanPlaywrightAdapter:
         except ValueError as error:
             raise ValueError("Qianfan evidence path escapes runtime storage.") from error
         absolute_path.parent.mkdir(parents=True, exist_ok=True)
-        absolute_path.write_text(
-            json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        if is_cancelled is not None and is_cancelled():
+            raise QianfanCollectionCancelled("Qianfan collection was cancelled.")
+        encoded = json.dumps(
+            outcome.model_dump(mode="json"),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+        absolute_path.write_bytes(encoded)
+        if is_cancelled is not None and is_cancelled():
+            raise QianfanCollectionCancelled("Qianfan collection was cancelled.")
+        digest = sha256(encoded).hexdigest()
+        metadata: dict[str, Any] = {
+            "source_url": QIANFAN_RANK_URL,
+            "capture_status": outcome.status,
+            "reason": outcome.reason,
+            "sha256": digest,
+        }
+        if board is not None and dimension is not None:
+            metadata.update(
+                {
+                    "board": board,
+                    "dimension": dimension,
+                    "selector_profile_version": selector_profile_version,
+                }
+            )
         artifact = self._job_service.attach_artifact(
             job_id,
             kind="qianfan_raw_capture",
             path=relative_path.as_posix(),
-            metadata={
-                "source_url": QIANFAN_RANK_URL,
-                "capture_status": outcome.status,
-                "reason": outcome.reason,
-            },
+            metadata=metadata,
         )
         self._job_service.append_log(
             job_id,
@@ -552,9 +915,41 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
                 raw_evidence=item_evidence,
                 data={
                     "rank": raw_item.get("rank"),
+                    "title": _first_present(raw_item, "noteTitle", "title", "note_title"),
+                    "author_name": _first_present(
+                        raw_item, "userNickname", "authorName", "author_name"
+                    ),
+                    "publish_date": _first_present(
+                        raw_item,
+                        "publishTime",
+                        "publishDate",
+                        "publish_time",
+                        "publish_date",
+                    ),
+                    "read_range": _first_present(
+                        raw_item,
+                        "readNumRange",
+                        "noteReadNumRange",
+                        "readRange",
+                        "read_range",
+                    ),
+                    "click_rate_range": _first_present(
+                        raw_item,
+                        "clickRateRange",
+                        "noteClickRateRange",
+                        "click_rate_range",
+                    ),
+                    "pay_rate_range": _first_present(
+                        raw_item,
+                        "payRateRange",
+                        "notePayRateRange",
+                        "pay_rate_range",
+                    ),
+                    "gmv_range": _first_present(
+                        raw_item, "gmvRange", "noteGmvRange", "gmv_range"
+                    ),
                     "note_id": note_id or None,
                     "user_id": raw_item.get("userId") or raw_item.get("user_id"),
-                    "author_name": raw_item.get("userNickname"),
                 },
             )
             if item_id in chosen:
@@ -572,6 +967,31 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
         rejected_items=rejected_items,
         valid_response_observed=valid_response_observed,
     )
+
+
+def _response_matches_scope(
+    response: dict[str, Any],
+    *,
+    board: BoardName,
+    dimension: DimensionName,
+    selector_profile: QianfanSelectorProfile,
+) -> bool:
+    body = response.get("body")
+    if not isinstance(body, dict) or not _successful_response(response, body):
+        return False
+    return (
+        _nested_value(body, selector_profile.response_board_path) == board
+        and _nested_value(body, selector_profile.response_dimension_path) == dimension
+    )
+
+
+def _nested_value(value: Any, path: tuple[str, ...]) -> Any:
+    current = value
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
 
 
 def _item_identity(raw_item: dict[str, Any]) -> tuple[str, str | None, str | None]:

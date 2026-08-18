@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from datetime import date
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from backend.app.db import Database
@@ -21,8 +21,14 @@ from backend.app.features.radar.models import (
     RankSnapshotInput,
     RankSnapshotRead,
     RankSnapshotRecord,
+    QianfanCollectionRecord,
 )
 from backend.app.features.radar.scoring import has_recognized_evidence, score_account
+from backend.app.models.jobs import JobRecord, JobState
+
+
+class RadarJobFinalizationConflict(RuntimeError):
+    """Raised when cancellation or another owner won before snapshot commit."""
 
 
 class RadarService:
@@ -31,38 +37,69 @@ class RadarService:
 
     def ingest_snapshot(self, snapshot: RankSnapshotInput) -> RankSnapshotRead:
         chosen = _deduplicate(snapshot.items)
-        source_date = snapshot.source_date.isoformat()
         with self.database.session() as session:
-            record = session.scalar(
-                select(RankSnapshotRecord)
-                .options(selectinload(RankSnapshotRecord.items))
-                .where(
-                    RankSnapshotRecord.source_date == source_date,
-                    RankSnapshotRecord.board == snapshot.board,
-                    RankSnapshotRecord.dimension == snapshot.dimension,
+            record = _upsert_snapshot(session, snapshot, chosen)
+            session.commit()
+            session.refresh(record)
+            return _snapshot_read(record)
+
+    def start_qianfan_collection(
+        self,
+        *,
+        collection_id: str,
+        source_date: date,
+        started_at: datetime,
+        expected_count_per_scope: int,
+        selector_profile_version: str,
+    ) -> None:
+        """Persist the execution-time batch identity used to filter same-day reruns."""
+        with self.database.session() as session:
+            session.add(
+                QianfanCollectionRecord(
+                    collection_id=collection_id,
+                    source_date=source_date.isoformat(),
+                    started_at=started_at.isoformat(),
+                    expected_count_per_scope=expected_count_per_scope,
+                    selector_profile_version=selector_profile_version,
                 )
             )
-            if record is None:
-                record = RankSnapshotRecord(
-                    source_date=source_date,
-                    collected_at=snapshot.collected_at.isoformat(),
-                    board=snapshot.board,
-                    dimension=snapshot.dimension,
-                    source_url=str(snapshot.source_url),
-                    raw_evidence=snapshot.raw_evidence,
-                    submitted_count=len(snapshot.items),
-                )
-                session.add(record)
-            else:
-                record.items.clear()
-                session.flush()
-                record.collected_at = snapshot.collected_at.isoformat()
-                record.source_url = str(snapshot.source_url)
-                record.raw_evidence = snapshot.raw_evidence
-                record.submitted_count = len(snapshot.items)
+            session.commit()
 
-            for stable_key, item in chosen:
-                record.items.append(_item_record(stable_key, item))
+    def ingest_snapshot_and_finalize_job(
+        self,
+        snapshot: RankSnapshotInput,
+        *,
+        job_id: str,
+        progress_current: int,
+        progress_total: int,
+    ) -> RankSnapshotRead:
+        """Commit one exact snapshot and its running-job success as one SQLite fact."""
+        chosen = _deduplicate(snapshot.items)
+        with self.database.session() as session:
+            record = _upsert_snapshot(session, snapshot, chosen)
+            now = datetime.now(UTC).replace(tzinfo=None)
+            result = session.execute(
+                update(JobRecord)
+                .where(
+                    JobRecord.id == job_id,
+                    JobRecord.state == JobState.running.value,
+                )
+                .values(
+                    state=JobState.succeeded.value,
+                    progress_current=progress_current,
+                    progress_total=progress_total,
+                    current_stage="qianfan_scope_complete",
+                    error_category=None,
+                    updated_at=now,
+                    completed_at=now,
+                    lease_expires_at=None,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                raise RadarJobFinalizationConflict(
+                    "Qianfan scope job no longer owns snapshot finalization."
+                )
             session.commit()
             session.refresh(record)
             return _snapshot_read(record)
@@ -82,9 +119,12 @@ class RadarService:
             RankSnapshotRecord.source_date.desc(),
             RankSnapshotRecord.board,
             RankSnapshotRecord.dimension,
-        ).limit(limit).offset(offset)
+        )
         with self.database.session() as session:
-            return [_snapshot_read(record) for record in session.scalars(statement).all()]
+            records = session.scalars(statement).all()
+            active = _active_qianfan_collections(session)
+            filtered = _filter_active_qianfan_snapshots(records, active)
+            return [_snapshot_read(record) for record in filtered[offset : offset + limit]]
 
     def list_accounts(self, *, limit: int = 100, offset: int = 0) -> list[AccountRead]:
         return self._scored_accounts()[offset : offset + limit]
@@ -99,6 +139,9 @@ class RadarService:
             snapshots = session.scalars(
                 select(RankSnapshotRecord).options(selectinload(RankSnapshotRecord.items))
             ).all()
+            snapshots = _filter_active_qianfan_snapshots(
+                snapshots, _active_qianfan_collections(session)
+            )
 
         by_user: dict[str, list[tuple[RankSnapshotRecord, RankItemRecord]]] = {}
         eligible_users: set[str] = set()
@@ -165,6 +208,77 @@ def _stable_key(item: RankItemInput) -> str:
         sort_keys=True,
     )
     return f"semantic:{sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _upsert_snapshot(
+    session: Any,
+    snapshot: RankSnapshotInput,
+    chosen: list[tuple[str, RankItemInput]],
+) -> RankSnapshotRecord:
+    source_date = snapshot.source_date.isoformat()
+    record = session.scalar(
+        select(RankSnapshotRecord)
+        .options(selectinload(RankSnapshotRecord.items))
+        .where(
+            RankSnapshotRecord.source_date == source_date,
+            RankSnapshotRecord.board == snapshot.board,
+            RankSnapshotRecord.dimension == snapshot.dimension,
+        )
+    )
+    if record is None:
+        record = RankSnapshotRecord(
+            source_date=source_date,
+            collected_at=snapshot.collected_at.isoformat(),
+            board=snapshot.board,
+            dimension=snapshot.dimension,
+            source_url=str(snapshot.source_url),
+            raw_evidence=snapshot.raw_evidence,
+            submitted_count=len(snapshot.items),
+        )
+        session.add(record)
+    else:
+        record.items.clear()
+        session.flush()
+        record.collected_at = snapshot.collected_at.isoformat()
+        record.source_url = str(snapshot.source_url)
+        record.raw_evidence = snapshot.raw_evidence
+        record.submitted_count = len(snapshot.items)
+    for stable_key, item in chosen:
+        record.items.append(_item_record(stable_key, item))
+    return record
+
+
+def _active_qianfan_collections(session: Any) -> dict[str, str]:
+    collections = session.scalars(select(QianfanCollectionRecord)).all()
+    latest: dict[str, tuple[int, str]] = {}
+    for collection in collections:
+        if (
+            collection.source_date not in latest
+            or collection.id > latest[collection.source_date][0]
+        ):
+            latest[collection.source_date] = (
+                collection.id,
+                collection.collection_id,
+            )
+    return {source_date: value[1] for source_date, value in latest.items()}
+
+
+def _filter_active_qianfan_snapshots(
+    snapshots: list[RankSnapshotRecord], active: dict[str, str]
+) -> list[RankSnapshotRecord]:
+    filtered: list[RankSnapshotRecord] = []
+    for snapshot in snapshots:
+        active_collection = active.get(snapshot.source_date)
+        if active_collection is None:
+            filtered.append(snapshot)
+            continue
+        binding = snapshot.raw_evidence.get("collection_binding")
+        if (
+            isinstance(binding, dict)
+            and binding.get("collection_id") == active_collection
+        ):
+            filtered.append(snapshot)
+    return filtered
 
 
 def _semantic_identity(item: RankItemInput) -> dict[str, Any]:

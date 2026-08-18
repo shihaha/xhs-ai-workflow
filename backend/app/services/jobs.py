@@ -58,6 +58,15 @@ class Job:
     artifacts: list[JobArtifact]
 
 
+@dataclass(frozen=True)
+class JobCreateSpec:
+    job_type: str
+    input_data: dict[str, Any]
+    progress_current: int = 0
+    progress_total: int | None = None
+    current_stage: str | None = None
+
+
 _PERMITTED_TRANSITIONS = {
     JobState.queued: {JobState.running, JobState.cancelled},
     JobState.running: {
@@ -106,6 +115,29 @@ class JobService:
             session.commit()
             session.refresh(record)
             return _as_job(record)
+
+    def create_batch(self, specs: list[JobCreateSpec]) -> list[Job]:
+        """Reserve a related job set in one transaction or persist none of it."""
+        now = _utc_now()
+        records = [
+            JobRecord(
+                type=spec.job_type,
+                input_data=spec.input_data,
+                state=JobState.queued,
+                progress_current=spec.progress_current,
+                progress_total=spec.progress_total,
+                current_stage=spec.current_stage,
+                created_at=now,
+                updated_at=now,
+            )
+            for spec in specs
+        ]
+        with self.database.session() as session:
+            session.add_all(records)
+            session.commit()
+            for record in records:
+                session.refresh(record)
+            return [_as_job(record) for record in records]
 
     def get(self, job_id: str) -> Job:
         with self.database.session() as session:

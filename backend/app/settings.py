@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     database_path: Path | None = None
     adb_executable: str = "adb"
     browser_executable: str | None = None
+    qianfan_browser_profile_dir: Path | None = None
+    qianfan_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     bailian_api_key: str | None = Field(
         default=None,
         validation_alias="BAILIAN_API_KEY",

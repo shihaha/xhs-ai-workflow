@@ -25,7 +25,9 @@ npm run dev
 
 The operator flow is available at `/radar`, `/accounts/<user-id>`, `/opportunities`, and `/content`. System prerequisites remain at `/status`, while `/jobs` shows persisted job, log, progress, and evidence facts. A fresh runtime has no sample business records.
 
-The ranking page reads stored snapshots; the backend does not currently expose a route that starts the Qianfan Playwright collector. Shop verification can be queued from an account using a runtime-relative evidence directory. Content export creates a local pending-publication ZIP only and never publishes to Xiaohongshu.
+The ranking page reads stored snapshots. The backend can reserve the fixed Qianfan four-board by two-dimension pass with `POST /api/v1/radar/qianfan-collections` and a body such as `{"expected_count_per_scope": 20}`. The endpoint creates eight evidence-backed scope jobs; it does not accept URLs, selectors, scripts, profile paths, dates, or profile versions. The checked-in live selector profile remains explicitly unsupported until an authenticated current-layout probe verifies it, so current live attempts stop as `needs_human` rather than inventing snapshots. Configure the browser executable and an existing persistent login profile only through `XHS_BROWSER_EXECUTABLE` and `XHS_QIANFAN_BROWSER_PROFILE_DIR`.
+
+Shop verification can be queued from an account using a runtime-relative evidence directory. Content export creates a local pending-publication ZIP only and never publishes to Xiaohongshu.
 
 Frontend verification:
 

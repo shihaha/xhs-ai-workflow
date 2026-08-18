@@ -24,8 +24,12 @@ from backend.app.services.jobs import (
 
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
-_RESERVED_JOB_TYPES = {"android_shop_collection", "shop_collection"}
-_RESERVED_ARTIFACT_KINDS = {"shop_collection_result"}
+_RESERVED_JOB_TYPES = {
+    "android_shop_collection",
+    "shop_collection",
+    "qianfan_ranking_scope",
+}
+_RESERVED_ARTIFACT_KINDS = {"shop_collection_result", "qianfan_raw_capture"}
 
 
 def _service(request: Request) -> JobService:
