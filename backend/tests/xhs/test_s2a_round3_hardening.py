@@ -29,7 +29,7 @@ from backend.app.models.jobs import JobRecord, JobState
 from backend.app.services.jobs import JobService
 
 
-JOURNAL_MIGRATION = "xhs_artifact_promotion_journal_v1"
+JOURNAL_MIGRATION = "xhs_artifact_promotion_journal_v2"
 JOURNAL_TABLE = "xhs_artifact_promotion_journal"
 
 
@@ -107,6 +107,8 @@ def test_fresh_database_installs_valid_artifact_promotion_journal(
         "created_at",
         "updated_at",
         "completed_at",
+        "owner_token",
+        "recovery_lease_expires_at",
     }
     foreign_keys = {
         (tuple(item["constrained_columns"]), item["referred_table"], item["options"].get("ondelete"))
@@ -182,7 +184,8 @@ def test_missing_journal_marker_repairs_only_an_empty_malformed_table(
         "id", "job_id", "artifact_kind", "producer", "stage_path", "final_path",
         "sha256", "size_bytes", "file_dev", "file_ino", "file_mtime_ns",
         "target_state", "state", "resolution", "artifact_id", "created_at",
-        "updated_at", "completed_at",
+        "updated_at", "completed_at", "owner_token",
+        "recovery_lease_expires_at",
     }
     repaired.close()
 
@@ -266,13 +269,17 @@ def test_journal_marker_requires_all_physical_triggers_without_repair(
     with database.engine.connect() as connection:
         trigger_names = set(connection.execute(text(
             "SELECT name FROM sqlite_master WHERE type='trigger' "
-            "AND tbl_name=:table"
-        ), {"table": JOURNAL_TABLE}).scalars())
+            "AND name LIKE 'ck_xhs_artifact_journal_%'"
+        )).scalars())
     database.close()
     assert trigger_names == {
         "ck_xhs_artifact_journal_binding_insert",
         "ck_xhs_artifact_journal_binding_update",
         "ck_xhs_artifact_journal_no_delete",
+        "ck_xhs_artifact_journal_job_update",
+        "ck_xhs_artifact_journal_job_delete",
+        "ck_xhs_artifact_journal_artifact_update",
+        "ck_xhs_artifact_journal_artifact_delete",
     }
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TRIGGER ck_xhs_artifact_journal_binding_update")
@@ -305,9 +312,15 @@ def test_handle_bound_store_writes_promotes_and_demotes_one_exact_identity(
         assert store.inspect_stage(stage_name).status == "missing"
         assert store.read_final(final_name, identity) == payload
 
-        assert store.demote_and_discard(final_name, stage_name, identity) is True
-        assert store.inspect_final(final_name).status == "missing"
-        assert store.inspect_stage(stage_name).status == "missing"
+        discarded = store.demote_and_discard(final_name, stage_name, identity)
+        if os.name == "nt":
+            assert discarded is True
+            assert store.inspect_final(final_name).status == "missing"
+            assert store.inspect_stage(stage_name).status == "missing"
+        else:
+            assert discarded is False
+            assert store.inspect_final(final_name).status == "missing"
+            assert store.inspect_stage(stage_name).status == "trusted"
 
     assert not list((runtime / "evidence" / "xhs").glob("*.json"))
 
@@ -424,6 +437,8 @@ def test_promotion_crash_is_reconciled_from_durable_prepared_journal(
         assert journal is not None and journal.state == "prepared"
         final_path = service.runtime_dir / journal.final_path
         assert final_path.is_file()
+        journal.recovery_lease_expires_at = datetime(2000, 1, 1)
+        session.commit()
     service.database.close()
     monkeypatch.setattr(
         service_module,
@@ -571,6 +586,8 @@ def test_prepared_journal_ack_unknown_preserves_stage_until_restart_recovery(
         stage = service.runtime_dir / journal.stage_path
         final = service.runtime_dir / journal.final_path
         assert stage.is_file() and not final.exists()
+        journal.recovery_lease_expires_at = datetime(2000, 1, 1)
+        session.commit()
     service.database.close()
 
     restarted = _service(tmp_path)

@@ -139,13 +139,18 @@ class XhsArtifactPromotionJournalRecord(Base):
             name="ck_xhs_artifact_journal_sha",
         ),
         CheckConstraint(
-            "size_bytes BETWEEN 0 AND 20971520 "
-            "AND file_dev >= 0 AND file_ino >= 0 AND file_mtime_ns >= 0",
+            "size_bytes BETWEEN 0 AND 20971520 AND ((file_dev IS NULL "
+            "AND file_ino IS NULL AND file_mtime_ns IS NULL AND "
+            "(state = 'allocating' OR (state = 'completed' AND resolution IN "
+            "('rolled_back','inconsistent')))) OR (file_dev IS NOT NULL "
+            "AND file_ino IS NOT NULL AND file_mtime_ns IS NOT NULL "
+            "AND file_dev >= 0 AND file_ino >= 0 AND file_mtime_ns >= 0 "
+            "AND state != 'allocating'))",
             name="ck_xhs_artifact_journal_identity",
         ),
         CheckConstraint(
             "target_state IN ('succeeded','failed','needs_human') "
-            "AND state IN ('prepared','promoted','completed')",
+            "AND state IN ('allocating','prepared','promoted','completed')",
             name="ck_xhs_artifact_journal_state",
         ),
         CheckConstraint(
@@ -163,8 +168,19 @@ class XhsArtifactPromotionJournalRecord(Base):
             "AND (completed_at IS NULL OR datetime(completed_at) IS NOT NULL)",
             name="ck_xhs_artifact_journal_timestamps",
         ),
+        CheckConstraint(
+            "((owner_token IS NULL AND recovery_lease_expires_at IS NULL) OR "
+            "(is_canonical_uuid(owner_token) = 1 "
+            "AND datetime(recovery_lease_expires_at) IS NOT NULL))",
+            name="ck_xhs_artifact_journal_owner_lease",
+        ),
         Index("ix_xhs_artifact_journal_state", "state"),
         Index("ix_xhs_artifact_journal_artifact_id", "artifact_id"),
+        Index(
+            "ix_xhs_artifact_journal_recovery_lease",
+            "recovery_lease_expires_at",
+            "state",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -177,9 +193,9 @@ class XhsArtifactPromotionJournalRecord(Base):
     final_path: Mapped[str] = mapped_column(Text, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
-    file_dev: Mapped[int] = mapped_column(Integer, nullable=False)
-    file_ino: Mapped[int] = mapped_column(Integer, nullable=False)
-    file_mtime_ns: Mapped[int] = mapped_column(Integer, nullable=False)
+    file_dev: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    file_ino: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    file_mtime_ns: Mapped[int | None] = mapped_column(Integer, nullable=True)
     target_state: Mapped[str] = mapped_column(String(32), nullable=False)
     state: Mapped[str] = mapped_column(String(20), nullable=False)
     resolution: Mapped[str | None] = mapped_column(String(20), nullable=True)
@@ -189,3 +205,8 @@ class XhsArtifactPromotionJournalRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    owner_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    recovery_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )

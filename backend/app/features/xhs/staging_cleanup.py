@@ -8,7 +8,7 @@ import stat
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from backend.app.features.content.export import (
     _delete_open_file,
@@ -32,6 +32,10 @@ _FINAL_NAME = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
     r"(?:-failure)?\.json"
 )
+
+# Narrow fault-injection hook: tests raise only after the exact new file handle
+# has been retained by the store.
+_stage_creation_after_open_hook: Callable[[int], None] | None = None
 
 
 class UnsafeXhsArtifactStore(OSError):
@@ -142,6 +146,11 @@ class TrustedXhsArtifactStore(AbstractContextManager["TrustedXhsArtifactStore"])
         _require_stage_name(name)
         return self._backend.discard_stage(name, identity)
 
+    def discard_owned_stage(self, name: str) -> bool:
+        """Delete only the still-held file created by this store instance."""
+        _require_stage_name(name)
+        return self._backend.discard_owned_stage(name)
+
 
 def _require_stage_name(name: str) -> None:
     if _ACTIVE_STAGE_NAME.fullmatch(name) is None:
@@ -215,6 +224,46 @@ def _rename_windows_fd_relative(
     ) == 0
 
 
+def _rename_posix_noreplace(
+    source_parent: int,
+    source_name: str,
+    target_parent: int,
+    target_name: str,
+) -> None:
+    """Use Linux renameat2 without replacement; unsupported hosts fail closed."""
+
+    import ctypes
+    import errno
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise UnsafeXhsArtifactStore("Atomic no-replace rename is unavailable.")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_parent,
+        os.fsencode(source_name),
+        target_parent,
+        os.fsencode(target_name),
+        1,  # RENAME_NOREPLACE
+    )
+    if result == 0:
+        return
+    code = ctypes.get_errno()
+    if code == errno.EEXIST:
+        raise FileExistsError(target_name)
+    if code in {errno.ENOSYS, errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}:
+        raise UnsafeXhsArtifactStore("Atomic no-replace rename is unavailable.")
+    raise OSError(code, os.strerror(code), source_name)
+
+
 class _PosixArtifactStore:
     def __init__(self, runtime_root: Path, *, max_bytes: int) -> None:
         self.max_bytes = max_bytes
@@ -268,15 +317,20 @@ class _PosixArtifactStore:
         descriptor: int | None = None
         try:
             descriptor = os.open(name, flags, 0o600, dir_fd=self._stage_parent)
+            self._stage_handles[name] = descriptor
+            descriptor = None
+            held = self._stage_handles[name]
+            if _stage_creation_after_open_hook is not None:
+                _stage_creation_after_open_hook(held)
             view = memoryview(payload)
             offset = 0
             while offset < len(view):
-                written = os.write(descriptor, view[offset:])
+                written = os.write(held, view[offset:])
                 if written <= 0:
                     raise OSError("short XHS staging write")
                 offset += written
-            os.fsync(descriptor)
-            identity = _trusted_identity(os.fstat(descriptor), max_bytes=self.max_bytes)
+            os.fsync(held)
+            identity = _trusted_identity(os.fstat(held), max_bytes=self.max_bytes)
             if identity.size_bytes != len(payload):
                 raise UnsafeXhsArtifactStore("XHS staging write changed identity.")
             named = self._open("stage", name)
@@ -286,8 +340,6 @@ class _PosixArtifactStore:
             finally:
                 os.close(named)
             os.fsync(self._stage_parent)
-            self._stage_handles[name] = descriptor
-            descriptor = None
             return identity
         finally:
             if descriptor is not None:
@@ -340,13 +392,11 @@ class _PosixArtifactStore:
         named = self.inspect("stage", stage_name)
         if named.status != "trusted" or named.identity != identity:
             raise UnsafeXhsArtifactStore("XHS staging name identity changed.")
-        if self.inspect("final", final_name).status != "missing":
-            raise UnsafeXhsArtifactStore("XHS final evidence target is not absent.")
-        os.rename(
+        _rename_posix_noreplace(
+            self._stage_parent,
             stage_name,
+            self._final_parent,
             final_name,
-            src_dir_fd=self._stage_parent,
-            dst_dir_fd=self._final_parent,
         )
         os.fsync(self._stage_parent)
         os.fsync(self._final_parent)
@@ -361,13 +411,11 @@ class _PosixArtifactStore:
         try:
             if _trusted_identity(os.fstat(descriptor), max_bytes=self.max_bytes) != identity:
                 raise UnsafeXhsArtifactStore("Recovered XHS staging identity changed.")
-            if self.inspect("final", final_name).status != "missing":
-                raise UnsafeXhsArtifactStore("Recovered XHS final target is not absent.")
-            os.rename(
+            _rename_posix_noreplace(
+                self._stage_parent,
                 stage_name,
+                self._final_parent,
                 final_name,
-                src_dir_fd=self._stage_parent,
-                dst_dir_fd=self._final_parent,
             )
             os.fsync(self._stage_parent)
             os.fsync(self._final_parent)
@@ -385,37 +433,27 @@ class _PosixArtifactStore:
             return stage.status == "missing" or self.discard_stage(stage_name, identity)
         if final.status != "trusted" or final.identity != identity or stage.status != "missing":
             return False
-        os.rename(
+        _rename_posix_noreplace(
+            self._final_parent,
             final_name,
+            self._stage_parent,
             stage_name,
-            src_dir_fd=self._final_parent,
-            dst_dir_fd=self._stage_parent,
         )
         os.fsync(self._final_parent)
         os.fsync(self._stage_parent)
         return self.discard_stage(stage_name, identity)
 
     def discard_stage(self, name: str, identity: XhsArtifactIdentity) -> bool:
-        held = self._stage_handles.pop(name, None)
-        if held is not None:
-            os.close(held)
-        descriptor: int | None = None
-        try:
-            descriptor = self._open("stage", name)
-            opened = _trusted_identity(os.fstat(descriptor), max_bytes=self.max_bytes)
-            named = os.stat(name, dir_fd=self._stage_parent, follow_symlinks=False)
-            if opened != identity or _trusted_identity(named, max_bytes=self.max_bytes) != identity:
-                return False
-            os.unlink(name, dir_fd=self._stage_parent)
-            os.fsync(self._stage_parent)
+        inspection = self.inspect("stage", name)
+        if inspection.status == "missing":
             return True
-        except FileNotFoundError:
-            return True
-        except (OSError, ValueError, TypeError):
-            return False
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
+        # POSIX pathname unlink cannot prove that the directory entry still
+        # names the inspected open identity at the deletion instant.
+        return False
+
+    def discard_owned_stage(self, name: str) -> bool:
+        # Keep the exact handle and stage for manual recovery on POSIX hosts.
+        return False
 
 
 class _WindowsArtifactStore:
@@ -601,7 +639,13 @@ class _WindowsArtifactStore:
         )
         if status != 0:
             code = int(status) & 0xFFFFFFFF
-            if code in {0xC000000F, 0xC0000034, 0xC0000039, 0xC000003A}:
+            if code in {
+                0xC000000F,
+                0xC0000034,
+                0xC0000039,
+                0xC000003A,
+                0xC0000056,  # STATUS_DELETE_PENDING: the name is no longer openable.
+            }:
                 raise FileNotFoundError(name)
             if code in {0xC0000035, 0xC0000043}:
                 raise FileExistsError(name)
@@ -632,15 +676,20 @@ class _WindowsArtifactStore:
         descriptor: int | None = None
         try:
             descriptor = self._open_file("stage", name, create=True, writable=True)
+            self._stage_handles[name] = descriptor
+            descriptor = None
+            held = self._stage_handles[name]
+            if _stage_creation_after_open_hook is not None:
+                _stage_creation_after_open_hook(held)
             view = memoryview(payload)
             offset = 0
             while offset < len(view):
-                written = os.write(descriptor, view[offset:])
+                written = os.write(held, view[offset:])
                 if written <= 0:
                     raise OSError("short XHS staging write")
                 offset += written
-            os.fsync(descriptor)
-            identity = _trusted_identity(os.fstat(descriptor), max_bytes=self.max_bytes)
+            os.fsync(held)
+            identity = _trusted_identity(os.fstat(held), max_bytes=self.max_bytes)
             if identity.size_bytes != len(payload):
                 raise UnsafeXhsArtifactStore("XHS staging write changed identity.")
             named = self._open_file("stage", name)
@@ -649,8 +698,6 @@ class _WindowsArtifactStore:
                     raise UnsafeXhsArtifactStore("XHS staging name changed while writing.")
             finally:
                 os.close(named)
-            self._stage_handles[name] = descriptor
-            descriptor = None
             return identity
         finally:
             if descriptor is not None:
@@ -742,9 +789,14 @@ class _WindowsArtifactStore:
         return self.discard_stage(stage_name, identity)
 
     def discard_stage(self, name: str, identity: XhsArtifactIdentity) -> bool:
-        held = self._stage_handles.pop(name, None)
+        held = self._stage_handles.get(name)
         if held is not None:
-            os.close(held)
+            if _trusted_identity(os.fstat(held), max_bytes=self.max_bytes) != identity:
+                return False
+            deleted = _delete_open_file(held)
+            if deleted:
+                os.close(self._stage_handles.pop(name))
+            return deleted
         descriptor: int | None = None
         try:
             descriptor = self._open_file("stage", name)
@@ -758,6 +810,18 @@ class _WindowsArtifactStore:
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+
+    def discard_owned_stage(self, name: str) -> bool:
+        descriptor = self._stage_handles.get(name)
+        if descriptor is None:
+            return False
+        try:
+            deleted = _delete_open_file(descriptor)
+        except (OSError, ValueError, TypeError):
+            return False
+        if deleted:
+            os.close(self._stage_handles.pop(name))
+        return deleted
 
 
 def discard_xhs_staging_file(
@@ -800,61 +864,6 @@ def discard_xhs_staging_file(
             limit=max_bytes,
             expected_identity=inspection.identity,
         )
-    return _discard_posix_stage(
-        root,
-        relative.parts[:-1],
-        relative.parts[-1],
-        expected_identity=inspection.identity,
-        max_bytes=max_bytes,
-    )
-
-
-def _discard_posix_stage(
-    root: Path,
-    parent_parts: tuple[str, ...],
-    name: str,
-    *,
-    expected_identity: tuple[int, int, int, int],
-    max_bytes: int,
-) -> bool:
-    root_descriptor: int | None = None
-    file_descriptor: int | None = None
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory = getattr(os, "O_DIRECTORY", 0)
-    try:
-        root_descriptor = os.open(root, os.O_RDONLY | nofollow | directory)
-        parent_descriptor = root_descriptor
-        for component in parent_parts:
-            parent_descriptor = os.open(
-                component,
-                os.O_RDONLY | nofollow | directory,
-                dir_fd=parent_descriptor,
-            )
-            if root_descriptor != parent_descriptor:
-                os.close(root_descriptor)
-            root_descriptor = parent_descriptor
-        file_descriptor = os.open(
-            name,
-            os.O_RDONLY | nofollow,
-            dir_fd=parent_descriptor,
-        )
-        opened = os.fstat(file_descriptor)
-        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
-        named_identity = (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or identity != expected_identity
-            or named_identity != identity
-            or opened.st_size > max_bytes
-        ):
-            return False
-        os.unlink(name, dir_fd=parent_descriptor)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
-    finally:
-        if file_descriptor is not None:
-            os.close(file_descriptor)
-        if root_descriptor is not None:
-            os.close(root_descriptor)
+    # A POSIX pathname unlink cannot bind the removal atomically to the
+    # inspected descriptor identity.  Retain the stage for manual recovery.
+    return False

@@ -350,3 +350,128 @@ not_run
 No external authenticated state was supplied and `XHS_LIVE_TEST=1` was not
 enabled. This round makes no claim about a real account, search result, identity,
 or live persisted fact.
+
+# Stabilization S2A report — fix round 4/5
+
+Date: 2026-08-19
+
+## Scope and decisions
+
+This round closes the five remaining account-note S2A trust and recovery
+findings without changing S2B evidence semantics, Bailian integration, or the
+untracked `research/` tree.
+
+### C1 — one formal-read provenance gate
+
+- Profile, account-note, and search-result reads now share one trust resolver.
+  Formal facts are returned only for an exact succeeded job with exactly one
+  completed/committed journal row and one bound artifact row.
+- The resolver verifies job type/input, artifact kind/producer/path, strictly
+  typed metadata, account or search binding, journal identity, final-file
+  identity, size, SHA-256, and payload job binding. Replaced or contradictory
+  files fail closed.
+- `inconsistent` and `needs_human` evidence remains available to operators in
+  the database, but normal account/search reads do not expose it as fact.
+
+### I1 — bidirectional physical binding
+
+- The v2 schema installs and validates exactly seven journal-family triggers:
+  journal insert/update/no-delete, parent-job update/delete, and parent-artifact
+  update/delete. Parent updates cover every predicate field used by the trust
+  contract, including identifiers, type/state/input, job linkage, kind,
+  producer, path, and metadata.
+- Metadata trigger predicates and startup scans require JSON objects with
+  present, correctly typed, NULL-safe-equal `artifact_id`, `job_id`, `sha256`,
+  and `size_bytes` values. A textified integer, JSON null, missing key, wrong
+  account/search binding, or malformed JSON fails closed.
+- Migration certification compares exact table, index, foreign-key, check, and
+  trigger definitions and scans populated rows. Runtime parent tampering is
+  rejected by SQLite and bypassed historical tampering is rejected on restart.
+
+### I2 — durable allocation intent before staging
+
+- Journal v2 adds `allocating` before `prepared`: the allocating row, owner,
+  DB-clock lease, intended names, digest, size, and target state are committed
+  before the store or stage file is created. Every newly created stage therefore
+  has a durable journal owner.
+- After creation, the exact open-handle identity is bound with a CAS transition
+  to `prepared`. A stage-creation failure deletes only through the still-held
+  exact handle when the platform can prove it; cleanup ambiguity is persisted
+  as `needs_human` and the evidence is retained.
+- A prepared-commit acknowledgement failure leaves an observable durable
+  allocating/prepared row and never performs pathname cleanup. Startup retains
+  an old unjournaled stage for manual review instead of sweeping it.
+- Populated v1 databases migrate mechanically to v2, retain the v1 history
+  marker, receive the v2 marker only after validation, and preserve journal
+  rows and evidence.
+
+### I3 — cross-process recovery claims and leases
+
+- `owner_token` and `recovery_lease_expires_at` form a checked pair. Claims and
+  renewals are database CAS operations using SQLite's clock, not a process
+  clock. Active finalizers hold and refresh their lease through promotion,
+  commit, rollback, and acknowledgement handling.
+- Worker restart recovery skips a job with an unexpired active finalizer.
+  Startup reconciliation may make destructive decisions only after claiming an
+  unowned or expired row. Expired work can be reclaimed, while two independent
+  Python processes racing for the same row produce exactly one claim winner.
+- Allocating ambiguity and identity contradictions are retained and escalated;
+  reconciliation does not roll back a live finalizer or delete an unowned file.
+
+### I4 — pathname-race closure
+
+- POSIX promotion uses `renameat2(..., RENAME_NOREPLACE)` with pinned directory
+  file descriptors. If the kernel cannot provide that primitive, promotion
+  fails closed. No ordinary overwrite-capable rename is used.
+- POSIX cleanup retains the stage when deletion-time identity cannot be proved;
+  it never performs check-then-name-unlink. Windows continues to promote and
+  delete through held handles, including no-overwrite collision behavior.
+- The XHS staging implementation contains no ordinary `os.rename` or
+  `os.unlink` call.
+
+## TDD evidence
+
+The required defects were observed before implementation:
+
+- formal-read provenance: `3 failed, 1 passed` before the shared trust gate;
+- strict/bidirectional physical binding: `4 failed, 5 passed` before the parent
+  guards and strict JSON predicates;
+- durable intent and recovery ownership: `7 failed, 9 passed` before allocating
+  intent, leases, CAS claims, and active-finalizer protection;
+- partial-NULL identity was separately RED because the old check admitted it;
+- the POSIX forbidden-call scan was RED while a pathname `os.unlink` remained.
+
+The final dedicated round-4 hardening suite is `22 passed`, repeated three
+times (`22 passed` each run). It covers formal-read tamper, all seven physical
+guards, exact schema/data validation, populated v1-to-v2 migration, allocation
+and acknowledgement failures, lease constraints, DB-clock and cross-process
+CAS races, expired recovery, retained unjournaled stages, POSIX fail-closed
+behavior, and Windows handle/no-overwrite regressions.
+
+## Final controlled verification
+
+- Focused XHS, Settings, and health suites: `435 passed, 1 skipped`.
+- Schema migration/hardening suite: `63 passed`.
+- Analysis regression: `90 passed, 1 skipped`.
+- Guarded live contract: `2 passed, 1 skipped`; the skip is exactly
+  `not_run: XHS_LIVE_TEST=1 was not supplied`.
+- Controlled frontend E2E repeat gate: `5 passed` with `--repeat-each=5`.
+- `scripts/verify.ps1`: exit 0; full backend `1112 passed, 2 skipped`; Python
+  compile passed; frontend `47 passed`; production build passed; controlled
+  fresh-runtime E2E `1 passed`; npm audit found `0 vulnerabilities`;
+  tracked-secret and release-boundary scans passed.
+- Independent diff, staged-scope, trigger-schema, strict-metadata,
+  journal-mutation, forbidden-POSIX-call, and secret scans passed. No
+  S2B/Bailian implementation or `research/` file is included.
+
+## Live status
+
+Real authenticated XHS execution remains exactly:
+
+```text
+not_run
+```
+
+No external authenticated state was supplied and `XHS_LIVE_TEST=1` was not
+enabled. This round makes no claim about a real account, search result, identity,
+or live persisted fact.

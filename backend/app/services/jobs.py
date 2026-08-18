@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import case, select, update
+from sqlalchemy import case, exists, func, select, update
 from sqlalchemy.orm import selectinload
 
 from backend.app.db import Database
@@ -399,9 +399,31 @@ class JobService:
             session.commit()
             return len(records)
 
-    def recover_interrupted_workers(self, *, job_type: str) -> int:
+    def recover_interrupted_workers(
+        self,
+        *,
+        job_type: str,
+        protect_active_xhs_finalizers: bool = False,
+    ) -> int:
         """Require explicit human restart for unsafe queued/running physical work."""
         now = _utc_now()
+        active_finalizer = None
+        if protect_active_xhs_finalizers:
+            from backend.app.features.xhs.models import (
+                XhsArtifactPromotionJournalRecord,
+            )
+
+            active_finalizer = exists(
+                select(XhsArtifactPromotionJournalRecord.id).where(
+                    XhsArtifactPromotionJournalRecord.job_id == JobRecord.id,
+                    XhsArtifactPromotionJournalRecord.owner_token.is_not(None),
+                    XhsArtifactPromotionJournalRecord.recovery_lease_expires_at
+                    > func.current_timestamp(),
+                    XhsArtifactPromotionJournalRecord.state.in_(
+                        ("allocating", "prepared", "promoted")
+                    ),
+                )
+            )
         with self.database.session() as session:
             records = session.scalars(
                 select(JobRecord).where(
@@ -411,12 +433,31 @@ class JobService:
                     ),
                 )
             ).all()
+            recovered = 0
             for record in records:
-                record.state = JobState.needs_human
-                record.current_stage = "worker_restart_required"
-                record.error_category = "worker_restart_required"
-                record.lease_expires_at = None
-                record.updated_at = now
+                conditions = [
+                    JobRecord.id == record.id,
+                    JobRecord.type == job_type,
+                    JobRecord.state.in_(
+                        (JobState.queued.value, JobState.running.value)
+                    ),
+                ]
+                if active_finalizer is not None:
+                    conditions.append(~active_finalizer)
+                changed = session.execute(
+                    update(JobRecord)
+                    .where(*conditions)
+                    .values(
+                        state=JobState.needs_human.value,
+                        current_stage="worker_restart_required",
+                        error_category="worker_restart_required",
+                        lease_expires_at=None,
+                        updated_at=now,
+                    )
+                )
+                if changed.rowcount != 1:
+                    continue
+                recovered += 1
                 session.add(
                     JobLogRecord(
                         job_id=record.id,
@@ -429,7 +470,7 @@ class JobService:
                     )
                 )
             session.commit()
-            return len(records)
+            return recovered
 
     @staticmethod
     def _record(session: Any, job_id: str) -> JobRecord:

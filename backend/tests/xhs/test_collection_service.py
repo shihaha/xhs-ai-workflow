@@ -10,6 +10,7 @@ from time import monotonic, sleep
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.adapters.contracts import CollectionItem, CollectionRequest, CollectionResult
 from backend.app.adapters.xhs_cli_read import XhsCliReadAdapter
@@ -935,7 +936,9 @@ def test_historical_search_artifact_with_conflicting_owner_aliases_fails_closed(
             "sha256": hashlib.sha256(encoded).hexdigest(),
             "size_bytes": len(encoded),
         }
-        session.commit()
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
 
     with pytest.raises(LookupError, match="do not exist"):
         service.get_search_results(queued.id)

@@ -22,12 +22,16 @@ from backend.app.features.xhs.constants import (
 
 
 XHS_ARTIFACT_PROMOTION_JOURNAL_MIGRATION = (
+    "xhs_artifact_promotion_journal_v2"
+)
+_XHS_ARTIFACT_PROMOTION_JOURNAL_LEGACY_MIGRATION = (
     "xhs_artifact_promotion_journal_v1"
 )
 _XHS_ARTIFACT_PROMOTION_LEFTOVERS = (
     "xhs_artifact_promotion_journal_v0",
+    "xhs_artifact_promotion_journal_v1_rebuild",
 )
-_XHS_ARTIFACT_JOURNAL_BINDING_WHEN = """
+_XHS_ARTIFACT_JOURNAL_V1_BINDING_WHEN = """
 NOT EXISTS (
     SELECT 1 FROM jobs AS job
     WHERE job.id=NEW.job_id
@@ -48,6 +52,124 @@ OR (
         AND artifact.path=NEW.final_path
         AND json_extract(artifact.metadata_json, '$.sha256')=NEW.sha256
         AND json_extract(artifact.metadata_json, '$.size_bytes')=NEW.size_bytes
+    )
+)
+OR (
+    NEW.state='completed' AND NEW.resolution='committed'
+    AND NOT EXISTS (
+        SELECT 1 FROM jobs AS committed_job
+        WHERE committed_job.id=NEW.job_id
+        AND committed_job.state=NEW.target_state
+    )
+)
+""".strip()
+_XHS_ARTIFACT_JOURNAL_V1_TRIGGERS = {
+    "ck_xhs_artifact_journal_binding_insert": f"""
+CREATE TRIGGER ck_xhs_artifact_journal_binding_insert
+BEFORE INSERT ON xhs_artifact_promotion_journal
+WHEN {_XHS_ARTIFACT_JOURNAL_V1_BINDING_WHEN}
+BEGIN
+    SELECT RAISE(ABORT, 'xhs artifact journal binding mismatch');
+END
+""".strip(),
+    "ck_xhs_artifact_journal_binding_update": f"""
+CREATE TRIGGER ck_xhs_artifact_journal_binding_update
+BEFORE UPDATE ON xhs_artifact_promotion_journal
+WHEN {_XHS_ARTIFACT_JOURNAL_V1_BINDING_WHEN}
+BEGIN
+    SELECT RAISE(ABORT, 'xhs artifact journal binding mismatch');
+END
+""".strip(),
+    "ck_xhs_artifact_journal_no_delete": """
+CREATE TRIGGER ck_xhs_artifact_journal_no_delete
+BEFORE DELETE ON xhs_artifact_promotion_journal
+BEGIN
+    SELECT RAISE(ABORT, 'xhs artifact journal is durable');
+END
+""".strip(),
+}
+_XHS_ARTIFACT_METADATA_BINDING = """
+json_valid(artifact.metadata_json) IS 1
+AND json_type(artifact.metadata_json) IS 'object'
+AND json_type(artifact.metadata_json, '$.artifact_id') IS 'integer'
+AND json_extract(artifact.metadata_json, '$.artifact_id') IS artifact.id
+AND json_type(artifact.metadata_json, '$.job_id') IS 'text'
+AND json_extract(artifact.metadata_json, '$.job_id') IS journal.job_id
+AND json_type(artifact.metadata_json, '$.sha256') IS 'text'
+AND json_extract(artifact.metadata_json, '$.sha256') IS journal.sha256
+AND json_type(artifact.metadata_json, '$.size_bytes') IS 'integer'
+AND json_extract(artifact.metadata_json, '$.size_bytes') IS journal.size_bytes
+AND (
+    (
+        job.type='xhs_account_collection'
+        AND json_valid(job.input_data) IS 1
+        AND json_type(job.input_data) IS 'object'
+        AND json_type(job.input_data, '$.user_id') IS 'text'
+        AND json_type(artifact.metadata_json, '$.user_id') IS 'text'
+        AND json_extract(artifact.metadata_json, '$.user_id') IS
+            json_extract(job.input_data, '$.user_id')
+    )
+    OR (
+        job.type='xhs_note_search'
+        AND json_valid(job.input_data) IS 1
+        AND json_type(job.input_data) IS 'object'
+        AND json_type(job.input_data, '$.keyword') IS 'text'
+        AND json_type(artifact.metadata_json, '$.keyword') IS 'text'
+        AND json_extract(artifact.metadata_json, '$.keyword') IS
+            json_extract(job.input_data, '$.keyword')
+    )
+)
+""".strip()
+_XHS_ARTIFACT_JOURNAL_BINDING_WHEN = """
+NOT EXISTS (
+    SELECT 1 FROM jobs AS job
+    WHERE job.id=NEW.job_id
+    AND NEW.producer='xhs_cli_read_worker_v1'
+    AND NEW.artifact_kind=CASE job.type
+        WHEN 'xhs_account_collection' THEN 'xhs_account_collection_raw'
+        WHEN 'xhs_note_search' THEN 'xhs_note_search_raw'
+        ELSE '' END
+)
+OR (
+    NEW.artifact_id IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM job_artifacts AS artifact
+        WHERE artifact.id=NEW.artifact_id
+        AND artifact.job_id=NEW.job_id
+        AND artifact.kind=NEW.artifact_kind
+        AND artifact.producer=NEW.producer
+        AND artifact.path=NEW.final_path
+        AND json_valid(artifact.metadata_json) IS 1
+        AND json_type(artifact.metadata_json) IS 'object'
+        AND json_type(artifact.metadata_json, '$.artifact_id') IS 'integer'
+        AND json_extract(artifact.metadata_json, '$.artifact_id') IS artifact.id
+        AND json_type(artifact.metadata_json, '$.job_id') IS 'text'
+        AND json_extract(artifact.metadata_json, '$.job_id') IS NEW.job_id
+        AND json_type(artifact.metadata_json, '$.sha256') IS 'text'
+        AND json_extract(artifact.metadata_json, '$.sha256') IS NEW.sha256
+        AND json_type(artifact.metadata_json, '$.size_bytes') IS 'integer'
+        AND json_extract(artifact.metadata_json, '$.size_bytes') IS NEW.size_bytes
+        AND EXISTS (
+            SELECT 1 FROM jobs AS bound_job
+            WHERE bound_job.id=NEW.job_id
+            AND (
+                (bound_job.type='xhs_account_collection'
+                 AND json_valid(bound_job.input_data) IS 1
+                 AND json_type(bound_job.input_data) IS 'object'
+                 AND json_type(bound_job.input_data, '$.user_id') IS 'text'
+                 AND json_type(artifact.metadata_json, '$.user_id') IS 'text'
+                 AND json_extract(artifact.metadata_json, '$.user_id') IS
+                     json_extract(bound_job.input_data, '$.user_id'))
+                OR
+                (bound_job.type='xhs_note_search'
+                 AND json_valid(bound_job.input_data) IS 1
+                 AND json_type(bound_job.input_data) IS 'object'
+                 AND json_type(bound_job.input_data, '$.keyword') IS 'text'
+                 AND json_type(artifact.metadata_json, '$.keyword') IS 'text'
+                 AND json_extract(artifact.metadata_json, '$.keyword') IS
+                     json_extract(bound_job.input_data, '$.keyword'))
+            )
+        )
     )
 )
 OR (
@@ -81,6 +203,104 @@ CREATE TRIGGER ck_xhs_artifact_journal_no_delete
 BEFORE DELETE ON xhs_artifact_promotion_journal
 BEGIN
     SELECT RAISE(ABORT, 'xhs artifact journal is durable');
+END
+""".strip(),
+    "ck_xhs_artifact_journal_job_update": """
+CREATE TRIGGER ck_xhs_artifact_journal_job_update
+BEFORE UPDATE OF id, type, state, input_data ON jobs
+WHEN EXISTS (
+    SELECT 1 FROM xhs_artifact_promotion_journal AS journal
+    LEFT JOIN job_artifacts AS artifact ON artifact.id=journal.artifact_id
+    WHERE journal.job_id=OLD.id
+    AND (
+        NEW.id IS NOT journal.job_id
+        OR journal.producer IS NOT 'xhs_cli_read_worker_v1'
+        OR journal.artifact_kind IS NOT CASE NEW.type
+            WHEN 'xhs_account_collection' THEN 'xhs_account_collection_raw'
+            WHEN 'xhs_note_search' THEN 'xhs_note_search_raw'
+            ELSE '' END
+        OR (journal.state='completed' AND journal.resolution='committed'
+            AND NEW.state IS NOT journal.target_state)
+        OR (journal.artifact_id IS NOT NULL AND (
+            artifact.id IS NULL
+            OR json_valid(NEW.input_data)!=1
+            OR json_type(NEW.input_data) IS NOT 'object'
+            OR (NEW.type='xhs_account_collection' AND (
+                json_type(NEW.input_data, '$.user_id') IS NOT 'text'
+                OR json_type(artifact.metadata_json, '$.user_id') IS NOT 'text'
+                OR json_extract(artifact.metadata_json, '$.user_id')
+                    IS NOT json_extract(NEW.input_data, '$.user_id')))
+            OR (NEW.type='xhs_note_search' AND (
+                json_type(NEW.input_data, '$.keyword') IS NOT 'text'
+                OR json_type(artifact.metadata_json, '$.keyword') IS NOT 'text'
+                OR json_extract(artifact.metadata_json, '$.keyword')
+                    IS NOT json_extract(NEW.input_data, '$.keyword')))
+        ))
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'xhs artifact journal job binding mismatch');
+END
+""".strip(),
+    "ck_xhs_artifact_journal_job_delete": """
+CREATE TRIGGER ck_xhs_artifact_journal_job_delete
+BEFORE DELETE ON jobs
+WHEN EXISTS (
+    SELECT 1 FROM xhs_artifact_promotion_journal AS journal
+    WHERE journal.job_id=OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'xhs artifact journal job is durable');
+END
+""".strip(),
+    "ck_xhs_artifact_journal_artifact_update": """
+CREATE TRIGGER ck_xhs_artifact_journal_artifact_update
+BEFORE UPDATE OF id, job_id, kind, producer, path, metadata_json ON job_artifacts
+WHEN EXISTS (
+    SELECT 1 FROM xhs_artifact_promotion_journal AS journal
+    JOIN jobs AS job ON job.id=journal.job_id
+    WHERE journal.artifact_id=OLD.id
+    AND (
+        NEW.id IS NOT journal.artifact_id
+        OR NEW.job_id IS NOT journal.job_id
+        OR NEW.kind IS NOT journal.artifact_kind
+        OR NEW.producer IS NOT journal.producer
+        OR NEW.path IS NOT journal.final_path
+        OR json_valid(NEW.metadata_json)!=1
+        OR json_type(NEW.metadata_json) IS NOT 'object'
+        OR json_type(NEW.metadata_json, '$.artifact_id') IS NOT 'integer'
+        OR json_extract(NEW.metadata_json, '$.artifact_id') IS NOT NEW.id
+        OR json_type(NEW.metadata_json, '$.job_id') IS NOT 'text'
+        OR json_extract(NEW.metadata_json, '$.job_id') IS NOT journal.job_id
+        OR json_type(NEW.metadata_json, '$.sha256') IS NOT 'text'
+        OR json_extract(NEW.metadata_json, '$.sha256') IS NOT journal.sha256
+        OR json_type(NEW.metadata_json, '$.size_bytes') IS NOT 'integer'
+        OR json_extract(NEW.metadata_json, '$.size_bytes') IS NOT journal.size_bytes
+        OR (job.type='xhs_account_collection' AND (
+            json_type(job.input_data, '$.user_id') IS NOT 'text'
+            OR json_type(NEW.metadata_json, '$.user_id') IS NOT 'text'
+            OR json_extract(NEW.metadata_json, '$.user_id')
+                IS NOT json_extract(job.input_data, '$.user_id')))
+        OR (job.type='xhs_note_search' AND (
+            json_type(job.input_data, '$.keyword') IS NOT 'text'
+            OR json_type(NEW.metadata_json, '$.keyword') IS NOT 'text'
+            OR json_extract(NEW.metadata_json, '$.keyword')
+                IS NOT json_extract(job.input_data, '$.keyword')))
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'xhs artifact journal artifact binding mismatch');
+END
+""".strip(),
+    "ck_xhs_artifact_journal_artifact_delete": """
+CREATE TRIGGER ck_xhs_artifact_journal_artifact_delete
+BEFORE DELETE ON job_artifacts
+WHEN EXISTS (
+    SELECT 1 FROM xhs_artifact_promotion_journal AS journal
+    WHERE journal.artifact_id=OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'xhs artifact journal artifact is durable');
 END
 """.strip(),
 }
@@ -582,6 +802,27 @@ class Database:
                     )
                 return
             inspector = inspect(connection)
+            legacy_marker = connection.scalar(text(
+                "SELECT 1 FROM workbench_schema_migrations WHERE name=:name"
+            ), {
+                "name": _XHS_ARTIFACT_PROMOTION_JOURNAL_LEGACY_MIGRATION,
+            }) is not None
+            if legacy_marker:
+                if (
+                    not _xhs_artifact_promotion_journal_v1_schema_valid(
+                        inspector,
+                        connection,
+                    )
+                    or not _xhs_artifact_promotion_journal_data_valid(connection)
+                ):
+                    raise SchemaMigrationError(
+                        "XHS artifact promotion journal v1 validation failed."
+                    )
+                _rebuild_xhs_artifact_promotion_journal_v2(
+                    connection,
+                    XhsArtifactPromotionJournalRecord,
+                )
+                inspector = inspect(connection)
             if not _xhs_artifact_promotion_journal_schema_valid(
                 inspector, connection
             ):
@@ -2094,6 +2335,43 @@ def _require_no_xhs_artifact_promotion_leftovers(connection: Connection) -> None
         )
 
 
+def _rebuild_xhs_artifact_promotion_journal_v2(
+    connection: Connection,
+    journal_record: object,
+) -> None:
+    """Mechanically add allocation identity and recovery lease fields to v1."""
+
+    temporary_table = "xhs_artifact_promotion_journal_v1_rebuild"
+    _require_no_xhs_artifact_promotion_leftovers(connection)
+    for name in _XHS_ARTIFACT_JOURNAL_V1_TRIGGERS:
+        connection.execute(text(f"DROP TRIGGER {name}"))
+    explicit_indexes = connection.execute(text(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND tbl_name='xhs_artifact_promotion_journal' AND sql IS NOT NULL"
+    )).all()
+    for name, in explicit_indexes:
+        connection.execute(text(f'DROP INDEX "{name}"'))
+    connection.execute(text(
+        "ALTER TABLE xhs_artifact_promotion_journal "
+        f"RENAME TO {temporary_table}"
+    ))
+    journal_record.__table__.create(connection)
+    legacy_columns = (
+        "id", "job_id", "artifact_kind", "producer", "stage_path",
+        "final_path", "sha256", "size_bytes", "file_dev", "file_ino",
+        "file_mtime_ns", "target_state", "state", "resolution",
+        "artifact_id", "created_at", "updated_at", "completed_at",
+    )
+    rendered = ", ".join(f'"{column}"' for column in legacy_columns)
+    connection.execute(text(
+        "INSERT INTO xhs_artifact_promotion_journal "
+        f"({rendered}, owner_token, recovery_lease_expires_at) "
+        f"SELECT {rendered}, NULL, NULL FROM {temporary_table}"
+    ))
+    connection.execute(text(f"DROP TABLE {temporary_table}"))
+    _create_xhs_artifact_promotion_journal_triggers(connection)
+
+
 def _create_xhs_artifact_promotion_journal_triggers(
     connection: Connection,
 ) -> None:
@@ -2102,11 +2380,11 @@ def _create_xhs_artifact_promotion_journal_triggers(
         connection.execute(text(definition))
 
 
-def _xhs_artifact_promotion_journal_schema_valid(
+def _xhs_artifact_promotion_journal_v1_schema_valid(
     inspector: object,
     connection: Connection,
 ) -> bool:
-    """Validate the journal's complete physical schema, not only its marker."""
+    """Recognize the one published v1 layout before its mechanical v2 rebuild."""
 
     table = "xhs_artifact_promotion_journal"
     expected_types = {
@@ -2176,15 +2454,10 @@ def _xhs_artifact_promotion_journal_schema_valid(
         ),
     }
     try:
-        if table not in set(inspector.get_table_names()):
-            return False
         columns = {
-            column["name"]: column
-            for column in inspector.get_columns(table)
+            column["name"]: column for column in inspector.get_columns(table)
         }
-        if set(columns) != set(expected_types):
-            return False
-        if {
+        if set(columns) != set(expected_types) or {
             name: str(column.get("type") or "").upper()
             for name, column in columns.items()
         } != expected_types:
@@ -2236,8 +2509,177 @@ def _xhs_artifact_promotion_journal_schema_valid(
             row[0]: _compact_sql(row[1])
             for row in connection.execute(text(
                 "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
-                "AND tbl_name=:table"
-            ), {"table": table})
+                "AND name LIKE 'ck_xhs_artifact_journal_%'"
+            ))
+        }
+        return triggers == {
+            name: _compact_sql(definition)
+            for name, definition in _XHS_ARTIFACT_JOURNAL_V1_TRIGGERS.items()
+        }
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+
+
+def _xhs_artifact_promotion_journal_schema_valid(
+    inspector: object,
+    connection: Connection,
+) -> bool:
+    """Validate the journal's complete physical schema, not only its marker."""
+
+    table = "xhs_artifact_promotion_journal"
+    expected_types = {
+        "id": "VARCHAR(36)",
+        "job_id": "VARCHAR(36)",
+        "artifact_kind": "VARCHAR(100)",
+        "producer": "VARCHAR(64)",
+        "stage_path": "TEXT",
+        "final_path": "TEXT",
+        "sha256": "VARCHAR(64)",
+        "size_bytes": "INTEGER",
+        "file_dev": "INTEGER",
+        "file_ino": "INTEGER",
+        "file_mtime_ns": "INTEGER",
+        "target_state": "VARCHAR(32)",
+        "state": "VARCHAR(20)",
+        "resolution": "VARCHAR(20)",
+        "artifact_id": "INTEGER",
+        "created_at": "DATETIME",
+        "updated_at": "DATETIME",
+        "completed_at": "DATETIME",
+        "owner_token": "VARCHAR(36)",
+        "recovery_lease_expires_at": "DATETIME",
+    }
+    nullable = {
+        "file_dev",
+        "file_ino",
+        "file_mtime_ns",
+        "resolution",
+        "artifact_id",
+        "completed_at",
+        "owner_token",
+        "recovery_lease_expires_at",
+    }
+    expected_checks = {
+        "ck_xhs_artifact_journal_uuid": (
+            "is_canonical_uuid(id)=1andis_canonical_uuid(job_id)=1"
+        ),
+        "ck_xhs_artifact_journal_source": (
+            "length(artifact_kind)between1and100andlength(producer)between1and64"
+        ),
+        "ck_xhs_artifact_journal_stage_path": (
+            "artifact_path_key(stage_path)isnotnullandlength(stage_path)<=1000and"
+            "stage_pathlike'evidence/xhs/.staging/%.stage'and"
+            "stage_pathnotlike'evidence/xhs/.staging/%/%'andstage_pathin("
+            "'evidence/xhs/.staging/'||job_id||'-'||replace(id,'-','')||'.stage',"
+            "'evidence/xhs/.staging/'||job_id||'-'||replace(id,'-','')||'-failure.stage')"
+        ),
+        "ck_xhs_artifact_journal_final_path": (
+            "artifact_path_key(final_path)isnotnullandlength(final_path)<=1000and"
+            "final_pathlike'evidence/xhs/%.json'and"
+            "final_pathnotlike'evidence/xhs/%/%'and((final_path="
+            "'evidence/xhs/'||job_id||'.json'andstage_pathnotlike'%-failure.stage')or("
+            "final_path='evidence/xhs/'||job_id||'-failure.json'and"
+            "stage_pathlike'%-failure.stage'))"
+        ),
+        "ck_xhs_artifact_journal_sha": (
+            "length(sha256)=64andsha256notglob'*[^0-9a-f]*'"
+        ),
+        "ck_xhs_artifact_journal_identity": (
+            "size_bytesbetween0and20971520and((file_devisnulland"
+            "file_inoisnullandfile_mtime_nsisnulland(state='allocating'or("
+            "state='completed'andresolutionin('rolled_back','inconsistent'))))"
+            "or(file_devisnotnullandfile_inoisnotnulland"
+            "file_mtime_nsisnotnullandfile_dev>=0andfile_ino>=0and"
+            "file_mtime_ns>=0andstate!='allocating'))"
+        ),
+        "ck_xhs_artifact_journal_state": (
+            "target_statein('succeeded','failed','needs_human')and"
+            "statein('allocating','prepared','promoted','completed')"
+        ),
+        "ck_xhs_artifact_journal_resolution": (
+            "((state!='completed'andresolutionisnullandartifact_idisnulland"
+            "completed_atisnull)or(state='completed'andresolutionin"
+            "('committed','rolled_back','inconsistent')andcompleted_atisnotnulland"
+            "(resolution!='committed'orartifact_idisnotnull)and"
+            "(resolution!='rolled_back'orartifact_idisnull)))"
+        ),
+        "ck_xhs_artifact_journal_timestamps": (
+            "datetime(created_at)isnotnullanddatetime(updated_at)isnotnulland"
+            "(completed_atisnullordatetime(completed_at)isnotnull)"
+        ),
+        "ck_xhs_artifact_journal_owner_lease": (
+            "((owner_tokenisnullandrecovery_lease_expires_atisnull)or("
+            "is_canonical_uuid(owner_token)=1and"
+            "datetime(recovery_lease_expires_at)isnotnull))"
+        ),
+    }
+    try:
+        if table not in set(inspector.get_table_names()):
+            return False
+        columns = {
+            column["name"]: column
+            for column in inspector.get_columns(table)
+        }
+        if set(columns) != set(expected_types):
+            return False
+        if {
+            name: str(column.get("type") or "").upper()
+            for name, column in columns.items()
+        } != expected_types:
+            return False
+        if any(
+            columns[name].get("nullable") is not (name in nullable)
+            for name in columns
+        ):
+            return False
+        if tuple(
+            inspector.get_pk_constraint(table).get("constrained_columns") or ()
+        ) != ("id",):
+            return False
+        if {
+            tuple(item.get("column_names") or ())
+            for item in inspector.get_unique_constraints(table)
+        } != {("job_id",), ("stage_path",), ("final_path",)}:
+            return False
+        if {
+            (
+                tuple(item.get("constrained_columns") or ()),
+                item.get("referred_table"),
+                tuple(item.get("referred_columns") or ()),
+                (item.get("options") or {}).get("ondelete"),
+            )
+            for item in inspector.get_foreign_keys(table)
+        } != {
+            (("job_id",), "jobs", ("id",), "RESTRICT"),
+            (("artifact_id",), "job_artifacts", ("id",), "RESTRICT"),
+        }:
+            return False
+        if {
+            item.get("name"): (
+                tuple(item.get("column_names") or ()),
+                bool(item.get("unique")),
+            )
+            for item in inspector.get_indexes(table)
+        } != {
+            "ix_xhs_artifact_journal_state": (("state",), False),
+            "ix_xhs_artifact_journal_artifact_id": (("artifact_id",), False),
+            "ix_xhs_artifact_journal_recovery_lease": (
+                ("recovery_lease_expires_at", "state"),
+                False,
+            ),
+        }:
+            return False
+        if {
+            item.get("name"): _compact_sql(item.get("sqltext"))
+            for item in inspector.get_check_constraints(table)
+        } != expected_checks:
+            return False
+        triggers = {
+            row[0]: _compact_sql(row[1])
+            for row in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'ck_xhs_artifact_journal_%'"
+            ))
         }
         return triggers == {
             name: _compact_sql(definition)
@@ -2251,32 +2693,68 @@ def _xhs_artifact_promotion_journal_data_valid(connection: Connection) -> bool:
     """Reject rows whose job, artifact, path or durable state bindings disagree."""
 
     try:
-        return connection.scalar(text(
-            "SELECT 1 FROM xhs_artifact_promotion_journal AS journal "
-            "LEFT JOIN jobs AS job ON job.id=journal.job_id "
-            "LEFT JOIN job_artifacts AS artifact ON artifact.id=journal.artifact_id "
-            "WHERE job.id IS NULL "
-            "OR job.type NOT IN ('xhs_account_collection','xhs_note_search') "
-            "OR journal.producer!='xhs_cli_read_worker_v1' "
-            "OR journal.artifact_kind != CASE job.type "
-            "WHEN 'xhs_account_collection' THEN 'xhs_account_collection_raw' "
-            "ELSE 'xhs_note_search_raw' END "
-            "OR journal.stage_path NOT LIKE "
-            "('evidence/xhs/.staging/' || journal.job_id || '-%.stage') "
-            "OR journal.final_path NOT IN "
-            "('evidence/xhs/' || journal.job_id || '.json', "
-            " 'evidence/xhs/' || journal.job_id || '-failure.json') "
-            "OR (journal.state='completed' AND journal.resolution='committed' AND ("
-            "artifact.id IS NULL OR artifact.job_id!=journal.job_id "
-            "OR artifact.kind!=journal.artifact_kind "
-            "OR artifact.producer!=journal.producer "
-            "OR artifact.path!=journal.final_path "
-            "OR json_extract(artifact.metadata_json,'$.sha256')!=journal.sha256 "
-            "OR json_extract(artifact.metadata_json,'$.size_bytes')!=journal.size_bytes "
-            "OR job.state!=journal.target_state)) "
-            "OR (journal.state!='completed' AND artifact.id IS NOT NULL) "
-            "LIMIT 1"
-        )) is None
+        violation = connection.scalar(text(f"""
+            SELECT 1 FROM xhs_artifact_promotion_journal AS journal
+            LEFT JOIN jobs AS job ON job.id=journal.job_id
+            LEFT JOIN job_artifacts AS artifact ON artifact.id=journal.artifact_id
+            WHERE job.id IS NULL
+            OR job.type NOT IN ('xhs_account_collection','xhs_note_search')
+            OR journal.producer IS NOT 'xhs_cli_read_worker_v1'
+            OR journal.artifact_kind IS NOT CASE job.type
+                WHEN 'xhs_account_collection' THEN 'xhs_account_collection_raw'
+                ELSE 'xhs_note_search_raw' END
+            OR journal.stage_path NOT LIKE
+                ('evidence/xhs/.staging/' || journal.job_id || '-%.stage')
+            OR journal.final_path NOT IN
+                ('evidence/xhs/' || journal.job_id || '.json',
+                 'evidence/xhs/' || journal.job_id || '-failure.json')
+            OR (journal.artifact_id IS NOT NULL AND (
+                artifact.id IS NULL OR NOT ({_XHS_ARTIFACT_METADATA_BINDING})
+                OR artifact.job_id IS NOT journal.job_id
+                OR artifact.kind IS NOT journal.artifact_kind
+                OR artifact.producer IS NOT journal.producer
+                OR artifact.path IS NOT journal.final_path
+            ))
+            OR (journal.state='completed' AND journal.resolution='committed' AND (
+                artifact.id IS NULL OR job.state IS NOT journal.target_state
+            ))
+            OR (journal.state!='completed' AND journal.artifact_id IS NOT NULL)
+            OR ((journal.file_dev IS NULL) + (journal.file_ino IS NULL)
+                + (journal.file_mtime_ns IS NULL)) NOT IN (0, 3)
+            OR (journal.state='allocating' AND journal.file_dev IS NOT NULL)
+            OR (journal.state IN ('prepared','promoted')
+                AND journal.file_dev IS NULL)
+            OR (journal.state='completed' AND journal.resolution='committed'
+                AND journal.file_dev IS NULL)
+            OR (journal.file_dev IS NOT NULL AND (
+                journal.file_dev < 0 OR journal.file_ino < 0
+                OR journal.file_mtime_ns < 0
+            ))
+            LIMIT 1
+        """))
+        if violation is not None:
+            return False
+        columns = {
+            column["name"]
+            for column in inspect(connection).get_columns(
+                "xhs_artifact_promotion_journal"
+            )
+        }
+        if {
+            "owner_token",
+            "recovery_lease_expires_at",
+        }.issubset(columns):
+            return connection.scalar(text("""
+                SELECT 1 FROM xhs_artifact_promotion_journal
+                WHERE (owner_token IS NULL) IS NOT
+                    (recovery_lease_expires_at IS NULL)
+                OR (owner_token IS NOT NULL AND (
+                    is_canonical_uuid(owner_token) IS NOT 1
+                    OR datetime(recovery_lease_expires_at) IS NULL
+                ))
+                LIMIT 1
+            """)) is None
+        return True
     except SQLAlchemyError:
         return False
 

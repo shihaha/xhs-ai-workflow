@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Thread
 from typing import Any
@@ -14,6 +15,7 @@ from backend.app.adapters.contracts import (
     ModelResult,
     StructuredModelRequest,
 )
+import backend.app.db as db_module
 from backend.app.db import Database, canonical_raw_evidence_digest
 from backend.app.features.analysis.schemas import AnalysisCreate
 from backend.app.features.analysis.service import (
@@ -183,6 +185,24 @@ def _artifact_for_job(fixture: _Fixture, job_id: str) -> JobArtifactRecord:
         return artifact
 
 
+@contextmanager
+def _historical_parent_tamper(
+    fixture: _Fixture,
+    trigger_name: str,
+):
+    """Model corruption that predates the now-physical journal guards."""
+
+    with fixture.database.engine.begin() as connection:
+        connection.execute(text(f"DROP TRIGGER {trigger_name}"))
+    try:
+        yield
+    finally:
+        with fixture.database.engine.begin() as connection:
+            connection.execute(text(
+                db_module._XHS_ARTIFACT_JOURNAL_TRIGGERS[trigger_name]
+            ))
+
+
 def test_discovery_returns_only_account_notes_owned_by_requested_account(
     tmp_path: Path,
 ) -> None:
@@ -228,11 +248,15 @@ def test_unknown_job_state_fails_closed_in_filtered_and_unfiltered_discovery(
 ) -> None:
     fixture = _Fixture(tmp_path)
     job_id, note_id = fixture.collect("u1")
-    with fixture.database.engine.begin() as connection:
-        connection.execute(
-            text("UPDATE jobs SET state='retired_legacy_state' WHERE id=:job_id"),
-            {"job_id": job_id},
-        )
+    with _historical_parent_tamper(
+        fixture,
+        "ck_xhs_artifact_journal_job_update",
+    ):
+        with fixture.database.engine.begin() as connection:
+            connection.execute(
+                text("UPDATE jobs SET state='retired_legacy_state' WHERE id=:job_id"),
+                {"job_id": job_id},
+            )
     model = _ModelSpy()
     service = fixture.analysis(model)
 
@@ -288,20 +312,26 @@ def test_untrusted_job_or_artifact_identity_rejects_whole_request(
 ) -> None:
     fixture = _Fixture(tmp_path)
     job_id, note_id = fixture.collect("u1")
-    with fixture.database.session() as session:
-        artifact = session.scalar(
-            select(JobArtifactRecord).where(JobArtifactRecord.job_id == job_id)
-        )
-        assert artifact is not None
-        if tamper == "producer":
-            artifact.producer = "external"
-        elif tamper == "kind":
-            artifact.kind = "xhs_note_search_raw"
-        elif tamper == "job_type":
-            artifact.job.type = "manual_note"
-        else:
-            artifact.job.state = JobState.failed.value
-        session.commit()
+    trigger_name = (
+        "ck_xhs_artifact_journal_job_update"
+        if tamper.startswith("job_")
+        else "ck_xhs_artifact_journal_artifact_update"
+    )
+    with _historical_parent_tamper(fixture, trigger_name):
+        with fixture.database.session() as session:
+            artifact = session.scalar(
+                select(JobArtifactRecord).where(JobArtifactRecord.job_id == job_id)
+            )
+            assert artifact is not None
+            if tamper == "producer":
+                artifact.producer = "external"
+            elif tamper == "kind":
+                artifact.kind = "xhs_note_search_raw"
+            elif tamper == "job_type":
+                artifact.job.type = "manual_note"
+            else:
+                artifact.job.state = JobState.failed.value
+            session.commit()
     model = _ModelSpy()
 
     with pytest.raises(EvidenceNotFound):
@@ -321,24 +351,28 @@ def test_path_hash_size_and_metadata_must_match_the_physical_artifact(
 ) -> None:
     fixture = _Fixture(tmp_path)
     job_id, note_id = fixture.collect("u1")
-    with fixture.database.session() as session:
-        artifact = session.scalar(
-            select(JobArtifactRecord).where(JobArtifactRecord.job_id == job_id)
-        )
-        assert artifact is not None
-        metadata = dict(artifact.metadata_json)
-        if tamper == "path":
-            artifact.path = "evidence/xhs/foreign.json"
-        elif tamper == "sha256":
-            metadata["sha256"] = "0" * 64
-        elif tamper == "size_bytes":
-            metadata["size_bytes"] = metadata["size_bytes"] + 1
-        elif tamper == "metadata_count":
-            metadata["succeeded_note_count"] = 0
-        else:
-            metadata["artifact_id"] = metadata["artifact_id"] + 1
-        artifact.metadata_json = metadata
-        session.commit()
+    with _historical_parent_tamper(
+        fixture,
+        "ck_xhs_artifact_journal_artifact_update",
+    ):
+        with fixture.database.session() as session:
+            artifact = session.scalar(
+                select(JobArtifactRecord).where(JobArtifactRecord.job_id == job_id)
+            )
+            assert artifact is not None
+            metadata = dict(artifact.metadata_json)
+            if tamper == "path":
+                artifact.path = "evidence/xhs/foreign.json"
+            elif tamper == "sha256":
+                metadata["sha256"] = "0" * 64
+            elif tamper == "size_bytes":
+                metadata["size_bytes"] = metadata["size_bytes"] + 1
+            elif tamper == "metadata_count":
+                metadata["succeeded_note_count"] = 0
+            else:
+                metadata["artifact_id"] = metadata["artifact_id"] + 1
+            artifact.metadata_json = metadata
+            session.commit()
     model = _ModelSpy()
 
     with pytest.raises(EvidenceNotFound):

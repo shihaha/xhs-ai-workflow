@@ -19,7 +19,7 @@ from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from backend.app.adapters.contracts import CollectionItem, CollectionRequest, CollectionResult
 from backend.app.db import Database
@@ -58,6 +58,7 @@ DEFAULT_XHS_ARTIFACT_MAX_BYTES = 5 * 1024 * 1024
 _CLOSE_BUDGET_SECONDS = 0.25
 _JOURNAL_READ_BUDGET_SECONDS = 0.05
 _JOURNAL_RECONCILE_LOCK = RLock()
+_JOURNAL_LEASE_SQL = "datetime('now','+5 minutes')"
 
 # Narrow crash-injection hook used only by local lifecycle tests.
 _artifact_promotion_after_atomic_hook: Callable[[], None] | None = None
@@ -225,9 +226,13 @@ class XhsCollectionService:
         self.runtime_dir = Path(os.path.abspath(runtime_dir))
         self.clock = clock or (lambda: datetime.now(UTC).replace(tzinfo=None))
         self._max_artifact_bytes = max_artifact_bytes
+        self._journal_owner = str(uuid4())
         self._reconcile_artifact_promotions()
         for job_type in XHS_RESERVED_JOB_TYPES:
-            self.job_service.recover_interrupted_workers(job_type=job_type)
+            self.job_service.recover_interrupted_workers(
+                job_type=job_type,
+                protect_active_xhs_finalizers=True,
+            )
         self._worker = _DaemonSerialWorker() if submitter is None else None
         self._submitter = submitter or self._worker.submit
         self._lock = RLock()
@@ -358,69 +363,228 @@ class XhsCollectionService:
             self._finished(job_id)
 
     def get_profile(self, user_id: str) -> AccountProfileRead:
-        with self.database.session() as session:
-            record = session.get(XhsAccountProfileRecord, user_id)
-            if record is None:
-                raise CollectionFactNotFound(f"Account profile {user_id} does not exist.")
-            return AccountProfileRead(
-                user_id=record.user_id, source_url=record.source_url,
-                nickname=record.nickname, bio=record.bio,
-                public_stats=dict(record.public_stats_json),
-                collection_job_id=record.collection_job_id,
-                collection_artifact_id=record.collection_artifact_id,
-                collected_at=record.collected_at,
+        try:
+            with self.database.session() as session:
+                record = session.get(XhsAccountProfileRecord, user_id)
+                if record is None:
+                    raise CollectionFactNotFound(
+                        f"Account profile {user_id} does not exist."
+                    )
+                snapshot = AccountProfileRead(
+                    user_id=record.user_id,
+                    source_url=record.source_url,
+                    nickname=record.nickname,
+                    bio=record.bio,
+                    public_stats=dict(record.public_stats_json),
+                    collection_job_id=record.collection_job_id,
+                    collection_artifact_id=record.collection_artifact_id,
+                    collected_at=record.collected_at,
+                )
+            self._read_trusted_collection_result(
+                job_id=snapshot.collection_job_id,
+                artifact_id=snapshot.collection_artifact_id,
+                expected_job_type=ACCOUNT_COLLECTION_JOB_TYPE,
+                expected_artifact_kind=ACCOUNT_COLLECTION_ARTIFACT_KIND,
+                binding_name="user_id",
+                binding_value=user_id,
             )
+            return snapshot
+        except CollectionFactNotFound:
+            raise
+        except Exception as error:
+            raise CollectionFactNotFound(
+                f"Account profile {user_id} does not exist."
+            ) from error
 
     def list_account_notes(self, user_id: str) -> list[AccountNoteRead]:
-        with self.database.session() as session:
-            if session.get(XhsAccountProfileRecord, user_id) is None:
-                raise CollectionFactNotFound(f"Account profile {user_id} does not exist.")
-            records = session.scalars(
-                select(XhsAccountNoteRecord)
-                .where(XhsAccountNoteRecord.user_id == user_id)
-                .order_by(XhsAccountNoteRecord.id)
-            ).all()
-            return [AccountNoteRead(
-                note_id=row.note_id, user_id=row.user_id, source_url=row.source_url,
-                title=row.title, summary=row.summary, published_at=row.published_at,
-                public_interactions=dict(row.public_interactions_json),
-                collection_job_id=row.collection_job_id,
-                collection_artifact_id=row.collection_artifact_id,
-                collected_at=row.collected_at,
-            ) for row in records]
+        try:
+            with self.database.session() as session:
+                profile = session.get(XhsAccountProfileRecord, user_id)
+                if profile is None:
+                    raise CollectionFactNotFound(
+                        f"Account profile {user_id} does not exist."
+                    )
+                records = session.scalars(
+                    select(XhsAccountNoteRecord)
+                    .where(XhsAccountNoteRecord.user_id == user_id)
+                    .order_by(XhsAccountNoteRecord.id)
+                ).all()
+                if any(
+                    row.collection_job_id != profile.collection_job_id
+                    or row.collection_artifact_id != profile.collection_artifact_id
+                    for row in records
+                ):
+                    raise CollectionFactNotFound(
+                        f"Account notes for {user_id} do not exist."
+                    )
+                profile_job_id = profile.collection_job_id
+                profile_artifact_id = profile.collection_artifact_id
+                snapshots = [
+                    AccountNoteRead(
+                        note_id=row.note_id,
+                        user_id=row.user_id,
+                        source_url=row.source_url,
+                        title=row.title,
+                        summary=row.summary,
+                        published_at=row.published_at,
+                        public_interactions=dict(row.public_interactions_json),
+                        collection_job_id=row.collection_job_id,
+                        collection_artifact_id=row.collection_artifact_id,
+                        collected_at=row.collected_at,
+                    )
+                    for row in records
+                ]
+            self._read_trusted_collection_result(
+                job_id=profile_job_id,
+                artifact_id=profile_artifact_id,
+                expected_job_type=ACCOUNT_COLLECTION_JOB_TYPE,
+                expected_artifact_kind=ACCOUNT_COLLECTION_ARTIFACT_KIND,
+                binding_name="user_id",
+                binding_value=user_id,
+            )
+            return snapshots
+        except CollectionFactNotFound:
+            raise
+        except Exception as error:
+            raise CollectionFactNotFound(
+                f"Account notes for {user_id} do not exist."
+            ) from error
 
     def get_search_results(self, job_id: str) -> SearchResultsRead:
-        job = self.job_service.get(job_id)
-        if job.type != SEARCH_COLLECTION_JOB_TYPE or job.state is not JobState.succeeded:
-            raise CollectionFactNotFound(f"Search results for job {job_id} do not exist.")
-        artifacts = [artifact for artifact in job.artifacts if artifact.kind == SEARCH_COLLECTION_ARTIFACT_KIND]
-        if len(artifacts) != 1 or artifacts[0].producer != ACCOUNT_COLLECTION_ARTIFACT_PRODUCER:
-            raise CollectionFactNotFound(f"Search results for job {job_id} do not exist.")
-        artifact = artifacts[0]
         try:
-            encoded = self._read_committed_artifact(job_id, artifact)
-            payload = json.loads(encoded.decode("utf-8"))
-            if payload["job_id"] != job.id or payload["job_type"] != SEARCH_COLLECTION_JOB_TYPE:
-                raise ValueError("artifact binding mismatch")
-            result = CollectionResult.model_validate(payload["result"])
+            with self.database.session() as session:
+                job_record = session.get(JobRecord, job_id)
+                if job_record is None:
+                    raise CollectionFactNotFound(
+                        f"Search results for job {job_id} do not exist."
+                    )
+                keyword = job_record.input_data.get("keyword")
+                artifacts = session.scalars(
+                    select(JobArtifactRecord).where(JobArtifactRecord.job_id == job_id)
+                ).all()
+                if len(artifacts) != 1 or not isinstance(keyword, str):
+                    raise CollectionFactNotFound(
+                        f"Search results for job {job_id} do not exist."
+                    )
+                artifact_id = artifacts[0].id
+            job_input, artifact_metadata, payload, result = (
+                self._read_trusted_collection_result(
+                    job_id=job_id,
+                    artifact_id=artifact_id,
+                    expected_job_type=SEARCH_COLLECTION_JOB_TYPE,
+                    expected_artifact_kind=SEARCH_COLLECTION_ARTIFACT_KIND,
+                    binding_name="keyword",
+                    binding_value=keyword,
+                )
+            )
             if (
-                not _is_exact(result, expected_count=int(job.input["expected_count"]))
+                not _is_exact(result, expected_count=int(job_input["expected_count"]))
                 or any(item.kind != "note" for item in result.items)
             ):
                 raise ValueError("search facts are not exact")
             _validate_search_owners(result)
+        except CollectionFactNotFound:
+            raise
         except (OSError, ValueError, KeyError, TypeError, UnicodeError, json.JSONDecodeError) as error:
             raise CollectionFactNotFound(
                 f"Search results for job {job_id} do not exist."
             ) from error
         items = [_search_read(item) for item in result.items if item.kind == "note"]
         return SearchResultsRead(
-            job_id=job.id, keyword=str(job.input["keyword"]),
-            expected_count=int(job.input["expected_count"]),
+            job_id=job_id, keyword=str(job_input["keyword"]),
+            expected_count=int(job_input["expected_count"]),
             succeeded_count=result.succeeded_count,
-            artifact_id=int(artifact.metadata["artifact_id"]),
+            artifact_id=int(artifact_metadata["artifact_id"]),
             collected_at=datetime.fromisoformat(payload["collected_at"]), items=items,
         )
+
+    def _read_trusted_collection_result(
+        self,
+        *,
+        job_id: str,
+        artifact_id: int,
+        expected_job_type: str,
+        expected_artifact_kind: str,
+        binding_name: str,
+        binding_value: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], CollectionResult]:
+        """Read one stable succeeded artifact through the shared provenance gate."""
+
+        with self.database.session() as session:
+            job = session.get(JobRecord, job_id)
+            artifacts = session.scalars(
+                select(JobArtifactRecord).where(JobArtifactRecord.job_id == job_id)
+            ).all()
+            journals = session.scalars(
+                select(XhsArtifactPromotionJournalRecord).where(
+                    XhsArtifactPromotionJournalRecord.job_id == job_id,
+                    XhsArtifactPromotionJournalRecord.state == "completed",
+                    XhsArtifactPromotionJournalRecord.resolution == "committed",
+                )
+            ).all()
+            if job is None or len(artifacts) != 1 or len(journals) != 1:
+                raise UnsafeXhsArtifactStore("XHS provenance is not unique.")
+            artifact = artifacts[0]
+            journal = journals[0]
+            metadata = (
+                dict(artifact.metadata_json)
+                if isinstance(artifact.metadata_json, dict)
+                else {}
+            )
+            job_input = (
+                dict(job.input_data) if isinstance(job.input_data, dict) else {}
+            )
+            metadata_artifact_id = metadata.get("artifact_id")
+            metadata_size = metadata.get("size_bytes")
+            if (
+                JobState(job.state) is not JobState.succeeded
+                or job.type != expected_job_type
+                or artifact.id != artifact_id
+                or artifact.kind != expected_artifact_kind
+                or artifact.producer != ACCOUNT_COLLECTION_ARTIFACT_PRODUCER
+                or journal.target_state != JobState.succeeded.value
+                or journal.owner_token is not None
+                or journal.recovery_lease_expires_at is not None
+                or journal.artifact_id != artifact.id
+                or journal.artifact_kind != artifact.kind
+                or journal.producer != artifact.producer
+                or journal.final_path != artifact.path
+                or not isinstance(metadata_artifact_id, int)
+                or isinstance(metadata_artifact_id, bool)
+                or metadata_artifact_id != artifact.id
+                or metadata.get("job_id") != job_id
+                or metadata.get("sha256") != journal.sha256
+                or not isinstance(metadata_size, int)
+                or isinstance(metadata_size, bool)
+                or metadata_size != journal.size_bytes
+                or job_input.get(binding_name) != binding_value
+                or metadata.get(binding_name) != binding_value
+                or journal.file_dev is None
+                or journal.file_ino is None
+                or journal.file_mtime_ns is None
+            ):
+                raise UnsafeXhsArtifactStore("XHS provenance binding changed.")
+            final_name = Path(journal.final_path).name
+            identity = XhsArtifactIdentity(
+                journal.file_dev,
+                journal.file_ino,
+                journal.size_bytes,
+                journal.file_mtime_ns,
+            )
+            digest = journal.sha256
+            size = journal.size_bytes
+        with TrustedXhsArtifactStore(
+            self.runtime_dir,
+            max_bytes=self._max_artifact_bytes,
+        ) as store:
+            encoded = store.read_final(final_name, identity)
+        if len(encoded) != size or hashlib.sha256(encoded).hexdigest() != digest:
+            raise UnsafeXhsArtifactStore("XHS formal evidence changed.")
+        payload = json.loads(encoded.decode("utf-8"))
+        if payload.get("job_id") != job_id or payload.get("job_type") != expected_job_type:
+            raise UnsafeXhsArtifactStore("XHS formal evidence binding changed.")
+        result = CollectionResult.model_validate(payload.get("result"))
+        return job_input, metadata, payload, result
 
     def close(self) -> bool:
         deadline = monotonic() + _CLOSE_BUDGET_SECONDS
@@ -569,23 +733,28 @@ class XhsCollectionService:
             artifact_kind=kind,
             target_state=JobState.failed,
         )
+        metadata = {
+            "sha256": staged.digest,
+            "size_bytes": staged.size_bytes,
+            "source": "xhs-cli",
+            "job_id": job_id,
+            "capability": (
+                "fetch_account"
+                if job.type == ACCOUNT_COLLECTION_JOB_TYPE
+                else "search_notes"
+            ),
+            "error_category": category,
+        }
+        if job.type == ACCOUNT_COLLECTION_JOB_TYPE:
+            metadata["user_id"] = job.input["user_id"]
+        else:
+            metadata["keyword"] = job.input["keyword"]
         try:
             return self._commit_staged_artifact(
                 job=job,
                 staged=staged,
                 artifact_kind=kind,
-                metadata={
-                    "sha256": staged.digest,
-                    "size_bytes": staged.size_bytes,
-                    "source": "xhs-cli",
-                    "job_id": job_id,
-                    "capability": (
-                        "fetch_account"
-                        if job.type == ACCOUNT_COLLECTION_JOB_TYPE
-                        else "search_notes"
-                    ),
-                    "error_category": category,
-                },
+                metadata=metadata,
                 created_at=now,
                 target_state=JobState.failed,
                 progress=job.progress_current,
@@ -611,46 +780,92 @@ class XhsCollectionService:
         final_name = f"{job_id}{suffix}.json"
         relative = Path("evidence") / "xhs" / f"{job_id}{suffix}.json"
         stage_relative = Path("evidence") / "xhs" / ".staging" / stage_name
-        store = TrustedXhsArtifactStore(
-            self.runtime_dir,
-            max_bytes=self._max_artifact_bytes,
-        )
-        preserve_stage = False
+        digest = hashlib.sha256(encoded).hexdigest()
+        size_bytes = len(encoded)
+        with self.database.session() as session:
+            session.execute(text(f"""
+                INSERT INTO xhs_artifact_promotion_journal (
+                    id, job_id, artifact_kind, producer, stage_path, final_path,
+                    sha256, size_bytes, file_dev, file_ino, file_mtime_ns,
+                    target_state, state, resolution, artifact_id, created_at,
+                    updated_at, completed_at, owner_token,
+                    recovery_lease_expires_at
+                ) VALUES (
+                    :id, :job_id, :artifact_kind, :producer, :stage_path,
+                    :final_path, :sha256, :size_bytes, NULL, NULL, NULL,
+                    :target_state, 'allocating', NULL, NULL, CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP, NULL, :owner_token,
+                    {_JOURNAL_LEASE_SQL}
+                )
+            """), {
+                "id": journal_id,
+                "job_id": job_id,
+                "artifact_kind": artifact_kind,
+                "producer": ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+                "stage_path": stage_relative.as_posix(),
+                "final_path": relative.as_posix(),
+                "sha256": digest,
+                "size_bytes": size_bytes,
+                "target_state": target_state.value,
+                "owner_token": self._journal_owner,
+            })
+            session.commit()
         try:
-            identity = store.create_stage(stage_name, encoded)
-            now = self.clock()
+            store = TrustedXhsArtifactStore(
+                self.runtime_dir,
+                max_bytes=self._max_artifact_bytes,
+            )
+        except Exception:
+            self._complete_stage_creation_failure(
+                journal_id,
+                inconsistent=False,
+            )
+            raise
+        preserve_stage = False
+        failure_resolved = False
+        try:
+            try:
+                identity = store.create_stage(stage_name, encoded)
+            except Exception:
+                deleted = store.discard_owned_stage(stage_name)
+                self._complete_stage_creation_failure(
+                    journal_id,
+                    inconsistent=not deleted,
+                )
+                failure_resolved = True
+                raise
             staged = _StagedArtifact(
                 journal_id=journal_id,
                 store=store,
                 stage_name=stage_name,
                 final_name=final_name,
                 relative_path=relative,
-                digest=hashlib.sha256(encoded).hexdigest(),
-                size_bytes=len(encoded),
+                digest=digest,
+                size_bytes=size_bytes,
                 identity=identity,
             )
             try:
                 with self.database.session() as session:
-                    session.add(XhsArtifactPromotionJournalRecord(
-                        id=journal_id,
-                        job_id=job_id,
-                        artifact_kind=artifact_kind,
-                        producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
-                        stage_path=stage_relative.as_posix(),
-                        final_path=relative.as_posix(),
-                        sha256=staged.digest,
-                        size_bytes=staged.size_bytes,
-                        file_dev=identity.file_dev,
-                        file_ino=identity.file_ino,
-                        file_mtime_ns=identity.file_mtime_ns,
-                        target_state=target_state.value,
-                        state="prepared",
-                        resolution=None,
-                        artifact_id=None,
-                        created_at=now,
-                        updated_at=now,
-                        completed_at=None,
-                    ))
+                    changed = session.execute(text(f"""
+                        UPDATE xhs_artifact_promotion_journal
+                        SET state='prepared', file_dev=:file_dev,
+                            file_ino=:file_ino, file_mtime_ns=:file_mtime_ns,
+                            updated_at=CURRENT_TIMESTAMP,
+                            recovery_lease_expires_at={_JOURNAL_LEASE_SQL}
+                        WHERE id=:id AND state='allocating'
+                        AND owner_token=:owner_token
+                        AND recovery_lease_expires_at > CURRENT_TIMESTAMP
+                    """), {
+                        "id": journal_id,
+                        "owner_token": self._journal_owner,
+                        "file_dev": identity.file_dev,
+                        "file_ino": identity.file_ino,
+                        "file_mtime_ns": identity.file_mtime_ns,
+                    })
+                    if changed.rowcount != 1:
+                        raise ArtifactCommitUnknown(
+                            "artifact_journal_allocation_lease_lost"
+                        )
                     session.commit()
             except Exception as error:
                 outcome = self._prepared_journal_outcome(staged)
@@ -661,23 +876,74 @@ class XhsCollectionService:
                     raise ArtifactCommitUnknown(
                         "artifact_journal_prepare_unknown"
                     ) from error
+                deleted = store.discard_owned_stage(stage_name)
+                self._complete_stage_creation_failure(
+                    journal_id,
+                    inconsistent=not deleted,
+                )
+                failure_resolved = True
                 raise
             return staged
         except Exception:
-            try:
-                inspection = store.inspect_stage(stage_name)
-                if (
-                    not preserve_stage
-                    and inspection.status == "trusted"
-                    and inspection.identity == locals().get("identity")
-                ):
-                    store.discard_stage(stage_name, inspection.identity)
-            finally:
-                store.close()
+            if not preserve_stage and not failure_resolved:
+                # No pathname-based cleanup is attempted here.  A durable row
+                # plus the store's exact held handle decides the failure state.
+                deleted = store.discard_owned_stage(stage_name)
+                self._complete_stage_creation_failure(
+                    journal_id,
+                    inconsistent=not deleted,
+                )
+            store.close()
             raise
         except BaseException:
             store.close()
             raise
+
+    def _complete_stage_creation_failure(
+        self,
+        journal_id: str,
+        *,
+        inconsistent: bool,
+    ) -> Job | None:
+        resolution = "inconsistent" if inconsistent else "rolled_back"
+        category = (
+            "artifact_stage_create_inconsistent"
+            if inconsistent
+            else "artifact_stage_create_failed"
+        )
+        with self.database.session() as session:
+            journal = session.get(XhsArtifactPromotionJournalRecord, journal_id)
+            if journal is None:
+                return None
+            if journal.state != "completed":
+                journal.state = "completed"
+                journal.resolution = resolution
+                journal.artifact_id = None
+                journal.owner_token = None
+                journal.recovery_lease_expires_at = None
+                journal.updated_at = self.clock()
+                journal.completed_at = journal.updated_at
+            session.execute(
+                update(JobRecord)
+                .where(
+                    JobRecord.id == journal.job_id,
+                    JobRecord.state.in_((
+                        JobState.queued.value,
+                        JobState.running.value,
+                    )),
+                )
+                .values(
+                    state=JobState.needs_human.value,
+                    current_stage="xhs_artifact_recovery_required",
+                    error_category=category,
+                    lease_expires_at=None,
+                    completed_at=None,
+                    updated_at=self.clock(),
+                )
+            )
+            job_id = journal.job_id
+            session.commit()
+        return self._read_committed_job(job_id)
 
     def _probe_prepared_journal_outcome(
         self,
@@ -689,7 +955,7 @@ class XhsCollectionService:
                 staged.journal_id,
             )
             if journal is None:
-                return _CommitOutcome.rolled_back
+                return _CommitOutcome.unknown
             if (
                 journal.state == "prepared"
                 and journal.job_id == staged.relative_path.stem.removesuffix("-failure")
@@ -700,8 +966,20 @@ class XhsCollectionService:
                 and journal.file_dev == staged.identity.file_dev
                 and journal.file_ino == staged.identity.file_ino
                 and journal.file_mtime_ns == staged.identity.file_mtime_ns
+                and journal.owner_token == self._journal_owner
             ):
                 return _CommitOutcome.committed
+            if (
+                journal.state == "allocating"
+                and journal.job_id
+                == staged.relative_path.stem.removesuffix("-failure")
+                and journal.stage_path.endswith("/" + staged.stage_name)
+                and journal.final_path == staged.relative_path.as_posix()
+                and journal.sha256 == staged.digest
+                and journal.size_bytes == staged.size_bytes
+                and journal.owner_token == self._journal_owner
+            ):
+                return _CommitOutcome.rolled_back
             return _CommitOutcome.unknown
 
     def _prepared_journal_outcome(
@@ -718,6 +996,8 @@ class XhsCollectionService:
                 sleep(0.002)
 
     def _promote_staged_artifact(self, staged: _StagedArtifact) -> None:
+        if not self._refresh_journal_lease(staged.journal_id):
+            raise ArtifactCommitUnknown("artifact_journal_lease_lost")
         try:
             staged.store.promote(
                 staged.stage_name,
@@ -740,17 +1020,18 @@ class XhsCollectionService:
                 raise
 
     def _persist_promoted_journal(self, staged: _StagedArtifact) -> None:
-        now = self.clock()
         try:
             with self.database.session() as session:
-                changed = session.execute(
-                    update(XhsArtifactPromotionJournalRecord)
-                    .where(
-                        XhsArtifactPromotionJournalRecord.id == staged.journal_id,
-                        XhsArtifactPromotionJournalRecord.state == "prepared",
-                    )
-                    .values(state="promoted", updated_at=now)
-                )
+                changed = session.execute(text(f"""
+                    UPDATE xhs_artifact_promotion_journal
+                    SET state='promoted', updated_at=CURRENT_TIMESTAMP,
+                        recovery_lease_expires_at={_JOURNAL_LEASE_SQL}
+                    WHERE id=:id AND state='prepared'
+                    AND owner_token=:owner_token
+                """), {
+                    "id": staged.journal_id,
+                    "owner_token": self._journal_owner,
+                })
                 if changed.rowcount != 1:
                     session.rollback()
                     if self._read_journal_state(staged.journal_id) == "promoted":
@@ -764,6 +1045,47 @@ class XhsCollectionService:
             if state == "promoted":
                 return
             raise ArtifactCommitUnknown("artifact_journal_promotion_unknown") from error
+
+    def _refresh_journal_lease(self, journal_id: str) -> bool:
+        try:
+            with self.database.session() as session:
+                changed = session.execute(text(f"""
+                    UPDATE xhs_artifact_promotion_journal
+                    SET recovery_lease_expires_at={_JOURNAL_LEASE_SQL},
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=:id AND owner_token=:owner_token
+                """), {
+                    "id": journal_id,
+                    "owner_token": self._journal_owner,
+                })
+                session.commit()
+                return changed.rowcount == 1
+        except Exception:
+            return False
+
+    def _claim_journal(self, journal_id: str) -> bool:
+        """Acquire or renew one journal with a database-clock CAS."""
+
+        try:
+            with self.database.session() as session:
+                changed = session.execute(text(f"""
+                    UPDATE xhs_artifact_promotion_journal
+                    SET owner_token=:owner_token,
+                        recovery_lease_expires_at={_JOURNAL_LEASE_SQL},
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=:id AND (
+                        owner_token=:owner_token OR owner_token IS NULL
+                        OR recovery_lease_expires_at IS NULL
+                        OR recovery_lease_expires_at <= CURRENT_TIMESTAMP
+                    )
+                """), {
+                    "id": journal_id,
+                    "owner_token": self._journal_owner,
+                })
+                session.commit()
+                return changed.rowcount == 1
+        except Exception:
+            return False
 
     def _read_journal_state(self, journal_id: str) -> str | None:
         deadline = monotonic() + _JOURNAL_READ_BUDGET_SECONDS
@@ -794,7 +1116,7 @@ class XhsCollectionService:
         with self.database.session() as authorization:
             record = authorization.get(JobRecord, job.id)
             authorized = record is not None and JobState(record.state) is JobState.running
-        if not authorized:
+        if not authorized or not self._refresh_journal_lease(staged.journal_id):
             self._resolve_rolled_back(staged)
             return None
         with self._lock:
@@ -807,6 +1129,8 @@ class XhsCollectionService:
             except Exception:
                 return self._resolve_rolled_back(staged)
         self._persist_promoted_journal(staged)
+        if not self._refresh_journal_lease(staged.journal_id):
+            raise ArtifactCommitUnknown("artifact_journal_lease_lost")
 
         try:
             with self.database.session() as session:
@@ -820,6 +1144,7 @@ class XhsCollectionService:
                     or JobState(record.state) is not JobState.running
                     or journal is None
                     or journal.state != "promoted"
+                    or journal.owner_token != self._journal_owner
                 ):
                     session.rollback()
                     self._resolve_rolled_back(staged)
@@ -872,6 +1197,8 @@ class XhsCollectionService:
                     journal.state = "completed"
                     journal.resolution = "committed"
                     journal.artifact_id = artifact.id
+                    journal.owner_token = None
+                    journal.recovery_lease_expires_at = None
                     journal.updated_at = now
                     journal.completed_at = now
                     session.commit()
@@ -914,6 +1241,8 @@ class XhsCollectionService:
             journal.state == "completed"
             and journal.resolution == "committed"
             and journal.artifact_id is not None
+            and journal.owner_token is None
+            and journal.recovery_lease_expires_at is None
             and JobState(job.state) is expected_state
             and len(artifacts) == 1
             and artifacts[0].id == journal.artifact_id
@@ -958,6 +1287,8 @@ class XhsCollectionService:
                 sleep(0.002)
 
     def _resolve_rolled_back(self, staged: _StagedArtifact) -> Job | None:
+        if not self._refresh_journal_lease(staged.journal_id):
+            return None
         if not staged.store.demote_and_discard(
             staged.final_name,
             staged.stage_name,
@@ -967,7 +1298,7 @@ class XhsCollectionService:
         now = self.clock()
         with self.database.session() as session:
             journal = session.get(XhsArtifactPromotionJournalRecord, staged.journal_id)
-            if journal is None:
+            if journal is None or journal.owner_token != self._journal_owner:
                 return None
             if journal.state == "completed" and journal.resolution == "committed":
                 session.rollback()
@@ -975,6 +1306,8 @@ class XhsCollectionService:
             journal.state = "completed"
             journal.resolution = "rolled_back"
             journal.artifact_id = None
+            journal.owner_token = None
+            journal.recovery_lease_expires_at = None
             journal.updated_at = now
             journal.completed_at = now
             session.execute(
@@ -1000,13 +1333,17 @@ class XhsCollectionService:
         return self._read_committed_job(job_id)
 
     def _mark_artifact_inconsistent(self, journal_id: str) -> Job | None:
+        if not self._claim_journal(journal_id):
+            return None
         now = self.clock()
         with self.database.session() as session:
             journal = session.get(XhsArtifactPromotionJournalRecord, journal_id)
-            if journal is None:
+            if journal is None or journal.owner_token != self._journal_owner:
                 return None
             journal.state = "completed"
             journal.resolution = "inconsistent"
+            journal.owner_token = None
+            journal.recovery_lease_expires_at = None
             journal.updated_at = now
             journal.completed_at = now
             session.execute(
@@ -1033,7 +1370,13 @@ class XhsCollectionService:
         with _JOURNAL_RECONCILE_LOCK:
             with self.database.session() as session:
                 journal_ids = session.scalars(
-                    select(XhsArtifactPromotionJournalRecord.id).order_by(
+                    select(XhsArtifactPromotionJournalRecord.id).where(
+                        (XhsArtifactPromotionJournalRecord.state != "completed")
+                        | (
+                            XhsArtifactPromotionJournalRecord.resolution
+                            == "committed"
+                        )
+                    ).order_by(
                         XhsArtifactPromotionJournalRecord.created_at,
                         XhsArtifactPromotionJournalRecord.id,
                     )
@@ -1045,9 +1388,11 @@ class XhsCollectionService:
                     self._mark_artifact_inconsistent(journal_id)
 
     def _reconcile_artifact_promotion(self, journal_id: str) -> None:
+        if not self._claim_journal(journal_id):
+            return
         with self.database.session() as session:
             journal = session.get(XhsArtifactPromotionJournalRecord, journal_id)
-            if journal is None or (
+            if journal is None or journal.owner_token != self._journal_owner or (
                 journal.state == "completed"
                 and journal.resolution == "inconsistent"
             ):
@@ -1075,6 +1420,13 @@ class XhsCollectionService:
                     JobArtifactRecord.job_id == journal.job_id
                 )
             ).all()
+
+        if snapshot["state"] == "allocating" or any(
+            snapshot[field] is None
+            for field in ("file_dev", "file_ino", "file_mtime_ns")
+        ):
+            self._mark_artifact_inconsistent(journal_id)
+            return
 
         store = TrustedXhsArtifactStore(
             self.runtime_dir,
@@ -1190,11 +1542,13 @@ class XhsCollectionService:
         now = self.clock()
         with self.database.session() as session:
             journal = session.get(XhsArtifactPromotionJournalRecord, journal_id)
-            if journal is None:
+            if journal is None or journal.owner_token != self._journal_owner:
                 return
             journal.state = "completed"
             journal.resolution = "committed"
             journal.artifact_id = artifact_id
+            journal.owner_token = None
+            journal.recovery_lease_expires_at = None
             journal.updated_at = now
             journal.completed_at = journal.completed_at or now
             session.commit()
@@ -1219,6 +1573,8 @@ class XhsCollectionService:
                         XhsArtifactPromotionJournalRecord.job_id == job_id,
                         XhsArtifactPromotionJournalRecord.state == "completed",
                         XhsArtifactPromotionJournalRecord.resolution == "committed",
+                        XhsArtifactPromotionJournalRecord.owner_token.is_(None),
+                        XhsArtifactPromotionJournalRecord.recovery_lease_expires_at.is_(None),
                     )
                 )
             if journal is None or (digest is not None and journal.sha256 != digest):
@@ -1237,6 +1593,8 @@ class XhsCollectionService:
                     == artifact.metadata.get("artifact_id"),
                     XhsArtifactPromotionJournalRecord.state == "completed",
                     XhsArtifactPromotionJournalRecord.resolution == "committed",
+                    XhsArtifactPromotionJournalRecord.owner_token.is_(None),
+                    XhsArtifactPromotionJournalRecord.recovery_lease_expires_at.is_(None),
                 )
             )
             if journal is None:
