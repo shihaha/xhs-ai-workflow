@@ -169,3 +169,89 @@ third full run above passed all non-live tests.
 
 No authenticated live `xhs-cli` command was run. The existing live gate remains
 Task 5 scope and is still truthfully `not_run` here.
+
+## Fix round 2/5 — lifecycle lock order and exact credential names
+
+Commit: `HEAD` (`fix: remove xhs collection lock inversion`; one fix-round
+commit).
+
+### RED
+
+Barrier-based regression tests reproduced the review findings before the
+implementation changed:
+
+```text
+python -m pytest backend/tests/xhs/test_cli_adapter.py::test_structured_header_name_value_credentials_are_redacted_without_false_positive backend/tests/xhs/test_collection_service.py -q -k "structured_header or lifecycle_lock_while_waiting or close_fences_a_submit or two_normal_submits"
+3 failed, 2 passed
+```
+
+- a finalizer holding SQLite could not reacquire the lifecycle lock while a
+  concurrent submit held that lock waiting for SQLite; it missed the one-second
+  barrier and the submit later reached SQLite's lock timeout;
+- close could not set its admission fence while a submit was paused inside the
+  database create call;
+- substring credential matching removed ordinary `session title` and
+  `secret garden` values. The normal two-submit characterization already
+  passed and remained part of the concurrency gate.
+
+An additional strict RED assertion showed `access_token` still leaked after
+the first exact-name implementation; adding its normalized exact name made that
+test green without broadening matching back to substrings.
+
+### GREEN
+
+The four lifecycle interleavings pass together:
+
+```text
+python -m pytest backend/tests/xhs/test_collection_service.py -q -k "lifecycle_lock_while_waiting or close_fences_a_submit or shutdown_fence_wins or two_normal_submits"
+4 passed, 16 deselected in 0.87s
+```
+
+Fresh Task 3 focused suite:
+
+```text
+python -m pytest backend/tests/xhs/test_collection_service.py backend/tests/xhs/test_collection_api.py backend/tests/xhs/test_cli_adapter.py backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+109 passed in 9.14s
+```
+
+Fresh required XHS/jobs suite:
+
+```text
+python -m pytest backend/tests/xhs backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+125 passed in 11.13s
+```
+
+Fresh full backend regression:
+
+```text
+python -m pytest backend/tests -q
+747 passed, 1 skipped, 32 warnings in 90.69s
+```
+
+The skip remains the opt-in live gate; the warnings remain the existing Python
+3.12 sqlite datetime adapter deprecations. `python -m compileall -q backend/app`
+and `git diff --check` exited 0. This full run had no shop timing failure and no
+shop test or implementation was changed.
+
+### Fixes and self-review
+
+- Submit now holds the lifecycle condition only while acquiring an admission
+  generation/token and maintaining its active-admission count. Job creation,
+  cancellation and executor submission happen without the lifecycle lock.
+- Close first closes admission and increments the generation, then waits on a
+  condition (which releases the lifecycle lock) for in-flight admissions to
+  reconcile. A reservation created across the fence is cancelled and its
+  caller receives `CollectionServiceClosed`; an accepted submit is registered
+  before close snapshots/cancels futures.
+- Final success keeps the existing SQLite-to-short-lifecycle-lock order. No
+  lifecycle-lock-to-SQLite path remains, while the generation fence preserves
+  the rule that close wins over late success and account facts roll back.
+- Credential redaction now uses an exact, case-folded, underscore-normalized
+  allowlist for header/credential names. `Cookie`, `Authorization`, `token`,
+  `access_token` and the other enumerated credential names are removed, while
+  ordinary semantic names containing words such as session or secret survive.
+
+### Remaining live boundary
+
+No authenticated live `xhs-cli` command was run. Task 5 still owns that
+explicit opt-in gate, so the live boundary remains `not_run`.

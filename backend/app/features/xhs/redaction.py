@@ -2,14 +2,34 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 
-_SENSITIVE_NAME = re.compile(
-    r"(?:cookie|token|credential|authorization|password|secret|session|api[_-]?key)",
-    re.IGNORECASE,
-)
+_SENSITIVE_NAMES = frozenset({
+    "access-token",
+    "api-key",
+    "apikey",
+    "authorization",
+    "client-secret",
+    "clientsecret",
+    "cookie",
+    "credential",
+    "credentials",
+    "id-token",
+    "password",
+    "passwd",
+    "proxy-authorization",
+    "refresh-token",
+    "secret",
+    "session",
+    "session-token",
+    "set-cookie",
+    "token",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
+    "x-xsrf-token",
+})
 _STRUCTURED_VALUE_KEYS = frozenset({"value", "values"})
 
 
@@ -19,12 +39,12 @@ def redact_credentials(value: Any) -> Any:
         semantic_name = value.get("name")
         semantic_secret = (
             isinstance(semantic_name, str)
-            and _SENSITIVE_NAME.search(semantic_name) is not None
+            and _normalized_name(semantic_name) in _SENSITIVE_NAMES
         )
         return {
             str(key): (
                 "[redacted]"
-                if _SENSITIVE_NAME.search(str(key))
+                if _normalized_name(str(key)) in _SENSITIVE_NAMES
                 or (
                     semantic_secret
                     and str(key).casefold() in _STRUCTURED_VALUE_KEYS
@@ -36,3 +56,7 @@ def redact_credentials(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [redact_credentials(item) for item in value]
     return value
+
+
+def _normalized_name(value: str) -> str:
+    return "-".join(value.strip().casefold().replace("_", "-").split())

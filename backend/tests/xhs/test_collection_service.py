@@ -398,6 +398,142 @@ def test_shutdown_fence_wins_before_final_commit_and_rolls_back_account_facts(
     service.database.close()
 
 
+def test_submit_does_not_hold_lifecycle_lock_while_waiting_for_finalizer_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    first = service.submit_account("user-1", 1)
+    facts_flushed, release_finalizer = Event(), Event()
+    submit_entered_db, finalizer_done, submit_done = Event(), Event(), Event()
+    original_persist = xhs_service_module.persist_exact_account_result
+    original_create = service.job_service.create
+    outcomes: list[object] = []
+    errors: list[BaseException] = []
+
+    def paused_persist(*args, **kwargs):
+        value = original_persist(*args, **kwargs)
+        facts_flushed.set()
+        assert release_finalizer.wait(10)
+        return value
+
+    def observed_create(**kwargs):
+        submit_entered_db.set()
+        return original_create(**kwargs)
+
+    monkeypatch.setattr(xhs_service_module, "persist_exact_account_result", paused_persist)
+    monkeypatch.setattr(service.job_service, "create", observed_create)
+
+    def finalize() -> None:
+        try:
+            outcomes.append(service.execute(first.id))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finalizer_done.set()
+
+    def submit() -> None:
+        try:
+            outcomes.append(service.submit_search("并发", 1))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            submit_done.set()
+
+    finalizer_thread = Thread(target=finalize)
+    finalizer_thread.start()
+    assert facts_flushed.wait(2)
+    submit_thread = Thread(target=submit)
+    submit_thread.start()
+    assert submit_entered_db.wait(2)
+    release_finalizer.set()
+    finalized_without_lock_inversion = finalizer_done.wait(1)
+    submit_done.wait(7)
+    finalizer_thread.join(1)
+    submit_thread.join(1)
+    service.close()
+    service.database.close()
+
+    assert finalized_without_lock_inversion
+    assert not finalizer_thread.is_alive() and not submit_thread.is_alive()
+    assert errors == []
+    assert len(outcomes) == 2
+
+
+def test_close_fences_a_submit_blocked_in_database_without_waiting_on_lifecycle_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    create_entered, release_create, close_done = Event(), Event(), Event()
+    original_create = service.job_service.create
+    submitted: list[object] = []
+    submit_errors: list[BaseException] = []
+
+    def paused_create(**kwargs):
+        create_entered.set()
+        assert release_create.wait(10)
+        return original_create(**kwargs)
+
+    monkeypatch.setattr(service.job_service, "create", paused_create)
+
+    def submit() -> None:
+        try:
+            submitted.append(service.submit_account("user-1", 1))
+        except BaseException as error:
+            submit_errors.append(error)
+
+    submit_thread = Thread(target=submit)
+    submit_thread.start()
+    assert create_entered.wait(2)
+    close_thread = Thread(target=lambda: (service.close(), close_done.set()))
+    close_thread.start()
+    deadline = monotonic() + 1
+    while service._accepting and monotonic() < deadline:
+        sleep(0.01)
+    fenced_before_database_release = not service._accepting
+    release_create.set()
+    submit_thread.join(7)
+    close_thread.join(7)
+    jobs = service.job_service.list()
+    service.database.close()
+
+    assert fenced_before_database_release
+    assert close_done.is_set()
+    assert submitted == []
+    assert len(submit_errors) == 1
+    assert isinstance(submit_errors[0], CollectionServiceClosed)
+    assert jobs and all(job.state is JobState.cancelled for job in jobs)
+
+
+def test_two_normal_submits_complete_without_lifecycle_or_database_lock_contention(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    start = Event()
+    jobs: list[object] = []
+    errors: list[BaseException] = []
+
+    def submit(index: int) -> None:
+        assert start.wait(2)
+        try:
+            jobs.append(service.submit_search(f"并发-{index}", 1))
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [Thread(target=submit, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    start.set()
+    for thread in threads:
+        thread.join(3)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(jobs) == 2
+    assert all(service.job_service.get(job.id).state is JobState.queued for job in jobs)
+    service.close()
+    service.database.close()
+
+
 def test_conflicting_search_owner_aliases_cannot_finalize_success(tmp_path: Path) -> None:
     class ConflictingAdapter(_Adapter):
         def search_notes(self, request: CollectionRequest) -> CollectionResult:

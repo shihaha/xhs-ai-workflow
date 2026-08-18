@@ -238,12 +238,17 @@ def test_search_rejects_conflicting_owner_aliases() -> None:
 def test_structured_header_name_value_credentials_are_redacted_without_false_positive() -> None:
     secret = "structured-secret-sentinel"
     ordinary = "ordinary-value-sentinel"
+    session_title = "session-title-is-public"
+    secret_garden = "secret-garden-is-public"
     fake_runner = FakeRunner([_completed(["xhs"], {"notes": [{
         "id": "note-1",
         "headers": [
             {"name": "Cookie", "value": secret},
             {"name": "Authorization", "value": secret},
+            {"name": "access_token", "value": secret},
             {"name": "title", "value": ordinary},
+            {"name": "session title", "value": session_title},
+            {"name": "secret garden", "value": secret_garden},
         ],
     }]})])
     adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
@@ -257,6 +262,8 @@ def test_structured_header_name_value_credentials_are_redacted_without_false_pos
     rendered = result.model_dump_json()
     assert secret not in rendered
     assert ordinary in rendered
+    assert session_title in rendered
+    assert secret_garden in rendered
 
 
 @pytest.mark.parametrize("field", ["keyword", "user_id"])

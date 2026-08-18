@@ -10,7 +10,7 @@ from concurrent.futures import Future
 from datetime import UTC, datetime
 from pathlib import Path
 from queue import Empty, Queue
-from threading import RLock, Thread
+from threading import Condition, RLock, Thread
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -177,7 +177,10 @@ class XhsCollectionService:
         self._worker = _DaemonSerialWorker() if submitter is None else None
         self._submitter = submitter or self._worker.submit
         self._lock = RLock()
+        self._admission_condition = Condition(self._lock)
         self._accepting = True
+        self._admission_generation = 0
+        self._active_admissions = 0
         self._futures: dict[str, Future[Any]] = {}
 
     def submit_account(self, user_id: str, expected_note_count: int) -> Job:
@@ -202,24 +205,42 @@ class XhsCollectionService:
     def _submit(self, *, job_type: str, input_data: dict[str, Any], expected_count: int) -> Job:
         if isinstance(expected_count, bool) or not isinstance(expected_count, int) or not 0 <= expected_count <= 1000:
             raise ValueError("expected count must be an integer from 0 through 1000.")
-        with self._lock:
+        with self._admission_condition:
             if not self._accepting:
                 raise CollectionServiceClosed("XHS collection service is closed.")
+            generation = self._admission_generation
+            self._active_admissions += 1
+        try:
             job = self.job_service.create(
                 job_type=job_type,
                 input_data=input_data,
                 progress_total=expected_count,
                 current_stage="xhs_collection_reserved",
             )
+            with self._admission_condition:
+                admitted = (
+                    self._accepting
+                    and generation == self._admission_generation
+                )
+            if not admitted:
+                self._cancel_running(job.id)
+                raise CollectionServiceClosed("XHS collection service is closed.")
             try:
                 submitted = self._submitter(self.execute, job.id)
             except Exception:
                 self._fail_scheduling(job.id)
                 raise
             if isinstance(submitted, Future):
-                self._futures[job.id] = submitted
-                submitted.add_done_callback(lambda _future, job_id=job.id: self._finished(job_id))
+                with self._admission_condition:
+                    self._futures[job.id] = submitted
+                    submitted.add_done_callback(
+                        lambda _future, job_id=job.id: self._finished(job_id)
+                    )
             return job
+        finally:
+            with self._admission_condition:
+                self._active_admissions -= 1
+                self._admission_condition.notify_all()
 
     def execute(self, job_id: str) -> Job | None:
         try:
@@ -340,12 +361,13 @@ class XhsCollectionService:
         )
 
     def close(self) -> bool:
-        with self._lock:
+        with self._admission_condition:
             if self._accepting:
                 self._accepting = False
-                futures = tuple(self._futures.values())
-            else:
-                futures = tuple(self._futures.values())
+                self._admission_generation += 1
+            while self._active_admissions:
+                self._admission_condition.wait()
+            futures = tuple(self._futures.values())
         for future in futures:
             future.cancel()
         for job in self.job_service.list():
