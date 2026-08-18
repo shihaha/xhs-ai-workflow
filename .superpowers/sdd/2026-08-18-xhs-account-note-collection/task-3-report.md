@@ -507,3 +507,100 @@ datetime adapter deprecations. `python -m compileall -q backend/app` and
 
 No authenticated live `xhs-cli` command was run. Task 5 still owns that
 explicit opt-in gate, so the live boundary remains `not_run`.
+
+## Stabilization S1 — identifier tokenization and credential grammar
+
+Commit: `HEAD` (`fix: stabilize xhs credential tokenization`; one independent
+Task 3 stabilization commit after the five review rounds).
+
+### RED
+
+The new table-driven tests separate identifier tokenization from credential
+grammar, then exercise the same classifier through direct mapping keys,
+structured `{"name": ..., "value": ...}` entries, the real CLI adapter and
+the account/search persistence boundary:
+
+```text
+python -m pytest backend/tests/xhs/test_redaction.py backend/tests/xhs/test_cli_adapter.py::test_direct_and_structured_credential_aliases_are_redacted backend/tests/xhs/test_cli_adapter.py::test_noncredential_full_token_sequences_are_preserved backend/tests/xhs/test_collection_service.py::test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts backend/tests/xhs/test_collection_service.py::test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_facts -q --tb=short
+62 failed, 126 passed in 0.87s
+```
+
+The RED run confirmed the root cause before production code changed:
+
+- `OAuthToken` tokenized as `('o', 'auth', 'token')`;
+- `XOAuthToken` tokenized as `('xo', 'auth', 'token')`;
+- `XCSRFToken` tokenized as `('xcsrf', 'token')`;
+- `XAPIKey` tokenized as `('xapi', 'key')`;
+- those names and `URLToken` failed direct and structured redaction, and their
+  unique sentinels reached real account/search artifacts and normalized facts.
+
+### GREEN
+
+The same targeted tokenizer, grammar, adapter and persistence command passed:
+
+```text
+188 passed in 0.61s
+```
+
+Fresh Task 3 focused suite, including the standalone redaction tests and
+adapter registry:
+
+```text
+python -m pytest backend/tests/xhs/test_redaction.py backend/tests/xhs/test_collection_service.py backend/tests/xhs/test_collection_api.py backend/tests/xhs/test_cli_adapter.py backend/tests/test_adapter_registry.py backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+300 passed in 8.63s
+```
+
+Lifecycle lock order, shutdown fence, commit acknowledgement and owner
+conflict regression:
+
+```text
+python -m pytest backend/tests/xhs/test_collection_service.py -q -k "lifecycle_lock_while_waiting or close_fences_a_submit or shutdown_fence_wins or commit_ack or conflicting_search_owner or historical_search_artifact or two_normal_submits"
+8 passed, 14 deselected in 1.33s
+```
+
+Fresh required XHS/jobs suite:
+
+```text
+python -m pytest backend/tests/xhs backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+313 passed in 10.72s
+```
+
+Fresh full backend regression:
+
+```text
+python -m pytest backend/tests -q
+935 passed, 1 skipped, 32 warnings in 85.37s
+```
+
+The skip remains the existing opt-in live gate and the warnings remain the
+existing Python 3.12 sqlite datetime adapter deprecations. `python -m
+compileall -q backend/app` and `git diff --check` exited 0.
+
+### Stabilization and self-review
+
+- Identifier tokenization now has its own literal table for lower camel case,
+  Pascal case, uppercase acronym-plus-suffix identifiers, snake/kebab/space
+  separators and joined/explicit `x` prefixes.
+- The tokenizer preserves lexical acronym boundaries (`OAuth`, API, CSRF/XSRF,
+  JWT, URL and ID) without enumerating complete credential aliases. The
+  credential classifier consumes the resulting complete token tuple through a
+  separate finite grammar; `url` is an approved token qualifier.
+- `OAuthToken`, `XOAuthToken`, `XCSRFToken`, `XAPIKey`, `APIKey`, `CSRFToken`,
+  `JWTToken`, `URLToken`, `AccessToken`, `RefreshToken`,
+  `PersonalAccessToken`, `SessionID`, `WebSession` and every earlier alias are
+  covered as both direct and structured names.
+- Negative full-token controls retain `access`, `refresh`, `session`,
+  `session title`, `secret garden`, `tokenCount`, `api response`,
+  `oauth display name`, ordinary `title` and ordinary `body`; there is no
+  substring fallback.
+- Direct and structured redaction still share `_is_credential_name`. Real
+  `XhsCliReadAdapter -> XhsCollectionService` account and search tests verify
+  unique secret sentinels are absent from the raw artifact, profile fact, note
+  fact and normalized search read fact.
+- No adapter command, service transaction, lifecycle, shutdown,
+  commit-acknowledgement or owner-binding control flow changed in S1.
+
+### Remaining live boundary
+
+No authenticated live `xhs-cli` command was run. The explicit live boundary is
+still truthfully `not_run`.

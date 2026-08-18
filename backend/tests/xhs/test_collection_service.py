@@ -280,7 +280,7 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
 ) -> None:
     secrets = [
         f"real-account-alias-secret-sentinel-{index:02d}-end"
-        for index in range(20)
+        for index in range(40)
     ]
     responses = iter([
         subprocess.CompletedProcess(
@@ -296,6 +296,14 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
                 "sessionId": secrets[5],
                 "web_session": secrets[6],
                 "personalAccessToken": secrets[7],
+                "OAuthToken": secrets[20],
+                "XOAuthToken": secrets[21],
+                "XCSRFToken": secrets[22],
+                "XAPIKey": secrets[23],
+                "URLToken": secrets[24],
+                "AccessToken": secrets[25],
+                "SessionID": secrets[26],
+                "WebSession": secrets[27],
                 "headers": [
                     {"name": "xsrfToken", "value": secrets[8]},
                     {"name": "jwtToken", "value": secrets[9]},
@@ -315,6 +323,18 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
                 "xsrfToken": secrets[14],
                 "jwtToken": secrets[15],
                 "apiToken": secrets[16],
+                "OAuthToken": secrets[28],
+                "XOAuthToken": secrets[29],
+                "XCSRFToken": secrets[30],
+                "XAPIKey": secrets[31],
+                "APIKey": secrets[32],
+                "CSRFToken": secrets[33],
+                "JWTToken": secrets[34],
+                "URLToken": secrets[35],
+                "AccessToken": secrets[36],
+                "RefreshToken": secrets[37],
+                "SessionID": secrets[38],
+                "WebSession": secrets[39],
                 "headers": [
                     {"name": "csrfToken", "value": secrets[17]},
                     {"name": "bearerToken", "value": secrets[18]},
@@ -355,7 +375,7 @@ def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_fact
 ) -> None:
     secrets = [
         f"real-search-alias-secret-sentinel-{index:02d}-end"
-        for index in range(18)
+        for index in range(30)
     ]
     response = subprocess.CompletedProcess(
         ["xhs"], 0,
@@ -372,6 +392,18 @@ def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_fact
             "sessionId": secrets[7],
             "web_session": secrets[8],
             "personalAccessToken": secrets[9],
+            "OAuthToken": secrets[18],
+            "XOAuthToken": secrets[19],
+            "XCSRFToken": secrets[20],
+            "XAPIKey": secrets[21],
+            "URLToken": secrets[22],
+            "APIKey": secrets[23],
+            "CSRFToken": secrets[24],
+            "JWTToken": secrets[25],
+            "AccessToken": secrets[26],
+            "RefreshToken": secrets[27],
+            "SessionID": secrets[28],
+            "WebSession": secrets[29],
             "headers": [
                 {"name": "cookie_string", "value": secrets[10]},
                 {"name": "csrfToken", "value": secrets[11]},

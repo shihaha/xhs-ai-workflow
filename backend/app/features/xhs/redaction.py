@@ -35,6 +35,7 @@ _TOKEN_QUALIFIERS = frozenset({
     "oauth",
     "refresh",
     "session",
+    "url",
     "xsrf",
 })
 _TOKEN_QUALIFIER_CHAINS = frozenset({("personal", "access")})
@@ -51,6 +52,8 @@ _STRUCTURED_VALUE_KEYS = frozenset({"value", "values"})
 _ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
 _NAME_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
+_X_PREFIX_ACRONYMS = frozenset({"api", "csrf", "id", "jwt", "oauth", "url", "xsrf"})
+_JOINED_IDENTIFIER_WORDS = frozenset({"oauth"})
 
 
 def redact_credentials(value: Any) -> Any:
@@ -80,7 +83,11 @@ def redact_credentials(value: Any) -> Any:
 
 def _is_credential_name(value: str) -> bool:
     """Classify a complete canonical name, never an arbitrary substring."""
-    tokens = _credential_name_tokens(value)
+    return _is_credential_tokens(_credential_name_tokens(value))
+
+
+def _is_credential_tokens(tokens: tuple[str, ...]) -> bool:
+    """Apply credential grammar to already-tokenized identifier components."""
     if tokens[:1] == ("x",):
         tokens = tokens[1:]
     if len(tokens) == 1:
@@ -101,4 +108,18 @@ def _credential_name_tokens(value: str) -> tuple[str, ...]:
     words = _ACRONYM_BOUNDARY.sub(r"\1-\2", value.strip())
     words = _CAMEL_BOUNDARY.sub(r"\1-\2", words)
     canonical = _NAME_SEPARATOR.sub("-", words).strip("-").casefold()
-    return tuple(token for token in canonical.split("-") if token)
+    tokens = [token for token in canonical.split("-") if token]
+    if tokens and tokens[0].startswith("x") and len(tokens[0]) > 1:
+        remainder = tokens[0][1:]
+        if remainder in _X_PREFIX_ACRONYMS:
+            tokens[:1] = ["x", remainder]
+        elif len(tokens) > 1 and remainder + tokens[1] in _X_PREFIX_ACRONYMS:
+            tokens[:2] = ["x", remainder + tokens[1]]
+    index = 0
+    while index + 1 < len(tokens):
+        joined = tokens[index] + tokens[index + 1]
+        if joined in _JOINED_IDENTIFIER_WORDS:
+            tokens[index:index + 2] = [joined]
+        else:
+            index += 1
+    return tuple(tokens)
