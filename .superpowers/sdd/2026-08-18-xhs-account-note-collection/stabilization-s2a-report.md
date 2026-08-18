@@ -145,3 +145,125 @@ not_run
 host interpreter has no usable live `xhs_cli` installation for this gate. No
 real account/search success, identity or fact is claimed. Controlled fake/E2E
 evidence is software verification only. S2B remains pending.
+
+# Stabilization S2A report — fix round 2/5
+
+Date: 2026-08-19
+
+## Scope and outcome
+
+This follow-up closes the four round-2 findings without changing S2B
+append-only/versioned persistence or analysis TOCTOU behavior, Bailian behavior,
+or the untracked `research/` tree. The authenticated live gate remains separate
+and was not inferred from controlled tests.
+
+## C1 — verified bytes are the executed XHS package
+
+- The pinned manifest now covers every executable Python source in the audited
+  `xhs_cli` package: `__init__.py`, `exceptions.py`, `auth.py`, `client.py` and
+  `cli.py`. The wrapper rejects a missing, extra or changed package source.
+- The wrapper locates one filesystem package without using Python import
+  loaders, reads and hashes every source once, retains those exact bytes, and
+  compiles them with `verified-memory:` origins. It pre-registers only the exact
+  controlled `ModuleType` set, executes it in dependency order and rejects any
+  pre-existing or additional `xhs_cli` module.
+- No verified source path is reopened after hashing, and neither ordinary
+  import resolution nor `.pyc` loading can select package code. Process-level
+  tests trap alternative loaders and malicious bytecode, mutate all source
+  files after the verified reads, and independently tamper each of the five
+  pinned files. Only retained verified bytes execute.
+
+## C2 — post-CreateProcess cleanup is one bounded state machine
+
+- Capture construction and thread start are separate. Every successfully or
+  partially started reader is recorded, cancellable and joined only against the
+  shared execution deadline.
+- After any exception following `CreateProcessW`, cleanup first terminates and
+  closes the kill-on-close Job Object, then cancels synchronous reader I/O,
+  reaps the direct process and closes owned pipe/process handles. Timeout,
+  overflow and cancellation use the same ordering.
+- Parent pipes now use a minimal unbuffered raw-fd owner, so cleanup does not
+  enter a potentially blocking high-level `stream.close()`. Sanitized exception
+  translation is raised outside the caught low-level exception context so
+  traceback retention cannot accumulate reader-thread handles.
+- Regressions cover a partial reader start, a later pipe conversion failure,
+  a descendant that retains a pipe/tries to write a delayed marker, a failed
+  `TerminateJobObject` call with kill-on-close backstop, a deliberately blocking
+  high-level close, and repeated failures with stable process-handle counts.
+
+## I1 — staged evidence and truthful commit acknowledgement
+
+- Result and failure payloads are first written to unique, fsynced `.stage`
+  files. A formal JSON path is linked only after the job is re-read as running,
+  the shutdown fence is still open, the final-state CAS wins and all normalized
+  facts are inside the same transaction.
+- Commit-acknowledgement loss is resolved by directly re-reading the job state,
+  exact single artifact row, bounded file size and SHA-256. A committed result
+  remains successful; a pre-commit rollback cannot masquerade as success.
+- Shutdown, CAS loss, transaction rollback and promotion-acknowledgement loss
+  move any formal link back into private staging and remove only the verified
+  staging entry. A side-effecting `os.link` failure is detected with same-file
+  identity before rollback.
+- Permanent deletion is confined to the reviewed XHS staging cleanup module.
+  It accepts only the fixed `evidence/xhs/.staging/<validated>.stage` shape,
+  uses the existing handle-bound Windows deletion primitive (or parent `dir_fd`
+  containment on POSIX), and refuses formal `.json` evidence paths. The release
+  boundary scanner explicitly recognizes only that module.
+- Tests prove no late account facts, success/failure formal orphan or staging
+  file remains after shutdown fencing, CAS loss, result rollback, failure
+  rollback or uncertain promotion. Successful commit leaves exactly one formal
+  artifact consistent with the database.
+
+## I2 — parent handles precede every credential probe
+
+- Runtime is opened once, then every state component, `.xhs-cli` and
+  `cookies.json` is opened relative to the already-held parent handle on
+  Windows (`NtCreateFile`) or parent `dir_fd` on POSIX. No full cookie path is
+  probed before those parents are fixed.
+- Missing prepared state remains bounded `needs_human/login_required`; a state
+  component reparse fails closed as `external_state_untrusted` without touching
+  the external cookie target or creating a private runtime there.
+- Private runtime creation is likewise handle-relative. The state, config,
+  cookie and private-directory handles remain held for the child lifetime.
+
+## TDD evidence
+
+The required defects were observed before their fixes:
+
+- source binding: `7 failed` (missing `exceptions.py` coverage and loader-bound
+  execution);
+- parent-first isolation: `1 failed` (the full cookie path reached an external
+  reparse target);
+- post-create cleanup: `2 failed` (raw setup exceptions/tree survival), plus a
+  separate blocking-close RED (`1 failed`);
+- finalization: shutdown/CAS/rollback cases failed before staging, and the
+  side-effecting promotion acknowledgement test separately failed with one
+  formal orphan.
+
+The dedicated round-2 hardening suite is now `17 passed`. The combined
+round-2/round-1/service regression is green.
+
+## Final controlled verification
+
+- Focused XHS, Settings, health and guarded-live suites:
+  `395 passed, 1 skipped`.
+- Analysis regression: `90 passed, 1 skipped`.
+- Controlled frontend E2E repeat gate: `5 passed` with `--repeat-each=5`.
+- `scripts/verify.ps1`: exit 0; full backend `1072 passed, 2 skipped`; Python
+  compile passed; frontend `47 passed`; production build passed; controlled E2E
+  `1 passed`; npm audit found `0 vulnerabilities`; tracked-secret and release
+  boundary scans passed.
+- Independent `git diff --check`, compile, fixed-argv/no-shell/process-boundary,
+  source-loader and staged-scope scans passed. No S2B/Bailian implementation or
+  `research/` file is part of this round.
+
+## Live status
+
+Real authenticated XHS execution remains exactly:
+
+```text
+not_run
+```
+
+`XHS_LIVE_TEST=1` and external authenticated state were not supplied. No real
+account/search result, identity or persisted fact is claimed.

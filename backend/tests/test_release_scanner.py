@@ -63,6 +63,19 @@ def test_scanner_allows_native_delete_implementation_only_in_export_module(
     assert scan_python_boundaries(tmp_path) == []
 
 
+def test_scanner_allows_only_the_reviewed_xhs_staging_delete_boundary(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "backend" / "app" / "features" / "xhs"
+    staging.mkdir(parents=True)
+    (staging / "staging_cleanup.py").write_text(
+        "import os\nos.unlink('one-private.stage')\n",
+        encoding="utf-8",
+    )
+
+    assert scan_python_boundaries(tmp_path) == []
+
+
 def test_scanner_catches_destructive_http_route(tmp_path: Path) -> None:
     api = tmp_path / "backend" / "app" / "api"
     api.mkdir(parents=True)

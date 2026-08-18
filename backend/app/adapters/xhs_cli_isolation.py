@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
@@ -58,20 +59,8 @@ def prepare_xhs_execution(*, runtime_dir: Path, state_dir: Path) -> PreparedXhsE
         raise PreparedStateError("external_state_untrusted") from error
 
     relative_state = state.relative_to(runtime)
-    trusted_paths = [runtime]
-    trusted_cursor = runtime
-    for component in relative_state.parts:
-        trusted_cursor /= component
-        trusted_paths.append(trusted_cursor)
     config = state / ".xhs-cli"
-    trusted_paths.append(config)
     cookie_file = config / "cookies.json"
-    try:
-        os.lstat(cookie_file)
-    except FileNotFoundError:
-        raise PreparedStateError("login_required")
-    except OSError as error:
-        raise PreparedStateError("external_state_untrusted") from error
 
     private = state / "private-runtime"
     private_paths = [
@@ -86,8 +75,12 @@ def prepare_xhs_execution(*, runtime_dir: Path, state_dir: Path) -> PreparedXhsE
         private / "xdg" / "data",
     ]
     if os.name == "nt":
-        return _prepare_windows(trusted_paths, private_paths, cookie_file, private)
-    return _prepare_posix(trusted_paths, private_paths, cookie_file, private)
+        return _prepare_windows(
+            runtime, relative_state.parts, state, config, private_paths, cookie_file, private
+        )
+    return _prepare_posix(
+        runtime, relative_state.parts, state, config, private_paths, cookie_file, private
+    )
 
 
 def isolated_environment(private: Path) -> dict[str, str]:
@@ -146,7 +139,10 @@ def _validated_cookie_bytes(encoded: bytes) -> bytes:
 
 
 def _prepare_windows(
-    trusted_paths: list[Path],
+    runtime: Path,
+    state_parts: tuple[str, ...],
+    state: Path,
+    config: Path,
     private_paths: list[Path],
     cookie_file: Path,
     private: Path,
@@ -169,6 +165,30 @@ def _prepare_windows(
             ("nFileIndexHigh", wintypes.DWORD),
             ("nFileIndexLow", wintypes.DWORD),
         ]
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", wintypes.LPWSTR),
+        ]
+
+    class OBJECT_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(UNICODE_STRING)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", wintypes.LPVOID),
+            ("SecurityQualityOfService", wintypes.LPVOID),
+        ]
+
+    class STATUS_OR_POINTER(ctypes.Union):
+        _fields_ = [("Status", wintypes.LONG), ("Pointer", wintypes.LPVOID)]
+
+    class IO_STATUS_BLOCK(ctypes.Structure):
+        _anonymous_ = ("value",)
+        _fields_ = [("value", STATUS_OR_POINTER), ("Information", ctypes.c_size_t)]
 
     kernel32.CreateFileW.argtypes = [
         wintypes.LPCWSTR,
@@ -194,6 +214,21 @@ def _prepare_windows(
     ]
     kernel32.ReadFile.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    ntdll.NtCreateFile.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.ULONG,
+        ctypes.POINTER(OBJECT_ATTRIBUTES),
+        ctypes.POINTER(IO_STATUS_BLOCK),
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.LPVOID,
+        wintypes.ULONG,
+    ]
+    ntdll.NtCreateFile.restype = wintypes.LONG
 
     invalid_handle = wintypes.HANDLE(-1).value
     handles: list[int] = []
@@ -202,22 +237,9 @@ def _prepare_windows(
         while handles:
             kernel32.CloseHandle(wintypes.HANDLE(handles.pop()))
 
-    def open_path(path: Path, *, directory: bool) -> tuple[int, BY_HANDLE_FILE_INFORMATION]:
-        # BACKUP_SEMANTICS opens directories; OPEN_REPARSE_POINT prevents traversal.
-        flags = (0x02000000 if directory else 0) | 0x00200000
-        handle = kernel32.CreateFileW(
-            str(path),
-            0x80000000,
-            0x00000001,
-            None,
-            3,
-            flags,
-            None,
-        )
-        if handle in (None, 0, invalid_handle):
-            raise OSError(ctypes.get_last_error(), "CreateFileW")
-        handle_value = int(handle)
-        handles.append(handle_value)
+    def validate_handle(
+        handle_value: int, path: Path, *, directory: bool
+    ) -> BY_HANDLE_FILE_INFORMATION:
         info = BY_HANDLE_FILE_INFORMATION()
         if not kernel32.GetFileInformationByHandle(
             wintypes.HANDLE(handle_value), ctypes.byref(info)
@@ -238,12 +260,106 @@ def _prepare_windows(
         expected = str(Path(os.path.abspath(path)))
         if os.path.normcase(actual) != os.path.normcase(expected):
             raise PreparedStateError("external_state_untrusted")
-        return handle_value, info
+        return info
+
+    def open_absolute(
+        path: Path, *, directory: bool
+    ) -> tuple[int, BY_HANDLE_FILE_INFORMATION]:
+        # BACKUP_SEMANTICS opens directories; OPEN_REPARSE_POINT prevents traversal.
+        flags = (0x02000000 if directory else 0) | 0x00200000
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80000000,
+            0x00000001,
+            None,
+            3,
+            flags,
+            None,
+        )
+        if handle in (None, 0, invalid_handle):
+            raise OSError(ctypes.get_last_error(), "CreateFileW")
+        handle_value = int(handle)
+        handles.append(handle_value)
+        return handle_value, validate_handle(handle_value, path, directory=directory)
+
+    missing_statuses = {0xC000000F, 0xC0000034, 0xC0000039, 0xC000003A}
+
+    def open_relative(
+        parent_handle: int,
+        name: str,
+        path: Path,
+        *,
+        directory: bool,
+        create: bool = False,
+        missing_category: str = "external_state_untrusted",
+    ) -> tuple[int, BY_HANDLE_FILE_INFORMATION]:
+        name_buffer = ctypes.create_unicode_buffer(name)
+        name_bytes = len(name.encode("utf-16-le"))
+        unicode_name = UNICODE_STRING(
+            name_bytes,
+            name_bytes + ctypes.sizeof(ctypes.c_wchar),
+            ctypes.cast(name_buffer, wintypes.LPWSTR),
+        )
+        attributes = OBJECT_ATTRIBUTES(
+            ctypes.sizeof(OBJECT_ATTRIBUTES),
+            wintypes.HANDLE(parent_handle),
+            ctypes.pointer(unicode_name),
+            0x00000040,
+            None,
+            None,
+        )
+        io_status = IO_STATUS_BLOCK()
+        opened = wintypes.HANDLE()
+        options = 0x00200000 | 0x00000020 | (0x00000001 if directory else 0x00000040)
+        status = ntdll.NtCreateFile(
+            ctypes.byref(opened),
+            0x00100081,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            0,
+            0x00000001,
+            0x00000003 if create else 0x00000001,
+            options,
+            None,
+            0,
+        )
+        if status != 0:
+            if (int(status) & 0xFFFFFFFF) in missing_statuses:
+                raise PreparedStateError(missing_category)
+            raise PreparedStateError("external_state_untrusted")
+        handle_value = int(opened.value)
+        handles.append(handle_value)
+        return handle_value, validate_handle(handle_value, path, directory=directory)
 
     try:
-        for directory in trusted_paths:
-            open_path(directory, directory=True)
-        cookie_handle, before = open_path(cookie_file, directory=False)
+        runtime_handle, _ = open_absolute(runtime, directory=True)
+        parent_handle = runtime_handle
+        cursor = runtime
+        for component in state_parts:
+            cursor /= component
+            parent_handle, _ = open_relative(
+                parent_handle,
+                component,
+                cursor,
+                directory=True,
+                missing_category="login_required",
+            )
+        state_handle = parent_handle
+        config_handle, _ = open_relative(
+            state_handle,
+            ".xhs-cli",
+            config,
+            directory=True,
+            missing_category="login_required",
+        )
+        cookie_handle, before = open_relative(
+            config_handle,
+            "cookies.json",
+            cookie_file,
+            directory=False,
+            missing_category="login_required",
+        )
         size = (int(before.nFileSizeHigh) << 32) | int(before.nFileSizeLow)
         if before.nNumberOfLinks != 1 or size < 1 or size > MAX_STATE_FILE_BYTES:
             raise PreparedStateError("external_state_untrusted")
@@ -269,12 +385,19 @@ def _prepare_windows(
         if identity_before != identity_after:
             raise PreparedStateError("external_state_untrusted")
         encoded = _validated_cookie_bytes(buffer.raw[:size])
+        directory_handles = {state: state_handle}
         for directory in private_paths:
-            try:
-                directory.mkdir(exist_ok=True)
-            except OSError as error:
-                raise PreparedStateError("external_state_untrusted") from error
-            open_path(directory, directory=True)
+            parent = directory_handles.get(directory.parent)
+            if parent is None:
+                raise PreparedStateError("external_state_untrusted")
+            directory_handle, _ = open_relative(
+                parent,
+                directory.name,
+                directory,
+                directory=True,
+                create=True,
+            )
+            directory_handles[directory] = directory_handle
         return PreparedXhsExecution(
             cookie_bytes=encoded, runtime_dir=private, handles=handles
         )
@@ -287,7 +410,10 @@ def _prepare_windows(
 
 
 def _prepare_posix(
-    trusted_paths: list[Path],
+    runtime: Path,
+    state_parts: tuple[str, ...],
+    state: Path,
+    config: Path,
     private_paths: list[Path],
     cookie_file: Path,
     private: Path,
@@ -296,13 +422,36 @@ def _prepare_posix(
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
     try:
-        for directory in trusted_paths:
-            handle = os.open(directory, os.O_RDONLY | nofollow | directory_flag)
-            handles.append(handle)
-            stat = os.fstat(handle)
-            if not os.path.isdir(directory) or stat.st_nlink < 1:
+        runtime_handle = os.open(runtime, os.O_RDONLY | nofollow | directory_flag)
+        handles.append(runtime_handle)
+        if not stat.S_ISDIR(os.fstat(runtime_handle).st_mode):
+            raise PreparedStateError("external_state_untrusted")
+        parent_handle = runtime_handle
+        for component in state_parts:
+            try:
+                parent_handle = os.open(
+                    component,
+                    os.O_RDONLY | nofollow | directory_flag,
+                    dir_fd=parent_handle,
+                )
+            except FileNotFoundError as error:
+                raise PreparedStateError("login_required") from error
+            handles.append(parent_handle)
+            if not stat.S_ISDIR(os.fstat(parent_handle).st_mode):
                 raise PreparedStateError("external_state_untrusted")
-        cookie_handle = os.open(cookie_file, os.O_RDONLY | nofollow)
+        state_handle = parent_handle
+        try:
+            config_handle = os.open(
+                ".xhs-cli",
+                os.O_RDONLY | nofollow | directory_flag,
+                dir_fd=state_handle,
+            )
+            handles.append(config_handle)
+            cookie_handle = os.open(
+                "cookies.json", os.O_RDONLY | nofollow, dir_fd=config_handle
+            )
+        except FileNotFoundError as error:
+            raise PreparedStateError("login_required") from error
         handles.append(cookie_handle)
         before = os.fstat(cookie_handle)
         if before.st_nlink != 1 or before.st_size < 1 or before.st_size > MAX_STATE_FILE_BYTES:
@@ -320,12 +469,24 @@ def _prepare_posix(
             != (after.st_dev, after.st_ino, after.st_size, after.st_nlink)
         ):
             raise PreparedStateError("external_state_untrusted")
+        directory_handles = {state: state_handle}
         for directory in private_paths:
-            directory.mkdir(exist_ok=True)
-            handle = os.open(directory, os.O_RDONLY | nofollow | directory_flag)
-            handles.append(handle)
-            if not os.path.isdir(directory):
+            parent = directory_handles.get(directory.parent)
+            if parent is None:
                 raise PreparedStateError("external_state_untrusted")
+            try:
+                os.mkdir(directory.name, mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            handle = os.open(
+                directory.name,
+                os.O_RDONLY | nofollow | directory_flag,
+                dir_fd=parent,
+            )
+            handles.append(handle)
+            if not stat.S_ISDIR(os.fstat(handle).st_mode):
+                raise PreparedStateError("external_state_untrusted")
+            directory_handles[directory] = handle
         return PreparedXhsExecution(
             cookie_bytes=_validated_cookie_bytes(encoded),
             runtime_dir=private,

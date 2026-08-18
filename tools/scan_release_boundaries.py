@@ -11,6 +11,7 @@ from pathlib import Path
 _APPROVED_DELETE_BOUNDARIES = {
     Path("backend/app/features/content/cleanup.py"),
     Path("backend/app/features/content/export.py"),
+    Path("backend/app/features/xhs/staging_cleanup.py"),
 }
 _PROJECT_DELETE_HELPERS = {
     "remove_contained_regular",

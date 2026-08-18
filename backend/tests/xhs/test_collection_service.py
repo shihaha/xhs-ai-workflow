@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -508,6 +509,161 @@ def test_commit_acknowledgement_error_reads_back_committed_success(tmp_path: Pat
     assert completed is not None and completed.state is JobState.succeeded
     assert len(completed.artifacts) == 1
     assert service.get_profile("user-1").collection_job_id == queued.id
+    evidence_root = service.runtime_dir / "evidence" / "xhs"
+    assert list(evidence_root.rglob("*.json")) == [
+        service.runtime_dir / completed.artifacts[0].path
+    ]
+
+
+def test_precommit_rollback_cleans_uncommitted_success_before_failure_artifact(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    queued = service.submit_account("user-1", 1)
+    original_session = service.database.session
+    injected = False
+
+    class PrecommitFailureProxy:
+        def __init__(self, session):
+            self._session = session
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+        def commit(self):
+            nonlocal injected
+            final_state = self._session.get(JobRecord, queued.id).state
+            if not injected and JobState(final_state) is JobState.succeeded:
+                injected = True
+                raise RuntimeError("controlled precommit rollback")
+            self._session.commit()
+
+    @contextmanager
+    def failing_session():
+        with original_session() as session:
+            yield PrecommitFailureProxy(session)
+
+    service.database.session = failing_session
+
+    completed = service.execute(queued.id)
+
+    assert injected is True
+    assert completed is not None and completed.state is JobState.failed
+    assert len(completed.artifacts) == 1
+    evidence_root = service.runtime_dir / "evidence" / "xhs"
+    assert list(evidence_root.rglob("*.json")) == [
+        service.runtime_dir / completed.artifacts[0].path
+    ]
+    with original_session() as session:
+        assert session.scalars(select(XhsAccountProfileRecord)).all() == []
+        assert session.scalars(select(XhsAccountNoteRecord)).all() == []
+    service.database.close()
+
+
+def test_finalizer_cas_loss_cleans_staging_and_never_creates_formal_evidence(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    queued = service.submit_account("user-1", 1)
+    service.job_service.claim(queued.id)
+    claimed = service.job_service.get(queued.id)
+    service.job_service.transition(queued.id, JobState.cancelled)
+
+    finalized = service._finalize_result(claimed, _account_result())
+
+    assert finalized is None
+    assert service.job_service.get(queued.id).artifacts == []
+    evidence_root = service.runtime_dir / "evidence" / "xhs"
+    assert not evidence_root.exists() or list(evidence_root.rglob("*.json")) == []
+    with service.database.session() as session:
+        assert session.scalars(select(XhsAccountProfileRecord)).all() == []
+        assert session.scalars(select(XhsAccountNoteRecord)).all() == []
+    service.database.close()
+
+
+def test_promotion_side_effect_error_is_detected_and_cleans_formal_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    queued = service.submit_account("user-1", 1)
+    service.job_service.claim(queued.id)
+    claimed = service.job_service.get(queued.id)
+    real_link = os.link
+    injected = False
+
+    def uncertain_link(source: Path, destination: Path) -> None:
+        nonlocal injected
+        real_link(source, destination)
+        if not injected:
+            injected = True
+            raise OSError("controlled promotion acknowledgement loss")
+
+    monkeypatch.setattr(os, "link", uncertain_link)
+
+    with pytest.raises(OSError, match="controlled promotion acknowledgement loss"):
+        service._finalize_result(claimed, _account_result())
+
+    assert injected is True
+    durable = service.job_service.get(queued.id)
+    assert durable.state is JobState.running
+    assert durable.artifacts == []
+    evidence_root = service.runtime_dir / "evidence" / "xhs"
+    assert not evidence_root.exists() or [
+        path for path in evidence_root.rglob("*") if path.is_file()
+    ] == []
+    with service.database.session() as session:
+        assert session.scalars(select(XhsAccountProfileRecord)).all() == []
+        assert session.scalars(select(XhsAccountNoteRecord)).all() == []
+    service.database.close()
+
+
+def test_failure_finalizer_rollback_leaves_no_failure_or_staging_orphan(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    queued = service.submit_search("rollback", 1)
+    service.job_service.claim(queued.id)
+    original_session = service.database.session
+    injected = False
+
+    class FailureRollbackProxy:
+        def __init__(self, session):
+            self._session = session
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+        def commit(self):
+            nonlocal injected
+            final_state = self._session.get(JobRecord, queued.id).state
+            if not injected and JobState(final_state) is JobState.failed:
+                injected = True
+                raise RuntimeError("controlled failure-artifact rollback")
+            self._session.commit()
+
+    @contextmanager
+    def failing_session():
+        with original_session() as session:
+            yield FailureRollbackProxy(session)
+
+    service.database.session = failing_session
+
+    with pytest.raises(RuntimeError, match="controlled failure-artifact rollback"):
+        service._finalize_failure(
+            queued.id,
+            category="controlled_failure",
+            error_type="ControlledError",
+        )
+
+    assert injected is True
+    durable = service.job_service.get(queued.id)
+    assert durable.state is JobState.running
+    assert durable.artifacts == []
+    evidence_root = service.runtime_dir / "evidence" / "xhs"
+    assert not evidence_root.exists() or [
+        path for path in evidence_root.rglob("*") if path.is_file()
+    ] == []
+    service.database.close()
 
 
 def test_commit_ack_and_transient_read_failure_never_overwrite_succeeded_artifact(tmp_path: Path) -> None:
@@ -594,6 +750,8 @@ def test_shutdown_fence_wins_before_final_commit_and_rolls_back_account_facts(
     with service.database.session() as session:
         assert session.scalars(select(XhsAccountProfileRecord)).all() == []
         assert session.scalars(select(XhsAccountNoteRecord)).all() == []
+    evidence_root = service.runtime_dir / "evidence" / "xhs"
+    assert not evidence_root.exists() or list(evidence_root.rglob("*.json")) == []
     service.database.close()
 
 

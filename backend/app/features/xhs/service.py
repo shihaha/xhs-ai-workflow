@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections.abc import Callable
 from concurrent.futures import Future
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Condition, RLock, Thread
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select, update
@@ -28,6 +31,7 @@ from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProf
 from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
 from backend.app.features.xhs.redaction import redact_credentials
 from backend.app.features.xhs.schemas import AccountEvidenceBinding, persist_exact_account_result
+from backend.app.features.xhs.staging_cleanup import discard_xhs_staging_file
 from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 from backend.app.services.jobs import InvalidJobTransition, Job, JobService
 
@@ -54,6 +58,16 @@ class CollectionFactNotFound(LookupError):
 
 class CollectionResultTooLarge(ValueError):
     """The transformed collection artifact crossed its configured hard cap."""
+
+
+@dataclass
+class _StagedArtifact:
+    staging_path: Path
+    final_path: Path
+    relative_path: Path
+    digest: str
+    size_bytes: int
+    promoted: bool = False
 
 
 class _ReadModel(BaseModel):
@@ -300,7 +314,7 @@ class XhsCollectionService:
             )
         except Exception as error:
             if self._committed_result(job.id):
-                return self.job_service.get(job.id)
+                return self._read_committed_job(job.id)
             return self._finalize_failure(job.id, category="xhs_collection_finalization_failed", error_type=type(error).__name__)
         finally:
             self._finished(job_id)
@@ -428,7 +442,8 @@ class XhsCollectionService:
             collected_at,
             max_bytes=self._max_artifact_bytes,
         )
-        relative, digest = self._write_artifact(job.id, encoded)
+        staged = self._stage_artifact(job.id, encoded)
+        commit_confirmed = False
         artifact_kind = (
             ACCOUNT_COLLECTION_ARTIFACT_KIND
             if job.type == ACCOUNT_COLLECTION_JOB_TYPE
@@ -440,7 +455,7 @@ class XhsCollectionService:
         )
         progress = _note_success_count(result, account=job.type == ACCOUNT_COLLECTION_JOB_TYPE)
         metadata = {
-            "sha256": digest, "size_bytes": len(encoded),
+            "sha256": staged.digest, "size_bytes": staged.size_bytes,
             "source": "xhs-cli", "job_id": job.id,
             "capability": (
                 "fetch_account" if job.type == ACCOUNT_COLLECTION_JOB_TYPE else "search_notes"
@@ -460,54 +475,83 @@ class XhsCollectionService:
         else:
             metadata["keyword"] = job.input["keyword"]
         try:
-            with self.database.session() as session:
-                record = session.get(JobRecord, job.id)
-                if record is None or JobState(record.state) is not JobState.running:
-                    session.rollback()
-                    return None
-                artifact = JobArtifactRecord(
-                    job_id=job.id, kind=artifact_kind,
-                    producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
-                    path=relative.as_posix(), metadata_json=metadata, created_at=collected_at,
-                )
-                session.add(artifact)
-                session.flush()
-                artifact.metadata_json = {**metadata, "artifact_id": artifact.id}
-                if job.type == ACCOUNT_COLLECTION_JOB_TYPE and exact:
-                    persist_exact_account_result(
-                        session, result=result,
-                        binding=AccountEvidenceBinding(
-                            collection_job_id=job.id,
-                            collection_artifact_id=artifact.id,
-                            collected_at=collected_at,
-                        ),
-                    )
-                now = self.clock()
-                with self._lock:
-                    if not self._accepting:
+            try:
+                with self.database.session() as session:
+                    record = session.get(JobRecord, job.id)
+                    if record is None or JobState(record.state) is not JobState.running:
                         session.rollback()
                         return None
-                    changed = session.execute(
-                        update(JobRecord)
-                        .where(JobRecord.id == job.id, JobRecord.state == JobState.running.value)
-                        .values(
-                            state=target_state.value, progress_current=progress,
-                            progress_total=job.progress_total,
-                            current_stage=("xhs_collection_complete" if target_state is JobState.succeeded else "xhs_collection_incomplete"),
-                            error_category=None if target_state is JobState.succeeded else (result.detail or result.status),
-                            lease_expires_at=None, completed_at=now if target_state in {JobState.succeeded, JobState.failed} else None,
-                            updated_at=now,
+                    artifact = JobArtifactRecord(
+                        job_id=job.id, kind=artifact_kind,
+                        producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+                        path=staged.relative_path.as_posix(),
+                        metadata_json=metadata, created_at=collected_at,
+                    )
+                    session.add(artifact)
+                    session.flush()
+                    artifact.metadata_json = {**metadata, "artifact_id": artifact.id}
+                    if job.type == ACCOUNT_COLLECTION_JOB_TYPE and exact:
+                        persist_exact_account_result(
+                            session, result=result,
+                            binding=AccountEvidenceBinding(
+                                collection_job_id=job.id,
+                                collection_artifact_id=artifact.id,
+                                collected_at=collected_at,
+                            ),
                         )
-                    )
-                    if changed.rowcount != 1:
-                        session.rollback()
-                        return None
-                    session.commit()
-        except Exception:
-            if self._committed_result(job.id, digest=digest):
-                return self.job_service.get(job.id)
-            raise
-        return self.job_service.get(job.id)
+                    now = self.clock()
+                    with self._lock:
+                        if not self._accepting:
+                            session.rollback()
+                            return None
+                        changed = session.execute(
+                            update(JobRecord)
+                            .where(
+                                JobRecord.id == job.id,
+                                JobRecord.state == JobState.running.value,
+                            )
+                            .values(
+                                state=target_state.value,
+                                progress_current=progress,
+                                progress_total=job.progress_total,
+                                current_stage=(
+                                    "xhs_collection_complete"
+                                    if target_state is JobState.succeeded
+                                    else "xhs_collection_incomplete"
+                                ),
+                                error_category=(
+                                    None
+                                    if target_state is JobState.succeeded
+                                    else (result.detail or result.status)
+                                ),
+                                lease_expires_at=None,
+                                completed_at=(
+                                    now
+                                    if target_state in {JobState.succeeded, JobState.failed}
+                                    else None
+                                ),
+                                updated_at=now,
+                            )
+                        )
+                        if changed.rowcount != 1:
+                            session.rollback()
+                            return None
+                        self._promote_staged_artifact(staged)
+                        session.commit()
+                        commit_confirmed = True
+            except Exception:
+                if self._artifact_commit_matches(
+                    job.id,
+                    expected_state=target_state,
+                    digest=staged.digest,
+                ):
+                    commit_confirmed = True
+                    return self._read_committed_job(job.id)
+                raise
+            return self._read_committed_job(job.id)
+        finally:
+            if not commit_confirmed:
+                self._cleanup_uncommitted_artifact(staged)
 
     def _finalize_failure(self, job_id: str, *, category: str, error_type: str) -> Job | None:
         job = self.job_service.get(job_id)
@@ -518,70 +562,204 @@ class XhsCollectionService:
             "status": "failed", "error_category": category, "error_type": error_type,
             "collected_at": self.clock().isoformat(),
         }
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        relative, digest = self._write_artifact(job_id, encoded, suffix="-failure")
-        kind = ACCOUNT_COLLECTION_ARTIFACT_KIND if job.type == ACCOUNT_COLLECTION_JOB_TYPE else SEARCH_COLLECTION_ARTIFACT_KIND
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        staged = self._stage_artifact(job_id, encoded, suffix="-failure")
+        commit_confirmed = False
+        kind = (
+            ACCOUNT_COLLECTION_ARTIFACT_KIND
+            if job.type == ACCOUNT_COLLECTION_JOB_TYPE
+            else SEARCH_COLLECTION_ARTIFACT_KIND
+        )
         now = self.clock()
-        with self.database.session() as session:
-            record = session.get(JobRecord, job_id)
-            if record is None or JobState(record.state) is not JobState.running:
-                session.rollback()
-                return None
-            artifact = JobArtifactRecord(
-                job_id=job_id, kind=kind, producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
-                path=relative.as_posix(),
-                metadata_json={
-                    "sha256": digest, "size_bytes": len(encoded),
-                    "source": "xhs-cli", "job_id": job_id,
-                    "capability": (
-                        "fetch_account" if job.type == ACCOUNT_COLLECTION_JOB_TYPE else "search_notes"
-                    ),
-                    "error_category": category,
-                },
-                created_at=now,
-            )
-            session.add(artifact)
-            session.flush()
-            artifact.metadata_json = {**artifact.metadata_json, "artifact_id": artifact.id}
-            with self._lock:
-                if not self._accepting:
-                    session.rollback()
-                    return None
-                changed = session.execute(
-                    update(JobRecord)
-                    .where(JobRecord.id == job_id, JobRecord.state == JobState.running.value)
-                    .values(
-                        state=JobState.failed.value, current_stage="xhs_collection_failed",
-                        error_category=category, lease_expires_at=None,
-                        completed_at=now, updated_at=now,
-                    )
-                )
-                if changed.rowcount != 1:
-                    session.rollback()
-                    return None
-                session.commit()
-        return self.job_service.get(job_id)
-
-    def _write_artifact(
-        self, job_id: str, encoded: bytes, *, suffix: str = ""
-    ) -> tuple[Path, str]:
-        relative = Path("evidence") / "xhs" / f"{job_id}{suffix}.json"
-        absolute = (self.runtime_dir / relative).resolve()
-        absolute.relative_to(self.runtime_dir)
-        absolute.parent.mkdir(parents=True, exist_ok=True)
-        temporary = absolute.with_suffix(".json.tmp")
-        temporary.write_bytes(encoded)
-        temporary.replace(absolute)
-        return relative, hashlib.sha256(encoded).hexdigest()
-
-    def _committed_result(self, job_id: str, *, digest: str | None = None) -> bool:
         try:
-            job = self.job_service.get(job_id)
+            try:
+                with self.database.session() as session:
+                    record = session.get(JobRecord, job_id)
+                    if record is None or JobState(record.state) is not JobState.running:
+                        session.rollback()
+                        return None
+                    artifact = JobArtifactRecord(
+                        job_id=job_id, kind=kind,
+                        producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+                        path=staged.relative_path.as_posix(),
+                        metadata_json={
+                            "sha256": staged.digest,
+                            "size_bytes": staged.size_bytes,
+                            "source": "xhs-cli", "job_id": job_id,
+                            "capability": (
+                                "fetch_account"
+                                if job.type == ACCOUNT_COLLECTION_JOB_TYPE
+                                else "search_notes"
+                            ),
+                            "error_category": category,
+                        },
+                        created_at=now,
+                    )
+                    session.add(artifact)
+                    session.flush()
+                    artifact.metadata_json = {
+                        **artifact.metadata_json,
+                        "artifact_id": artifact.id,
+                    }
+                    with self._lock:
+                        if not self._accepting:
+                            session.rollback()
+                            return None
+                        changed = session.execute(
+                            update(JobRecord)
+                            .where(
+                                JobRecord.id == job_id,
+                                JobRecord.state == JobState.running.value,
+                            )
+                            .values(
+                                state=JobState.failed.value,
+                                current_stage="xhs_collection_failed",
+                                error_category=category,
+                                lease_expires_at=None,
+                                completed_at=now,
+                                updated_at=now,
+                            )
+                        )
+                        if changed.rowcount != 1:
+                            session.rollback()
+                            return None
+                        self._promote_staged_artifact(staged)
+                        session.commit()
+                        commit_confirmed = True
+            except Exception:
+                if self._artifact_commit_matches(
+                    job_id,
+                    expected_state=JobState.failed,
+                    digest=staged.digest,
+                ):
+                    commit_confirmed = True
+                    return self._read_committed_job(job_id)
+                raise
+            return self._read_committed_job(job_id)
+        finally:
+            if not commit_confirmed:
+                self._cleanup_uncommitted_artifact(staged)
+
+    def _stage_artifact(
+        self, job_id: str, encoded: bytes, *, suffix: str = ""
+    ) -> _StagedArtifact:
+        artifact_root = (self.runtime_dir / "evidence" / "xhs").resolve()
+        artifact_root.relative_to(self.runtime_dir)
+        staging_root = artifact_root / ".staging"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        relative = Path("evidence") / "xhs" / f"{job_id}{suffix}.json"
+        final_path = self.runtime_dir / relative
+        staging_path = staging_root / f"{job_id}-{uuid4().hex}{suffix}.stage"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(staging_path, flags, 0o600)
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                descriptor = None
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            self._discard_staging_path(staging_path)
+            raise
+        return _StagedArtifact(
+            staging_path=staging_path,
+            final_path=final_path,
+            relative_path=relative,
+            digest=hashlib.sha256(encoded).hexdigest(),
+            size_bytes=len(encoded),
+        )
+
+    def _promote_staged_artifact(self, staged: _StagedArtifact) -> None:
+        staged.final_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(staged.staging_path, staged.final_path)
+        except BaseException:
+            try:
+                staged.promoted = os.path.samefile(
+                    staged.staging_path, staged.final_path
+                )
+            except OSError:
+                staged.promoted = False
+            raise
+        staged.promoted = True
+        self._discard_staging_path(staged.staging_path)
+
+    def _cleanup_uncommitted_artifact(self, staged: _StagedArtifact) -> None:
+        if staged.promoted and staged.final_path.exists():
+            quarantine = staged.staging_path.with_name(
+                f"rollback-{uuid4().hex}.stage"
+            )
+            os.replace(staged.final_path, quarantine)
+            staged.promoted = False
+            self._discard_staging_path(quarantine)
+        self._discard_staging_path(staged.staging_path)
+
+    def _discard_staging_path(self, path: Path) -> None:
+        if not discard_xhs_staging_file(
+            self.runtime_dir,
+            path,
+            max_bytes=self._max_artifact_bytes,
+        ):
+            raise OSError("XHS staging cleanup was not safely authorized.")
+
+    def _artifact_commit_matches(
+        self,
+        job_id: str,
+        *,
+        expected_state: JobState,
+        digest: str | None,
+    ) -> bool:
+        try:
+            with self.database.session() as session:
+                record = session.get(JobRecord, job_id)
+                artifacts = session.scalars(
+                    select(JobArtifactRecord).where(JobArtifactRecord.job_id == job_id)
+                ).all()
+            if (
+                record is None
+                or JobState(record.state) is not expected_state
+                or len(artifacts) != 1
+            ):
+                return False
+            artifact = artifacts[0]
+            metadata = dict(artifact.metadata_json)
+            expected_digest = digest or metadata.get("sha256")
+            expected_size = metadata.get("size_bytes")
+            if not isinstance(expected_digest, str) or not isinstance(expected_size, int):
+                return False
+            absolute = (self.runtime_dir / artifact.path).resolve()
+            absolute.relative_to(self.runtime_dir)
+            with absolute.open("rb") as stream:
+                encoded = stream.read(self._max_artifact_bytes + 1)
+            return (
+                len(encoded) <= self._max_artifact_bytes
+                and len(encoded) == expected_size
+                and hashlib.sha256(encoded).hexdigest() == expected_digest
+            )
         except Exception:
             return False
-        if job.state is not JobState.succeeded or len(job.artifacts) != 1:
-            return False
-        return digest is None or job.artifacts[0].metadata.get("sha256") == digest
+
+    def _committed_result(self, job_id: str, *, digest: str | None = None) -> bool:
+        return self._artifact_commit_matches(
+            job_id,
+            expected_state=JobState.succeeded,
+            digest=digest,
+        )
+
+    def _read_committed_job(self, job_id: str) -> Job:
+        deadline = monotonic() + 0.05
+        while True:
+            try:
+                return self.job_service.get(job_id)
+            except Exception:
+                if monotonic() >= deadline:
+                    raise
+                sleep(0.002)
 
     def _fail_scheduling(self, job_id: str) -> None:
         try:

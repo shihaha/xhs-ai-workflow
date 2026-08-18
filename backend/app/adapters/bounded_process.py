@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Thread
 from time import monotonic, sleep
@@ -70,7 +71,55 @@ def run_bounded_process(
     )
 
 
-def _capture_threads(
+@dataclass
+class _CaptureState:
+    overflow: Event
+    stop: Event
+    stdout: bytearray
+    stderr: bytearray
+    errors: list[BaseException]
+    threads: tuple[Thread, ...]
+    started: list[Thread]
+
+
+class _OwnedFdStream:
+    """Minimal unbuffered pipe stream whose close is one bounded CRT fd close."""
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor: int | None = descriptor
+
+    def fileno(self) -> int:
+        descriptor = self._descriptor
+        if descriptor is None:
+            raise ValueError("I/O operation on closed pipe")
+        return descriptor
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            raise ValueError("Bounded pipe reads require an explicit size")
+        return os.read(self.fileno(), size)
+
+    def write(self, encoded: bytes) -> int:
+        view = memoryview(encoded)
+        written = 0
+        while written < len(view):
+            count = os.write(self.fileno(), view[written:])
+            if count <= 0:
+                raise OSError("Pipe write made no progress")
+            written += count
+        return written
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        self._descriptor = None
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _prepare_capture(
     stdout_stream: BinaryIO,
     stderr_stream: BinaryIO,
     stdin_stream: BinaryIO,
@@ -78,15 +127,16 @@ def _capture_threads(
     input_bytes: bytes,
     max_stdout_bytes: int,
     max_stderr_bytes: int,
-) -> tuple[Event, bytearray, bytearray, list[BaseException], tuple[Thread, ...]]:
+) -> _CaptureState:
     overflow = Event()
+    stop = Event()
     stdout = bytearray()
     stderr = bytearray()
     errors: list[BaseException] = []
 
     def read_bounded(stream: BinaryIO, target: bytearray, limit: int) -> None:
         try:
-            while not overflow.is_set():
+            while not overflow.is_set() and not stop.is_set():
                 chunk = stream.read(64 * 1024)
                 if not chunk:
                     return
@@ -97,7 +147,8 @@ def _capture_threads(
                     overflow.set()
                     return
         except (OSError, ValueError) as error:
-            errors.append(error)
+            if not stop.is_set():
+                errors.append(error)
 
     def write_input() -> None:
         try:
@@ -127,27 +178,32 @@ def _capture_threads(
         ),
         Thread(target=write_input, name="xhs-cli-stdin", daemon=True),
     )
-    for thread in threads:
-        thread.start()
-    return overflow, stdout, stderr, errors, threads
+    return _CaptureState(
+        overflow=overflow,
+        stop=stop,
+        stdout=stdout,
+        stderr=stderr,
+        errors=errors,
+        threads=threads,
+        started=[],
+    )
 
 
-def _finish_threads(
-    threads: tuple[Thread, ...],
-    streams: tuple[BinaryIO, ...],
-    *,
-    deadline: float,
-) -> bool:
-    for thread in threads:
-        thread.join(timeout=max(deadline - monotonic(), 0))
-    for stream in streams:
+def _start_capture(capture: _CaptureState) -> None:
+    for thread in capture.threads:
         try:
-            stream.close()
-        except (OSError, ValueError):
-            pass
-    for thread in threads:
+            thread.start()
+        except BaseException:
+            if thread.ident is not None and thread not in capture.started:
+                capture.started.append(thread)
+            raise
+        capture.started.append(thread)
+
+
+def _finish_capture(capture: _CaptureState, *, deadline: float) -> bool:
+    for thread in capture.started:
         thread.join(timeout=max(deadline - monotonic(), 0))
-    return all(not thread.is_alive() for thread in threads)
+    return all(not thread.is_alive() for thread in capture.started)
 
 
 def _run_posix_group(
@@ -173,7 +229,7 @@ def _run_posix_group(
         start_new_session=True,
     )
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
-    overflow, stdout, stderr, errors, threads = _capture_threads(
+    capture = _prepare_capture(
         process.stdout,
         process.stderr,
         process.stdin,
@@ -181,6 +237,7 @@ def _run_posix_group(
         max_stdout_bytes=max_stdout_bytes,
         max_stderr_bytes=max_stderr_bytes,
     )
+    _start_capture(capture)
     cleanup_reserve = min(0.05, timeout / 3)
     execution_deadline = deadline - cleanup_reserve
     category: str | None = None
@@ -188,11 +245,11 @@ def _run_posix_group(
         if cancel_event is not None and cancel_event.is_set():
             category = "cancelled"
             break
-        if overflow.is_set():
+        if capture.overflow.is_set():
             category = "output_too_large"
             break
         if process.poll() is not None and not _posix_group_alive(process.pid) and all(
-            not thread.is_alive() for thread in threads
+            not thread.is_alive() for thread in capture.started
         ):
             break
         if monotonic() >= execution_deadline:
@@ -214,17 +271,19 @@ def _run_posix_group(
         process.wait(timeout=max(cleanup_deadline - monotonic(), 0))
     except (OSError, subprocess.TimeoutExpired):
         category = "process_cleanup_failed"
-    clean = _finish_threads(
-        threads,
-        (process.stdin, process.stdout, process.stderr),
-        deadline=cleanup_deadline,
-    )
-    if not clean or errors:
+    capture.stop.set()
+    clean = _finish_capture(capture, deadline=cleanup_deadline)
+    for stream in (process.stdin, process.stdout, process.stderr):
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+    if not clean or capture.errors:
         raise BoundedProcessError("process_cleanup_failed")
     if category is not None:
         raise BoundedProcessError(category)
     return subprocess.CompletedProcess(
-        list(argv), int(process.returncode or 0), bytes(stdout), bytes(stderr)
+        list(argv), int(process.returncode or 0), bytes(capture.stdout), bytes(capture.stderr)
     )
 
 
@@ -381,6 +440,10 @@ def _run_windows_job(
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+    kernel32.CancelSynchronousIo.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -392,6 +455,39 @@ def _run_windows_job(
     def close_handle(handle: int | None) -> None:
         if handle not in (None, 0, invalid_handle):
             kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+    def wait_for_process(handle: int | None, *, until: float) -> bool:
+        if handle in (None, 0, invalid_handle):
+            return True
+        while True:
+            remaining = until - monotonic()
+            wait_ms = 0 if remaining <= 0 else min(max(int(remaining * 1000), 1), 10)
+            result = kernel32.WaitForSingleObject(wintypes.HANDLE(handle), wait_ms)
+            if result == 0:
+                return True
+            if result == 0xFFFFFFFF or remaining <= 0:
+                return False
+
+    def cancel_capture_io(capture: _CaptureState | None) -> bool:
+        if capture is None:
+            return True
+        capture.stop.set()
+        clean = True
+        for reader in capture.started:
+            if not reader.is_alive() or reader.native_id is None:
+                continue
+            thread_os_handle = kernel32.OpenThread(0x0001, False, reader.native_id)
+            if thread_os_handle in (None, 0, invalid_handle):
+                clean = False
+                continue
+            try:
+                if not kernel32.CancelSynchronousIo(thread_os_handle):
+                    error = ctypes.get_last_error()
+                    if error != 1168:  # ERROR_NOT_FOUND means no synchronous I/O was pending.
+                        clean = False
+            finally:
+                close_handle(int(thread_os_handle))
+        return clean
 
     def pipe() -> tuple[int, int]:
         read_handle, write_handle = wintypes.HANDLE(), wintypes.HANDLE()
@@ -408,7 +504,36 @@ def _run_windows_job(
     attribute_list_initialized = False
     fds_to_close: list[int] = []
     streams_to_close: list[BinaryIO] = []
-    streams: tuple[BinaryIO, BinaryIO, BinaryIO] | None = None
+    capture: _CaptureState | None = None
+
+    def terminate_and_close_job() -> bool:
+        """Stop the whole tree before any pipe or process handle is released."""
+        nonlocal job_handle
+        if job_handle in (None, 0, invalid_handle):
+            return True
+        terminated = False
+        closed = False
+        try:
+            terminated = bool(
+                kernel32.TerminateJobObject(wintypes.HANDLE(job_handle), 1)
+            )
+        except (OSError, ValueError):
+            terminated = False
+        finally:
+            try:
+                closed = bool(kernel32.CloseHandle(wintypes.HANDLE(job_handle)))
+            except (OSError, ValueError):
+                closed = False
+            job_handle = None
+        return terminated and closed
+
+    def cleanup_after_created_process(*, until: float) -> bool:
+        job_clean = terminate_and_close_job()
+        io_cancelled = cancel_capture_io(capture)
+        process_clean = wait_for_process(process_handle, until=until)
+        readers_clean = capture is None or _finish_capture(capture, deadline=until)
+        return job_clean and io_cancelled and process_clean and readers_clean
+
     try:
         stdout_read, stdout_write = pipe()
         stderr_read, stderr_write = pipe()
@@ -514,17 +639,16 @@ def _run_windows_job(
         handles_to_close.remove(stdin_write)
         stdin_write = None
         fds_to_close.append(stdin_fd)
-        stdout_stream = os.fdopen(stdout_fd, "rb", buffering=0)
+        stdout_stream = _OwnedFdStream(stdout_fd)
         fds_to_close.remove(stdout_fd)
         streams_to_close.append(stdout_stream)
-        stderr_stream = os.fdopen(stderr_fd, "rb", buffering=0)
+        stderr_stream = _OwnedFdStream(stderr_fd)
         fds_to_close.remove(stderr_fd)
         streams_to_close.append(stderr_stream)
-        stdin_stream = os.fdopen(stdin_fd, "wb", buffering=0)
+        stdin_stream = _OwnedFdStream(stdin_fd)
         fds_to_close.remove(stdin_fd)
         streams_to_close.append(stdin_stream)
-        streams = (stdin_stream, stdout_stream, stderr_stream)
-        overflow, stdout, stderr, errors, threads = _capture_threads(
+        capture = _prepare_capture(
             stdout_stream,
             stderr_stream,
             stdin_stream,
@@ -532,6 +656,7 @@ def _run_windows_job(
             max_stdout_bytes=max_stdout_bytes,
             max_stderr_bytes=max_stderr_bytes,
         )
+        _start_capture(capture)
         cleanup_reserve = min(0.05, timeout / 3)
         execution_deadline = deadline - cleanup_reserve
         category: str | None = None
@@ -539,7 +664,7 @@ def _run_windows_job(
             if cancel_event is not None and cancel_event.is_set():
                 category = "cancelled"
                 break
-            if overflow.is_set():
+            if capture.overflow.is_set():
                 category = "output_too_large"
                 break
             accounting = BASIC_ACCOUNTING()
@@ -551,7 +676,7 @@ def _run_windows_job(
                 break
             main_done = kernel32.WaitForSingleObject(wintypes.HANDLE(process_handle), 0) == 0
             if main_done and accounting.ActiveProcesses == 0 and all(
-                not thread.is_alive() for thread in threads
+                not thread.is_alive() for thread in capture.started
             ):
                 break
             if monotonic() >= execution_deadline:
@@ -559,41 +684,36 @@ def _run_windows_job(
                 break
             sleep(0.005)
 
-        if category is not None:
-            if not kernel32.TerminateJobObject(wintypes.HANDLE(job_handle), 1):
-                category = "process_cleanup_failed"
         cleanup_deadline = (
             min(deadline, monotonic() + 0.15)
             if category in {"cancelled", "output_too_large"}
             else deadline
         )
-        active_processes = 1
-        while monotonic() < cleanup_deadline:
-            accounting = BASIC_ACCOUNTING()
-            if not kernel32.QueryInformationJobObject(
-                wintypes.HANDLE(job_handle), 1, ctypes.byref(accounting),
-                ctypes.sizeof(accounting), None
-            ):
+        if category is not None:
+            if not cleanup_after_created_process(until=cleanup_deadline):
                 category = "process_cleanup_failed"
-                break
-            active_processes = int(accounting.ActiveProcesses)
-            if active_processes == 0:
-                break
-            sleep(0.002)
-        if active_processes != 0:
-            category = "process_cleanup_failed"
-        clean_threads = _finish_threads(threads, streams, deadline=cleanup_deadline)
-        streams = None
+        else:
+            capture.stop.set()
+            if not _finish_capture(capture, deadline=cleanup_deadline):
+                category = "process_cleanup_failed"
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(wintypes.HANDLE(process_handle), ctypes.byref(exit_code)):
             category = "process_cleanup_failed"
-        if not clean_threads or errors:
+        if capture.errors:
             category = "process_cleanup_failed"
         if category is not None:
             raise BoundedProcessError(category)
         return subprocess.CompletedProcess(
-            list(argv), int(exit_code.value), bytes(stdout), bytes(stderr)
+            list(argv), int(exit_code.value), bytes(capture.stdout), bytes(capture.stderr)
         )
+    except BoundedProcessError:
+        raise
+    except BaseException as error:
+        if process_handle is not None:
+            cleanup_deadline = min(deadline, monotonic() + 0.15)
+            cleanup_after_created_process(until=cleanup_deadline)
+            raise BoundedProcessError("process_cleanup_failed") from error
+        raise
     finally:
         if attribute_list_initialized:
             try:

@@ -105,6 +105,7 @@ def _run_bounded_process(
     input_bytes: bytes = b"",
     cancel_event: Event | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    failure_category: str | None = None
     try:
         return run_bounded_process(
             argv,
@@ -118,7 +119,10 @@ def _run_bounded_process(
             cancel_event=cancel_event,
         )
     except BoundedProcessError as error:
-        raise XhsCliReadError(error.category) from error
+        failure_category = error.category
+    if failure_category is None:
+        raise RuntimeError("bounded process failed without a safe category")
+    raise XhsCliReadError(failure_category) from None
 
 
 def decode_bounded_json(

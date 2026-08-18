@@ -9,13 +9,11 @@ workbench.
 from __future__ import annotations
 
 import hashlib
-import importlib
-import importlib.util
 import json
 import re
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import CodeType, ModuleType
 from typing import Any
 
 
@@ -25,33 +23,124 @@ PINNED_SOURCE_SHA256 = {
     "auth.py": "771c8fa87f5776261735c3bac4c827d4d0b9b419d0d935588c7cba8a64dca6a2",
     "cli.py": "f40dd3fd431e72ec0afc412705bf00b4aadc244738db528204635df9d0801fb7",
     "client.py": "7c87b97568ff512a2b0f45fc9b74687a3f627b034b768fdd0bffbf60da9147bf",
+    "exceptions.py": "6de0dca064444f6cb55c8f6186eec57d210be5bd97d763e039f7807e0d2859be",
 }
+_PINNED_EXECUTION_ORDER = (
+    "__init__.py",
+    "exceptions.py",
+    "auth.py",
+    "client.py",
+    "cli.py",
+)
+_MAX_SOURCE_BYTES = 2 * 1024 * 1024
 _MAX_STDIN_BYTES = 1024 * 1024
 _COOKIE_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _REQUIRED_COOKIES = frozenset({"a1", "web_session"})
 
 
-def _normalized_source_digest(path: Path) -> str:
-    encoded = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _verify_pinned_package() -> None:
-    spec = importlib.util.find_spec("xhs_cli")
-    if spec is None or not spec.submodule_search_locations:
-        raise RuntimeError("pinned_package_unavailable")
-    roots = tuple(Path(location) for location in spec.submodule_search_locations)
-    if len(roots) != 1:
-        raise RuntimeError("pinned_source_mismatch")
-    root = roots[0]
-    for name, expected in PINNED_SOURCE_SHA256.items():
-        path = root / name
+def _locate_pinned_source_root() -> Path:
+    """Find one filesystem package without consulting Python import loaders."""
+    candidates: list[Path] = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        candidate = Path(entry) / "xhs_cli"
         try:
-            actual = _normalized_source_digest(path)
+            if candidate.is_dir():
+                candidates.append(candidate)
+        except OSError:
+            continue
+    if not candidates:
+        raise RuntimeError("pinned_package_unavailable")
+    if len(candidates) != 1:
+        raise RuntimeError("pinned_source_mismatch")
+    return candidates[0]
+
+
+def _module_name(filename: str) -> str:
+    return "xhs_cli" if filename == "__init__.py" else f"xhs_cli.{filename[:-3]}"
+
+
+def _verified_source_bytes(source_root: Path) -> dict[str, bytes]:
+    """Read each allowed source once; the returned bytes are the execution input."""
+    try:
+        source_names = {
+            entry.name
+            for entry in source_root.iterdir()
+            if entry.is_file() and entry.suffix == ".py"
+        }
+    except OSError as error:
+        raise RuntimeError("pinned_source_mismatch") from error
+    if source_names != set(PINNED_SOURCE_SHA256):
+        raise RuntimeError("pinned_source_mismatch")
+
+    sources: dict[str, bytes] = {}
+    for filename in _PINNED_EXECUTION_ORDER:
+        try:
+            with (source_root / filename).open("rb") as stream:
+                encoded = stream.read(_MAX_SOURCE_BYTES + 1)
         except OSError as error:
             raise RuntimeError("pinned_source_mismatch") from error
-        if actual != expected:
+        if len(encoded) > _MAX_SOURCE_BYTES:
             raise RuntimeError("pinned_source_mismatch")
+        normalized = encoded.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        if hashlib.sha256(normalized).hexdigest() != PINNED_SOURCE_SHA256[filename]:
+            raise RuntimeError("pinned_source_mismatch")
+        sources[filename] = normalized
+    return sources
+
+
+def _load_verified_package(source_root: Path) -> dict[str, ModuleType]:
+    """Compile and execute only already-hashed bytes, never source paths or pyc."""
+    sources = _verified_source_bytes(source_root)
+    expected_names = {_module_name(filename) for filename in _PINNED_EXECUTION_ORDER}
+    if any(
+        name == "xhs_cli" or name.startswith("xhs_cli.")
+        for name in sys.modules
+    ):
+        raise RuntimeError("pinned_module_conflict")
+
+    code: dict[str, CodeType] = {}
+    for filename in _PINNED_EXECUTION_ORDER:
+        module_name = _module_name(filename)
+        origin = f"verified-memory:{module_name}"
+        code[module_name] = compile(
+            sources[filename], origin, "exec", dont_inherit=True
+        )
+
+    modules: dict[str, ModuleType] = {}
+    try:
+        for filename in _PINNED_EXECUTION_ORDER:
+            module_name = _module_name(filename)
+            module = ModuleType(module_name)
+            module.__file__ = f"verified-memory:{module_name}"
+            module.__loader__ = None
+            module.__package__ = "xhs_cli" if module_name != "xhs_cli" else "xhs_cli"
+            module.__spec__ = None
+            if module_name == "xhs_cli":
+                module.__path__ = ()
+            modules[module_name] = module
+            sys.modules[module_name] = module
+        for filename in _PINNED_EXECUTION_ORDER:
+            module_name = _module_name(filename)
+            exec(code[module_name], modules[module_name].__dict__)
+        actual_names = {
+            name
+            for name in sys.modules
+            if name == "xhs_cli" or name.startswith("xhs_cli.")
+        }
+        if actual_names != expected_names or any(
+            sys.modules.get(name) is not module
+            or module.__file__ != f"verified-memory:{name}"
+            for name, module in modules.items()
+        ):
+            raise RuntimeError("pinned_module_conflict")
+        return modules
+    except BaseException:
+        for name, module in modules.items():
+            if sys.modules.get(name) is module:
+                del sys.modules[name]
+        raise
 
 
 def _read_cookies() -> dict[str, str]:
@@ -136,12 +225,12 @@ def main() -> int:
         sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
         command = _validated_cli_args(sys.argv[1:])
         cookies = _read_cookies()
-        _verify_pinned_package()
-        package = importlib.import_module("xhs_cli")
+        modules = _load_verified_package(_locate_pinned_source_root())
+        package = modules["xhs_cli"]
         if getattr(package, "__version__", None) != PINNED_XHS_CLI_VERSION:
             raise RuntimeError("pinned_source_mismatch")
-        auth_module = importlib.import_module("xhs_cli.auth")
-        cli_module = importlib.import_module("xhs_cli.cli")
+        auth_module = modules["xhs_cli.auth"]
+        cli_module = modules["xhs_cli.cli"]
         _install_readonly_boundary(cli_module, auth_module, cookies)
         cli_module.cli.main(args=command, prog_name="xhs", standalone_mode=True)
         return 0
@@ -153,6 +242,7 @@ def main() -> int:
             "command_not_allowed",
             "pinned_package_unavailable",
             "pinned_source_mismatch",
+            "pinned_module_conflict",
             "prepared_state_invalid",
             "readonly boundary disabled",
         }:

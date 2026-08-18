@@ -393,7 +393,7 @@ def test_runner_setup_failure_does_not_leak_converted_pipe_handles(
     monkeypatch.setattr(msvcrt, "open_osfhandle", fail_every_second_conversion)
     before = handle_count()
     for _ in range(6):
-        with pytest.raises(OSError, match="controlled fd conversion failure"):
+        with pytest.raises(cli_module.XhsCliReadError) as captured:
             cli_module._run_bounded_process(
                 [sys.executable, "-c", "import time; time.sleep(2)"],
                 shell=False,
@@ -404,6 +404,7 @@ def test_runner_setup_failure_does_not_leak_converted_pipe_handles(
                 max_stderr_bytes=4096,
                 input_bytes=b"",
             )
+        assert captured.value.category == "process_cleanup_failed"
     after = handle_count()
 
     assert after <= before + 2
