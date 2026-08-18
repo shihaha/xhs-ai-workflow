@@ -1,9 +1,11 @@
+import re
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.db import (
     Database,
@@ -26,9 +28,15 @@ from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 
 MIGRATION = "xhs_account_note_evidence_v1"
 IDENTITY_MIGRATION = "xhs_account_note_identity_v2"
+CANONICAL_ID_MIGRATION = "xhs_account_note_canonical_id_v3"
 
 
-def _insert_trusted_note(database: Database, *, note_id: str) -> int:
+def _insert_trusted_note(
+    database: Database,
+    *,
+    note_id: str,
+    row_id: int | None = None,
+) -> int:
     now = datetime.now(UTC).replace(tzinfo=None)
     profile_raw = {"profile": {"user_id": "u1"}}
     note_raw = {"row": {"note_id": note_id, "user_id": "u1"}}
@@ -69,6 +77,7 @@ def _insert_trusted_note(database: Database, *, note_id: str) -> int:
         profile.collection_artifact_id = artifact.id
         profile.collected_at = now
         note = XhsAccountNoteRecord(
+            id=row_id,
             note_id=note_id,
             user_id="u1",
             source_url=f"https://www.xiaohongshu.com/explore/{note_id}",
@@ -142,6 +151,10 @@ def _downgrade_note_identity_to_v1(path: Path, *, keep_marker: bool) -> None:
             "DELETE FROM sqlite_sequence WHERE name IN "
             "('xhs_account_notes', 'xhs_account_notes_v2')"
         )
+        connection.execute(
+            "DELETE FROM workbench_schema_migrations WHERE name=?",
+            (CANONICAL_ID_MIGRATION,),
+        )
         if not keep_marker:
             connection.execute(
                 "DELETE FROM workbench_schema_migrations WHERE name=?",
@@ -165,8 +178,8 @@ def _identity_disk_state(path: Path) -> tuple[object, ...]:
             ).fetchone()[0],
             connection.execute(
                 "SELECT name, applied_at FROM workbench_schema_migrations "
-                "WHERE name=?",
-                (IDENTITY_MIGRATION,),
+                "WHERE name IN (?, ?) ORDER BY name",
+                (IDENTITY_MIGRATION, CANONICAL_ID_MIGRATION),
             ).fetchall(),
             connection.execute(
                 "SELECT * FROM xhs_account_notes ORDER BY id"
@@ -180,9 +193,45 @@ def _identity_disk_state(path: Path) -> tuple[object, ...]:
             ).fetchall(),
             connection.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type='table' "
-                "AND name='xhs_account_notes_identity_v1'"
+                "AND name LIKE 'xhs_account_notes_%' ORDER BY name"
             ).fetchall(),
         )
+
+
+def _downgrade_canonical_note_ids_to_v2(
+    path: Path,
+    *,
+    keep_marker: bool,
+) -> None:
+    with sqlite3.connect(path) as connection:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='xhs_account_notes'"
+        ).fetchone()[0]
+        downgraded_sql = re.sub(
+            r",\s*CONSTRAINT\s+ck_xhs_note_canonical_id\s+"
+            r"CHECK\s*\(id\s+BETWEEN\s+1\s+AND\s+9223372036854775807\)",
+            "",
+            table_sql,
+            flags=re.IGNORECASE,
+        )
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='table' "
+            "AND name='xhs_account_notes'",
+            (downgraded_sql,),
+        )
+        connection.execute("PRAGMA writable_schema=OFF")
+        connection.execute(
+            "DELETE FROM workbench_schema_migrations WHERE name=?",
+            (CANONICAL_ID_MIGRATION,),
+        )
+        if keep_marker:
+            connection.execute(
+                "INSERT INTO workbench_schema_migrations(name, applied_at) "
+                "VALUES (?, CURRENT_TIMESTAMP)",
+                (CANONICAL_ID_MIGRATION,),
+            )
 
 
 def _foreign_key(
@@ -319,8 +368,8 @@ def test_marker_absent_repairs_only_an_empty_half_migration(tmp_path: Path) -> N
 
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "DELETE FROM workbench_schema_migrations WHERE name IN (?, ?)",
-            (MIGRATION, IDENTITY_MIGRATION),
+            "DELETE FROM workbench_schema_migrations WHERE name IN (?, ?, ?)",
+            (MIGRATION, IDENTITY_MIGRATION, CANONICAL_ID_MIGRATION),
         )
         connection.execute("DROP TABLE xhs_account_notes")
 
@@ -347,8 +396,8 @@ def test_marker_absent_populated_weakened_schema_requires_manual_migration(
 
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "DELETE FROM workbench_schema_migrations WHERE name IN (?, ?)",
-            (MIGRATION, IDENTITY_MIGRATION),
+            "DELETE FROM workbench_schema_migrations WHERE name IN (?, ?, ?)",
+            (MIGRATION, IDENTITY_MIGRATION, CANONICAL_ID_MIGRATION),
         )
         connection.executescript(
             """
@@ -703,3 +752,176 @@ def test_identity_half_migration_with_new_ddl_and_old_table_fails_every_restart(
         with pytest.raises(SchemaMigrationError, match="Interrupted"):
             Database(path)
         assert _identity_disk_state(path) == before
+
+
+def test_fresh_schema_has_canonical_note_id_check_and_v3_marker(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "fresh-canonical-id.sqlite3")
+    try:
+        checks = {
+            item.get("name"): "".join(str(item.get("sqltext") or "").split()).lower()
+            for item in inspect(database.engine).get_check_constraints(
+                "xhs_account_notes"
+            )
+        }
+        assert checks["ck_xhs_note_canonical_id"] == (
+            "idbetween1and9223372036854775807"
+        )
+        with database.engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM workbench_schema_migrations "
+                    "WHERE name=:name"
+                ),
+                {"name": CANONICAL_ID_MIGRATION},
+            ) == 1
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("row_id", [0, -1])
+def test_fresh_schema_rejects_explicit_noncanonical_note_id(
+    tmp_path: Path,
+    row_id: int,
+) -> None:
+    database = Database(tmp_path / f"fresh-invalid-{row_id}.sqlite3")
+    try:
+        with pytest.raises(IntegrityError):
+            _insert_trusted_note(database, note_id=f"invalid-{row_id}", row_id=row_id)
+    finally:
+        database.close()
+
+
+def test_canonical_id_marker_present_is_validation_only(tmp_path: Path) -> None:
+    path = tmp_path / "canonical-marker-tamper.sqlite3"
+    database = Database(path)
+    database.close()
+    _downgrade_canonical_note_ids_to_v2(path, keep_marker=True)
+    before = _identity_disk_state(path)
+
+    with pytest.raises(SchemaMigrationError, match="canonical id"):
+        Database(path)
+
+    assert _identity_disk_state(path) == before
+
+
+@pytest.mark.parametrize("row_ids", [(0,), (-1, 2)], ids=["zero", "mixed-negative"])
+def test_canonical_id_preflight_rejects_populated_noncanonical_v2_without_writes(
+    tmp_path: Path,
+    row_ids: tuple[int, ...],
+) -> None:
+    path = tmp_path / "canonical-invalid-v2.sqlite3"
+    database = Database(path)
+    canonical_ids: list[int] = []
+    for index, _row_id in enumerate(row_ids):
+        canonical_ids.append(
+            _insert_trusted_note(
+                database,
+                note_id=f"legacy-{index}",
+            )
+        )
+    database.close()
+    _downgrade_canonical_note_ids_to_v2(path, keep_marker=False)
+    with sqlite3.connect(path) as connection:
+        for canonical_id, row_id in zip(canonical_ids, row_ids, strict=True):
+            connection.execute(
+                "UPDATE xhs_account_notes SET id=? WHERE id=?",
+                (row_id, canonical_id),
+            )
+    before = _identity_disk_state(path)
+
+    with pytest.raises(SchemaMigrationError, match="canonical id"):
+        Database(path)
+
+    assert _identity_disk_state(path) == before
+
+
+def test_canonical_id_migration_preserves_rows_and_sequence_high_water(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "canonical-v2-migration.sqlite3"
+    database = Database(path)
+    first_id = _insert_trusted_note(database, note_id="preserved")
+    database.close()
+    _downgrade_canonical_note_ids_to_v2(path, keep_marker=False)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE sqlite_sequence SET seq=41 WHERE name='xhs_account_notes'"
+        )
+
+    migrated = Database(path)
+    try:
+        with migrated.engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT id, note_id FROM xhs_account_notes ORDER BY id")
+            ).all() == [(first_id, "preserved")]
+            assert connection.scalar(
+                text(
+                    "SELECT seq FROM sqlite_sequence "
+                    "WHERE name='xhs_account_notes'"
+                )
+            ) == 41
+            assert connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM workbench_schema_migrations "
+                    "WHERE name=:name"
+                ),
+                {"name": CANONICAL_ID_MIGRATION},
+            ) == 1
+            checks = {
+                item.get("name")
+                for item in inspect(connection).get_check_constraints(
+                    "xhs_account_notes"
+                )
+            }
+            assert "ck_xhs_note_canonical_id" in checks
+    finally:
+        migrated.close()
+
+
+def test_canonical_id_half_migration_fails_every_restart_without_changes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "canonical-half-restart.sqlite3"
+    database = Database(path)
+    _insert_trusted_note(database, note_id="preserved")
+    database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DELETE FROM workbench_schema_migrations WHERE name=?",
+            (CANONICAL_ID_MIGRATION,),
+        )
+        connection.execute(
+            "CREATE TABLE xhs_account_notes_canonical_id_v2 "
+            "(sentinel TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO xhs_account_notes_canonical_id_v2(sentinel) "
+            "VALUES ('old')"
+        )
+    before = _identity_disk_state(path)
+
+    for _attempt in range(2):
+        with pytest.raises(SchemaMigrationError, match="Interrupted"):
+            Database(path)
+        assert _identity_disk_state(path) == before
+
+
+def test_canonical_id_marker_rejects_leftover_half_migration_table(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "canonical-marker-half.sqlite3"
+    database = Database(path)
+    database.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE xhs_account_notes_canonical_id_v2 "
+            "(sentinel TEXT NOT NULL)"
+        )
+    before = _identity_disk_state(path)
+
+    with pytest.raises(SchemaMigrationError, match="canonical id"):
+        Database(path)
+
+    assert _identity_disk_state(path) == before

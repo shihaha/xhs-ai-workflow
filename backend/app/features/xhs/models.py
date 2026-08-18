@@ -56,6 +56,10 @@ class XhsAccountNoteRecord(Base):
     __tablename__ = "xhs_account_notes"
     __table_args__ = (
         UniqueConstraint("note_id", "user_id", name="uq_xhs_note_account_identity"),
+        CheckConstraint(
+            "id BETWEEN 1 AND 9223372036854775807",
+            name="ck_xhs_note_canonical_id",
+        ),
         CheckConstraint("length(note_id) BETWEEN 1 AND 500", name="ck_xhs_note_id"),
         CheckConstraint(_SOURCE_URL_CHECK, name="ck_xhs_note_source_url"),
         CheckConstraint(_RAW_DIGEST_CHECK, name="ck_xhs_note_raw_digest"),

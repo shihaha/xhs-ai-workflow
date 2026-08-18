@@ -565,6 +565,34 @@ def test_concurrent_recollection_cannot_rebind_an_inflight_analysis_citation(
     ]
 
 
+@pytest.mark.parametrize("poison_id", [0, -1])
+def test_noncanonical_persisted_note_id_is_never_discovered_or_used(
+    tmp_path: Path,
+    poison_id: int,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    _, note_row_id = fixture.collect("u1")
+    with fixture.database.engine.begin() as connection:
+        connection.execute(text("PRAGMA ignore_check_constraints=ON"))
+        connection.execute(
+            text("UPDATE xhs_account_notes SET id=:poison_id WHERE id=:note_id"),
+            {"poison_id": poison_id, "note_id": note_row_id},
+        )
+    model = _ModelSpy()
+    service = fixture.analysis(model)
+    payload = AnalysisCreate.model_construct(
+        analysis_type="account_report",
+        account_user_id="u1",
+        account_user_ids=[],
+        evidence_ids=[f"account-note:{poison_id}"],
+    )
+
+    assert service.list_evidence(account_user_id="u1") == []
+    with pytest.raises(EvidenceNotFound):
+        service.create(payload)
+    assert model.calls == []
+
+
 @pytest.mark.parametrize("evidence_id", ["account-note:0", "account-note:01", "account-note:+1"])
 def test_account_note_ids_must_be_canonical_sqlite_identities(evidence_id: str) -> None:
     with pytest.raises(ValidationError):

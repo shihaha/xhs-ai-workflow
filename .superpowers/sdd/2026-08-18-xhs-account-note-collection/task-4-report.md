@@ -264,3 +264,76 @@ backend/tests` and `git diff --check` exited 0.
 - Provider-neutral analysis behavior, note trust-chain checks, the exact shop N/N
   opportunity gate, Task 5, Bailian media, platform writes and untracked research
   remain unchanged. The authenticated live boundary remains `not_run`.
+
+## Fix round 3/5 — canonical physical note-row IDs
+
+### Review finding closed
+
+- Fresh `xhs_account_notes` tables now enforce the named physical constraint
+  `ck_xhs_note_canonical_id: id BETWEEN 1 AND 9223372036854775807` while retaining
+  `INTEGER PRIMARY KEY AUTOINCREMENT`.
+- An independent `xhs_account_note_canonical_id_v3` marker controls the upgrade.
+  Marker-present startup is validation-only and rejects a missing/weakened CHECK,
+  poisoned rows, or a leftover migration table without repair.
+- Marker-absent startup performs every row, v2 identity, history, sequence and
+  half-migration check before rebuilding. Canonical legacy rows retain their exact
+  IDs, and the previous `sqlite_sequence` high-water mark is restored after the
+  CHECK-bearing rebuild. Populated v2 tables containing ID `0` or mixed `-1, 2`
+  fail closed with DDL, marker, rows and sequence unchanged.
+- Discovery skips any noncanonical persisted note row even if check enforcement is
+  bypassed after startup. Evidence resolution uses a bounded canonical SQLite-ID
+  parser before every database lookup, and trusted-note verification independently
+  rejects a noncanonical ORM row. `account-note:0` and `account-note:-1` therefore
+  never reach the model, including through a deliberately unvalidated internal
+  request object.
+- The older v1 evidence validator accepts only its original exact CHECK set or that
+  set plus the exact named v3 CHECK. This preserves v1/v2 migration compatibility
+  without allowing arbitrary extra constraints to satisfy v3.
+
+### Fix-round RED evidence
+
+Before production changes, the selected fresh/marker/preflight/migration/analysis
+regressions produced:
+
+```text
+10 failed, 50 deselected
+```
+
+They demonstrated missing fresh CHECK/marker, successful explicit inserts at ID
+`0` and `-1`, marker-present old DDL being accepted, populated noncanonical v2
+data being certified, no v3 upgrade/sequence-preservation path, a leftover half
+migration being ignored, and discovery exposing trusted `account-note:0/-1` rows.
+
+A self-review regression for a present v3 marker plus a leftover half-migration
+table then produced an independent `1 failed`; strict marker validation initially
+verified only the main table and missed the stale migration table.
+
+### Fix-round GREEN evidence
+
+```text
+python -m pytest backend/tests/xhs/test_schema_migration.py backend/tests/analysis/test_account_note_grounding.py -q
+61 passed in 9.96s
+
+python -m pytest backend/tests/analysis backend/tests/xhs -q
+399 passed, 1 skipped in 22.53s
+
+python -m pytest backend/tests -q
+991 passed, 1 skipped, 32 warnings in 109.24s
+```
+
+The skip remains the explicit opt-in live gate. The warnings remain the existing
+Python 3.12 SQLite datetime-adapter deprecations in content tests.
+`python -m compileall -q backend/app backend/tests` and `git diff --check` exited
+0 after the final changes.
+
+### Fix-round self-review and boundary
+
+- v3 never assumes SQLite DDL rollback. Known data, history, sequence, physical
+  schema and half-migration failures are rejected during read-only preflight.
+- A valid sequence higher than all current rows and persisted citations is retained,
+  preventing a CHECK-only rebuild from lowering the permanent identity floor.
+- The physical CHECK is the primary invariant; discovery, request parsing and
+  trusted-note resolution are defense-in-depth for post-startup tampering.
+- Provider-neutral analysis, the full note/artifact ownership chain, exact shop N/N
+  opportunity gating, Task 5, Bailian media and untracked research remain unchanged.
+  The authenticated live boundary remains `not_run`.

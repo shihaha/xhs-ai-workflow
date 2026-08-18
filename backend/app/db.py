@@ -179,6 +179,9 @@ class Database:
         xhs_account_note_identity_marker_present = self._migration_marker_exists(
             "xhs_account_note_identity_v2"
         )
+        xhs_account_note_canonical_id_marker_present = self._migration_marker_exists(
+            "xhs_account_note_canonical_id_v3"
+        )
         quarantine_marker_present = self._migration_marker_exists(
             "task8_artifact_quarantine_v1"
         )
@@ -207,6 +210,8 @@ class Database:
             self._require_xhs_account_note_evidence_schema()
         if xhs_account_note_identity_marker_present:
             self._require_xhs_account_note_identity_schema()
+        if xhs_account_note_canonical_id_marker_present:
+            self._require_xhs_account_note_canonical_id_schema()
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
@@ -236,6 +241,9 @@ class Database:
         )
         self._migrate_xhs_account_note_identity(
             marker_present=xhs_account_note_identity_marker_present
+        )
+        self._migrate_xhs_account_note_canonical_ids(
+            marker_present=xhs_account_note_canonical_id_marker_present
         )
         self._recover_stranded_content_regenerations()
 
@@ -310,6 +318,13 @@ class Database:
             if not _xhs_account_note_identity_schema_valid(connection):
                 raise SchemaMigrationError(
                     "XHS account note identity schema validation failed."
+                )
+
+    def _require_xhs_account_note_canonical_id_schema(self) -> None:
+        with self.engine.connect() as connection:
+            if not _xhs_account_note_canonical_id_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "XHS account note canonical id schema validation failed."
                 )
 
     def _migrate_xhs_account_note_evidence(self, *, marker_present: bool) -> None:
@@ -402,6 +417,53 @@ class Database:
                 "VALUES ('xhs_account_note_identity_v2', CURRENT_TIMESTAMP)"
             ))
         self._require_xhs_account_note_identity_schema()
+
+    def _migrate_xhs_account_note_canonical_ids(
+        self,
+        *,
+        marker_present: bool,
+    ) -> None:
+        """Add a physical positive-rowid check without repairing poisoned rows."""
+        from backend.app.features.xhs.models import XhsAccountNoteRecord
+
+        if marker_present:
+            self._require_xhs_account_note_canonical_id_schema()
+            return
+        with self.engine.connect() as connection:
+            sequence = _require_xhs_account_note_canonical_id_preconditions(connection)
+        with self.engine.begin() as connection:
+            sequence = max(
+                sequence,
+                _require_xhs_account_note_canonical_id_preconditions(connection),
+            )
+            if connection.scalar(text(
+                "SELECT 1 FROM workbench_schema_migrations "
+                "WHERE name='xhs_account_note_canonical_id_v3'"
+            )) is not None:
+                if not _xhs_account_note_canonical_id_schema_valid(connection):
+                    raise SchemaMigrationError(
+                        "XHS account note canonical id schema validation failed."
+                    )
+                return
+            if not _xhs_account_note_canonical_id_check_valid(connection):
+                _rebuild_xhs_account_notes_with_permanent_ids(
+                    connection,
+                    XhsAccountNoteRecord,
+                    temporary_table="xhs_account_notes_canonical_id_v2",
+                )
+            _advance_xhs_account_note_identity_sequence(
+                connection,
+                minimum=sequence,
+            )
+            if not _xhs_account_note_canonical_id_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "XHS account note canonical id schema validation failed."
+                )
+            connection.execute(text(
+                "INSERT INTO workbench_schema_migrations(name, applied_at) "
+                "VALUES ('xhs_account_note_canonical_id_v3', CURRENT_TIMESTAMP)"
+            ))
+        self._require_xhs_account_note_canonical_id_schema()
 
     def _migrate_content_schema(self) -> None:
         inspector = inspect(self.engine)
@@ -1400,6 +1462,7 @@ _ACCOUNT_NOTE_EVIDENCE_PREFIX = "account-note:"
 _ACCOUNT_NOTE_EVIDENCE_ID = re.compile(r"^account-note:([1-9][0-9]*)$", re.ASCII)
 _SQLITE_MAX_ROW_ID = 9_223_372_036_854_775_807
 _SQLITE_MAX_ROW_ID_TEXT = str(_SQLITE_MAX_ROW_ID)
+_XHS_CANONICAL_NOTE_ID_CHECK = "idbetween1and9223372036854775807"
 
 
 def _sqlite_schema_tokens(value: object) -> list[tuple[str, str]] | None:
@@ -1656,10 +1719,103 @@ def _require_xhs_account_note_identity_preconditions(
         ) from None
 
 
-def _advance_xhs_account_note_identity_sequence(connection: Connection) -> None:
+def _xhs_account_note_canonical_id_check_valid(connection: Connection) -> bool:
+    try:
+        checks = {
+            item.get("name"): _compact_sql(item.get("sqltext"))
+            for item in inspect(connection).get_check_constraints(
+                "xhs_account_notes"
+            )
+        }
+        return (
+            checks.get("ck_xhs_note_canonical_id")
+            == _XHS_CANONICAL_NOTE_ID_CHECK
+        )
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+
+
+def _xhs_account_note_rows_have_canonical_ids(connection: Connection) -> bool:
+    try:
+        return connection.scalar(text(
+            "SELECT COUNT(*) FROM xhs_account_notes "
+            "WHERE typeof(id) != 'integer' OR id < 1 "
+            "OR id > 9223372036854775807"
+        )) == 0
+    except SQLAlchemyError:
+        return False
+
+
+def _xhs_account_note_canonical_id_schema_valid(connection: Connection) -> bool:
+    try:
+        return (
+            _xhs_account_note_identity_schema_valid(connection)
+            and _xhs_account_note_canonical_id_check_valid(connection)
+            and _xhs_account_note_rows_have_canonical_ids(connection)
+            and "xhs_account_notes_canonical_id_v2"
+            not in inspect(connection).get_table_names()
+        )
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+
+
+def _require_xhs_account_note_canonical_id_preconditions(
+    connection: Connection,
+) -> int:
+    temporary_table = "xhs_account_notes_canonical_id_v2"
+    try:
+        if temporary_table in inspect(connection).get_table_names():
+            raise SchemaMigrationError(
+                "Interrupted XHS account note canonical id migration requires "
+                "isolated manual migration."
+            )
+        if not _xhs_account_note_rows_have_canonical_ids(connection):
+            raise SchemaMigrationError(
+                "XHS account note canonical id data is invalid."
+            )
+        if not _xhs_account_note_identity_schema_valid(connection):
+            raise SchemaMigrationError(
+                "XHS account note canonical id requires a valid identity schema."
+            )
+        rows = connection.execute(text(
+            "SELECT seq FROM sqlite_sequence WHERE name='xhs_account_notes'"
+        )).all()
+        if len(rows) != 1:
+            raise SchemaMigrationError(
+                "XHS account note canonical id sequence is invalid."
+            )
+        sequence = rows[0][0]
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or not 0 <= sequence <= _SQLITE_MAX_ROW_ID
+        ):
+            raise SchemaMigrationError(
+                "XHS account note canonical id sequence is invalid."
+            )
+        return sequence
+    except SchemaMigrationError:
+        raise
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError, OverflowError):
+        raise SchemaMigrationError(
+            "XHS account note canonical id preflight failed."
+        ) from None
+
+
+def _advance_xhs_account_note_identity_sequence(
+    connection: Connection,
+    *,
+    minimum: int = 0,
+) -> None:
     if not _xhs_account_note_autoincrement_ddl_valid(connection):
         raise SchemaMigrationError("XHS account note identity DDL is invalid.")
-    floor = _xhs_account_note_reference_floor(connection)
+    if (
+        isinstance(minimum, bool)
+        or not isinstance(minimum, int)
+        or not 0 <= minimum <= _SQLITE_MAX_ROW_ID
+    ):
+        raise SchemaMigrationError("XHS account note identity sequence is invalid.")
+    floor = max(_xhs_account_note_reference_floor(connection), minimum)
     rows = connection.execute(text(
         "SELECT rowid, seq FROM sqlite_sequence WHERE name='xhs_account_notes'"
     )).all()
@@ -1714,9 +1870,11 @@ def _xhs_account_note_identity_schema_valid(connection: Connection) -> bool:
 
 
 def _rebuild_xhs_account_notes_with_permanent_ids(
-    connection: Connection, note_record: object
+    connection: Connection,
+    note_record: object,
+    *,
+    temporary_table: str = "xhs_account_notes_identity_v1",
 ) -> None:
-    temporary_table = "xhs_account_notes_identity_v1"
     if temporary_table in inspect(connection).get_table_names():
         raise SchemaMigrationError(
             "Interrupted XHS account note identity migration requires isolated manual migration."
@@ -1851,7 +2009,15 @@ def _xhs_account_note_evidence_schema_valid(
                 item.get("name"): _compact_sql(item.get("sqltext"))
                 for item in inspector.get_check_constraints(table)
             }
-            if checks != expected_checks[table]:
+            allowed_checks = [expected_checks[table]]
+            if table == "xhs_account_notes":
+                allowed_checks.append(
+                    {
+                        **expected_checks[table],
+                        "ck_xhs_note_canonical_id": _XHS_CANONICAL_NOTE_ID_CHECK,
+                    }
+                )
+            if checks not in allowed_checks:
                 return False
             foreign_keys = {
                 (

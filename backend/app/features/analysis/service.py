@@ -46,6 +46,7 @@ from backend.app.models.jobs import JobState
 PROMPT_VERSION = "tutorial-demand-radar-grounded-v1"
 MAX_TRUSTED_RESULT_BYTES = 5 * 1024 * 1024
 MAX_TRUSTED_ACCOUNT_RESULT_BYTES = 20 * 1024 * 1024
+MAX_SQLITE_ID = 9_223_372_036_854_775_807
 XHS_RAW_TRUST_ANCHOR_KINDS = frozenset(
     {ACCOUNT_COLLECTION_ARTIFACT_KIND, "xhs_note_search_raw"}
 )
@@ -272,6 +273,8 @@ class AnalysisService:
                 account_note_query.order_by(XhsAccountNoteRecord.id)
             ).all()
             for note in account_notes:
+                if not _canonical_sqlite_identity(note.id):
+                    continue
                 trusted = self._trusted_account_note(session, note)
                 rows.append(
                     AnalysisEvidenceRead(
@@ -322,13 +325,14 @@ class AnalysisService:
         with self.database.session() as session:
             for evidence_id in payload.evidence_ids:
                 prefix, separator, raw_id = evidence_id.partition(":")
-                if not separator or not raw_id.isdigit():
+                identity = _parse_sqlite_identity(raw_id) if separator else None
+                if identity is None:
                     raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
                 if prefix == "artifact":
                     artifact = session.scalar(
                         select(JobArtifactRecord)
                         .options(selectinload(JobArtifactRecord.job))
-                        .where(JobArtifactRecord.id == int(raw_id))
+                        .where(JobArtifactRecord.id == identity)
                     )
                     if artifact is None:
                         raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
@@ -354,7 +358,7 @@ class AnalysisService:
                         }
                     )
                 elif prefix == "rank-item":
-                    item = session.get(RankItemRecord, int(raw_id))
+                    item = session.get(RankItemRecord, identity)
                     if item is None:
                         raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
                     if (
@@ -383,7 +387,7 @@ class AnalysisService:
                         }
                     )
                 elif prefix == "account-note":
-                    note = session.get(XhsAccountNoteRecord, int(raw_id))
+                    note = session.get(XhsAccountNoteRecord, identity)
                     if note is None:
                         raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
                     if note.user_id not in account_scope:
@@ -403,6 +407,8 @@ class AnalysisService:
     def _trusted_account_note(
         self, session: Any, note: XhsAccountNoteRecord
     ) -> dict[str, Any] | None:
+        if not _canonical_sqlite_identity(note.id):
+            return None
         profile = session.get(XhsAccountProfileRecord, note.user_id)
         artifact = session.get(JobArtifactRecord, note.collection_artifact_id)
         if profile is None or artifact is None:
@@ -624,6 +630,23 @@ def _safe_job_state(value: object) -> JobState | None:
         return JobState(value)
     except (ValueError, TypeError):
         return None
+
+
+def _canonical_sqlite_identity(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and 1 <= value <= MAX_SQLITE_ID
+    )
+
+
+def _parse_sqlite_identity(value: str) -> int | None:
+    if re.fullmatch(r"[1-9][0-9]*", value, re.ASCII) is None:
+        return None
+    if len(value) > 19 or (len(value) == 19 and value > str(MAX_SQLITE_ID)):
+        return None
+    identity = int(value)
+    return identity if _canonical_sqlite_identity(identity) else None
 
 
 def _exact_account_result(
