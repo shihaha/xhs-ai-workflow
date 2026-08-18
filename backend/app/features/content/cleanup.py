@@ -65,12 +65,18 @@ class ArtifactCleanupCandidate:
     expected_size_bytes: int
     reason: str
     not_before: datetime
+    source_build_token: str | None = None
 
     def __post_init__(self) -> None:
         path_key = canonical_artifact_path_key(self.relative_path)
         if (
             self.owner_type not in {"material", "content_package"}
             or not is_canonical_uuid_text(self.owner_id)
+            or (
+                self.source_build_token is not None
+                if self.owner_type == "material"
+                else not is_canonical_uuid_text(self.source_build_token)
+            )
             or path_key is None
             or len(self.relative_path) > 1000
             or len(self.expected_sha256) != 64
@@ -132,6 +138,7 @@ class ArtifactCleanupService:
             "id": cleanup_id,
             "owner_type": candidate.owner_type,
             "owner_id": candidate.owner_id,
+            "source_build_token": candidate.source_build_token,
             "relative_path": candidate.relative_path,
             "path_key": path_key,
             "expected_sha256": candidate.expected_sha256,
@@ -170,6 +177,7 @@ class ArtifactCleanupService:
             raise RuntimeError("Cleanup enqueue produced no open record.")
         if (
             record.relative_path != candidate.relative_path
+            or record.source_build_token != candidate.source_build_token
             or record.expected_sha256 != candidate.expected_sha256
             or record.expected_size_bytes != candidate.expected_size_bytes
         ):
@@ -922,6 +930,7 @@ class ArtifactCleanupService:
                         ContentPackageRecord.status,
                         ContentPackageRecord.sha256,
                         ContentPackageRecord.size_bytes,
+                        ContentPackageRecord.build_token,
                     )
                     .order_by(ContentPackageRecord.id)
                 )
@@ -984,12 +993,15 @@ class ArtifactCleanupService:
                     and material_size == record.expected_size_bytes
                 ) else "owner_identity_mismatch"
             references.append(("material", material_path, material_sha, material_size))
-        for package_id, package_path, package_status, package_sha, package_size in packages:
+        for (
+            package_id, package_path, package_status, package_sha, package_size,
+            package_build_token,
+        ) in packages:
             package_windows_key = windows_artifact_reference_path_key(package_path)
             exact_failed_owner = (
                 record.owner_type == "content_package"
                 and package_id == record.owner_id
-                and package_status == "failed"
+                and package_build_token == record.source_build_token
                 and package_windows_key is not None
                 and package_windows_key == original_windows_key
                 and package_sha == record.expected_sha256
@@ -998,6 +1010,12 @@ class ArtifactCleanupService:
             if exact_failed_owner:
                 continue
             if record.owner_type == "content_package" and package_id == record.owner_id:
+                if (
+                    package_build_token != record.source_build_token
+                    and package_windows_key != original_windows_key
+                ):
+                    references.append(("package", package_path, package_sha, package_size))
+                    continue
                 if (
                     quarantine_key is None
                     or package_windows_key != quarantine_key
@@ -1153,6 +1171,7 @@ def _read(record: ArtifactCleanupRecord) -> ArtifactCleanupRead:
             "id": record.id,
             "owner_type": record.owner_type,
             "owner_id": record.owner_id,
+            "source_build_token": record.source_build_token,
             "relative_path": record.relative_path,
             "path_key": record.path_key,
             "expected_sha256": record.expected_sha256,

@@ -110,6 +110,7 @@ def _insert_package_reference(
     digest: str,
     size_bytes: int,
     created_at: datetime,
+    build_token: str | None = None,
 ) -> None:
     with database.engine.connect() as connection:
         connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
@@ -119,7 +120,7 @@ def _insert_package_reference(
                 "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
                 "build_token,created_at,error_detail) VALUES "
                 "(:id,:item_id,:revision_id,'failed',:path,:sha256,:size_bytes,"
-                "NULL,:created_at,'different_artifact')"
+                ":build_token,:created_at,'different_artifact')"
             ),
             {
                 "id": package_id,
@@ -129,6 +130,7 @@ def _insert_package_reference(
                 "sha256": digest,
                 "size_bytes": size_bytes,
                 "created_at": created_at.isoformat(sep=" "),
+                "build_token": build_token,
             },
         )
         connection.commit()
@@ -624,6 +626,7 @@ def test_same_package_owner_nonoriginal_future_quarantine_path_is_live(
     original = runtime / "orphaned" / "package.zip"
     original.parent.mkdir(parents=True)
     original.write_bytes(payload)
+    build_token = str(uuid4())
     candidate = ArtifactCleanupCandidate(
         owner_type="content_package",
         owner_id=str(uuid4()),
@@ -632,17 +635,24 @@ def test_same_package_owner_nonoriginal_future_quarantine_path_is_live(
         expected_size_bytes=len(payload),
         reason="failed_package",
         not_before=clock.now(),
+        source_build_token=build_token,
     )
-    record = service.enqueue(candidate)
-    quarantine_path = f"artifacts-quarantine/{record.id}/package.zip"
     _insert_package_reference(
         database,
         package_id=candidate.owner_id,
-        relative_path=quarantine_path.swapcase(),
+        relative_path=candidate.relative_path,
         digest=candidate.expected_sha256,
         size_bytes=candidate.expected_size_bytes,
         created_at=clock.now(),
+        build_token=build_token,
     )
+    record = service.enqueue(candidate)
+    quarantine_path = f"artifacts-quarantine/{record.id}/package.zip"
+    with database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE content_packages SET path=:path WHERE id=:id"),
+            {"path": quarantine_path.swapcase(), "id": candidate.owner_id},
+        )
 
     result = service.process_one(record.id)
 
@@ -661,6 +671,7 @@ def test_exact_failed_package_owner_with_windows_equivalent_original_is_source(
     original = runtime / "content-packages" / "item" / "Caf\u00e9.ZIP"
     original.parent.mkdir(parents=True)
     original.write_bytes(payload)
+    build_token = str(uuid4())
     candidate = ArtifactCleanupCandidate(
         owner_type="content_package",
         owner_id=str(uuid4()),
@@ -669,8 +680,8 @@ def test_exact_failed_package_owner_with_windows_equivalent_original_is_source(
         expected_size_bytes=len(payload),
         reason="failed_package",
         not_before=clock.now(),
+        source_build_token=build_token,
     )
-    record = service.enqueue(candidate)
     _insert_package_reference(
         database,
         package_id=candidate.owner_id,
@@ -678,7 +689,9 @@ def test_exact_failed_package_owner_with_windows_equivalent_original_is_source(
         digest=candidate.expected_sha256,
         size_bytes=candidate.expected_size_bytes,
         created_at=clock.now(),
+        build_token=build_token,
     )
+    record = service.enqueue(candidate)
 
     result = service.process_one(record.id)
 

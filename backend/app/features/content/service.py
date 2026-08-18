@@ -568,8 +568,17 @@ class ContentService:
                     owner_type="content_package", owner_id=package_id,
                     relative_path=old_path, expected_sha256=existing.sha256,
                     expected_size_bytes=existing.size_bytes, reason="package_replaced",
-                    not_before=_now(),
+                    not_before=_now(), source_build_token=existing.build_token,
                 )
+                try:
+                    replaced_cleanup = self.cleanup_service.enqueue_in_session(
+                        session, replaced_candidate
+                    )
+                except IntegrityError as error:
+                    session.rollback()
+                    raise ContentStateError(
+                        "This revision package was concurrently reserved."
+                    ) from error
                 won = session.execute(update(ContentPackageRecord).where(
                     ContentPackageRecord.id == package_id,
                     ContentPackageRecord.content_item_id == item_id,
@@ -582,9 +591,6 @@ class ContentService:
                 )).rowcount
                 if won != 1:
                     raise ContentStateError("This revision package was concurrently reserved.")
-                replaced_cleanup = self.cleanup_service.enqueue_in_session(
-                    session, replaced_candidate
-                )
             else:
                 package_id = str(uuid4())
                 package_path = f"content-packages/{item_id}/{package_id}.zip"
@@ -601,6 +607,7 @@ class ContentService:
                 relative_path=package_path, expected_sha256=archive_sha,
                 expected_size_bytes=archive_size, reason="package_build_reserved",
                 not_before=_now() + timedelta(hours=24),
+                source_build_token=build_token,
             )
             build_cleanup = self.cleanup_service.enqueue_in_session(
                 session, build_candidate
@@ -737,7 +744,7 @@ class ContentService:
                     and package.sha256 == expected_sha256
                     and package.size_bytes == expected_size_bytes
                     and self._cleanup_matches(cleanup, candidate, state="pending")
-                    and cleanup.not_before == _naive_datetime(candidate.not_before)
+                    and cleanup.not_before <= _naive_datetime(candidate.not_before)
                 )
                 if landed and replaced_candidate is not None:
                     landed = bool(
@@ -745,7 +752,7 @@ class ContentService:
                             replaced, replaced_candidate, state="pending"
                         )
                         and replaced.not_before
-                        == _naive_datetime(replaced_candidate.not_before)
+                        <= _naive_datetime(replaced_candidate.not_before)
                     )
                 if landed:
                     return _ReservationOutcome.LANDED
@@ -892,6 +899,7 @@ class ContentService:
             cleanup is not None and cleanup.state == state
             and cleanup.owner_type == candidate.owner_type
             and cleanup.owner_id == candidate.owner_id
+            and cleanup.source_build_token == candidate.source_build_token
             and cleanup.relative_path == candidate.relative_path
             and cleanup.expected_sha256 == candidate.expected_sha256
             and cleanup.expected_size_bytes == candidate.expected_size_bytes

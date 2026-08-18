@@ -153,11 +153,15 @@ class Database:
         quarantine_reference_guard_marker_present = self._migration_marker_exists(
             "task8_artifact_quarantine_reference_guard_v1"
         )
+        quarantine_source_token_marker_present = self._migration_marker_exists(
+            "task8_artifact_quarantine_source_token_v1"
+        )
         if quarantine_marker_present:
             self._require_artifact_quarantine_schema(
-                require_identity=quarantine_identity_marker_present
+                require_identity=quarantine_identity_marker_present,
+                require_source_token=quarantine_source_token_marker_present,
             )
-        if quarantine_reference_guard_marker_present:
+        if quarantine_reference_guard_marker_present and quarantine_source_token_marker_present:
             self._require_artifact_quarantine_reference_guards()
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
@@ -168,6 +172,9 @@ class Database:
         )
         self._migrate_artifact_quarantine_identity(
             marker_present=quarantine_identity_marker_present
+        )
+        self._migrate_artifact_quarantine_source_token(
+            marker_present=quarantine_source_token_marker_present
         )
         self._migrate_artifact_quarantine_reference_guards(
             marker_present=quarantine_reference_guard_marker_present
@@ -186,18 +193,20 @@ class Database:
             ) is not None
 
     def _require_artifact_quarantine_schema(
-        self, *, require_identity: bool = True
+        self, *, require_identity: bool = True, require_source_token: bool = True
     ) -> None:
         with self.engine.connect() as connection:
             if (
                 not _artifact_quarantine_schema_valid(
-                    inspect(connection), require_identity=require_identity
+                    inspect(connection), require_identity=require_identity,
+                    require_source_token=require_source_token,
                 )
                 or not _artifact_quarantine_triggers_valid(
                     connection, require_identity=require_identity
                 )
                 or not _artifact_quarantine_data_valid(
-                    connection, require_identity=require_identity
+                    connection, require_identity=require_identity,
+                    require_source_token=require_source_token,
                 )
             ):
                 raise SchemaMigrationError(
@@ -243,7 +252,9 @@ class Database:
         from backend.app.features.content.models import ArtifactCleanupRecord
 
         if marker_present:
-            self._require_artifact_quarantine_schema(require_identity=False)
+            self._require_artifact_quarantine_schema(
+                require_identity=False, require_source_token=False
+            )
             self._recover_stranded_content_packages()
             return
 
@@ -266,7 +277,7 @@ class Database:
             if "artifact_gc_queue" not in tables:
                 ArtifactCleanupRecord.__table__.create(connection)
             elif not _artifact_quarantine_table_valid(
-                inspect(connection), require_identity=False
+                inspect(connection), require_identity=False, require_source_token=False
             ):
                 row_count = connection.scalar(
                     text("SELECT COUNT(*) FROM artifact_gc_queue")
@@ -283,25 +294,29 @@ class Database:
             inspector = inspect(connection)
             if (
                 not _artifact_quarantine_schema_valid(
-                    inspector, require_identity=False
+                    inspector, require_identity=False, require_source_token=False
                 )
                 or not _artifact_quarantine_triggers_valid(
                     connection, require_identity=False
                 )
                 or not _artifact_quarantine_data_valid(
-                    connection, require_identity=False
+                    connection, require_identity=False, require_source_token=False
                 )
             ):
                 raise SchemaMigrationError("Task 8 artifact cleanup schema validation failed.")
 
         self._recover_stranded_content_packages(write_marker=True)
-        self._require_artifact_quarantine_schema(require_identity=False)
+        self._require_artifact_quarantine_schema(
+            require_identity=False, require_source_token=False
+        )
 
     def _migrate_artifact_quarantine_identity(self, *, marker_present: bool) -> None:
         """Add durable quarantine identity without trusting a partial migration."""
 
         if marker_present:
-            self._require_artifact_quarantine_schema(require_identity=True)
+            self._require_artifact_quarantine_schema(
+                require_identity=True, require_source_token=False
+            )
             return
         identity_columns = (
             "quarantine_volume_id",
@@ -327,13 +342,13 @@ class Database:
             _create_artifact_quarantine_identity_triggers(connection)
             if (
                 not _artifact_quarantine_schema_valid(
-                    inspect(connection), require_identity=True
+                    inspect(connection), require_identity=True, require_source_token=False
                 )
                 or not _artifact_quarantine_triggers_valid(
                     connection, require_identity=True
                 )
                 or not _artifact_quarantine_data_valid(
-                    connection, require_identity=True
+                    connection, require_identity=True, require_source_token=False
                 )
             ):
                 raise SchemaMigrationError(
@@ -345,7 +360,9 @@ class Database:
                     "VALUES ('task8_artifact_quarantine_identity_v1', CURRENT_TIMESTAMP)"
                 )
             )
-        self._require_artifact_quarantine_schema(require_identity=True)
+        self._require_artifact_quarantine_schema(
+            require_identity=True, require_source_token=False
+        )
 
     def _require_artifact_quarantine_reference_guards(self) -> None:
         with self.engine.connect() as connection:
@@ -355,6 +372,107 @@ class Database:
             ):
                 raise SchemaMigrationError(
                     "Task 8 artifact quarantine reference guard validation failed."
+                )
+
+    def _migrate_artifact_quarantine_source_token(
+        self, *, marker_present: bool
+    ) -> None:
+        """Bind every package cleanup to the immutable builder generation."""
+        from backend.app.features.content.models import ArtifactCleanupRecord
+
+        if marker_present:
+            self._require_artifact_quarantine_schema(
+                require_identity=True, require_source_token=True
+            )
+            with self.engine.connect() as connection:
+                if not _artifact_cleanup_source_token_triggers_valid(connection):
+                    raise SchemaMigrationError(
+                        "Task 8 artifact cleanup source-token guards are invalid."
+                    )
+            return
+
+        with self.engine.begin() as connection:
+            columns = {
+                column["name"]
+                for column in inspect(connection).get_columns("artifact_gc_queue")
+            }
+            if "source_build_token" not in columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE artifact_gc_queue "
+                        "ADD COLUMN source_build_token VARCHAR(36)"
+                    )
+                )
+            connection.execute(
+                text(
+                    "UPDATE artifact_gc_queue AS cleanup "
+                    "SET source_build_token=("
+                    "SELECT package.build_token FROM content_packages AS package "
+                    "WHERE package.id=cleanup.owner_id "
+                    "AND windows_artifact_path_key(package.path)="
+                    "windows_artifact_path_key(cleanup.relative_path) "
+                    "AND package.sha256=cleanup.expected_sha256 "
+                    "AND package.size_bytes=cleanup.expected_size_bytes) "
+                    "WHERE cleanup.owner_type='content_package' "
+                    "AND cleanup.source_build_token IS NULL"
+                )
+            )
+            invalid = connection.scalar(
+                text(
+                    "SELECT 1 FROM artifact_gc_queue WHERE "
+                    "(owner_type='material' AND source_build_token IS NOT NULL) OR "
+                    "(owner_type='content_package' AND "
+                    "is_canonical_uuid(source_build_token) != 1) LIMIT 1"
+                )
+            )
+            if invalid is not None:
+                raise SchemaMigrationError(
+                    "Historical package cleanup generation cannot be proven."
+                )
+
+            for trigger_name in (
+                "ck_artifact_gc_identity_insert",
+                "ck_artifact_gc_identity_update",
+                "ck_gc_cleanup_reference_insert",
+                "ck_gc_cleanup_reference_update",
+                "ck_gc_material_path_insert",
+                "ck_gc_material_path_update",
+                "ck_gc_package_path_insert",
+                "ck_gc_package_path_update",
+            ):
+                connection.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name}"))
+            connection.execute(text("DROP INDEX IF EXISTS uq_artifact_gc_open_owner"))
+            connection.execute(
+                text("ALTER TABLE artifact_gc_queue RENAME TO artifact_gc_queue_source_old")
+            )
+            ArtifactCleanupRecord.__table__.create(connection)
+            target_columns = [column.name for column in ArtifactCleanupRecord.__table__.columns]
+            column_list = ", ".join(target_columns)
+            connection.execute(
+                text(
+                    f"INSERT INTO artifact_gc_queue ({column_list}) "
+                    f"SELECT {column_list} FROM artifact_gc_queue_source_old"
+                )
+            )
+            connection.execute(text("DROP TABLE artifact_gc_queue_source_old"))
+            _create_artifact_quarantine_triggers(connection)
+            _create_artifact_quarantine_identity_triggers(connection)
+            _create_artifact_cleanup_source_token_triggers(connection)
+            _create_artifact_reference_guard_triggers(connection)
+            connection.execute(
+                text(
+                    "INSERT INTO workbench_schema_migrations (name, applied_at) "
+                    "VALUES ('task8_artifact_quarantine_source_token_v1', "
+                    "CURRENT_TIMESTAMP)"
+                )
+            )
+        self._require_artifact_quarantine_schema(
+            require_identity=True, require_source_token=True
+        )
+        with self.engine.connect() as connection:
+            if not _artifact_cleanup_source_token_triggers_valid(connection):
+                raise SchemaMigrationError(
+                    "Task 8 artifact cleanup source-token guards are invalid."
                 )
 
     def _migrate_artifact_quarantine_reference_guards(
@@ -389,7 +507,8 @@ class Database:
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             stranded = connection.execute(
                 text(
-                    "SELECT id, path, sha256, size_bytes FROM content_packages "
+                    "SELECT id, path, sha256, size_bytes, build_token "
+                    "FROM content_packages "
                     "WHERE status='building'"
                 )
             ).mappings().all()
@@ -413,6 +532,7 @@ class Database:
                         "id": str(uuid4()),
                         "owner_type": "content_package",
                         "owner_id": package["id"],
+                        "source_build_token": package["build_token"],
                         "relative_path": package["path"],
                         "path_key": path_key,
                         "expected_sha256": package["sha256"],
@@ -437,6 +557,7 @@ class Database:
                         "AND relative_path=:relative_path AND path_key=:path_key "
                         "AND expected_sha256=:expected_sha256 "
                         "AND expected_size_bytes=:expected_size_bytes "
+                        "AND source_build_token=:source_build_token "
                         "AND state='pending'"
                     ),
                     {
@@ -446,6 +567,7 @@ class Database:
                         "path_key": path_key,
                         "expected_sha256": package["sha256"],
                         "expected_size_bytes": package["size_bytes"],
+                        "source_build_token": package["build_token"],
                     },
                 ).rowcount
                 if advanced != 1:
@@ -838,12 +960,14 @@ def _compact_sql(value: object) -> str:
 
 
 def _artifact_quarantine_schema_valid(
-    inspector: object, *, require_identity: bool = True
+    inspector: object, *, require_identity: bool = True,
+    require_source_token: bool = True,
 ) -> bool:
     """Validate the physical cleanup contract instead of trusting a marker."""
 
     if not _artifact_quarantine_table_valid(
-        inspector, require_identity=require_identity
+        inspector, require_identity=require_identity,
+        require_source_token=require_source_token,
     ):
         return False
     try:
@@ -862,7 +986,8 @@ def _artifact_quarantine_schema_valid(
 
 
 def _artifact_quarantine_table_valid(
-    inspector: object, *, require_identity: bool = True
+    inspector: object, *, require_identity: bool = True,
+    require_source_token: bool = True,
 ) -> bool:
     """Validate every physical queue column, CHECK and open-row identity index."""
 
@@ -892,6 +1017,7 @@ def _artifact_quarantine_table_valid(
         "quarantine_size_bytes",
         "quarantine_mtime_ns",
     }
+    source_columns = {"source_build_token"}
     required_not_null = {
         "id",
         "owner_type",
@@ -911,6 +1037,7 @@ def _artifact_quarantine_table_valid(
         "id": "VARCHAR(36)",
         "owner_type": "VARCHAR(32)",
         "owner_id": "VARCHAR(36)",
+        "source_build_token": "VARCHAR(36)",
         "relative_path": "TEXT",
         "path_key": "TEXT",
         "expected_sha256": "VARCHAR(64)",
@@ -958,10 +1085,17 @@ def _artifact_quarantine_table_valid(
             column["name"]: column
             for column in inspector.get_columns("artifact_gc_queue")
         }
-        has_identity = set(columns) == base_columns | identity_columns
-        if set(columns) != base_columns and not has_identity:
+        column_names = set(columns)
+        has_identity = identity_columns <= column_names
+        has_source_token = source_columns <= column_names
+        allowed = base_columns | (identity_columns if has_identity else set()) | (
+            source_columns if has_source_token else set()
+        )
+        if column_names != allowed:
             return False
         if require_identity and not has_identity:
+            return False
+        if require_source_token and not has_source_token:
             return False
         if any(columns[name].get("nullable") is not False for name in required_not_null):
             return False
@@ -979,9 +1113,16 @@ def _artifact_quarantine_table_valid(
             item.get("name"): _compact_sql(item.get("sqltext"))
             for item in inspector.get_check_constraints("artifact_gc_queue")
         }
-        if checks != hardened_checks and not (has_identity and checks == legacy_checks):
-            return False
-        if not has_identity and checks != legacy_checks:
+        source_check = (
+            "is_canonical_uuid(id)=1andis_canonical_uuid(owner_id)=1and"
+            "(lease_tokenisnulloris_canonical_uuid(lease_token)=1)and"
+            "((owner_type='material'andsource_build_tokenisnull)or"
+            "(owner_type='content_package'andis_canonical_uuid(source_build_token)=1))"
+        )
+        expected_checks = dict(hardened_checks if has_identity else legacy_checks)
+        if has_source_token:
+            expected_checks["ck_artifact_gc_uuid_identity"] = source_check
+        if checks != expected_checks:
             return False
         indexes = {
             item.get("name"): (
@@ -1019,6 +1160,36 @@ BEFORE UPDATE OF build_token ON content_packages
 WHEN NEW.build_token IS NOT NULL AND is_canonical_uuid(NEW.build_token) != 1
 BEGIN
     SELECT RAISE(ABORT, 'content_packages.build_token must be a canonical UUID');
+END
+"""
+
+_CLEANUP_SOURCE_TOKEN_INSERT_TRIGGER = """
+CREATE TRIGGER ck_artifact_gc_source_token_insert
+BEFORE INSERT ON artifact_gc_queue
+WHEN (NEW.owner_type = 'material' AND NEW.source_build_token IS NOT NULL)
+OR (NEW.owner_type = 'content_package' AND (
+    is_canonical_uuid(NEW.source_build_token) != 1
+    OR NOT EXISTS (
+        SELECT 1 FROM content_packages AS package
+        WHERE package.id = NEW.owner_id
+          AND package.build_token = NEW.source_build_token
+          AND windows_artifact_path_key(package.path)
+              = windows_artifact_path_key(NEW.relative_path)
+          AND package.sha256 = NEW.expected_sha256
+          AND package.size_bytes = NEW.expected_size_bytes
+    )
+))
+BEGIN
+    SELECT RAISE(ABORT, 'artifact cleanup source generation is invalid');
+END
+"""
+
+_CLEANUP_SOURCE_TOKEN_UPDATE_TRIGGER = """
+CREATE TRIGGER ck_artifact_gc_source_token_update
+BEFORE UPDATE OF source_build_token ON artifact_gc_queue
+WHEN OLD.source_build_token IS NOT NEW.source_build_token
+BEGIN
+    SELECT RAISE(ABORT, 'artifact cleanup source generation is immutable');
 END
 """
 
@@ -1089,10 +1260,12 @@ _PACKAGE_PATH_INSERT_TRIGGER = _reference_guard_trigger(
 )
 
 _ARTIFACT_REFERENCE_ROWS = """
-SELECT 'material' AS reference_type, id, NULL AS status, path, sha256, size_bytes
+SELECT 'material' AS reference_type, id, NULL AS status, path, sha256, size_bytes,
+       NULL AS build_token
 FROM content_product_materials
 UNION ALL
-SELECT 'content_package' AS reference_type, id, status, path, sha256, size_bytes
+SELECT 'content_package' AS reference_type, id, status, path, sha256, size_bytes,
+       build_token
 FROM content_packages
 """
 
@@ -1134,7 +1307,7 @@ def _cleanup_reference_exists(
             "NOT (artifact_reference.reference_type = 'content_package' "
             f"AND {cleanup}.owner_type = 'content_package' "
             f"AND artifact_reference.id = {cleanup}.owner_id "
-            "AND artifact_reference.status = 'failed' "
+            f"AND artifact_reference.build_token = {cleanup}.source_build_token "
             "AND windows_artifact_path_key(artifact_reference.path) "
             f"= windows_artifact_path_key({cleanup}.relative_path) "
             f"AND artifact_reference.sha256 = {cleanup}.expected_sha256 "
@@ -1286,6 +1459,33 @@ def _create_artifact_quarantine_identity_triggers(connection: Connection) -> Non
     connection.execute(text(_CLEANUP_IDENTITY_UPDATE_TRIGGER))
 
 
+def _create_artifact_cleanup_source_token_triggers(connection: Connection) -> None:
+    connection.execute(text("DROP TRIGGER IF EXISTS ck_artifact_gc_source_token_insert"))
+    connection.execute(text("DROP TRIGGER IF EXISTS ck_artifact_gc_source_token_update"))
+    connection.execute(text(_CLEANUP_SOURCE_TOKEN_INSERT_TRIGGER))
+    connection.execute(text(_CLEANUP_SOURCE_TOKEN_UPDATE_TRIGGER))
+
+
+def _artifact_cleanup_source_token_triggers_valid(connection: Connection) -> bool:
+    names = (
+        "ck_artifact_gc_source_token_insert",
+        "ck_artifact_gc_source_token_update",
+    )
+    rows = connection.execute(
+        text(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+            "AND name IN ('ck_artifact_gc_source_token_insert',"
+            "'ck_artifact_gc_source_token_update')"
+        )
+    ).mappings().all()
+    actual = {row["name"]: _compact_sql(row["sql"]) for row in rows}
+    expected = {
+        names[0]: _compact_sql(_CLEANUP_SOURCE_TOKEN_INSERT_TRIGGER),
+        names[1]: _compact_sql(_CLEANUP_SOURCE_TOKEN_UPDATE_TRIGGER),
+    }
+    return actual == expected
+
+
 def _create_artifact_reference_guard_triggers(connection: Connection) -> None:
     for name, definition in _REFERENCE_GUARD_TRIGGERS.items():
         connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
@@ -1364,13 +1564,20 @@ def _artifact_quarantine_triggers_valid(
 
 
 def _artifact_quarantine_data_valid(
-    connection: Connection, *, require_identity: bool = True
+    connection: Connection, *, require_identity: bool = True,
+    require_source_token: bool = True,
 ) -> bool:
     try:
         build_tokens = connection.execute(
             text("SELECT build_token FROM content_packages WHERE build_token IS NOT NULL")
         ).scalars()
         if any(not is_canonical_uuid_text(token) for token in build_tokens):
+            return False
+        cleanup_columns = {
+            column["name"] for column in inspect(connection).get_columns("artifact_gc_queue")
+        }
+        has_source_token = "source_build_token" in cleanup_columns
+        if require_source_token and not has_source_token:
             return False
         identity_sql = (
             ", quarantine_volume_id, quarantine_file_id, quarantine_size_bytes, "
@@ -1380,7 +1587,8 @@ def _artifact_quarantine_data_valid(
             text(
                 "SELECT id, owner_id, relative_path, path_key, quarantine_path, "
                 "expected_size_bytes, state, lease_token, lease_expires_at"
-                f"{identity_sql} FROM artifact_gc_queue"
+                + (", owner_type, source_build_token" if has_source_token else "")
+                + f"{identity_sql} FROM artifact_gc_queue"
             )
         ).mappings()
         for row in rows:
@@ -1401,6 +1609,16 @@ def _artifact_quarantine_data_valid(
                     and canonical_artifact_path_key(row["quarantine_path"]) is None
                 )
                 or ((row["state"] == "claimed") != lease_complete)
+                or (
+                    has_source_token
+                    and (
+                        (row["owner_type"] == "material" and row["source_build_token"] is not None)
+                        or (
+                            row["owner_type"] == "content_package"
+                            and not is_canonical_uuid_text(row["source_build_token"])
+                        )
+                    )
+                )
             ):
                 return False
             if require_identity:

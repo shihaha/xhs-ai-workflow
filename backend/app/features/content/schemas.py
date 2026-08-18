@@ -254,6 +254,7 @@ class ArtifactCleanupRead(StrictModel):
     id: str = Field(min_length=36, max_length=36)
     owner_type: Literal["material", "content_package"]
     owner_id: str = Field(min_length=36, max_length=36)
+    source_build_token: str | None
     relative_path: str = Field(min_length=1, max_length=1000)
     path_key: str = Field(min_length=1, max_length=1000)
     expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -283,7 +284,7 @@ class ArtifactCleanupRead(StrictModel):
             raise ValueError("cleanup identities must be canonical UUIDs")
         return value
 
-    @field_validator("lease_token")
+    @field_validator("lease_token", "source_build_token")
     @classmethod
     def canonical_lease(cls, value: str | None) -> str | None:
         if value is not None and not is_canonical_uuid_text(value):
@@ -292,6 +293,8 @@ class ArtifactCleanupRead(StrictModel):
 
     @model_validator(mode="after")
     def canonical_paths_and_lease_state(self) -> "ArtifactCleanupRead":
+        if (self.owner_type == "material") != (self.source_build_token is None):
+            raise ValueError("cleanup source token must identify only package generations")
         expected_key = canonical_artifact_path_key(self.relative_path)
         if expected_key is None or self.path_key != expected_key:
             raise ValueError("relative_path and path_key must be one canonical identity")

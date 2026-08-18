@@ -226,7 +226,10 @@ class ArtifactCleanupRecord(Base):
         CheckConstraint("attempt_count >= 0", name="ck_artifact_gc_attempts"),
         CheckConstraint(
             "is_canonical_uuid(id) = 1 AND is_canonical_uuid(owner_id) = 1 "
-            "AND (lease_token IS NULL OR is_canonical_uuid(lease_token) = 1)",
+            "AND (lease_token IS NULL OR is_canonical_uuid(lease_token) = 1) "
+            "AND ((owner_type = 'material' AND source_build_token IS NULL) "
+            "OR (owner_type = 'content_package' "
+            "AND is_canonical_uuid(source_build_token) = 1))",
             name="ck_artifact_gc_uuid_identity",
         ),
         CheckConstraint(
@@ -279,6 +282,7 @@ class ArtifactCleanupRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     owner_type: Mapped[str] = mapped_column(String(32), nullable=False)
     owner_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    source_build_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     relative_path: Mapped[str] = mapped_column(Text, nullable=False)
     path_key: Mapped[str] = mapped_column(Text, nullable=False)
     expected_sha256: Mapped[str] = mapped_column(String(64), nullable=False)

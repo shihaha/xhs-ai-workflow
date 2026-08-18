@@ -146,11 +146,13 @@ def test_startup_preserves_windows_equivalent_path_referenced_by_any_record(
             connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
             connection.exec_driver_sql(
                 "INSERT INTO content_packages "
-                "(id,content_item_id,revision_id,status,path,sha256,size_bytes,created_at,error_detail) "
-                "VALUES (?,?,?,?,?,?,0,?,NULL)",
+                "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                "build_token,created_at,error_detail) "
+                "VALUES (?,?,?,?,?,?,0,?,?,NULL)",
                 (
                     str(uuid4()), item.id, str(uuid4()), conflict_kind,
-                    case_variant, "0" * 64, "2026-08-18 00:00:00",
+                    case_variant, "0" * 64, str(uuid4()),
+                    "2026-08-18 00:00:00",
                 ),
             )
     database_path = service.database.database_path

@@ -4,7 +4,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -765,8 +765,12 @@ def test_replacement_reservation_partial_cleanup_is_transaction_unknown(
     now = datetime.now(UTC).replace(tzinfo=None)
     path_key = canonical_artifact_path_key(original.path)
     assert path_key is not None
+    with service.database.session() as session:
+        source_build_token = session.get(ContentPackageRecord, original.id).build_token
+    assert source_build_token is not None
     partial = ArtifactCleanupRecord(
         id=str(uuid4()), owner_type="content_package", owner_id=original.id,
+        source_build_token=source_build_token,
         relative_path=original.path, path_key=path_key,
         expected_sha256=original.sha256,
         expected_size_bytes=original.size_bytes, state="cancelled",
@@ -923,3 +927,41 @@ def test_reference_created_while_cleanup_pending_is_retained(
     assert processed.state == "needs_human"
     assert processed.last_error_category == "live_reference"
     assert (tmp_path / record.relative_path).exists()
+
+
+def test_retried_package_keeps_old_generation_cleanup_authorized(
+    tmp_path: Path,
+) -> None:
+    service, item, image = _image_item(tmp_path)
+    cleanup_service = _inject_cleanup(service, tmp_path)
+    approved = service.review(item.id, _approval(item, image))
+    request = ExportCreate(expected_revision_id=approved.current_revision.id)
+    first = service.export_package(item.id, request)
+    first_bytes = (tmp_path / first.path).read_bytes()
+
+    (tmp_path / first.path).write_bytes(b"corrupt")
+    second = service.export_package(item.id, request)
+    assert second.path != first.path
+
+    old_cleanup = next(
+        cleanup
+        for cleanup in cleanup_service.list_records()
+        if cleanup.reason == "package_replaced" and cleanup.relative_path == first.path
+    )
+    assert old_cleanup.source_build_token is not None
+    with service.database.session() as session:
+        current = session.get(ContentPackageRecord, first.id)
+        assert current is not None
+        assert current.build_token != old_cleanup.source_build_token
+
+    # Restore the recorded immutable bytes: replacement tests deliberately corrupt
+    # the file only to force a new package generation.
+    (tmp_path / first.path).write_bytes(first_bytes)
+    with service.database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE artifact_gc_queue SET not_before=created_at WHERE id=:id"),
+            {"id": old_cleanup.id},
+        )
+    processed = cleanup_service.process_one(old_cleanup.id)
+    assert processed.state == "quarantined"
+    assert not (tmp_path / first.path).exists()

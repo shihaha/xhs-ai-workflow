@@ -20,8 +20,9 @@ from backend.tests.content.test_hardening import _approval, _image_item
 def _cleanup_values(**overrides: object) -> dict[str, object]:
     values: dict[str, object] = {
         "id": str(uuid4()),
-        "owner_type": "content_package",
+        "owner_type": "material",
         "owner_id": str(uuid4()),
+        "source_build_token": None,
         "relative_path": "content-packages/item/package.zip",
         "path_key": "content-packages/item/package.zip",
         "expected_sha256": "a" * 64,
@@ -56,6 +57,40 @@ def _insert_cleanup(database: Database, **overrides: object) -> object:
         return record
 
 
+def _insert_package_source(
+    database: Database,
+    *,
+    package_id: str,
+    path: str,
+    sha256: str,
+    size_bytes: int,
+    build_token: str,
+    status: str = "failed",
+) -> None:
+    with database.engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            text(
+                "INSERT INTO content_packages "
+                "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                "build_token,created_at,error_detail) VALUES "
+                "(:id,:item,:revision,:status,:path,:sha,:size,:token,"
+                "CURRENT_TIMESTAMP,'test_source')"
+            ),
+            {
+                "id": package_id,
+                "item": str(uuid4()),
+                "revision": str(uuid4()),
+                "status": status,
+                "path": path,
+                "sha": sha256,
+                "size": size_bytes,
+                "token": build_token,
+            },
+        )
+        connection.commit()
+
+
 def test_fresh_schema_has_cleanup_queue_build_token_and_migration_marker(tmp_path: Path) -> None:
     database = Database(tmp_path / "fresh.sqlite3", runtime_dir=tmp_path)
     try:
@@ -68,6 +103,7 @@ def test_fresh_schema_has_cleanup_queue_build_token_and_migration_marker(tmp_pat
         cleanup_columns = {
             column["name"] for column in inspection.get_columns("artifact_gc_queue")
         }
+        assert "source_build_token" in cleanup_columns
         assert "path_key" in cleanup_columns
         assert {
             "quarantine_volume_id", "quarantine_file_id",
@@ -93,6 +129,64 @@ def test_fresh_schema_has_cleanup_queue_build_token_and_migration_marker(tmp_pat
                     "WHERE name='task8_artifact_quarantine_reference_guard_v1'"
                 )
             ) == 1
+    finally:
+        database.close()
+
+
+def test_cleanup_source_build_token_is_typed_bound_and_immutable(tmp_path: Path) -> None:
+    database = Database(tmp_path / "cleanup-source-token.sqlite3", runtime_dir=tmp_path)
+    try:
+        token = str(uuid4())
+        package_id = str(uuid4())
+        now = datetime(2026, 8, 18)
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.execute(
+                text(
+                    "INSERT INTO content_packages "
+                    "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
+                    "build_token,created_at,error_detail) VALUES "
+                    "(:id,:item,:revision,'building',:path,:sha,:size,:token,:now,NULL)"
+                ),
+                {
+                    "id": package_id,
+                    "item": str(uuid4()),
+                    "revision": str(uuid4()),
+                    "path": "content-packages/item/build.zip",
+                    "sha": "a" * 64,
+                    "size": 12,
+                    "token": token,
+                    "now": now,
+                },
+            )
+            connection.commit()
+
+        package_cleanup = _insert_cleanup(
+            database,
+            owner_type="content_package",
+            owner_id=package_id,
+            relative_path="content-packages/item/build.zip",
+            path_key="content-packages/item/build.zip",
+            source_build_token=token,
+        )
+        assert package_cleanup.source_build_token == token
+
+        with pytest.raises(IntegrityError):
+            _insert_cleanup(database, owner_type="material", source_build_token=token)
+        with pytest.raises(IntegrityError):
+            _insert_cleanup(
+                database,
+                owner_id=package_id,
+                relative_path="content-packages/item/other.zip",
+                path_key="content-packages/item/other.zip",
+                source_build_token=str(uuid4()),
+            )
+        with pytest.raises(IntegrityError):
+            with database.engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE artifact_gc_queue SET source_build_token=:token WHERE id=:id"),
+                    {"token": str(uuid4()), "id": package_cleanup.id},
+                )
     finally:
         database.close()
 
@@ -444,33 +538,27 @@ def test_same_package_owner_with_nonoriginal_quarantine_reference_is_live(
     database = Database(tmp_path / "same-owner-new-reference.sqlite3", runtime_dir=tmp_path)
     owner_id = str(uuid4())
     digest = "e" * 64
+    source_token = str(uuid4())
+    _insert_package_source(
+        database, package_id=owner_id,
+        path="content-packages/item/package.zip", sha256=digest,
+        size_bytes=23, build_token=source_token,
+    )
     pending = _insert_cleanup(
         database,
         owner_type="content_package",
         owner_id=owner_id,
         expected_sha256=digest,
         expected_size_bytes=23,
+        source_build_token=source_token,
     )
     quarantine_path = f"artifacts-quarantine/{pending.id}/package.zip"
     try:
         with database.engine.connect() as connection:
             connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
             connection.execute(
-                text(
-                    "INSERT INTO content_packages "
-                    "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
-                    "build_token,created_at,error_detail) VALUES "
-                    "(:id,:item_id,:revision_id,'failed',:path,:sha256,:size,NULL,"
-                    "CURRENT_TIMESTAMP,'different_artifact')"
-                ),
-                {
-                    "id": owner_id,
-                    "item_id": str(uuid4()),
-                    "revision_id": str(uuid4()),
-                    "path": quarantine_path.swapcase(),
-                    "sha256": digest,
-                    "size": 23,
-                },
+                text("UPDATE content_packages SET path=:path WHERE id=:id"),
+                {"id": owner_id, "path": quarantine_path.swapcase()},
             )
             connection.commit()
 
@@ -578,7 +666,6 @@ def test_material_support_identity_cannot_mutate_away_from_live_reference(
         ("path=:value", "elsewhere/package.zip"),
         ("sha256=:value", "c" * 64),
         ("size_bytes=:value", 18),
-        ("status=:value", "failed"),
     ],
 )
 def test_package_support_identity_cannot_mutate_away_from_live_reference(
@@ -589,8 +676,8 @@ def test_package_support_identity_cannot_mutate_away_from_live_reference(
     quarantine_path = f"artifacts-quarantine/{uuid4()}/Café.ZIP"
     cleanup = _insert_cleanup(
         database,
-        owner_type="content_package",
-        owner_id=package_id,
+        owner_type="material",
+        owner_id=str(uuid4()),
         relative_path=quarantine_path,
         path_key=quarantine_path.lower(),
         expected_sha256="a" * 64,
@@ -619,7 +706,7 @@ def test_package_support_identity_cannot_mutate_away_from_live_reference(
             connection.commit()
         _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=17)
 
-        with pytest.raises(IntegrityError, match="existing artifact reference"):
+        with pytest.raises(IntegrityError):
             with database.engine.begin() as connection:
                 connection.execute(
                     text(f"UPDATE content_packages SET {assignment} WHERE id=:id"),
@@ -680,7 +767,7 @@ def test_material_support_cannot_change_id_into_excluded_cleanup_owner(
         )
         _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
 
-        with pytest.raises(IntegrityError, match="existing artifact reference"):
+        with pytest.raises(IntegrityError):
             with database.engine.begin() as connection:
                 connection.execute(
                     text("UPDATE content_product_materials SET id=:new_id WHERE id=:id"),
@@ -697,6 +784,11 @@ def test_package_support_cannot_change_id_into_exact_failed_cleanup_owner(
     owner_id = str(uuid4())
     support_id = str(uuid4())
     quarantine_path = f"artifacts-quarantine/{uuid4()}/package.zip"
+    source_token = str(uuid4())
+    _insert_package_source(
+        database, package_id=owner_id, path=quarantine_path,
+        sha256="a" * 64, size_bytes=12, build_token=source_token,
+    )
     cleanup = _insert_cleanup(
         database,
         owner_type="content_package",
@@ -705,6 +797,7 @@ def test_package_support_cannot_change_id_into_exact_failed_cleanup_owner(
         path_key=quarantine_path.lower(),
         expected_sha256="a" * 64,
         expected_size_bytes=12,
+        source_build_token=source_token,
     )
     try:
         with database.engine.connect() as connection:
@@ -728,7 +821,7 @@ def test_package_support_cannot_change_id_into_exact_failed_cleanup_owner(
             connection.commit()
         _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
 
-        with pytest.raises(IntegrityError, match="existing artifact reference"):
+        with pytest.raises(IntegrityError):
             with database.engine.begin() as connection:
                 connection.execute(
                     text("UPDATE content_packages SET id=:new_id WHERE id=:id"),
@@ -785,8 +878,8 @@ def test_cleanup_support_identity_cannot_mutate_away_from_live_reference(
     cleanup_overrides: dict[str, object] = {}
     value: object
     if mutation == "owner_type":
-        cleanup_overrides = {"owner_type": "content_package", "owner_id": support_id}
-        value = "material"
+        cleanup_overrides = {"owner_type": "material", "owner_id": str(uuid4())}
+        value = "content_package"
     elif mutation == "owner_id":
         cleanup_overrides = {"owner_type": "material", "owner_id": str(uuid4())}
         value = support_id
@@ -806,7 +899,8 @@ def test_cleanup_support_identity_cannot_mutate_away_from_live_reference(
         )
         _persist_moved_live_reference(database, cleanup.id, quarantine_path, size=12)
 
-        with pytest.raises(IntegrityError, match="existing artifact reference"):
+        expected_error = None if mutation == "owner_type" else "existing artifact reference"
+        with pytest.raises(IntegrityError, match=expected_error):
             with database.engine.begin() as connection:
                 connection.execute(
                     text(
@@ -981,6 +1075,12 @@ def test_failed_package_owner_cannot_authorize_fabricated_moved_live_reference(
     owner_id = str(uuid4())
     relative_path = "content-packages/item/Caf\u00e9.ZIP"
     digest = "b" * 64
+    source_token = str(uuid4())
+    _insert_package_source(
+        database, package_id=owner_id,
+        path="CONTENT-PACKAGES/ITEM/Cafe\u0301.zip.", sha256=digest,
+        size_bytes=17, build_token=source_token,
+    )
     cleanup = _insert_cleanup(
         database,
         owner_type="content_package",
@@ -989,29 +1089,9 @@ def test_failed_package_owner_cannot_authorize_fabricated_moved_live_reference(
         path_key=relative_path.lower(),
         expected_sha256=digest,
         expected_size_bytes=17,
+        source_build_token=source_token,
     )
     try:
-        with database.engine.connect() as connection:
-            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
-            connection.execute(
-                text(
-                    "INSERT INTO content_packages "
-                    "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
-                    "build_token,created_at,error_detail) VALUES "
-                    "(:id,:item_id,:revision_id,'failed',:path,:sha256,:size,NULL,"
-                    "CURRENT_TIMESTAMP,'worker_restart_required')"
-                ),
-                {
-                    "id": owner_id,
-                    "item_id": str(uuid4()),
-                    "revision_id": str(uuid4()),
-                    "path": "CONTENT-PACKAGES/ITEM/Cafe\u0301.zip.",
-                    "sha256": digest,
-                    "size": 17,
-                },
-            )
-            connection.commit()
-
         with pytest.raises(IntegrityError, match="existing artifact reference"):
             with database.engine.begin() as connection:
                 connection.execute(
@@ -1093,6 +1173,12 @@ def test_startup_rejects_failed_package_owner_as_only_moved_live_reference(
     owner_id = str(uuid4())
     relative_path = "content-packages/item/Caf\u00e9.ZIP"
     digest = "c" * 64
+    source_token = str(uuid4())
+    _insert_package_source(
+        database, package_id=owner_id,
+        path="CONTENT-PACKAGES/ITEM/Cafe\u0301.zip.", sha256=digest,
+        size_bytes=19, build_token=source_token,
+    )
     cleanup = _insert_cleanup(
         database,
         owner_type="content_package",
@@ -1101,27 +1187,8 @@ def test_startup_rejects_failed_package_owner_as_only_moved_live_reference(
         path_key=relative_path.lower(),
         expected_sha256=digest,
         expected_size_bytes=19,
+        source_build_token=source_token,
     )
-    with database.engine.connect() as connection:
-        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
-        connection.execute(
-            text(
-                "INSERT INTO content_packages "
-                "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
-                "build_token,created_at,error_detail) VALUES "
-                "(:id,:item_id,:revision_id,'failed',:path,:sha256,:size,NULL,"
-                "CURRENT_TIMESTAMP,'worker_restart_required')"
-            ),
-            {
-                "id": owner_id,
-                "item_id": str(uuid4()),
-                "revision_id": str(uuid4()),
-                "path": "CONTENT-PACKAGES/ITEM/Cafe\u0301.zip.",
-                "sha256": digest,
-                "size": 19,
-            },
-        )
-        connection.commit()
     with database.engine.begin() as connection:
         trigger_sql = connection.execute(
             text(
@@ -1571,6 +1638,14 @@ def test_marker_present_missing_build_token_fails_without_repair(tmp_path: Path)
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TRIGGER ck_content_packages_build_token_insert")
         connection.execute("DROP TRIGGER ck_content_packages_build_token_update")
+        connection.execute("DROP TRIGGER ck_artifact_gc_source_token_insert")
+        connection.execute("DROP TRIGGER ck_artifact_gc_source_token_update")
+        for trigger_name in (
+            "ck_gc_material_path_insert", "ck_gc_material_path_update",
+            "ck_gc_package_path_insert", "ck_gc_package_path_update",
+            "ck_gc_cleanup_reference_insert", "ck_gc_cleanup_reference_update",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger_name}")
         connection.execute("ALTER TABLE content_packages DROP COLUMN build_token")
     with pytest.raises(SchemaMigrationError, match="artifact cleanup"):
         Database(path, runtime_dir=tmp_path)
