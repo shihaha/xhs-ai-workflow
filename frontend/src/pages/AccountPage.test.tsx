@@ -68,4 +68,17 @@ describe("AccountPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Generate opportunity analysis" }));
     await waitFor(() => expect(createAnalysis).toHaveBeenCalledWith({ analysis_type: "account_opportunity", account_user_ids: ["author-1"], evidence_ids: ["rank-item:7"] }));
   });
+
+  it("blocks duplicate account mutations while one request is pending", async () => {
+    let resolve!: (value: { job_id: string; status: "queued" }) => void;
+    const queueShop = vi.fn(() => new Promise<{ job_id: string; status: "queued" }>(done => { resolve = done; }));
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({ account, evidence: [], analyses: [], jobs: [], devices: [] })} queueShop={queueShop} />);
+    await screen.findByRole("heading", { name: "真实账号" });
+    const button = screen.getByRole("button", { name: "Queue device collection" });
+    fireEvent.click(button); fireEvent.click(button);
+    expect(queueShop).toHaveBeenCalledTimes(1);
+    expect(button).toBeDisabled();
+    resolve({ job_id: "job-1", status: "queued" });
+    await waitFor(() => expect(button).toBeEnabled());
+  });
 });

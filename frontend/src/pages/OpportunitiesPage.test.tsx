@@ -30,4 +30,20 @@ describe("OpportunitiesPage", () => {
     render(<OpportunitiesPage loadOpportunities={vi.fn().mockRejectedValue(new Error("offline"))} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not load opportunities");
   });
+
+  it("blocks duplicate product creation while the first request is pending", async () => {
+    let resolve!: (value: { id: string }) => void;
+    const createProduct = vi.fn(() => new Promise<{ id: string }>(done => { resolve = done; }));
+    const data = { opportunities: [{ id: "opp-1", analysis_id: "analysis-1", title: "露营收纳", status: "升温", summary: "证据", evidence_ids: ["rank:1"], next_action: "验证", created_at: "2026-08-17" }], products: [] };
+    render(<OpportunitiesPage loadOpportunities={vi.fn().mockResolvedValue(data)} createProduct={createProduct} />);
+    await screen.findByText("露营收纳");
+    fireEvent.change(screen.getByLabelText("Product name for 露营收纳"), { target: { value: "产品" } });
+    fireEvent.change(screen.getByLabelText("Target user for 露营收纳"), { target: { value: "用户" } });
+    const button = screen.getByRole("button", { name: "Create product for 露营收纳" });
+    fireEvent.click(button); fireEvent.click(button);
+    expect(createProduct).toHaveBeenCalledTimes(1);
+    expect(button).toBeDisabled();
+    resolve({ id: "product-1" });
+    await waitFor(() => expect(button).toBeEnabled());
+  });
 });

@@ -92,6 +92,8 @@ export interface RankSnapshot {
   source_url: string; raw_evidence: Record<string, unknown>; submitted_count: number;
   deduplicated_count: number; items: Array<Record<string, unknown>>;
 }
+export interface QianfanScopeQueued { job_id: string; board: string; dimension: string; status: "queued"; }
+export interface QianfanCollectionQueued { collection_id: string; scopes: QianfanScopeQueued[]; }
 export interface Account {
   user_id: string; account_name: string; score: number; evidence: number; credibility: number;
   accessibility: number; fans: number; gmv: string; pay: string; read: string; nday: number; nboard: number;
@@ -120,6 +122,7 @@ async function getAllPages<T>(path: string): Promise<T[]> {
 export const fetchRankSnapshots = () => getAllPages<RankSnapshot>("/api/v1/radar/rank-snapshots");
 export const fetchAccounts = () => getAllPages<Account>("/api/v1/radar/accounts");
 export const ingestRankSnapshot = (payload: Record<string, unknown>) => postJson<RankSnapshot>("/api/v1/radar/rank-snapshots", payload);
+export const startQianfanCollection = (payload: { expected_count_per_scope: number }) => postJson<QianfanCollectionQueued>("/api/v1/radar/qianfan-collections", payload);
 export const fetchDevices = () => getJson<DeviceHealth[]>("/api/v1/devices");
 export const fetchAnalysisEvidence = (accountId?: string) => getJson<AnalysisEvidence[]>(`/api/v1/analysis-evidence${accountId ? `?account_user_id=${encodeURIComponent(accountId)}` : ""}`);
 export const fetchAnalyses = () => getJson<Analysis[]>("/api/v1/analyses");

@@ -3,44 +3,45 @@ import { expect, test } from "@playwright/test";
 test("fresh temporary database reaches an available pending-publication package", async ({ page, request }, testInfo) => {
   const browserErrors: string[] = [];
   const suffix = `${testInfo.workerIndex}-${testInfo.repeatEachIndex}-${Date.now()}`;
-  const accountId = `e2e-author-${suffix}`;
-  const accountName = `受控真实链路账号-${suffix}`;
-  const opportunityTitle = `受控露营收纳机会-${accountId}`;
+  const accountId = "controlled-qianfan-account";
+  const accountName = "受控千帆账号";
   const productName = `受控露营收纳产品-${suffix}`;
   const contentTitle = `${productName}清单`;
   page.on("console", message => { if (message.type() === "error") browserErrors.push(message.text()); });
   page.on("pageerror", error => browserErrors.push(error.message));
-  const snapshotPayload = {
-    source_date: "2026-08-17", collected_at: "2026-08-17T08:00:00Z", board: "热卖榜", dimension: "优秀账号",
-    source_url: "https://qianfan.example/rank", raw_evidence: { fixture: "controlled-task9" },
-    items: [{ rank_no: 1, author_name: accountName, user_id: accountId, source_url: `https://www.xiaohongshu.com/explore/rank-note-${suffix}`, gmv_range: "1万-5万", pay_rate_range: "70%-90%", read_range: "10万以上", raw_evidence: { fixture: "controlled-task9-row" } }],
-  };
-
   await page.goto("/radar");
-  await page.getByLabel("Captured ranking snapshot JSON").fill(JSON.stringify(snapshotPayload));
-  await page.getByRole("button", { name: "Import captured snapshot" }).click();
-  await expect(page.getByText(/Snapshot \d+ persisted/)).toBeVisible();
+  await page.getByLabel("Expected rows per ranking scope").fill("1");
+  await page.getByRole("button", { name: "Start automatic Qianfan collection" }).click();
+  await expect(page.getByText(/Collection [0-9a-f-]+ reserved as one batch of 8 scope jobs/)).toBeVisible();
+  await expect(page.getByText("Complete: 8/8 scopes succeeded.")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/Selector profile: controlled-qianfan-v1/)).toBeVisible();
+  await page.reload();
   await expect(page.getByRole("link", { name: accountName })).toBeVisible();
   await page.getByRole("link", { name: accountName }).click();
   await expect(page.getByText("Device available: controlled_device_ready")).toBeVisible();
   await page.getByLabel("Expected shop products").fill("1");
   await page.getByLabel("Verification evidence directory").fill("fixtures/shop-account");
   await page.getByRole("button", { name: "Queue device collection" }).click();
-  await expect(page.getByText(/Queued job/)).toBeVisible();
+  const queuedNotice = page.getByText(/Queued job/);
+  await expect(queuedNotice).toBeVisible();
+  const shopJobId = (await queuedNotice.textContent())!.replace("Queued job ", "").trim();
 
   await expect.poll(async () => {
     const response = await request.get("http://127.0.0.1:8000/api/v1/jobs");
     const jobs = await response.json() as Array<{ state: string; type: string }>;
-    return jobs.find((job: { state: string; type: string; input?: { account_user_id?: string } }) => job.type === "android_shop_collection" && job.input?.account_user_id === accountId)?.state;
+    return jobs.find((job: { id?: string; state: string }) => job.id === shopJobId)?.state;
   }).toBe("succeeded");
   await page.reload();
-  await expect(page.getByText("1 / 1 verified or collected")).toBeVisible();
-  const deepEvidence = page.getByLabel(/^artifact:/);
+  await expect(page.getByText("1 / 1 verified or collected").last()).toBeVisible();
+  const deepEvidence = page.getByLabel(/^artifact:/).last();
   await deepEvidence.check();
+  const evidenceId = await deepEvidence.getAttribute("aria-label");
+  expect(evidenceId).toBeTruthy();
   await page.getByRole("button", { name: "Generate opportunity analysis" }).click();
   await expect(page.getByText(/Opportunity analysis request completed/)).toBeVisible();
 
   await page.goto("/opportunities");
+  const opportunityTitle = `受控露营收纳机会-${accountId}-${evidenceId}`;
   await expect(page.getByRole("heading", { name: opportunityTitle })).toBeVisible();
   await page.getByLabel(`Product name for ${opportunityTitle}`).fill(productName);
   await page.getByLabel(`Target user for ${opportunityTitle}`).fill("需要整理露营装备的用户");
@@ -72,13 +73,10 @@ test("fresh temporary database reaches an available pending-publication package"
   const createdProduct = (materials as Array<{ id: string; name?: string; materials: Array<{ id: string; kind: string }> }>).find(product => product.name === productName)!;
   const sourceId = createdProduct.materials.find(material => material.kind === "source")!.id;
   const imageId = createdProduct.materials.find(material => material.kind === "output_image")!.id;
-  const evidence = await request.get(`http://127.0.0.1:8000/api/v1/analysis-evidence?account_user_id=${encodeURIComponent(accountId)}`).then(response => response.json()) as Array<{ evidence_id: string; eligible_for_opportunity: boolean }>;
-  const evidenceId = evidence.find(item => item.eligible_for_opportunity)!.evidence_id;
-
   const finalProductRecord = page.getByRole("heading", { name: productName }).locator("..").locator("..");
   await finalProductRecord.getByText("Create model draft").click();
   const draftForm = finalProductRecord.getByText("Create model draft").locator("..");
-  await draftForm.getByLabel("Evidence IDs, comma-separated").fill(evidenceId);
+  await draftForm.getByLabel("Evidence IDs, comma-separated").fill(evidenceId!);
   await draftForm.getByLabel("Source material IDs, comma-separated").fill(sourceId);
   await draftForm.getByLabel("Ordered image material IDs").fill(imageId);
   await draftForm.getByLabel("Research fact").fill("受控证据证明需求存在");

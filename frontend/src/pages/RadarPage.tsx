@@ -1,32 +1,76 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-import { fetchAccounts, fetchRankSnapshots, ingestRankSnapshot as postSnapshot, type Account, type RankSnapshot } from "../api/client";
+import { fetchAccounts, fetchHealth, fetchJobs, fetchRankSnapshots, ingestRankSnapshot as postSnapshot, startQianfanCollection as postCollection, type Account, type HealthResponse, type Job, type QianfanCollectionQueued, type RankSnapshot } from "../api/client";
 
-type RadarData = { snapshots: RankSnapshot[]; accounts: Account[] };
-export interface RadarPageProps { loadRadar?: () => Promise<RadarData>; ingestSnapshot?: (payload: Record<string, unknown>) => Promise<Partial<RankSnapshot> & { id: number }>; }
+type RadarData = { snapshots: RankSnapshot[]; accounts: Account[]; health?: HealthResponse };
+export interface RadarPageProps {
+  loadRadar?: () => Promise<RadarData>;
+  ingestSnapshot?: (payload: Record<string, unknown>) => Promise<Partial<RankSnapshot> & { id: number }>;
+  startCollection?: (payload: { expected_count_per_scope: number }) => Promise<QianfanCollectionQueued>;
+  loadCollectionJobs?: () => Promise<Job[]>;
+  pollIntervalMs?: number;
+}
 
 const defaultLoad = async (): Promise<RadarData> => {
-  const [snapshots, accounts] = await Promise.all([fetchRankSnapshots(), fetchAccounts()]);
-  return { snapshots, accounts };
+  const [snapshots, accounts, health] = await Promise.all([fetchRankSnapshots(), fetchAccounts(), fetchHealth()]);
+  return { snapshots, accounts, health };
 };
 
-export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapshot }: RadarPageProps) {
+const terminal = new Set(["needs_human", "succeeded", "failed", "cancelled"]);
+
+export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapshot, startCollection = postCollection, loadCollectionJobs = fetchJobs, pollIntervalMs = 1000 }: RadarPageProps) {
   const [state, setState] = useState<{ kind: "loading" } | { kind: "error" } | { kind: "ready"; data: RadarData }>({ kind: "loading" });
   const [snapshotJson, setSnapshotJson] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [expected, setExpected] = useState("1");
+  const [pending, setPending] = useState(false);
+  const pendingRef = useRef(false);
+  const [collection, setCollection] = useState<QianfanCollectionQueued | null>(null);
+  const [scopeJobs, setScopeJobs] = useState<Job[]>([]);
+  const [pollCount, setPollCount] = useState(0);
+  const [pollError, setPollError] = useState<string | null>(null);
+  const mounted = useRef(true);
   const refresh = useCallback(async () => {
     setState({ kind: "loading" });
     try { setState({ kind: "ready", data: await loadRadar() }); } catch { setState({ kind: "error" }); }
   }, [loadRadar]);
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { mounted.current = true; void refresh(); return () => { mounted.current = false; }; }, [refresh]);
+  const refreshScopes = useCallback(async () => {
+    if (!collection) return;
+    const ids = new Set(collection.scopes.map(scope => scope.job_id));
+    const jobs = (await loadCollectionJobs()).filter(job => ids.has(job.id));
+    if (mounted.current) { setScopeJobs(jobs); setPollError(null); }
+  }, [collection, loadCollectionJobs]);
+  useEffect(() => {
+    if (!collection || pollCount >= 10 || (scopeJobs.length === 8 && scopeJobs.every(job => terminal.has(job.state)))) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => { void refreshScopes().catch(error => { if (!cancelled && mounted.current) setPollError(error instanceof Error ? error.message : "Scope job refresh failed."); }).finally(() => { if (!cancelled && mounted.current) setPollCount(value => value + 1); }); }, pollIntervalMs);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [collection, pollCount, pollIntervalMs, refreshScopes, scopeJobs]);
+
+  const singleFlight = async (action: () => Promise<void>) => {
+    if (pendingRef.current) return;
+    pendingRef.current = true; setPending(true); setActionError(null);
+    try { await action(); } catch (error) { setActionError(error instanceof Error ? error.message : "Action failed."); }
+    finally { pendingRef.current = false; if (mounted.current) setPending(false); }
+  };
 
   if (state.kind === "loading") return <main className="workbench-page" id="main-content"><section className="loading-panel" aria-busy="true"><p role="status">Loading demand radar</p></section></main>;
   if (state.kind === "error") return <main className="workbench-page" id="main-content"><section className="message-panel" role="alert"><h1>Could not load demand radar</h1><p>The persisted ranking endpoints did not return a result.</p><button type="button" onClick={() => void refresh()}>Retry demand radar</button></section></main>;
   const { snapshots, accounts } = state.data;
+  const succeeded = scopeJobs.filter(job => job.state === "succeeded").length;
+  const stateCounts = scopeJobs.reduce<Record<string, number>>((counts, job) => ({ ...counts, [job.state]: (counts[job.state] ?? 0) + 1 }), {});
+  const profile = scopeJobs.map(job => job.input.selector_profile_version).find(value => typeof value === "string") as string | undefined;
+  const playwright = state.data.health?.checks.browser;
   return <main className="workbench-page" id="main-content">
     <header className="page-heading page-heading--split"><div><p className="eyebrow">Ranking evidence</p><h1>Demand radar</h1><p>Persisted Qianfan snapshots and explainable account scores.</p></div><p className="result-count" role="status">{snapshots.length} snapshots · {accounts.length} accounts</p></header>
-    <section className="operator-panel"><div className="panel-heading"><h2>Import captured ranking snapshot</h2><p>Existing persisted API</p></div><form className="action-form" onSubmit={event => { event.preventDefault(); setActionError(null); void (async () => { try { const parsed = JSON.parse(snapshotJson) as unknown; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Snapshot JSON must be one object."); const result = await ingestSnapshot(parsed as Record<string, unknown>); setNotice(`Snapshot ${result.id} persisted. Persisted facts were reloaded.`); setState({ kind: "ready", data: await loadRadar() }); } catch (error) { setActionError(error instanceof Error ? error.message : "Snapshot import failed."); } })(); }}><label>Captured ranking snapshot JSON<textarea aria-label="Captured ranking snapshot JSON" required value={snapshotJson} onChange={event => setSnapshotJson(event.target.value)} /></label><p className="field-help">Paste a real captured RankSnapshotInput object. This imports evidence through the existing API; it does not start the Playwright collector.</p><button type="submit">Import captured snapshot</button></form></section>
+    <section className="operator-panel"><div className="panel-heading"><h2>Automatic Qianfan collection</h2><p>Playwright collector · fixed eight scopes</p></div>
+      <p className={`inline-status state--${playwright?.healthy ? "available" : "unavailable"}`}>Browser executable {playwright?.healthy ? "available" : "unavailable"}{playwright?.executable ? `: ${playwright.executable}` : ""}. This health fact does not prove Playwright or a persistent Qianfan login profile is ready. Overall API health: {state.data.health?.status ?? "not returned"}.</p>
+      <form className="action-form" onSubmit={event => { event.preventDefault(); void singleFlight(async () => { const count = Number(expected); if (!Number.isInteger(count) || count < 1 || count > 1000) throw new Error("Expected rows must be a whole number from 1 to 1000."); const queued = await startCollection({ expected_count_per_scope: count }); const ids = new Set(queued.scopes.map(scope => scope.job_id)); setCollection(queued); setScopeJobs((await loadCollectionJobs()).filter(job => ids.has(job.id))); setPollCount(0); setNotice(`Collection ${queued.collection_id} reserved as one batch of ${queued.scopes.length} scope jobs.`); }); }}><label>Expected rows per ranking scope<input aria-label="Expected rows per ranking scope" min="1" max="1000" step="1" required type="number" value={expected} onChange={event => setExpected(event.target.value)} /></label><p className="field-help">Starts the real collector for four boards × two dimensions. Completion requires all eight persisted jobs to succeed.</p><button disabled={pending} type="submit">Start automatic Qianfan collection</button></form>
+      {collection ? <div className="collection-summary"><h3>Collection {collection.collection_id}</h3><p>Batch: {collection.scopes.length} reserved scope jobs; the API returns no separate batch ID.</p><p>{succeeded === 8 && scopeJobs.length === 8 ? "Complete: 8/8 scopes succeeded." : `Not complete: ${succeeded}/8 scopes succeeded${Object.entries(stateCounts).filter(([key]) => key !== "succeeded").map(([key, count]) => `; ${count} ${key}`).join("")}.`}</p><p>Selector profile: {profile ?? "waiting for persisted job facts"}. Profile status: {profile?.includes("unverified") ? "unverified" : profile ? "not asserted by API" : "waiting"}.</p>{pollError ? <p className="action-error" role="alert">Scope refresh failed: {pollError}. Persisted states shown above may be stale; retry manually.</p> : null}{pollCount >= 10 && !(scopeJobs.length === 8 && scopeJobs.every(job => terminal.has(job.state))) ? <p>Automatic refresh stopped after 10 checks.</p> : null}<button disabled={pending} type="button" onClick={() => void singleFlight(refreshScopes)}>Refresh eight scope jobs</button><ol className="collection-list">{collection.scopes.map(scope => { const job = scopeJobs.find(item => item.id === scope.job_id); return <li key={scope.job_id}><strong>{scope.board} · {scope.dimension}</strong><span>{job?.state ?? scope.status} · {job?.progress_current ?? 0} / {job?.progress_total ?? "waiting"}</span>{job?.error_category ? <span>Error: {job.error_category}</span> : null}<code>{scope.job_id}</code></li>; })}</ol></div> : null}
+    </section>
+    <section className="operator-panel"><div className="panel-heading"><h2>Import captured ranking snapshot</h2><p>Manual evidence import · not automatic collection</p></div><form className="action-form" onSubmit={event => { event.preventDefault(); void singleFlight(async () => { const parsed = JSON.parse(snapshotJson) as unknown; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Snapshot JSON must be one object."); const result = await ingestSnapshot(parsed as Record<string, unknown>); setNotice(`Snapshot ${result.id} persisted. Persisted facts were reloaded.`); setState({ kind: "ready", data: await loadRadar() }); }); }}><label>Captured ranking snapshot JSON<textarea aria-label="Captured ranking snapshot JSON" required value={snapshotJson} onChange={event => setSnapshotJson(event.target.value)} /></label><p className="field-help">Paste a real captured RankSnapshotInput object. This imports evidence through the existing API; it does not start the Playwright collector.</p><button disabled={pending} type="submit">Import captured snapshot</button></form></section>
     {notice ? <p className="action-notice" role="status">{notice}</p> : null}{actionError ? <p className="action-error" role="alert">{actionError}</p> : null}
     {snapshots.length === 0 && accounts.length === 0 ? <section className="message-panel" role="status"><h2>No ranking evidence recorded</h2><p>Run a controlled ranking collection or submit a real captured snapshot through the API. This page never inserts sample data.</p></section> : <>
       <section className="operator-panel" aria-labelledby="snapshots-heading"><div className="panel-heading"><h2 id="snapshots-heading">Ranking snapshots</h2></div>{snapshots.length === 0 ? <p className="panel-empty">No snapshots returned.</p> : <ol className="fact-list">{snapshots.map(snapshot => <li key={snapshot.id}><strong>{snapshot.board} · {snapshot.dimension}</strong><span>{snapshot.source_date} · {snapshot.deduplicated_count} deduplicated / {snapshot.submitted_count} submitted</span><a href={snapshot.source_url}>Source evidence</a></li>)}</ol>}</section>

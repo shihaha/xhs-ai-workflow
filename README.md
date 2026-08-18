@@ -38,4 +38,4 @@ npm run build
 npm run test:e2e
 ```
 
-The Playwright test starts a test-only FastAPI application with a fresh temporary SQLite database and controlled device/model adapters. It is not a live Qianfan, Android, or Bailian verification.
+The Playwright test starts a test-only FastAPI application with a fresh temporary SQLite database and controlled Qianfan/device/model adapters. It is not a live Qianfan, Android, or Bailian verification.

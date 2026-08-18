@@ -9,8 +9,11 @@ import tempfile
 from pathlib import Path
 
 from backend.app.adapters.contracts import CollectionItem, CollectionResult, DeviceHealth, ModelResult
+from backend.app.adapters.qianfan_playwright import QIANFAN_RANK_URL, QianfanSelectorProfile
 from backend.app.features.analysis.service import AnalysisService
 from backend.app.features.content.service import ContentService
+from backend.app.features.radar.qianfan_service import QianfanCollectionService
+from backend.app.features.radar.service import RadarService
 from backend.app.features.shops.service import ShopCollectionService
 from backend.app.main import create_app
 from backend.app.settings import Settings
@@ -50,7 +53,7 @@ class ControlledModel:
         if schema.__name__ == "AnalysisOutput":
             context = json.loads(request.user_prompt)
             account_ids = context.get("account_user_ids") or [context.get("account_user_id")]
-            account_suffix = account_ids[0]
+            account_suffix = f"{account_ids[0]}-{request.evidence_ids[0]}"
             output = {
                 "claims": [{"claim": "受控证据证明需求存在", "evidence_ids": request.evidence_ids}],
                 "product_clusters": [{"name": "露营收纳", "summary": "受控聚类", "evidence_ids": request.evidence_ids}],
@@ -80,12 +83,51 @@ class ControlledDevice:
         return CollectionResult(status="succeeded", evidence_artifacts=["fixtures/shop-account"], items=[item], expected_count_known=True, expected_count=1, succeeded_count=1, raw_observation_count=1, missing_items=[], overflow_count=0, complete=True)
 
 
+CONTROLLED_QIANFAN_PROFILE = QianfanSelectorProfile(
+    version="controlled-qianfan-v1", supported=True,
+    ready_selector="#ready", login_selector="#login", captcha_selector="#captcha",
+    board_selectors=(("阅读榜", "#read"), ("引流榜", "#traffic"), ("热卖榜", "#sales"), ("成交榜", "#orders")),
+    dimension_selectors=(("优秀内容", "#content"), ("优秀账号", "#accounts")),
+    active_board_selectors=(("阅读榜", "#read.active"), ("引流榜", "#traffic.active"), ("热卖榜", "#sales.active"), ("成交榜", "#orders.active")),
+    active_dimension_selectors=(("优秀内容", "#content.active"), ("优秀账号", "#accounts.active")),
+    response_board_path=("scope", "board"), response_dimension_path=("scope", "dimension"),
+)
+
+
+class ControlledQianfan:
+    def __init__(self, job_service):
+        self.job_service = job_service
+
+    def collect_scope(self, request, *, board, dimension, selector_profile):
+        job_id = request.parameters["job_id"]
+        payload = json.dumps({"scope": {"board": board, "dimension": dimension}, "fixture": "task9"}, ensure_ascii=False).encode("utf-8")
+        relative = Path("evidence") / "qianfan" / f"{job_id}.json"
+        absolute = RUNTIME / relative
+        absolute.parent.mkdir(parents=True, exist_ok=True)
+        absolute.write_bytes(payload)
+        self.job_service.attach_artifact(job_id, kind="qianfan_raw_capture", path=relative.as_posix(), metadata={
+            "sha256": hashlib.sha256(payload).hexdigest(), "source_url": QIANFAN_RANK_URL,
+            "selector_profile_version": selector_profile.version, "board": board, "dimension": dimension,
+        })
+        item = CollectionItem(id=f"{board}-{dimension}", kind="ranking_item", source_url=f"https://www.xiaohongshu.com/explore/{job_id}", raw_evidence={"fixture": "task9-qianfan"}, data={
+            "rank": 1, "author_name": "受控千帆账号", "user_id": "controlled-qianfan-account", "note_id": job_id,
+            "read_range": "10万以上", "pay_rate_range": "70%-90%", "gmv_range": "1万-5万",
+        })
+        return CollectionResult(status="succeeded", evidence_artifacts=[relative.as_posix()], items=[item], expected_count_known=True, expected_count=1, succeeded_count=1, raw_observation_count=1, missing_items=[], overflow_count=0, complete=True)
+
+
 settings = Settings(runtime_dir=RUNTIME, database_path=RUNTIME / "task9.sqlite3", bailian_api_key="controlled-not-live")
 app = create_app(settings)
 model = ControlledModel()
 app.state.bailian_adapter = model
 app.state.analysis_service = AnalysisService(app.state.database, model, runtime_dir=RUNTIME)
 app.state.content_service = ContentService(app.state.database, model, runtime_dir=RUNTIME, cleanup_service=app.state.artifact_cleanup_service)
+if app.state.qianfan_collection_service is not None:
+    app.state.qianfan_collection_service.close()
+app.state.qianfan_collection_service = QianfanCollectionService(
+    job_service=app.state.job_service, radar_service=RadarService(app.state.database), runtime_dir=RUNTIME,
+    adapter_factory=lambda: ControlledQianfan(app.state.job_service), selector_profile=CONTROLLED_QIANFAN_PROFILE,
+)
 app.state.shop_service.close()
 app.state.android_adapter = ControlledDevice()
 app.state.shop_service = ShopCollectionService(job_service=app.state.job_service, device_adapter=app.state.android_adapter, max_workers=1)

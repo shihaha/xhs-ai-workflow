@@ -55,4 +55,16 @@ describe("ContentStudioPage", () => {
     expect(await screen.findByText("Package available: packages/item-1.zip")).toBeVisible();
     await waitFor(() => expect(loadStudio).toHaveBeenCalledTimes(5));
   });
+
+  it("blocks duplicate content mutations while the first request is pending", async () => {
+    let resolve!: (value: { path: string }) => void;
+    const exportItem = vi.fn(() => new Promise<{ path: string }>(done => { resolve = done; }));
+    render(<ContentStudioPage loadStudio={vi.fn().mockResolvedValue({ products: [], items: [{ ...item, status: "approved" }], packages: [] })} exportItem={exportItem} />);
+    const button = await screen.findByRole("button", { name: "Export 露营清单" });
+    fireEvent.click(button); fireEvent.click(button);
+    expect(exportItem).toHaveBeenCalledTimes(1);
+    expect(button).toBeDisabled();
+    resolve({ path: "content-packages/item.zip" });
+    await waitFor(() => expect(button).toBeEnabled());
+  });
 });
