@@ -111,6 +111,7 @@ def _insert_package_reference(
     size_bytes: int,
     created_at: datetime,
     build_token: str | None = None,
+    status: str = "failed",
 ) -> None:
     with database.engine.connect() as connection:
         connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
@@ -119,7 +120,7 @@ def _insert_package_reference(
                 "INSERT INTO content_packages "
                 "(id,content_item_id,revision_id,status,path,sha256,size_bytes,"
                 "build_token,created_at,error_detail) VALUES "
-                "(:id,:item_id,:revision_id,'failed',:path,:sha256,:size_bytes,"
+                "(:id,:item_id,:revision_id,:status,:path,:sha256,:size_bytes,"
                 ":build_token,:created_at,'different_artifact')"
             ),
             {
@@ -131,6 +132,7 @@ def _insert_package_reference(
                 "size_bytes": size_bytes,
                 "created_at": created_at.isoformat(sep=" "),
                 "build_token": build_token,
+                "status": status,
             },
         )
         connection.commit()
@@ -702,6 +704,93 @@ def test_exact_failed_package_owner_with_windows_equivalent_original_is_source(
     )
     assert not original.exists()
     assert (runtime / result.quarantine_path).exists()
+
+
+@pytest.mark.parametrize("status", ["building", "ready"])
+def test_current_exact_nonfailed_package_generation_is_a_live_reference(
+    cleanup_environment, status: str,
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    payload = b"current package generation"
+    original = runtime / "content-packages" / "item" / "current.zip"
+    original.parent.mkdir(parents=True)
+    original.write_bytes(payload)
+    build_token = str(uuid4())
+    candidate = ArtifactCleanupCandidate(
+        owner_type="content_package",
+        owner_id=str(uuid4()),
+        relative_path="content-packages/item/current.zip",
+        expected_sha256=sha256(payload).hexdigest(),
+        expected_size_bytes=len(payload),
+        reason="package_build_reserved",
+        not_before=clock.now(),
+        source_build_token=build_token,
+    )
+    _insert_package_reference(
+        database,
+        package_id=candidate.owner_id,
+        relative_path=candidate.relative_path,
+        digest=candidate.expected_sha256,
+        size_bytes=candidate.expected_size_bytes,
+        created_at=clock.now(),
+        build_token=build_token,
+        status=status,
+    )
+    record = service.enqueue(candidate)
+
+    result = service.process_one(record.id)
+
+    assert result.state == "needs_human"
+    assert result.last_error_category == "live_reference"
+    assert result.quarantine_path is None
+    assert original.read_bytes() == payload
+
+
+def test_current_package_becoming_ready_blocks_final_quarantine_deletion(
+    cleanup_environment,
+) -> None:
+    database, runtime, clock, service, _ = cleanup_environment
+    payload = b"failed then retained package"
+    original = runtime / "content-packages" / "item" / "retained.zip"
+    original.parent.mkdir(parents=True)
+    original.write_bytes(payload)
+    build_token = str(uuid4())
+    candidate = ArtifactCleanupCandidate(
+        owner_type="content_package",
+        owner_id=str(uuid4()),
+        relative_path="content-packages/item/retained.zip",
+        expected_sha256=sha256(payload).hexdigest(),
+        expected_size_bytes=len(payload),
+        reason="failed_package",
+        not_before=clock.now(),
+        source_build_token=build_token,
+    )
+    _insert_package_reference(
+        database,
+        package_id=candidate.owner_id,
+        relative_path=candidate.relative_path,
+        digest=candidate.expected_sha256,
+        size_bytes=candidate.expected_size_bytes,
+        created_at=clock.now(),
+        build_token=build_token,
+        status="failed",
+    )
+    record = service.enqueue(candidate)
+    quarantined = service.process_one(record.id)
+    assert quarantined.state == "quarantined"
+    assert quarantined.quarantine_path is not None
+    with database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE content_packages SET status='ready' WHERE id=:id"),
+            {"id": candidate.owner_id},
+        )
+    clock.advance(timedelta(hours=24))
+
+    result = service.process_one(record.id)
+
+    assert result.state == "needs_human"
+    assert result.last_error_category == "live_reference"
+    assert (runtime / quarantined.quarantine_path).read_bytes() == payload
 
 
 def test_quarantined_record_continues_after_service_restart(cleanup_environment) -> None:

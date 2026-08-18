@@ -998,7 +998,7 @@ class ArtifactCleanupService:
             package_build_token,
         ) in packages:
             package_windows_key = windows_artifact_reference_path_key(package_path)
-            exact_failed_owner = (
+            exact_current_generation = (
                 record.owner_type == "content_package"
                 and package_id == record.owner_id
                 and package_build_token == record.source_build_token
@@ -1007,8 +1007,10 @@ class ArtifactCleanupService:
                 and package_sha == record.expected_sha256
                 and package_size == record.expected_size_bytes
             )
-            if exact_failed_owner:
-                continue
+            if exact_current_generation:
+                if package_status == "failed":
+                    continue
+                return "live_reference"
             if record.owner_type == "content_package" and package_id == record.owner_id:
                 if (
                     package_build_token != record.source_build_token

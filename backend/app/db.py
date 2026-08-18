@@ -396,6 +396,44 @@ class Database:
                 column["name"]
                 for column in inspect(connection).get_columns("artifact_gc_queue")
             }
+            has_source_token = "source_build_token" in columns
+            token_join = (
+                "AND (cleanup.source_build_token IS NULL OR "
+                "package.build_token=cleanup.source_build_token) "
+                if has_source_token else ""
+            )
+            token_requirement = (
+                "(is_canonical_uuid(package.build_token)=1 AND "
+                "(cleanup.source_build_token IS NULL OR "
+                "package.build_token=cleanup.source_build_token))"
+                if has_source_token
+                else "is_canonical_uuid(package.build_token)=1"
+            )
+            invalid_source = connection.scalar(
+                text(
+                    "SELECT 1 FROM artifact_gc_queue AS cleanup "
+                    "LEFT JOIN content_packages AS package ON "
+                    "package.id=cleanup.owner_id "
+                    "AND windows_artifact_path_key(package.path)="
+                    "windows_artifact_path_key(cleanup.relative_path) "
+                    "AND package.sha256=cleanup.expected_sha256 "
+                    "AND package.size_bytes=cleanup.expected_size_bytes "
+                    + token_join
+                    + "WHERE "
+                    + (
+                        "(cleanup.owner_type='material' AND "
+                        "cleanup.source_build_token IS NOT NULL) OR "
+                        if has_source_token else ""
+                    )
+                    + "(cleanup.owner_type='content_package' AND ("
+                    + token_requirement
+                    + " IS NOT TRUE OR package.id IS NULL)) LIMIT 1"
+                )
+            )
+            if invalid_source is not None:
+                raise SchemaMigrationError(
+                    "Historical package cleanup generation cannot be proven."
+                )
             if "source_build_token" not in columns:
                 connection.execute(
                     text(
@@ -1277,7 +1315,6 @@ def _cleanup_reference_exists(
     require_expected_identity: bool,
     exclude_material_owner: bool,
     exclude_exact_failed_package_owner: bool,
-    exclude_package_owner: bool = False,
 ) -> str:
     conditions = [
         "windows_artifact_path_key(artifact_reference.path) "
@@ -1296,17 +1333,12 @@ def _cleanup_reference_exists(
             f"AND {cleanup}.owner_type = 'material' "
             f"AND artifact_reference.id = {cleanup}.owner_id)"
         )
-    if exclude_package_owner:
-        conditions.append(
-            "NOT (artifact_reference.reference_type = 'content_package' "
-            f"AND {cleanup}.owner_type = 'content_package' "
-            f"AND artifact_reference.id = {cleanup}.owner_id)"
-        )
-    elif exclude_exact_failed_package_owner:
+    if exclude_exact_failed_package_owner:
         conditions.append(
             "NOT (artifact_reference.reference_type = 'content_package' "
             f"AND {cleanup}.owner_type = 'content_package' "
             f"AND artifact_reference.id = {cleanup}.owner_id "
+            "AND artifact_reference.status = 'failed' "
             f"AND artifact_reference.build_token = {cleanup}.source_build_token "
             "AND windows_artifact_path_key(artifact_reference.path) "
             f"= windows_artifact_path_key({cleanup}.relative_path) "
@@ -1343,7 +1375,6 @@ def _cleanup_reference_conflict_when(cleanup: str) -> str:
         require_expected_identity=True,
         exclude_material_owner=True,
         exclude_exact_failed_package_owner=True,
-        exclude_package_owner=True,
     )
     live_reference_exception = f"""
 {cleanup}.state = 'needs_human'

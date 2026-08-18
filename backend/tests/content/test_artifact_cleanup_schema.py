@@ -8,7 +8,13 @@ from pydantic import ValidationError
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
-from backend.app.db import Database, SchemaMigrationError
+from backend.app.db import (
+    Database,
+    SchemaMigrationError,
+    canonical_artifact_path_key,
+    is_canonical_uuid_text,
+    windows_artifact_reference_path_key,
+)
 from backend.app.features.content import models as content_models
 from backend.app.features.content import schemas as content_schemas
 from backend.app.features.content.models import ContentPackageRecord
@@ -1675,3 +1681,274 @@ def test_half_migration_without_marker_is_retry_safe(tmp_path: Path) -> None:
             ) == 1
     finally:
         reopened.close()
+
+
+def _remove_source_provenance_migration(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.create_function("is_canonical_uuid", 1, is_canonical_uuid_text)
+        connection.create_function("artifact_path_key", 1, canonical_artifact_path_key)
+        connection.create_function(
+            "windows_artifact_path_key", 1, windows_artifact_reference_path_key
+        )
+        connection.execute(
+            "DELETE FROM workbench_schema_migrations WHERE name IN "
+            "('task8_artifact_quarantine_source_token_v1',"
+            "'task8_artifact_quarantine_reference_guard_v1')"
+        )
+        for trigger_name in (
+            "ck_artifact_gc_source_token_insert",
+            "ck_artifact_gc_source_token_update",
+            "ck_gc_material_path_insert", "ck_gc_material_path_update",
+            "ck_gc_package_path_insert", "ck_gc_package_path_update",
+            "ck_gc_cleanup_reference_insert", "ck_gc_cleanup_reference_update",
+        ):
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+
+
+def _downgrade_cleanup_table_without_source_token(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.create_function("is_canonical_uuid", 1, is_canonical_uuid_text)
+        connection.create_function("artifact_path_key", 1, canonical_artifact_path_key)
+        connection.create_function(
+            "windows_artifact_path_key", 1, windows_artifact_reference_path_key
+        )
+        create_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='artifact_gc_queue'"
+        ).fetchone()[0]
+        legacy_sql = create_sql.replace(
+            "\n\tsource_build_token VARCHAR(36), ", ""
+        ).replace(
+            " AND ((owner_type = 'material' AND source_build_token IS NULL) "
+            "OR (owner_type = 'content_package' AND "
+            "is_canonical_uuid(source_build_token) = 1))",
+            "",
+        )
+        columns = [
+            row[1] for row in connection.execute("PRAGMA table_info(artifact_gc_queue)")
+            if row[1] != "source_build_token"
+        ]
+        rendered = ",".join(columns)
+        for trigger_name in (
+            "ck_gc_material_path_insert", "ck_gc_material_path_update",
+            "ck_gc_package_path_insert", "ck_gc_package_path_update",
+            "ck_gc_cleanup_reference_insert", "ck_gc_cleanup_reference_update",
+        ):
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND tbl_name='artifact_gc_queue'"
+        ).fetchall():
+            connection.execute(f"DROP TRIGGER {row[0]}")
+        connection.execute("DROP INDEX uq_artifact_gc_open_owner")
+        connection.execute("ALTER TABLE artifact_gc_queue RENAME TO artifact_gc_queue_old")
+        connection.execute(legacy_sql)
+        connection.execute(
+            f"INSERT INTO artifact_gc_queue ({rendered}) "
+            f"SELECT {rendered} FROM artifact_gc_queue_old"
+        )
+        connection.execute("DROP TABLE artifact_gc_queue_old")
+        connection.execute(
+            "CREATE UNIQUE INDEX uq_artifact_gc_open_owner ON artifact_gc_queue "
+            "(owner_type,owner_id,path_key) WHERE "
+            "state IN ('pending','claimed','quarantined','needs_human')"
+        )
+        connection.execute(
+            "DELETE FROM workbench_schema_migrations WHERE name LIKE "
+            "'task8_artifact_quarantine%'"
+        )
+
+
+def test_source_token_marker_absent_rejects_forged_canonical_token_without_repair(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "forged-source-token.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    source_token = str(uuid4())
+    _insert_package_source(
+        database, package_id=owner_id, path="content-packages/item/old.zip",
+        sha256="a" * 64, size_bytes=12, build_token=source_token,
+    )
+    cleanup = _insert_cleanup(
+        database, owner_type="content_package", owner_id=owner_id,
+        relative_path="content-packages/item/old.zip",
+        path_key="content-packages/item/old.zip", expected_sha256="a" * 64,
+        expected_size_bytes=12, source_build_token=source_token,
+    )
+    database.close()
+    _remove_source_provenance_migration(path)
+    forged = str(uuid4())
+    with sqlite3.connect(path) as connection:
+        connection.create_function("is_canonical_uuid", 1, is_canonical_uuid_text)
+        connection.execute(
+            "UPDATE artifact_gc_queue SET source_build_token=? WHERE id=?",
+            (forged, cleanup.id),
+        )
+
+    with pytest.raises(SchemaMigrationError, match="generation cannot be proven"):
+        Database(path, runtime_dir=tmp_path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT source_build_token FROM artifact_gc_queue WHERE id=?",
+            (cleanup.id,),
+        ).fetchone()[0] == forged
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workbench_schema_migrations WHERE "
+            "name='task8_artifact_quarantine_source_token_v1'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND "
+            "name='ck_artifact_gc_source_token_insert'"
+        ).fetchone()[0] == 0
+
+
+def test_source_token_marker_absent_rejects_unmatched_historical_generation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unmatched-source-generation.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    source_token = str(uuid4())
+    _insert_package_source(
+        database, package_id=owner_id, path="content-packages/item/old.zip",
+        sha256="b" * 64, size_bytes=13, build_token=source_token,
+    )
+    cleanup = _insert_cleanup(
+        database, owner_type="content_package", owner_id=owner_id,
+        relative_path="content-packages/item/old.zip",
+        path_key="content-packages/item/old.zip", expected_sha256="b" * 64,
+        expected_size_bytes=13, source_build_token=source_token,
+    )
+    database.close()
+    _remove_source_provenance_migration(path)
+    with sqlite3.connect(path) as connection:
+        connection.create_function("is_canonical_uuid", 1, is_canonical_uuid_text)
+        connection.execute(
+            "UPDATE content_packages SET path='content-packages/item/new.zip', "
+            "build_token=? WHERE id=?",
+            (str(uuid4()), owner_id),
+        )
+
+    with pytest.raises(SchemaMigrationError, match="generation cannot be proven"):
+        Database(path, runtime_dir=tmp_path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT source_build_token FROM artifact_gc_queue WHERE id=?",
+            (cleanup.id,),
+        ).fetchone()[0] == source_token
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workbench_schema_migrations WHERE "
+            "name='task8_artifact_quarantine_source_token_v1'"
+        ).fetchone()[0] == 0
+
+
+def test_source_token_marker_absent_accepts_exact_current_generation(tmp_path: Path) -> None:
+    path = tmp_path / "exact-source-generation.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    source_token = str(uuid4())
+    _insert_package_source(
+        database, package_id=owner_id, path="content-packages/item/exact.zip",
+        sha256="c" * 64, size_bytes=14, build_token=source_token,
+        status="building",
+    )
+    cleanup = _insert_cleanup(
+        database, owner_type="content_package", owner_id=owner_id,
+        relative_path="content-packages/item/exact.zip",
+        path_key="content-packages/item/exact.zip", expected_sha256="c" * 64,
+        expected_size_bytes=14, source_build_token=source_token,
+    )
+    database.close()
+    _remove_source_provenance_migration(path)
+
+    reopened = Database(path, runtime_dir=tmp_path)
+    try:
+        with reopened.engine.connect() as connection:
+            assert connection.scalar(text(
+                "SELECT COUNT(*) FROM workbench_schema_migrations WHERE "
+                "name='task8_artifact_quarantine_source_token_v1'"
+            )) == 1
+            assert connection.scalar(text(
+                "SELECT source_build_token FROM artifact_gc_queue WHERE id=:id"
+            ), {"id": cleanup.id}) == source_token
+            assert connection.scalar(text(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND "
+                "name IN ('ck_artifact_gc_source_token_insert',"
+                "'ck_artifact_gc_source_token_update')"
+            )) == 2
+    finally:
+        reopened.close()
+
+
+def test_source_token_migration_backfills_only_exact_current_package(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-source-backfill.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    source_token = str(uuid4())
+    _insert_package_source(
+        database, package_id=owner_id, path="content-packages/item/legacy.zip",
+        sha256="d" * 64, size_bytes=15, build_token=source_token,
+    )
+    cleanup = _insert_cleanup(
+        database, owner_type="content_package", owner_id=owner_id,
+        relative_path="content-packages/item/legacy.zip",
+        path_key="content-packages/item/legacy.zip", expected_sha256="d" * 64,
+        expected_size_bytes=15, source_build_token=source_token,
+    )
+    database.close()
+    _downgrade_cleanup_table_without_source_token(path)
+
+    reopened = Database(path, runtime_dir=tmp_path)
+    try:
+        with reopened.engine.connect() as connection:
+            assert connection.scalar(text(
+                "SELECT source_build_token FROM artifact_gc_queue WHERE id=:id"
+            ), {"id": cleanup.id}) == source_token
+    finally:
+        reopened.close()
+
+
+def test_source_token_migration_does_not_backfill_unmatched_legacy_package(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-unmatched-source.sqlite3"
+    database = Database(path, runtime_dir=tmp_path)
+    owner_id = str(uuid4())
+    source_token = str(uuid4())
+    _insert_package_source(
+        database, package_id=owner_id, path="content-packages/item/legacy-old.zip",
+        sha256="e" * 64, size_bytes=16, build_token=source_token,
+    )
+    cleanup = _insert_cleanup(
+        database, owner_type="content_package", owner_id=owner_id,
+        relative_path="content-packages/item/legacy-old.zip",
+        path_key="content-packages/item/legacy-old.zip", expected_sha256="e" * 64,
+        expected_size_bytes=16, source_build_token=source_token,
+    )
+    database.close()
+    _downgrade_cleanup_table_without_source_token(path)
+    with sqlite3.connect(path) as connection:
+        connection.create_function("is_canonical_uuid", 1, is_canonical_uuid_text)
+        connection.execute(
+            "UPDATE content_packages SET path='content-packages/item/current.zip', "
+            "build_token=? WHERE id=?",
+            (str(uuid4()), owner_id),
+        )
+
+    with pytest.raises(SchemaMigrationError, match="generation cannot be proven"):
+        Database(path, runtime_dir=tmp_path)
+
+    with sqlite3.connect(path) as connection:
+        assert "source_build_token" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(artifact_gc_queue)")
+        }
+        assert connection.execute(
+            "SELECT relative_path FROM artifact_gc_queue WHERE id=?", (cleanup.id,)
+        ).fetchone()[0] == "content-packages/item/legacy-old.zip"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workbench_schema_migrations WHERE "
+            "name='task8_artifact_quarantine_source_token_v1'"
+        ).fetchone()[0] == 0

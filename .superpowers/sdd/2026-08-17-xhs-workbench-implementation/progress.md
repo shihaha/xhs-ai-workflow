@@ -1,0 +1,168 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-17-xhs-workbench-implementation.md
+
+Setup: isolated standalone repository at `D:\AI_WORKSPACE\xhs-intelligence-workbench`, branch `feature/system-v1`, baseline commit `f821b49`.
+
+Spec: `SYSTEM_SPEC_AND_ACCEPTANCE.md` is reachable and authoritative.
+
+Baseline: repository began with documentation only; there was no application test suite to run.
+
+## Pre-flight interface scan
+
+| Task | Produces / consumes | Self-consistency and overlap finding |
+|---|---|---|
+| 1 | Produces settings, app factory and health API used by all later tasks | Consistent; health must report unknown/unavailable honestly. |
+| 2 | Consumes settings; produces job, log and evidence persistence | Consistent; owns shared state-machine semantics. |
+| 3 | Consumes settings/evidence conventions; produces normalized adapter DTOs | Consistent; probes may be unavailable without treating that as success. |
+| 4 | Consumes Task 1 and 2 HTTP interfaces; produces the initial UI shell | Consistent; uses complete response fixtures, not mocked UI components. |
+| 5 | Consumes Tasks 2 and 3; produces radar/account APIs used by Tasks 7 and 9 | Live Qianfan access may be unavailable; offline implementation remains testable. |
+| 6 | Consumes Tasks 2, 3 and 5; produces device/shop collection used by Tasks 7 and 9 | Live device is an opt-in smoke test; no-device is not a passing live check. |
+| 7 | Consumes evidence from Tasks 5 and 6; produces analysis/opportunity APIs | Live model call depends on user secret; contract tests must not claim live verification. |
+| 8 | Consumes Task 7 opportunities and Task 3/7 adapters; produces content APIs and ZIP | Consistent; tutorial demo content is configuration/fixture only. |
+| 9 | Consumes all feature APIs; produces end-to-end operator UI | Consistent; controlled fixtures cover software E2E, not external-live UAT. |
+| 10 | Consumes all modules; produces verification, recovery and UAT records | Seven-day UAT cannot be collapsed into a unit test and remains pending until real inputs exist. |
+| 1 + 2 + 4 | Health/job response shapes shared across backend and frontend | Task 4 must derive TypeScript types from the implemented API contract, preserving exact state names. |
+| 3 + 5 + 6 | `CollectionResult` shared by browser and Android collection | N/N invariants live in the shared contract; individual adapters may not override them. |
+| 2 + 7 + 8 | Evidence IDs shared by model analysis and content export | Only persisted evidence IDs may ground claims or appear in export manifests. |
+
+Ruling: The standalone feature repository itself is the isolated workspace; no nested Git worktree will be created — the user explicitly selected this isolated directory — cost if wrong: branch cleanup is manual rather than worktree-native.
+
+Ruling: Missing Qianfan login, Android hardware or Bailian key does not block software implementation — offline contract tests proceed and live checks remain visibly unverified — cost if wrong: external selector/API mismatches may require later adapter fixes.
+
+Ruling: The seven-day live run is a release/UAT gate, not something to simulate during implementation — cost if wrong: final status remains pending longer, but no false completion is reported.
+
+Task 1: fix round 1/5 (1 addressed, 0 open — database directory target no longer reports healthy; commits cc2327c..06b4bc3)
+
+Task 1: complete (commits f821b49..06b4bc3, review clean)
+
+Task 2: fix round 1/5 (6 addressed, 0 open — atomic claims, running leases, evidence containment, DB degradation, lifecycle cleanup, TDD evidence; commits 4785b4e..6feac19)
+
+Task 2: complete (commits 06b4bc3..6feac19, review clean)
+
+Task 3: fix round 1/5 (2 addressed, 1 new open — duplicate N/N IDs and missing/mismatched origins fixed; non-approved URL schemes remained; commits 6d19490..171df6d)
+
+Task 3: fix round 2/5 (1 addressed, 0 Important open — non-approved origin URL forms rejected; commits 171df6d..242f79d)
+
+Task 3: minor (deferred): origin parser may normalize empty `?`/`#` markers or doubled leading slashes; final review will decide whether literal exactness requires rejection.
+
+Task 3: complete (commits 6feac19..242f79d, review clean with 1 deferred minor)
+
+Task 4: fix round 1/5 (1 addressed, 0 open — Vitest/Vite audit vulnerabilities removed; commits a5acf39..40dbc82)
+
+Task 4: complete (commits 242f79d..40dbc82, review clean)
+
+Task 4: minor (deferred): document/pin Node requirement if Node 18 support is ever expected; current verified Node 24.18.0 satisfies Vitest 4.1.10.
+
+Task 5: fix round 1/5 (7 original findings addressed or narrowed; 5 Important follow-ups open — adapter path, terminal state, result contract, timing cleanup, fallback identity; commits 375b595..45380dc)
+
+Task 5: fix round 2/5 (job path/state and timing fixed; 3 Important accounting/identity findings open; commits 45380dc..9047090)
+
+Task 5: fix round 3/5 (known/unknown totals and direct overflow fixed; 3 Important Qianfan normalization findings open; commits 9047090..d62ed26)
+
+Task 5: fix round 4/5 (requested identity/URL/0-0 cases narrowed; 4 Important mixed-row, identity, URL-schema and HTTP-status findings open; commits d62ed26..973414b)
+
+Task 5: fix round 5/5 (mixed-row accounting and HTTP/business status addressed; 2 load-bearing identity/URL validation findings open; commits 973414b..bbf2d1c)
+
+Task 5: Ruling: fallback identity must require a non-empty string content type; every colliding source row after the first becomes an explicit `duplicate_identity` rejected observation with raw evidence and remains in observed accounting — this favors human review over false N/N — cost if wrong: legitimate duplicate feed records may require manual resolution.
+
+Task 5: Ruling: `noteId` must be a scalar safe token and platform-relative note URLs must match a strict known route with one safe ID segment and no dot segments; arbitrary objects and ambiguous paths become rejected observations — this favors false negatives over fabricated links — cost if wrong: a newly introduced legitimate route will be marked `needs_human` until an adapter profile update.
+
+Task 5: minor (deferred): fix-round-5 report RED transcript is stale by one test count (reported 23/72; reviewer reproduced 24/71).
+
+Task 5: complete (commits 40dbc82..bbf2d1c, 2 load-bearing rulings carried into Task 6)
+
+Task 6: fix round 1/5 (9 findings addressed — deep-verification gate, contained evidence, device reservation, cancellation checkpoints, fresh clipboard, URL identity, async 202, strict input validation and complete rejected evidence; commits 8032b83..473dfec)
+
+Task 6: fix round 2/5 (verified-vs-collected N/N, atomic cancellation/finalization, overlapping viewport accounting, worker restart/shutdown lifecycle and selector validation addressed; commits 473dfec..92a91c3)
+
+Task 6: fix round 3/5 (legacy/current shop-job restart classification, recovery order and duplicate-aware missing references addressed; commits 92a91c3..8d35e6f)
+
+Task 6: complete (commits bbf2d1c..8d35e6f, review clean; live Android smoke remains `not_run: device unavailable`)
+
+Task 7: fix round 1/5 (trusted Task 6 file binding, explicit account scopes, shared model request, canonical evidence IDs and bounded transient/model output handling; commits f0e7010..4bda201)
+
+Task 7: fix round 2/5 (SQLite scope migration, provider-neutral model errors, full Task 6 result invariants and bounded strict result reads; commits 4bda201..ff6b762)
+
+Task 7: fix round 3/5 (artifact producer provenance, migration/schema validation, shared-error sanitization, rejected-reference conservation and single-handle file identity checks; commits ff6b762..2df0835)
+
+Task 7: fix round 4/5 (success-path attempt sanitization, reserved worker job API boundary and retry-safe half-migration recovery; commits 2df0835..a5d669e)
+
+Task 7: fix round 5/5 (unknown job-transition fields rejected for reserved and generic jobs; commits a5d669e..73119e9)
+
+Task 7: Ruling: pre-provenance analysis successes and opportunities are preserved only as `needs_human` records and automatic opportunities are removed during migration; legacy artifacts default to `external` and are not trusted until recollected — this favors truthful re-verification over retaining unprovable results — cost if wrong: users must rerun earlier shop collection and analysis.
+
+Task 7: minor (deferred): identical analysis input digests are not unique/idempotent because an intentional rerun against the same evidence can be valid; final review may revisit only if duplicate writes cause data damage.
+
+Task 7: complete (commits 8d35e6f..73119e9, review clean; live Bailian contract remains `not_run: BAILIAN_API_KEY unavailable`)
+
+Task 8: initial implementation (commit 729bab1; reviewed content production, immutable revisions and deterministic export introduced)
+
+Task 8: fix round 1/5 (review CAS, evidence revalidation, real-image carousel contract, live artifact availability, package reservation and schema safeguards added; commits 729bab1..d5cd41b; re-review found 8 Important issues still open)
+
+Task 8: Ruling: a complete V1 Xiaohongshu content package requires at least one system-decodable output image, ordered cover-first, a complete image plan and per-image approval checks; text-only or marker-only fake-image packages remain blocked — this favors truthful package readiness over placeholder completion — cost if wrong: operators must provide or generate real images before export and text-only drafts cannot be packaged.
+
+Task 8: fix round 2/5 (post-model regenerate recovery, decoded-image validation, re-export CAS, physical schema checks, package size separation, startup recovery, auditable image/review export and Windows material names added; commits d5cd41b..d5332e1; re-review found unsafe orphan-root/deletion plus 4 Important lifecycle/schema/image/ZIP gaps)
+
+Task 8: fix round 3/5 (trusted runtime binding, handle-bound orphan deletion, package failure finalization, stricter schema checks, pre-decode image limits and generic ZIP name safety added; commits d5332e1..e630671; re-review still found unsafe material-conflict cleanup, missing artifact-ownership proof and SQL literal normalization gaps)
+
+Task 8: fix round 4/5 (material conflict cleanup, startup artifact ownership checks and literal-aware SQLite definition validation added; commits e630671..c2d79b0; re-review found Windows-equivalent ownership, non-IntegrityError material cleanup and package finalizer path-CAS gaps)
+
+Task 8: fix round 5/5 (Windows-equivalent ownership, conservative material cleanup and package reservation CAS tightened; commits c2d79b0..cb04f14; final review still found 2 Important exact-reservation and reference/delete race gaps)
+
+Task 8: approved deferred minors: final ZIP archive bytes can exceed the shared uncompressed-size limit near the absolute boundary because of container overhead; unconfigured-model create may return 503 before an otherwise applicable 404. Neither is currently load-bearing for V1 acceptance.
+
+Task 8: blocked after maximum 5 fix rounds — failed-package finalization is not bound to item and revision in every path, and reference-aware physical cleanup still separates database ownership proof from deletion while ambiguous link references do not fail closed. Backend tests are 407 passed, 1 live skip, but Task 8 is not accepted and Task 9 must not begin until an approved cleanup/finalization redesign closes these findings.
+
+Task 8 quarantine redesign: Task 1 complete — durable `artifact_gc_queue`, nullable package `build_token`, retry-safe `task8_artifact_quarantine_v1` physical validation and enqueue-only startup recovery added. Startup no longer performs any physical artifact deletion; interrupted builders become `failed` with one idempotent `pending` cleanup fact. Verification: focused migration 11 passed, content 103 passed, full backend 416 passed and 1 opt-in Bailian live skip; compile/diff clean. Task 8 remains blocked pending redesign Tasks 2—5 and independent review.
+
+Task 8 quarantine redesign: Task 1 fix round 1/5 — marker-before-DDL fail-closed validation, durable Windows-equivalent `path_key`, canonical path/UUID/build-token enforcement and claimed-lease state constraints added. Marker-present missing table/column/constraint/index/trigger is never auto-repaired; marker-absent empty half-migrations remain retry-safe. Verification: focused migration 34 passed, content 126 passed, full backend 439 passed and 1 live skip; compile/diff clean. Task 8 remains blocked pending redesign Tasks 2—5 and independent review.
+
+Task 8 quarantine redesign Ruling: a present `task8_artifact_quarantine_v1` marker is authoritative and forbids automatic schema repair; any marker/schema contradiction makes the app unavailable for isolated manual migration — this favors visible failure over silent alteration — cost if wrong: a database created by an earlier incompatible quarantine build cannot self-upgrade after the marker exists.
+
+Task 8 quarantine redesign Ruling: cleanup identity uses an NFC-plus-Windows-casefolded canonical `path_key`, while paths with Windows-trim/device/dot/control ambiguity are rejected — this favors preventing duplicate or ambiguous deletion candidates — cost if wrong: a legitimate newly introduced filename convention may require a reviewed path-policy migration.
+
+Task 8 quarantine redesign: Task 2 implemented — frozen cleanup candidates, idempotent durable enqueue, SQLite CAS leases, expired-lease recovery, same-volume quarantine rename, 24-hour delayed handle-bound deletion and read-only service queries added. All file operations occur outside SQLite write transactions; lease/reference/file identity are rechecked around rename and again from the opened delete handle. Missing artifacts become `deleted/already_missing` only after a reference check; links, junctions, owner reuse, hardlinks, identity changes, original-path reappearance, move/commit ambiguity and newly created references retain bytes and become `needs_human`. Verification: focused lifecycle plus round3/5 55 passed, content 149 passed, full backend 462 passed and 1 opt-in Bailian live skip; compile/diff clean. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending redesign Tasks 3—5 and independent review.
+
+Task 8 quarantine redesign Ruling: final deletion uses the verified open file identity plus a last-moment database authorization callback after the delete handle opens; any new reference or lost lease cancels deletion and retains the quarantine file — this favors a narrow fail-closed deletion boundary — cost if wrong: transient database-read failures can require human cleanup instead of automatically reclaiming disk space.
+
+Task 8 quarantine redesign: Task 2 fix round 1/5 — final deletion now serializes the exact lease/reference authorization, identity-bound handle disposition and `deleted` CAS in one bounded `BEGIN IMMEDIATE`; all hashing, reads, rename and waits remain outside write transactions. Persisted quarantine physical identity, Windows target-directory locking, expiry-aware terminal CAS, snapshot-safe lease recovery, uniform path/size caps and a post-move grace timestamp close the review findings. Verification: focused lifecycle plus round3/5 63 passed, content 159 passed, full backend 472 passed and 1 opt-in Bailian live skip; compile/diff clean. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending redesign Tasks 3—5 and independent review.
+
+Task 8 quarantine redesign Ruling: the only permitted SQLite write transaction containing file I/O is the final, already-open identity-bound handle disposition. `BEGIN IMMEDIATE` prevents a cooperating reference writer from crossing authorization and deletion; after the lock releases, writers must read the terminal GC/file outcome before deciding whether a reference can be created — cost if wrong: final deletion briefly serializes SQLite writers, but no hash, large read, wait or rename extends that lock.
+
+Task 8 quarantine redesign: Task 2 fix round 2/5 — missing finalization now uses a fresh strict-expiry CAS; Windows handle deletion remains reversible through database commit and persists `needs_human/delete_outcome_ambiguous` under the existing write lock when disarm fails; exact SQLite material/package reference guards reserve every Windows-equivalent quarantine path across INSERT/path UPDATE, marker tampering and historical conflicts fail closed, and content service checks return an explicit quarantine-reservation error. Verification: focused lifecycle/schema plus round3/5 106 passed, content 168 passed, full backend 481 passed and 1 opt-in Bailian live skip; compile/diff clean. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending redesign Tasks 3—5 and independent review.
+
+Task 8 quarantine redesign Ruling: every claimed/quarantined/deleted/needs-human `quarantine_path` is a durable path reservation, not merely a current file location. Material/package writers must be rejected by physically validated database triggers even after the file is gone; this favors preventing stale references over reusing quarantine names — cost if wrong: an operator must resolve or migrate the cleanup record before intentionally reusing that Windows-equivalent path.
+
+Task 8 quarantine redesign: Task 2 fix round 3/5 — cleanup queue INSERT/path-state UPDATE reverse guards now prevent protected cleanup records from capturing any Windows-equivalent material/package reference, with all six trigger definitions physically marker-validated and historical conflicts failing closed. Confirmed quarantine moves now persist path and physical identity through an expiry-aware moved-needs-human CAS; ambiguous acknowledgement stays claimed for deterministic restart recovery rather than inventing completion. Verification: focused lifecycle/schema plus round3/5 109 passed, content 171 passed, full backend 484 passed and 1 opt-in Bailian live skip; compile/diff clean. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending redesign Tasks 3—5 and independent review.
+
+Task 8 quarantine redesign Ruling: once a same-volume move is physically confirmed, the quarantine path and identity are safety facts. Any post-move ambiguity must durably expose them as `needs_human`, or retain the claimed lease fact for restart recovery if persistence cannot be proven — this favors honest recoverability over a convenient terminal state — cost if wrong: an ambiguous commit may require one lease-expiry retry before operators can see the final quarantine location.
+
+Task 8 quarantine redesign: Task 2 fix round 4/5 — deterministic future-quarantine-path references no longer strand a physically moved cleanup in `claimed`. The reverse guard permits only a durable `needs_human/live_reference` moved fact with complete quarantine identity and a real Windows-equivalent material/package reference; fabricated moved exceptions fail the trigger or startup validation, later references remain blocked, and the terminal row is not claimable or lease-recoverable. Verification: focused lifecycle/schema plus round3/5 112 passed, content 174 passed, full backend 487 passed and 1 opt-in Bailian live skip; compile/diff clean. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending redesign Tasks 3—5 and independent review.
+
+Task 8 quarantine redesign Ruling: a material/package path that was validly created before a pending cleanup disclosed its deterministic quarantine path is preserved as evidence rather than erased. After the verified move, only `needs_human/live_reference` with the complete moved identity and a matching Windows-equivalent reference may coexist with that reserved quarantine path; all later references remain forbidden — cost if wrong: the conflicted bytes stay in quarantine for manual resolution instead of being automatically reclaimed.
+Task 8 quarantine redesign: Task 2 fix round 5/5 — typed reference classification now distinguishes the exact failed content-package owner from a live artifact reference across the Python cleanup service, reverse SQLite triggers and startup validation. Exact failed owners remain cleanup sources but cannot authorize fabricated moved quarantine facts; material owners remain live only at a Windows-equivalent original path with the expected identity, while identity-matching external quarantine-path references (including a same package owner at a non-original destination) still persist as `needs_human/live_reference`. Direct SQL, restart, identity mismatch, same-owner and case/NFC/trailing-dot regressions fail closed. Verification: focused lifecycle/schema plus round3/5 119 passed, content 181 passed, full backend 494 passed and 1 opt-in Bailian live skip; compile/diff clean. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending redesign Tasks 3—5 and independent review.
+
+Task 8 quarantine redesign Ruling: a failed content-package row is an authorized cleanup source only when owner ID, failed status, Windows-equivalent original path, SHA-256 and size all match the cleanup record; that source alone never proves a moved live-reference conflict — cost if wrong: malformed historical package ownership is retained for human review instead of permitting automatic quarantine finalization.
+
+Task 8 quarantine redesign: Task 2 blocked after maximum 5 fix rounds — the final review found that reverse-guard validity depends on material/package `sha256`, `size_bytes` and package `status`, but runtime UPDATE triggers currently watch only `path`. A supporting reference can therefore mutate into an invalid identity during runtime and make the next startup fail schema/data validation. Verification is 494 passed and 1 live Bailian skip, but Task 2 is not accepted; redesign Tasks 3—5 and original Tasks 9—10 have not started.
+
+Task 8 quarantine redesign: Task 8R-2 stabilization S1 user-approved — one shared typed-reference conflict predicate now drives cleanup reverse guards, material/package UPDATE guards and startup validation. Material `id/path/sha256/size_bytes` and package `id/status/path/sha256/size_bytes` mutations cannot remove the last valid support for a durable `needs_human/live_reference` fact; a mutation remains permitted when another matching support exists, and weakened path-only trigger SQL fails closed at startup. RED: 7 expected mutation failures plus 2 expected ID-classification failures. GREEN: focused support 11 passed, cleanup schema 59 passed, content 192 passed, full backend 506 passed and 1 opt-in Bailian live skip; compile/diff clean. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8R-2 awaits independent review; Task 8R-3 has not started.
+
+Task 8 quarantine redesign: Task 8R-2 stabilization S1 fix round 1/5 — cleanup reverse UPDATE guards now also watch every mutable cleanup-source column used by the shared typed-reference predicate: `owner_type/owner_id/relative_path/path_key/expected_sha256/expected_size_bytes`, in addition to the existing quarantine/state/error/physical-identity columns. Direct single-column owner/hash/size mutations, consistent relative-path plus path-key mutation, second-support preservation, old-trigger marker tampering and startup same-source validation are covered. RED: 6 expected missing-guard failures and 2 already-correct passes. GREEN: focused 8 passed, cleanup schema 67 passed, content 201 passed, full backend 514 passed and 1 opt-in Bailian live skip; compile/diff clean. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8R-2 awaits independent re-review; Task 8R-3 has not started.
+
+Task 8 quarantine redesign: Task 8R-3 implemented — material persistence failures and ambiguous acknowledgements now retain bytes and idempotently enqueue cleanup facts; request paths no longer import or call the physical-delete helper. Every package reservation receives a canonical `build_token`; pre-build validation plus ready and failed finalizers bind package ID, item ID, revision ID, `building` status, path and token. Ready package and exported item commit together; CAS loss or uncertain failure finalization retains the artifact and enqueues a later fail-closed cleanup without changing the winner. Superseded round 2/4/5 direct-delete expectations now assert durable cleanup or fail-safe retention without weakening their concurrency and identity checks. RED: new integration 5 expected failures, plus one expected ambiguous-finalizer failure and 5 superseded direct-delete failures. GREEN: focused integration/round3/round5 38 passed, content 207 passed, full backend 520 passed and 1 opt-in Bailian live skip; compile/diff clean. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending Task 8R-3 independent review and redesign Tasks 4—5.
+
+Task 8 quarantine redesign: Task 8R-3 fix round 1/5 — replaced every post-failure best-effort enqueue with a durable reservation outbox. `enqueue_in_session` and exact idempotent `cancel_in_session` let material/package business transitions and cleanup facts share the caller's SQLite transaction without an internal commit. Material and package build reservations are persisted before managed-file writes and delayed 24 hours so the future cleanup worker cannot race an active writer; success persists the material or ready package plus exported item and cancels the exact reservation atomically. Replacement-path transition and its old-artifact cleanup are one transaction. Fresh exact reads turn material/package ready commit-ack ambiguity into proven success, and failed-package ambiguity is accepted only when the exact failed builder and pending cleanup are visible; otherwise `transaction_unknown` retains the pending fact and file. RED: 5 outbox gaps, 2 active-writer delay gaps and 10 superseded-contract regressions. GREEN: focused integration/round3/round5 45 passed, content 214 passed, full backend 527 passed and 1 opt-in Bailian live skip; compile/diff clean and no request/startup delete or business-path standalone enqueue remains. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending this fix-round independent review and redesign Tasks 4—5.
+
+Task 8 quarantine redesign Ruling: an active material or package-build cleanup reservation is not claimable for 24 hours; normal success cancels it atomically and crash/failure leaves it pending for later proof — this favors preventing the cleanup worker from racing an unfinished writer — cost if wrong: failed bytes wait up to 24 hours before first quarantine and therefore up to 48 hours before final deletion after the separate quarantine grace period.
+
+Task 8 quarantine redesign: Task 8R-3 fix round 2/5 — package reservation commit acknowledgement now has an exact three-way fresh proof (`landed`, `not_landed`, `unknown`) covering the building package, canonical builder token, placeholder artifact identity and pending cleanup reservation; only a fully proven landing proceeds to the filesystem write. Failed-package finalization now returns a typed four-way outcome (`failed`, `proven_failed`, `unknown`, `lost`), persists the exact produced hash/size and advances the pending cleanup due time in the same transaction. Explicit material/package failures and startup recovery make their exact pending cleanup immediately due, while active writers retain the original 24-hour protection. RED: the startup future-pending recovery test proved the old 24-hour delay remained; reservation landed/not-landed/partial/unreadable and failed-finalizer not-landed/identity-mismatch cases covered the new transaction boundaries. GREEN: focused integration/round3/round5/schema 119 passed, content 221 passed, full backend 534 passed and 1 opt-in Bailian live skip; compile/diff clean and no request/startup physical delete or business-path standalone enqueue exists. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending independent re-review and redesign Tasks 4—5.
+
+Task 8 quarantine redesign: Task 8R-3 fix round 3/5 — lost package ownership is now an explicit `package_builder_lost` state conflict from both unsafe-path and generic failure catches; the losing request does not mutate the winner or cleanup reservation and the existing API state-error translation returns HTTP 409. Material persistence acknowledgement now has typed `landed/not_landed/unknown` fresh proof. Exact non-landing advances the pending cleanup to fresh-now with `material_persistence_failed`; writable unknown advances it with `material_transaction_unknown`; a database outage retains the durable +24-hour reservation and reports that due-state could not be proven. Replacement reservation non-landing requires both the build and replacement cleanup IDs to be absent; either partial fact is unknown. RED: 6 tightened cases failed on the old error/delay classification. GREEN: focused integration/round3/round5/schema 125 passed, content 227 passed, full backend 540 passed and 1 opt-in Bailian live skip; compile/diff clean and no request/startup physical delete or business-path standalone enqueue exists. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending independent re-review and redesign Tasks 4—5.
+
+Task 8 quarantine redesign: Task 8R-3 fix round 4/5 — every package cleanup now freezes the canonical `source_build_token` of the exact builder generation that created its bytes. Physical CHECKs, exact INSERT/freeze triggers, a retry-safe marked table-rebuild migration, startup validation, outbox acknowledgement proof and Python/SQL reference classification share this provenance. Replacement cleanup is persisted while the old generation is current, then the same transaction reserves the new token/path; a later cleanup with an old frozen token and no live old-path reference is an authorized historical artifact, while same-token identity mismatch remains fail closed. RED: missing column/constraints/proof plus real retry historical cleanup failed. GREEN: schema 67 passed, cleanup service 40 passed, content 228 passed, full backend 541 passed and 1 opt-in Bailian live skip; compile/diff clean and no request/startup physical delete was introduced. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8 remains blocked pending independent re-review and redesign Tasks 4—5.
+
+Task 8 quarantine redesign Ruling: a package cleanup is owned by one immutable builder generation, not merely by a reusable package row ID. A current package with a different canonical token and different path may coexist while its old generation is quarantined; missing, forged, same-token-mismatched or live old-path provenance remains manual/fail closed — cost if wrong: unprovable legacy package cleanups require isolated manual migration instead of automatic deletion.
+
+Task 8 quarantine redesign: Task 8R-3 fix round 5/5 — current exact package ownership is now status-bound across Python classification, SQL reverse guards, final delete authorization and startup reference validation: only exact `failed` ID/token/Windows-path/SHA/size is a cleanup source, while `building` and `ready` remain `live_reference`. Before a missing source-token marker can authorize any schema/backfill write, every existing package cleanup must prove exact current ID/path/SHA/size/canonical token; existing non-NULL tokens must match, NULL is backfilled only from the exact package, and forged/unmatched/partial histories fail without repair. Valid half migration restores guards and marker; historical old-generation cleanup remains limited to a frozen different token plus different path. RED: current building/ready move/delete and forged/unmatched migration cases failed. GREEN: focused cleanup/integration/schema/hardening 174 passed, content 236 passed, full backend 549 passed and 1 opt-in Bailian live skip; compile/diff clean and no request/startup direct deletion exists. Live Bailian, Android and seven-day UAT remain `not_run`. Task 8R-3 awaits final independent re-review; Task 8R-4 has not started.
+
+Task 8 quarantine redesign Ruling: an exact current package generation is disposable only while its package status is `failed`; the same exact generation in `building` or `ready` is a live reference at quarantine and final-delete authorization. A missing source-token migration marker is not permission to trust UUID shape: preflight must prove every package cleanup against current ID, Windows-equivalent path, SHA-256, size and canonical token before any repair or marker write — cost if wrong: ambiguous historical cleanups require isolated manual migration and active/ready package bytes are retained for human review instead of reclaimed automatically.
