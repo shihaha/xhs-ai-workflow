@@ -14,6 +14,7 @@ from sqlalchemy import update
 
 from backend.app.db import Database
 import backend.app.features.content.cleanup as cleanup_module
+import backend.app.features.content.export as export_module
 from backend.app.features.content.cleanup import (
     ArtifactCleanupCandidate,
     ArtifactCleanupService,
@@ -450,4 +451,123 @@ async def test_app_lifespan_defers_database_close_until_blocked_worker_exits(
     finally:
         release.set()
     assert app.state.artifact_cleanup_worker.wait_stopped(timeout=1)
+    assert close_calls == ["closed"]
+
+
+def test_stop_at_internal_rename_boundary_prevents_os_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final helper-internal authorization fence must run after handle setup."""
+    database, runtime, service, artifact, record = _real_cleanup(tmp_path)
+    entered = Event()
+    release = Event()
+    close_calls: list[str] = []
+    real_close = database.close
+
+    def boundary_hook() -> None:
+        entered.set()
+        release.wait()
+
+    def close_database() -> None:
+        close_calls.append("closed")
+        real_close()
+
+    monkeypatch.setattr(
+        export_module,
+        "_rename_authorization_boundary_hook",
+        boundary_hook,
+    )
+    worker = ArtifactCleanupWorker(
+        service,
+        poll_seconds=30,
+        batch_size=1,
+        on_stopped=close_database,
+    )
+    worker.start()
+    if not entered.wait(timeout=1):
+        worker.close()
+        release.set()
+        worker.wait_stopped(timeout=1)
+        pytest.fail("rename authorization boundary was not reached")
+    try:
+        assert worker.close() is False
+        assert close_calls == []
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    quarantine = (
+        runtime
+        / "artifacts-quarantine"
+        / record.id
+        / artifact.name
+    )
+    current = service.get_record(record.id)
+    assert current is not None and current.state == "claimed"
+    assert artifact.exists()
+    assert quarantine.exists() is False
+    assert close_calls == ["closed"]
+    # Both source and target-directory handles must have been closed on cancellation.
+    probe = artifact.with_name("handle-probe.bin")
+    artifact.rename(probe)
+    probe.rename(artifact)
+
+
+def test_stop_after_atomic_rename_persists_moved_fact_before_database_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once Windows moved bytes, shutdown must durably record their new identity."""
+    database, runtime, service, artifact, record = _real_cleanup(tmp_path)
+    entered = Event()
+    release = Event()
+    close_calls: list[str] = []
+    real_close = database.close
+
+    def after_atomic_hook() -> None:
+        entered.set()
+        release.wait()
+
+    def close_database() -> None:
+        close_calls.append("closed")
+        real_close()
+
+    monkeypatch.setattr(
+        export_module,
+        "_rename_after_atomic_hook",
+        after_atomic_hook,
+    )
+    worker = ArtifactCleanupWorker(
+        service,
+        poll_seconds=30,
+        batch_size=1,
+        on_stopped=close_database,
+    )
+    worker.start()
+    if not entered.wait(timeout=1):
+        worker.close()
+        release.set()
+        worker.wait_stopped(timeout=1)
+        pytest.fail("post-atomic rename boundary was not reached")
+    try:
+        assert worker.close() is False
+        assert close_calls == []
+    finally:
+        release.set()
+    assert worker.wait_stopped(timeout=1)
+
+    quarantine = (
+        runtime
+        / "artifacts-quarantine"
+        / record.id
+        / artifact.name
+    )
+    current = service.get_record(record.id)
+    assert current is not None
+    assert current.state == "needs_human"
+    assert current.quarantine_path == (
+        f"artifacts-quarantine/{record.id}/{artifact.name}"
+    )
+    assert current.last_error_category == "shutdown_after_quarantine_move"
+    assert artifact.exists() is False
+    assert quarantine.exists()
     assert close_calls == ["closed"]

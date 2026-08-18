@@ -23,6 +23,24 @@ class UnsafeContentPath(ValueError):
     pass
 
 
+class ArtifactRenameCancelled(RuntimeError):
+    """Raised when the final rename authorization fence is closed."""
+
+
+# Narrow fault-injection hooks for boundary tests; production leaves both unset.
+_rename_authorization_boundary_hook: Callable[[], None] | None = None
+_rename_after_atomic_hook: Callable[[], None] | None = None
+
+
+def _rename_is_authorized(authorized: Callable[[], bool] | None) -> bool:
+    if authorized is None:
+        return True
+    try:
+        return bool(authorized())
+    except Exception:
+        return False
+
+
 ArtifactReference = tuple[str, tuple[int, int] | None]
 
 
@@ -342,16 +360,20 @@ def rename_contained_regular_to_directory(
     target_relative: str,
     *,
     expected_identity: tuple[int, int, int, int],
+    authorized: Callable[[], bool] | None = None,
 ) -> ArtifactPathInspection:
     """Retry one transient handle acquisition without ever falling back to paths."""
 
     moved = ArtifactPathInspection("ambiguous", absolute_key="not_attempted")
     for _attempt in range(2):
+        if not _rename_is_authorized(authorized):
+            raise ArtifactRenameCancelled("Artifact rename authorization was cancelled.")
         moved = _rename_contained_regular_to_directory_once(
             root,
             source_relative,
             target_relative,
             expected_identity=expected_identity,
+            authorized=authorized,
         )
         if moved.status == "trusted":
             return moved
@@ -372,6 +394,7 @@ def _rename_contained_regular_to_directory_once(
     target_relative: str,
     *,
     expected_identity: tuple[int, int, int, int],
+    authorized: Callable[[], bool] | None = None,
 ) -> ArtifactPathInspection:
     """Rename by source and target-directory handles; never resolve a late target path."""
 
@@ -402,12 +425,18 @@ def _rename_contained_regular_to_directory_once(
         directory_handle = _open_directory_handle(target_parent)
         if not _directory_handle_matches_path(directory_handle, target_parent, root):
             return ArtifactPathInspection("ambiguous", absolute_key="directory_handle_identity")
+        if _rename_authorization_boundary_hook is not None:
+            _rename_authorization_boundary_hook()
+        if not _rename_is_authorized(authorized):
+            raise ArtifactRenameCancelled("Artifact rename authorization was cancelled.")
         if not _rename_open_file(
             descriptor, 0, _windows_extended_path(target_parent / target_posix.name)
         ):
             return ArtifactPathInspection(
                 "ambiguous", absolute_key=f"rename_failed_{_windows_last_error()}"
             )
+        if _rename_after_atomic_hook is not None:
+            _rename_after_atomic_hook()
         moved_handle = os.fstat(descriptor)
         if _identity(moved_handle) != expected_identity:
             return ArtifactPathInspection("ambiguous", absolute_key="post_handle_identity")

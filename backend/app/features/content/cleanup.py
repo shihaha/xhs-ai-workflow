@@ -25,6 +25,7 @@ from backend.app.db import (
 )
 from backend.app.features.content import export as content_export
 from backend.app.features.content.export import (
+    ArtifactRenameCancelled,
     ArtifactPathInspection,
     MAX_PACKAGE_BYTES,
     inspect_contained_artifact,
@@ -741,13 +742,29 @@ class ArtifactCleanupService:
             )
         if _is_cancelled(cancelled):
             return record
-        rename_result = rename_contained_regular_to_directory(
-            self.runtime_dir,
-            record.relative_path,
-            quarantine_relative,
-            expected_identity=second.identity,
-        )
+        try:
+            rename_result = rename_contained_regular_to_directory(
+                self.runtime_dir,
+                record.relative_path,
+                quarantine_relative,
+                expected_identity=second.identity,
+                authorized=lambda: not _is_cancelled(cancelled),
+            )
+        except ArtifactRenameCancelled:
+            return record
         if _is_cancelled(cancelled):
+            if rename_result.status == "trusted" and rename_result.identity is not None:
+                return self._mark_moved_needs_human(
+                    record.id,
+                    token,
+                    "shutdown_after_quarantine_move",
+                    quarantine_relative,
+                    rename_result.identity,
+                    # The OS mutation already completed. Persisting its exact identity
+                    # is the required shutdown acknowledgement, not new cleanup work.
+                    cancelled=_never_cancelled,
+                    fallback=record,
+                )
             return record
         if rename_result.status != "trusted":
             return self._needs_human(
