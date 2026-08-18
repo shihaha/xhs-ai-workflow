@@ -822,3 +822,68 @@ Compilation and diff checks exited 0; Git emitted only the repository's Windows
 LF/CRLF notices. Bailian remains `not_run: BAILIAN_API_KEY unavailable`, Android
 remains `not_run: device unavailable`, and seven-day UAT remains `not_run`.
 Task 8 remains blocked pending redesign Tasks 3—5 and independent review.
+
+## Approved quarantine redesign — Task 8R-5 final closeout implementation
+
+The two approved Task 8 minors and the matching regenerate boundary were first
+reproduced against the real export and workflow code:
+
+```text
+python -m pytest backend/tests/content/test_export.py backend/tests/content/test_workflow.py -q
+4 failed, 15 passed
+```
+
+The failures proved that ZIP container overhead could cross the archive limit,
+the uncompressed aggregate did not have an independent cap, an unconfigured model
+masked a missing product as HTTP 503, and a valid rejected item acquired a false
+`regenerate` review before model readiness failed.
+
+Implemented closeout:
+
+- `MAX_PACKAGE_BYTES` now bounds the final serialized archive bytes. A separate
+  `MAX_UNCOMPRESSED_PACKAGE_BYTES` bounds the entry plus manifest aggregate, while
+  the compression-ratio defense remains independent.
+- Boundary tests reject archive overhead beyond the cap and independently reject
+  oversized uncompressed aggregates. A valid archive close to the byte cap remains
+  readable and projects `availability=available` rather than `corrupt`.
+- The create API no longer checks model configuration ahead of the content service.
+  Missing products and other persisted business errors are therefore returned first;
+  a fully valid request with no configured provider still returns truthful HTTP 503.
+- Regeneration validates item trust, revision and rejected state, reconstructs and
+  validates the persisted product/opportunity/evidence/material context, then checks
+  model readiness before reserving the item or writing a `regenerate` review. An
+  unconfigured adapter is never called.
+
+Final implementation verification before independent review:
+
+```text
+python -m pytest backend/tests/content/test_export.py backend/tests/content/test_workflow.py -q
+19 passed in 3.12s
+
+python -m pytest backend/tests/content -q
+267 passed in 41.96s
+
+python -m pytest backend/tests -q
+580 passed, 1 skipped in 62.53s
+
+python -m compileall -q backend/app backend/tests
+git diff --check
+```
+
+Compilation and diff checks exited 0. The only test warnings were the existing 32
+Python 3.12 sqlite datetime-adapter deprecation warnings. A source scan found no
+physical-delete helper, `unlink`, `os.remove`, `rmtree` or `DeleteFile` call in the
+content request API/service, database startup or app startup paths. Cleanup routes
+remain GET-only. Export manifest data still states `automatic_publish=false`; no
+demo data, fake progress or automatic-publish completion claim was introduced.
+
+Redesign implementation/review-fix ranges are 8R-1 `54a7ee1..8db03a4`, 8R-2
+`ae7b03f..6256dc8` plus user-approved stabilization `6c4bf9f..0edf06a`, 8R-3
+`606a857..c682d1b`, and 8R-4 `f3094b0..d2c00b2`. These ranges contain the
+review-driven fixes recorded in the ledger. Task 8 is not yet marked complete: the
+final cross-boundary independent review must still report no Critical or Important
+findings.
+
+Live Bailian remains `not_run: BAILIAN_API_KEY unavailable`; Android remains
+`not_run: device unavailable`; seven-day UAT remains `not_run`. None is inferred
+from the automated suite.

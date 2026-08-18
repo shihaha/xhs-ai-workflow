@@ -17,6 +17,7 @@ from typing import Callable, Iterator, Literal
 
 MAX_MATERIAL_BYTES = 50 * 1024 * 1024
 MAX_PACKAGE_BYTES = 250 * 1024 * 1024
+MAX_UNCOMPRESSED_PACKAGE_BYTES = 250 * 1024 * 1024
 
 
 class UnsafeContentPath(ValueError):
@@ -674,7 +675,10 @@ def _windows_component_key(value: str) -> str:
 
 
 def deterministic_zip(entries: dict[str, bytes], manifest: dict[str, object]) -> bytes:
-    if len(entries) > 127 or sum(len(value) for value in entries.values()) > MAX_PACKAGE_BYTES:
+    if (
+        len(entries) > 127
+        or sum(len(value) for value in entries.values()) > MAX_UNCOMPRESSED_PACKAGE_BYTES
+    ):
         raise UnsafeContentPath("ZIP entry count or uncompressed size limit exceeded.")
     normalized: dict[str, bytes] = {}
     windows_keys: set[str] = set()
@@ -708,10 +712,14 @@ def deterministic_zip(entries: dict[str, bytes], manifest: dict[str, object]) ->
             info.flag_bits = 0x800
             archive.writestr(info, normalized[name])
     payload = target.getvalue()
+    if len(payload) > MAX_PACKAGE_BYTES:
+        raise UnsafeContentPath("ZIP archive size limit exceeded.")
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         total_compressed = sum(max(info.compress_size, 1) for info in archive.infolist())
         total_uncompressed = sum(info.file_size for info in archive.infolist())
-        if total_uncompressed > MAX_PACKAGE_BYTES or total_uncompressed / max(total_compressed, 1) > 500:
+        if total_uncompressed > MAX_UNCOMPRESSED_PACKAGE_BYTES:
+            raise UnsafeContentPath("ZIP uncompressed size limit exceeded.")
+        if total_uncompressed / max(total_compressed, 1) > 500:
             raise UnsafeContentPath("ZIP compression ratio limit exceeded.")
     return payload
 

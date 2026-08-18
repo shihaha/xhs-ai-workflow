@@ -415,6 +415,7 @@ class ContentService:
             number = max(item.number for item in record.revisions) + 1
             prior_snapshot = {"title": prior.title, "body": prior.body}
             context = self._generation_context(session.get(ProductRecord, record.product_id), payload, session)
+            self._require_model_configured()
             won = session.execute(update(ContentItemRecord).where(
                 ContentItemRecord.id == item_id,
                 ContentItemRecord.status == "rejected",
@@ -1027,8 +1028,7 @@ class ContentService:
         )
 
     def _generate(self, payload: ContentItemCreate, *, revision_number: int, prior: dict[str, str] | None, review_notes: list[str], generation_context: dict[str, Any]) -> tuple[ContentDraftOutput, dict[str, Any]]:
-        if getattr(self.model_adapter, "configured", False) is not True:
-            raise ContentModelUnavailable("Model provider is not configured.")
+        self._require_model_configured()
         prompt_data = {
             "template_key": payload.template_key,
             "template_seed": TEMPLATE_SEEDS.get(payload.template_key, {
@@ -1063,6 +1063,10 @@ class ContentService:
             "model": _safe_identifier(result.model, limit=300), "usage": _safe_usage(result.usage),
             "attempts": _safe_attempts(result.raw_evidence),
         }
+
+    def _require_model_configured(self) -> None:
+        if getattr(self.model_adapter, "configured", False) is not True:
+            raise ContentModelUnavailable("Model provider is not configured.")
 
     @staticmethod
     def _validate_output(output: ContentDraftOutput, *, allowed: set[str], image_ids: list[str]) -> None:

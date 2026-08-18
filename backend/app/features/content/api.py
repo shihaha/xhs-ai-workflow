@@ -77,8 +77,6 @@ def add_material(product_id: str, payload: MaterialCreate, request: Request) -> 
 @router.post("/content-items", response_model=ContentItemRead, status_code=201)
 def create_content_item(payload: ContentItemCreate, request: Request) -> ContentItemRead:
     service = _service(request)
-    if getattr(service.model_adapter, "configured", False) is not True:
-        raise HTTPException(status_code=503, detail="Model provider is not configured.")
     try:
         return service.create_content_item(payload)
     except (ContentNotFound, ContentValidationError, ContentStateError, ContentModelUnavailable, ContentModelFailure) as error:

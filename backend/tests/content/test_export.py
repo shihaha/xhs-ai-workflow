@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -6,13 +7,22 @@ import zipfile
 import pytest
 import httpx
 
+import backend.app.features.content.export as content_export
+import backend.app.features.content.service as content_service_module
 from backend.app.features.content.export import UnsafeContentPath, deterministic_zip
+from backend.app.features.content.models import ContentPackageRecord
 from backend.app.features.content.schemas import ContentItemCreate, ExportCreate, MaterialCreate, ReviewCreate
 from backend.app.features.content.service import ContentStateError, ContentValidationError
 from backend.app.main import create_app
 from backend.app.settings import Settings
 from backend.tests.content.test_hardening import PNG_1X1
-from backend.tests.content.test_workflow import FakeModel, create_product, seed_database, seeded_service
+from backend.tests.content.test_workflow import (
+    FakeModel,
+    UnconfiguredNoCallModel,
+    create_product,
+    seed_database,
+    seeded_service,
+)
 
 
 def _item_with_material(tmp_path: Path):
@@ -111,6 +121,52 @@ def test_zip_rejects_traversal_and_case_collisions(tmp_path: Path) -> None:
         deterministic_zip({"MANIFEST.JSON": b"x"}, {"entries": []})
 
 
+def test_archive_byte_limit_includes_zip_container_overhead(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(content_export, "MAX_PACKAGE_BYTES", 300)
+    monkeypatch.setattr(content_export, "MAX_UNCOMPRESSED_PACKAGE_BYTES", 1024, raising=False)
+
+    with pytest.raises(UnsafeContentPath, match="archive size"):
+        deterministic_zip({"payload.bin": bytes(range(64))}, {"entries": []})
+
+
+def test_uncompressed_aggregate_limit_is_independent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(content_export, "MAX_PACKAGE_BYTES", 10_000)
+    monkeypatch.setattr(content_export, "MAX_UNCOMPRESSED_PACKAGE_BYTES", 50, raising=False)
+
+    with pytest.raises(UnsafeContentPath, match="uncompressed size"):
+        deterministic_zip({"payload.bin": bytes(range(64))}, {"entries": []})
+
+
+def test_near_limit_valid_archive_remains_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(content_export, "MAX_PACKAGE_BYTES", 300)
+    monkeypatch.setattr(content_export, "MAX_UNCOMPRESSED_PACKAGE_BYTES", 1024, raising=False)
+    monkeypatch.setattr(content_service_module, "MAX_PACKAGE_BYTES", 300)
+    archive = deterministic_zip({"payload.bin": bytes(range(32))}, {"entries": []})
+    assert 250 < len(archive) <= 300
+
+    service, item, _ = _item_with_material(tmp_path)
+    relative_path = "content-packages/near-limit.zip"
+    target = tmp_path / relative_path
+    target.parent.mkdir()
+    target.write_bytes(archive)
+    with service.database.session() as session:
+        session.add(ContentPackageRecord(
+            content_item_id=item.id,
+            revision_id=item.current_revision.id,
+            status="ready",
+            path=relative_path,
+            sha256=sha256(archive).hexdigest(),
+            size_bytes=len(archive),
+            build_token=None,
+            created_at=datetime.now(UTC).replace(tzinfo=None),
+        ))
+        session.commit()
+
+    assert service.list_packages()[0].availability == "available"
+
+
 @pytest.mark.anyio
 async def test_http_fresh_database_runs_controlled_adapter_e2e(tmp_path: Path) -> None:
     app = create_app(Settings(runtime_dir=tmp_path, database_path=tmp_path / "api.sqlite3"))
@@ -164,6 +220,8 @@ async def test_http_fresh_database_runs_controlled_adapter_e2e(tmp_path: Path) -
 async def test_http_unconfigured_model_never_claims_a_draft(tmp_path: Path) -> None:
     app = create_app(Settings(runtime_dir=tmp_path, database_path=tmp_path / "empty.sqlite3"))
     opportunity_id, evidence_id = seed_database(app.state.database)
+    unavailable = UnconfiguredNoCallModel()
+    app.state.content_service.model_adapter = unavailable
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -183,4 +241,24 @@ async def test_http_unconfigured_model_never_claims_a_draft(tmp_path: Path) -> N
         })
         listing = await client.get("/api/v1/content-items")
     assert response.status_code == 503
+    assert unavailable.calls == 0
     assert listing.json() == []
+
+
+@pytest.mark.anyio
+async def test_missing_product_precedes_model_configuration_error(tmp_path: Path) -> None:
+    app = create_app(Settings(runtime_dir=tmp_path, database_path=tmp_path / "missing.sqlite3"))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/api/v1/content-items", json={
+            "product_id": "missing-product",
+            "opportunity_id": "missing-opportunity",
+            "template_key": "list-v1",
+            "evidence_ids": ["rank-item:1"],
+            "image_material_ids": ["missing-image"],
+            "cover_material_id": "missing-image",
+            "research_facts": [{"fact": "persisted fact", "evidence_ids": ["rank-item:1"]}],
+        })
+
+    assert response.status_code == 404

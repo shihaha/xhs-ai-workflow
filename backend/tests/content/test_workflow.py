@@ -11,8 +11,14 @@ from backend.app.features.content.schemas import (
     ContentItemCreate,
     MaterialCreate,
     ProductCreate,
+    RegenerateCreate,
+    ReviewCreate,
 )
-from backend.app.features.content.service import ContentService, ContentValidationError
+from backend.app.features.content.service import (
+    ContentModelUnavailable,
+    ContentService,
+    ContentValidationError,
+)
 from backend.app.features.radar.models import RankItemRecord, RankSnapshotRecord
 
 
@@ -53,6 +59,19 @@ class FakeModel:
             usage={"total_tokens": 8},
             duration_ms=1,
         )
+
+
+class UnconfiguredNoCallModel:
+    configured = False
+    provider = "unconfigured"
+    model = "unconfigured"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate_structured(self, request: object, schema: object) -> ModelResult:
+        self.calls += 1
+        raise AssertionError("An unconfigured model must never be invoked.")
 
 
 def seed_database(database: Database) -> tuple[str, str]:
@@ -214,3 +233,40 @@ def test_unknown_or_cross_opportunity_citation_rejects_whole_draft(tmp_path: Pat
             research_facts=[{"fact": "伪造事实", "evidence_ids": ["rank-item:999999"]}],
         ))
     assert service.list_content_items() == []
+
+
+def test_regenerate_validates_business_state_before_model_readiness_without_reserving(
+    tmp_path: Path,
+) -> None:
+    service, opportunity_id, evidence_id = seeded_service(tmp_path)
+    product_id = create_product(service, opportunity_id)
+    image = add_output_image(service, product_id, tmp_path)
+    item = service.create_content_item(ContentItemCreate(
+        product_id=product_id,
+        opportunity_id=opportunity_id,
+        template_key="list-v1",
+        evidence_ids=[evidence_id],
+        image_material_ids=[image.id],
+        cover_material_id=image.id,
+        research_facts=[{"fact": "用户需要清单", "evidence_ids": [evidence_id]}],
+    ))
+    rejected = service.review(item.id, ReviewCreate(
+        decision="reject",
+        actor="operator",
+        note="需要重写",
+        expected_revision_id=item.current_revision.id,
+        visual_checks=[],
+    ))
+    unavailable = UnconfiguredNoCallModel()
+    service.model_adapter = unavailable
+
+    with pytest.raises(ContentModelUnavailable, match="not configured"):
+        service.regenerate(
+            item.id,
+            RegenerateCreate(expected_revision_id=rejected.current_revision.id),
+        )
+
+    unchanged = service.get_content_item(item.id)
+    assert unavailable.calls == 0
+    assert unchanged.status == "rejected"
+    assert [review.decision for review in unchanged.reviews] == ["reject"]
