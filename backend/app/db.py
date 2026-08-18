@@ -197,6 +197,8 @@ class Database:
         review_audit_marker_present = self._migration_marker_exists(
             "task8_content_review_outcome_v1"
         )
+        with self.engine.connect() as connection:
+            _require_no_xhs_account_note_identity_leftovers(connection)
         if review_audit_marker_present:
             self._require_content_review_audit_schema()
         if quarantine_marker_present:
@@ -1463,6 +1465,30 @@ _ACCOUNT_NOTE_EVIDENCE_ID = re.compile(r"^account-note:([1-9][0-9]*)$", re.ASCII
 _SQLITE_MAX_ROW_ID = 9_223_372_036_854_775_807
 _SQLITE_MAX_ROW_ID_TEXT = str(_SQLITE_MAX_ROW_ID)
 _XHS_CANONICAL_NOTE_ID_CHECK = "idbetween1and9223372036854775807"
+_XHS_ACCOUNT_NOTE_IDENTITY_TEMPORARY_TABLES = frozenset(
+    {
+        "xhs_account_notes_identity_v1",
+        "xhs_account_notes_canonical_id_v2",
+    }
+)
+
+
+def _xhs_account_note_identity_leftovers(
+    connection: Connection,
+) -> frozenset[str]:
+    return frozenset(inspect(connection).get_table_names()).intersection(
+        _XHS_ACCOUNT_NOTE_IDENTITY_TEMPORARY_TABLES
+    )
+
+
+def _require_no_xhs_account_note_identity_leftovers(
+    connection: Connection,
+) -> None:
+    if _xhs_account_note_identity_leftovers(connection):
+        raise SchemaMigrationError(
+            "Interrupted XHS account note identity or canonical id migration "
+            "requires isolated manual migration."
+        )
 
 
 def _sqlite_schema_tokens(value: object) -> list[tuple[str, str]] | None:
@@ -1689,11 +1715,7 @@ def _require_xhs_account_note_identity_preconditions(
             raise SchemaMigrationError(
                 "XHS account note identity requires a valid evidence schema."
             )
-        if "xhs_account_notes_identity_v1" in inspect(connection).get_table_names():
-            raise SchemaMigrationError(
-                "Interrupted XHS account note identity migration requires "
-                "isolated manual migration."
-            )
+        _require_no_xhs_account_note_identity_leftovers(connection)
         _xhs_account_note_reference_floor(connection)
         if _xhs_account_note_autoincrement_ddl_valid(connection):
             rows = connection.execute(text(
@@ -1752,8 +1774,7 @@ def _xhs_account_note_canonical_id_schema_valid(connection: Connection) -> bool:
             _xhs_account_note_identity_schema_valid(connection)
             and _xhs_account_note_canonical_id_check_valid(connection)
             and _xhs_account_note_rows_have_canonical_ids(connection)
-            and "xhs_account_notes_canonical_id_v2"
-            not in inspect(connection).get_table_names()
+            and not _xhs_account_note_identity_leftovers(connection)
         )
     except (KeyError, TypeError, AttributeError, SQLAlchemyError):
         return False
@@ -1762,13 +1783,8 @@ def _xhs_account_note_canonical_id_schema_valid(connection: Connection) -> bool:
 def _require_xhs_account_note_canonical_id_preconditions(
     connection: Connection,
 ) -> int:
-    temporary_table = "xhs_account_notes_canonical_id_v2"
     try:
-        if temporary_table in inspect(connection).get_table_names():
-            raise SchemaMigrationError(
-                "Interrupted XHS account note canonical id migration requires "
-                "isolated manual migration."
-            )
+        _require_no_xhs_account_note_identity_leftovers(connection)
         if not _xhs_account_note_rows_have_canonical_ids(connection):
             raise SchemaMigrationError(
                 "XHS account note canonical id data is invalid."
@@ -1843,7 +1859,8 @@ def _advance_xhs_account_note_identity_sequence(
 def _xhs_account_note_identity_schema_valid(connection: Connection) -> bool:
     try:
         if (
-            not _xhs_account_note_evidence_schema_valid(
+            _xhs_account_note_identity_leftovers(connection)
+            or not _xhs_account_note_evidence_schema_valid(
                 inspect(connection), connection
             )
             or not _xhs_account_note_evidence_data_valid(connection)
@@ -1875,10 +1892,7 @@ def _rebuild_xhs_account_notes_with_permanent_ids(
     *,
     temporary_table: str = "xhs_account_notes_identity_v1",
 ) -> None:
-    if temporary_table in inspect(connection).get_table_names():
-        raise SchemaMigrationError(
-            "Interrupted XHS account note identity migration requires isolated manual migration."
-        )
+    _require_no_xhs_account_note_identity_leftovers(connection)
     for name in (
         "ck_xhs_note_artifact_job_insert",
         "ck_xhs_note_artifact_job_update",

@@ -10,7 +10,11 @@ from sqlalchemy.exc import IntegrityError
 from backend.app.db import (
     Database,
     SchemaMigrationError,
+    _require_xhs_account_note_canonical_id_preconditions,
+    _require_xhs_account_note_identity_preconditions,
     _xhs_account_note_autoincrement_ddl_valid,
+    _xhs_account_note_canonical_id_schema_valid,
+    _xhs_account_note_identity_schema_valid,
     canonical_raw_evidence_digest,
 )
 from backend.app.features.analysis.models import AnalysisRecord
@@ -171,6 +175,14 @@ def _unique_columns(database: Database, table: str) -> set[tuple[str, ...]]:
 
 def _identity_disk_state(path: Path) -> tuple[object, ...]:
     with sqlite3.connect(path) as connection:
+        temporary_tables = connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' "
+            "AND name IN (?, ?) ORDER BY name",
+            (
+                "xhs_account_notes_identity_v1",
+                "xhs_account_notes_canonical_id_v2",
+            ),
+        ).fetchall()
         return (
             connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' "
@@ -178,8 +190,8 @@ def _identity_disk_state(path: Path) -> tuple[object, ...]:
             ).fetchone()[0],
             connection.execute(
                 "SELECT name, applied_at FROM workbench_schema_migrations "
-                "WHERE name IN (?, ?) ORDER BY name",
-                (IDENTITY_MIGRATION, CANONICAL_ID_MIGRATION),
+                "WHERE name IN (?, ?, ?) ORDER BY name",
+                (MIGRATION, IDENTITY_MIGRATION, CANONICAL_ID_MIGRATION),
             ).fetchall(),
             connection.execute(
                 "SELECT * FROM xhs_account_notes ORDER BY id"
@@ -191,10 +203,27 @@ def _identity_disk_state(path: Path) -> tuple[object, ...]:
                 "SELECT rowid, name, seq FROM sqlite_sequence "
                 "WHERE name LIKE 'xhs_account_notes%' ORDER BY rowid"
             ).fetchall(),
-            connection.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type='table' "
-                "AND name LIKE 'xhs_account_notes_%' ORDER BY name"
-            ).fetchall(),
+            temporary_tables,
+            tuple(
+                (
+                    table_name,
+                    connection.execute(
+                        f'SELECT * FROM "{table_name}" ORDER BY rowid'
+                    ).fetchall(),
+                )
+                for table_name, _table_sql in temporary_tables
+            ),
+        )
+
+
+def _create_identity_leftover(path: Path, temporary_table: str) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            f'CREATE TABLE "{temporary_table}" (sentinel TEXT NOT NULL)'
+        )
+        connection.execute(
+            f'INSERT INTO "{temporary_table}"(sentinel) VALUES (?)',
+            (f"leftover:{temporary_table}",),
         )
 
 
@@ -754,6 +783,66 @@ def test_identity_half_migration_with_new_ddl_and_old_table_fails_every_restart(
         assert _identity_disk_state(path) == before
 
 
+@pytest.mark.parametrize(
+    "temporary_table",
+    [
+        "xhs_account_notes_identity_v1",
+        "xhs_account_notes_canonical_id_v2",
+    ],
+)
+def test_identity_marker_validator_rejects_every_known_leftover_without_writes(
+    tmp_path: Path,
+    temporary_table: str,
+) -> None:
+    path = tmp_path / f"identity-marker-leftover-{temporary_table}.sqlite3"
+    database = Database(path)
+    _create_identity_leftover(path, temporary_table)
+    before = _identity_disk_state(path)
+    try:
+        with database.engine.connect() as connection:
+            assert _xhs_account_note_identity_schema_valid(connection) is False
+    finally:
+        database.close()
+
+    for _attempt in range(2):
+        with pytest.raises(SchemaMigrationError, match="note identity"):
+            Database(path)
+        assert _identity_disk_state(path) == before
+
+
+@pytest.mark.parametrize(
+    "temporary_table",
+    [
+        "xhs_account_notes_identity_v1",
+        "xhs_account_notes_canonical_id_v2",
+    ],
+)
+def test_identity_marker_absent_preflight_rejects_every_known_leftover_without_writes(
+    tmp_path: Path,
+    temporary_table: str,
+) -> None:
+    path = tmp_path / f"identity-preflight-leftover-{temporary_table}.sqlite3"
+    database = Database(path)
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "DELETE FROM workbench_schema_migrations "
+                "WHERE name=:marker"
+            ),
+            {"marker": IDENTITY_MIGRATION},
+        )
+    _create_identity_leftover(path, temporary_table)
+    before = _identity_disk_state(path)
+    try:
+        for _attempt in range(2):
+            with database.engine.connect() as connection:
+                with pytest.raises(SchemaMigrationError, match="Interrupted"):
+                    _require_xhs_account_note_identity_preconditions(connection)
+            assert _identity_disk_state(path) == before
+    finally:
+        database.close()
+
+
 def test_fresh_schema_has_canonical_note_id_check_and_v3_marker(
     tmp_path: Path,
 ) -> None:
@@ -925,3 +1014,67 @@ def test_canonical_id_marker_rejects_leftover_half_migration_table(
         Database(path)
 
     assert _identity_disk_state(path) == before
+
+
+@pytest.mark.parametrize(
+    "temporary_table",
+    [
+        "xhs_account_notes_identity_v1",
+        "xhs_account_notes_canonical_id_v2",
+    ],
+)
+def test_canonical_id_marker_validator_rejects_every_known_leftover_without_writes(
+    tmp_path: Path,
+    temporary_table: str,
+) -> None:
+    path = tmp_path / f"canonical-marker-leftover-{temporary_table}.sqlite3"
+    database = Database(path)
+    _create_identity_leftover(path, temporary_table)
+    before = _identity_disk_state(path)
+    try:
+        for _attempt in range(2):
+            with database.engine.connect() as connection:
+                assert _xhs_account_note_canonical_id_schema_valid(connection) is False
+            with pytest.raises(SchemaMigrationError, match="canonical id"):
+                database._require_xhs_account_note_canonical_id_schema()
+            assert _identity_disk_state(path) == before
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "temporary_table",
+    [
+        "xhs_account_notes_identity_v1",
+        "xhs_account_notes_canonical_id_v2",
+    ],
+)
+def test_canonical_id_marker_absent_preflight_rejects_every_known_leftover_without_writes(
+    tmp_path: Path,
+    temporary_table: str,
+) -> None:
+    path = tmp_path / f"canonical-preflight-leftover-{temporary_table}.sqlite3"
+    database = Database(path)
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "DELETE FROM workbench_schema_migrations "
+                "WHERE name=:marker"
+            ),
+            {"marker": CANONICAL_ID_MIGRATION},
+        )
+    _create_identity_leftover(path, temporary_table)
+    before = _identity_disk_state(path)
+    try:
+        for _attempt in range(2):
+            with database.engine.connect() as connection:
+                with pytest.raises(SchemaMigrationError, match="Interrupted"):
+                    _require_xhs_account_note_canonical_id_preconditions(connection)
+            assert _identity_disk_state(path) == before
+    finally:
+        database.close()
+
+    for _attempt in range(2):
+        with pytest.raises(SchemaMigrationError, match="Interrupted"):
+            Database(path)
+        assert _identity_disk_state(path) == before

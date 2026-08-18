@@ -337,3 +337,77 @@ Python 3.12 SQLite datetime-adapter deprecations in content tests.
 - Provider-neutral analysis, the full note/artifact ownership chain, exact shop N/N
   opportunity gating, Task 5, Bailian media and untracked research remain unchanged.
   The authenticated live boundary remains `not_run`.
+
+## Fix round 4/5 — unified interrupted identity-migration detection
+
+### Review finding closed
+
+- The v2 and v3 migrations now share one fixed set of every XHS note-identity
+  temporary table used by the repository:
+  `xhs_account_notes_identity_v1` and
+  `xhs_account_notes_canonical_id_v2`. One read-only detector is the only source
+  used to recognize these leftovers.
+- Startup checks that shared set before marker validation or any schema creation.
+  A normal three-marker database containing either leftover therefore fails with
+  an explicit interrupted-migration error instead of authenticating the database.
+- Both v2/v3 marker validators, both marker-absent preflights and the rebuild entry
+  point reject either leftover. Marker-present paths remain validation-only;
+  marker-absent paths never drop the table, repair schema, advance sequence or
+  write a replacement marker when any leftover exists.
+- Regression snapshots include the v1/v2/v3 marker rows, main DDL and rows,
+  historical citations, `sqlite_sequence`, both temporary-table DDL definitions
+  and their row contents. Repeated validator, preflight and real startup attempts
+  must leave that complete snapshot byte-for-value unchanged.
+
+### Fix-round RED evidence
+
+Before production changes, the new shared-leftover regression group produced:
+
+```text
+python -m pytest backend/tests/xhs/test_schema_migration.py -k "every_known_leftover" -q --tb=short
+5 failed, 3 passed, 34 deselected in 1.60s
+```
+
+The failures proved that the v2 marker validator ignored both temporary tables,
+the v2 marker-absent preflight ignored the v3 temporary table, and the v3 marker
+validator/preflight ignored the v2 temporary table. The three passing cases were
+the previous one-migration-only controls.
+
+### Fix-round GREEN evidence
+
+```text
+python -m pytest backend/tests/xhs/test_schema_migration.py -k "every_known_leftover" -q --tb=short
+8 passed, 34 deselected in 1.52s
+
+python -m pytest backend/tests/xhs/test_schema_migration.py -q --tb=short
+42 passed in 6.77s
+
+python -m pytest backend/tests/xhs/test_schema_migration.py backend/tests/analysis/test_account_note_grounding.py -q
+69 passed in 10.81s
+
+python -m pytest backend/tests/analysis backend/tests/xhs -q
+407 passed, 1 skipped in 23.94s
+
+python -m pytest backend/tests -q
+999 passed, 1 skipped, 32 warnings in 109.25s
+```
+
+The skip remains the explicit opt-in live gate. The warnings remain the existing
+Python 3.12 SQLite datetime-adapter deprecations in content tests.
+`python -m compileall -q backend/app backend/tests` and `git diff --check` exited
+0 after the round-4 production and test changes.
+
+### Fix-round self-review and boundary
+
+- The detector recognizes only the two audited migration implementation names;
+  ordinary XHS evidence tables and test-only downgrade names are not classified as
+  interrupted production migrations.
+- A missing v3 marker plus an `xhs_account_notes_identity_v1` leftover is exercised
+  through both the direct v3 preflight and two real `Database(path)` restarts. The
+  marker remains absent and the leftover remains intact after every rejection.
+- Fresh initialization, legal v1-to-v2 and v2-to-v3 upgrades, permanent ID floors,
+  canonical CHECK enforcement, historical citations and sequence preservation are
+  unchanged and remain covered by the complete schema suite.
+- Provider-neutral analysis, account-note trust, exact shop N/N gating, Task 5,
+  Bailian media and untracked research remain unchanged. The authenticated live
+  boundary remains `not_run`.
