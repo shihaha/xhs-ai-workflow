@@ -1016,3 +1016,41 @@ still states `automatic_publish=false`. The existing
 Task 10 and was not modified. Bailian remains
 `not_run: BAILIAN_API_KEY unavailable`, Android remains `not_run: device
 unavailable`, and seven-day UAT remains `not_run`.
+
+## Task 8R-5 fix round 4/5
+
+The round-3 independent re-review was **NOT CLEAN** with zero Critical and one
+Important finding. Both regeneration failure finalization and contradictory
+reservation normalization trusted `Session.commit()` acknowledgement: if SQLite
+committed and the client then raised, the caller could receive the acknowledgement
+error instead of the original model/trust error or the required explicit
+transaction-unknown result.
+
+Three strict fault-injection tests first failed on the old behavior: model-failure
+restoration landed then raised, trust-drift restoration landed then raised, and
+contradictory normalization landed then raised. Exact fresh classification now
+requires the same item, prior revision, regeneration attempt ID, decision, outcome
+and sanitized error category. A proven `rejected + failed` restoration preserves
+the original model/trust exception. A not-landed, contradictory or unreadable
+restoration raises `regeneration_failure_transaction_unknown`; normalization
+ambiguity always remains `regeneration_reservation_transaction_unknown` and is
+never reported as finalized. Two additional boundary tests cover exact not-landed
+and contradictory restoration facts.
+
+Fresh verification before independent re-review:
+
+```text
+RED fault-injection subset: 3 failed as expected
+GREEN fault-injection subset: 3 passed
+backend/tests/content/test_review.py: 15 passed
+focused review/audit/export/workflow: 48 passed
+backend/tests/content: 292 passed
+backend/tests: 605 passed, 1 skipped
+```
+
+Compilation and diff checks exited zero. The request/startup direct-delete and
+cleanup mutation-route scans had no matches; the export manifest still states
+`automatic_publish=False`.
+
+Live Bailian, Android and seven-day UAT remain `not_run`. The deferred Task 10
+jobs evidence unlink was not changed.

@@ -521,7 +521,50 @@ class ContentService:
                 raise ContentStateError(
                     "Regeneration failure could not finalize its exact audit attempt."
                 )
-            session.commit()
+            try:
+                session.commit()
+            except SQLAlchemyError as error:
+                outcome = self._regeneration_failure_after_unknown(
+                    item_id, revision_id, attempt_id=attempt_id,
+                    error_category=error_category,
+                )
+                if outcome is _ReservationOutcome.LANDED:
+                    return
+                raise ContentStateError(
+                    "regeneration_failure_transaction_unknown"
+                ) from error
+
+    def _regeneration_failure_after_unknown(
+        self, item_id: str, revision_id: str, *,
+        attempt_id: int, error_category: str,
+    ) -> _ReservationOutcome:
+        """Prove an exact regeneration failure finalization from fresh facts."""
+        try:
+            with self.database.session() as session:
+                item = session.get(ContentItemRecord, item_id)
+                attempt = session.get(ContentReviewRecord, attempt_id)
+                exact_attempt = attempt is not None and (
+                    attempt.content_item_id == item_id
+                    and attempt.revision_id == revision_id
+                    and attempt.decision == "regenerate"
+                )
+                if (
+                    item is not None and item.status == "rejected"
+                    and item.current_revision_id == revision_id
+                    and exact_attempt and attempt.outcome == "failed"
+                    and attempt.error_category == error_category
+                ):
+                    return _ReservationOutcome.LANDED
+                if (
+                    item is not None and item.status == "draft"
+                    and item.current_revision_id == revision_id
+                    and exact_attempt and attempt.outcome == "pending"
+                    and attempt.error_category is None
+                ):
+                    return _ReservationOutcome.NOT_LANDED
+                return _ReservationOutcome.UNKNOWN
+        except SQLAlchemyError:
+            return _ReservationOutcome.UNKNOWN
 
     def _resolve_regeneration_reservation_commit(
         self, item_id: str, revision_id: str, *, attempt_id: int,
@@ -573,7 +616,13 @@ class ContentService:
                     outcome="failed", error_category="transaction_unknown",
                 )).rowcount
             if item_won or audit_won:
-                session.commit()
+                try:
+                    session.commit()
+                except SQLAlchemyError:
+                    self._regeneration_failure_after_unknown(
+                        item_id, revision_id, attempt_id=attempt_id,
+                        error_category="transaction_unknown",
+                    )
             return "unknown"
 
     @staticmethod

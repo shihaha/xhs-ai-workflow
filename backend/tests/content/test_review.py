@@ -109,6 +109,151 @@ def test_regenerate_model_error_preserves_failed_attempt(tmp_path: Path) -> None
     assert "secret" not in json.dumps(failed.model_dump(mode="json"))
 
 
+def test_regenerate_model_error_restore_commit_ack_landed_preserves_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+
+    def model_error(request: object, schema: object):
+        raise ModelAdapterError("provider secret must not persist", category="network")
+
+    service.model_adapter.generate_structured = model_error  # type: ignore[attr-defined,method-assign]
+    real_commit = Session.commit
+    commit_count = 0
+
+    def restoration_commit_then_raise(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        real_commit(session)
+        if commit_count == 2:
+            raise SQLAlchemyError("ambiguous restoration acknowledgement")
+
+    monkeypatch.setattr(Session, "commit", restoration_commit_then_raise)
+
+    with pytest.raises(ContentModelFailure):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    failed = service.get_content_item(item.id)
+    assert failed.status == "rejected"
+    assert failed.reviews[-1].outcome == "failed"
+    assert failed.reviews[-1].error_category == "model_failure"
+
+
+def test_regenerate_trust_error_restore_commit_ack_landed_preserves_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    service.model_adapter = CallbackModel(
+        item.current_revision.source_evidence_ids[0],
+        lambda: rebind_product_to_another_valid_opportunity(
+            service, item.product_id, item.opportunity_id,
+        ),
+    )
+    real_commit = Session.commit
+    commit_count = 0
+
+    def restoration_commit_then_raise(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        real_commit(session)
+        if commit_count == 3:
+            raise SQLAlchemyError("ambiguous restoration acknowledgement")
+
+    monkeypatch.setattr(Session, "commit", restoration_commit_then_raise)
+
+    with pytest.raises(ContentValidationError, match="product.*opportunity"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    failed = service.get_content_item(item.id)
+    assert failed.status == "rejected"
+    assert failed.reviews[-1].outcome == "failed"
+    assert failed.reviews[-1].error_category == "trust_changed"
+
+
+def test_regenerate_restore_commit_not_landed_is_explicitly_transaction_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+
+    def model_error(request: object, schema: object):
+        raise ModelAdapterError("provider unavailable", category="network")
+
+    service.model_adapter.generate_structured = model_error  # type: ignore[attr-defined,method-assign]
+    real_commit = Session.commit
+    commit_count = 0
+
+    def restoration_commit_does_not_land(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 2:
+            raise SQLAlchemyError("restoration did not land")
+        real_commit(session)
+
+    monkeypatch.setattr(Session, "commit", restoration_commit_does_not_land)
+
+    with pytest.raises(ContentStateError, match="regeneration_failure_transaction_unknown"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    unresolved = service.get_content_item(item.id)
+    assert unresolved.status == "draft"
+    assert unresolved.reviews[-1].outcome == "pending"
+
+
+def test_regenerate_restore_commit_contradiction_is_explicitly_transaction_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+
+    def model_error(request: object, schema: object):
+        raise ModelAdapterError("provider unavailable", category="network")
+
+    service.model_adapter.generate_structured = model_error  # type: ignore[attr-defined,method-assign]
+    real_commit = Session.commit
+    commit_count = 0
+
+    def restoration_commit_then_contradiction(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        real_commit(session)
+        if commit_count == 2:
+            with service.database.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE content_reviews SET error_category='state_changed' "
+                    "WHERE decision='regenerate'"
+                )
+            raise SQLAlchemyError("contradictory restoration acknowledgement")
+
+    monkeypatch.setattr(Session, "commit", restoration_commit_then_contradiction)
+
+    with pytest.raises(ContentStateError, match="regeneration_failure_transaction_unknown"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    unresolved = service.get_content_item(item.id)
+    assert unresolved.status == "rejected"
+    assert unresolved.reviews[-1].outcome == "failed"
+    assert unresolved.reviews[-1].error_category == "state_changed"
+
+
 def test_regenerate_success_transaction_failure_records_failed_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -235,6 +380,43 @@ def test_regenerate_reservation_commit_unknown_restores_without_pending_deadlock
     result = service.get_content_item(item.id)
     assert result.status == "rejected"
     assert len(result.revisions) == 1
+    assert result.reviews[-1].outcome == "failed"
+    assert result.reviews[-1].error_category == "transaction_unknown"
+
+
+def test_regenerate_contradictory_normalization_commit_ack_landed_is_transaction_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, item, image = _draft(tmp_path)
+    r1 = item.current_revision.id
+    service.review(item.id, ReviewCreate(
+        decision="reject", actor="operator", note="标题不够具体", expected_revision_id=r1,
+        visual_checks=[{"material_id": image.id, "passed": False, "observation": "标题不具体"}],
+    ))
+    real_commit = Session.commit
+    commit_count = 0
+
+    def ambiguous_commits(session: Session) -> None:
+        nonlocal commit_count
+        commit_count += 1
+        real_commit(session)
+        if commit_count == 1:
+            with service.database.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE content_reviews SET outcome='failed', "
+                    "error_category='transaction_unknown' WHERE decision='regenerate'"
+                )
+            raise SQLAlchemyError("contradictory reservation acknowledgement")
+        if commit_count == 2:
+            raise SQLAlchemyError("ambiguous normalization acknowledgement")
+
+    monkeypatch.setattr(Session, "commit", ambiguous_commits)
+
+    with pytest.raises(ContentStateError, match="reservation_transaction_unknown"):
+        service.regenerate(item.id, RegenerateCreate(expected_revision_id=r1))
+
+    result = service.get_content_item(item.id)
+    assert result.status == "rejected"
     assert result.reviews[-1].outcome == "failed"
     assert result.reviews[-1].error_category == "transaction_unknown"
 
