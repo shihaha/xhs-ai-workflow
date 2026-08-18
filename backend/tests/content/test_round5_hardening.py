@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.db import Database, SchemaMigrationError
 from backend.app.features.content.models import (
+    ArtifactCleanupRecord,
     ContentItemRecord,
     ContentPackageRecord,
     ProductMaterialRecord,
@@ -28,14 +29,11 @@ def _new_source(tmp_path: Path) -> MaterialCreate:
     )
 
 
-def test_generic_database_failure_after_material_write_removes_only_unpersisted_file(
+def test_generic_database_failure_after_material_write_enqueues_and_retains_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import backend.app.features.content.service as service_module
-
     service, item, _ = _image_item(tmp_path)
     payload = _new_source(tmp_path)
-    removed: list[str] = []
     real_commit = Session.commit
 
     def fail_commit(session: Session) -> None:
@@ -43,31 +41,26 @@ def test_generic_database_failure_after_material_write_removes_only_unpersisted_
             raise SQLAlchemyError("generic commit failure")
         real_commit(session)
 
-    def record_remove(_root: Path, relative: str, **_kwargs: object) -> bool:
-        removed.append(relative)
-        return True
-
     monkeypatch.setattr(Session, "commit", fail_commit)
-    monkeypatch.setattr(service_module, "remove_contained_regular", record_remove)
 
     with pytest.raises(SQLAlchemyError, match="generic commit failure"):
         service.add_material(item.product_id, payload)
 
-    assert len(removed) == 1
     with service.database.session() as session:
         assert session.scalar(select(func.count(ProductMaterialRecord.id)).where(
             ProductMaterialRecord.logical_name == "facts.txt"
         )) == 0
+        cleanup = session.scalar(select(ArtifactCleanupRecord))
+        assert cleanup is not None
+        assert cleanup.state == "pending"
+        assert (tmp_path / cleanup.relative_path).exists()
 
 
-def test_commit_then_raise_does_not_delete_persisted_material(
+def test_commit_then_raise_retains_material_and_persists_cleanup_fact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import backend.app.features.content.service as service_module
-
     service, item, _ = _image_item(tmp_path)
     payload = _new_source(tmp_path)
-    removed: list[str] = []
     real_commit = Session.commit
 
     def commit_then_raise(session: Session) -> None:
@@ -75,23 +68,22 @@ def test_commit_then_raise_does_not_delete_persisted_material(
         raise SQLAlchemyError("ambiguous commit acknowledgement")
 
     monkeypatch.setattr(Session, "commit", commit_then_raise)
-    monkeypatch.setattr(
-        service_module,
-        "remove_contained_regular",
-        lambda _root, relative, **_kwargs: removed.append(relative) or True,
-    )
 
     with pytest.raises(SQLAlchemyError, match="ambiguous commit acknowledgement"):
         service.add_material(item.product_id, payload)
 
-    assert removed == []
     with service.database.engine.connect() as connection:
         assert connection.exec_driver_sql(
             "SELECT COUNT(*) FROM content_product_materials WHERE logical_name='facts.txt'"
         ).scalar_one() == 1
+        cleanup = connection.exec_driver_sql(
+            "SELECT relative_path, state FROM artifact_gc_queue"
+        ).mappings().one()
+        assert cleanup["state"] == "pending"
+        assert (tmp_path / cleanup["relative_path"]).exists()
 
 
-def test_path_validation_failure_after_material_creation_cleans_unpersisted_file(
+def test_path_validation_failure_after_material_creation_enqueues_and_retains_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import backend.app.features.content.service as service_module
@@ -99,23 +91,21 @@ def test_path_validation_failure_after_material_creation_cleans_unpersisted_file
     service, item, _ = _image_item(tmp_path)
     payload = _new_source(tmp_path)
     real_write = service_module.write_contained_atomic
-    removed: list[str] = []
 
     def write_then_reject(root: Path, relative: str, data: bytes) -> None:
         real_write(root, relative, data)
         raise service_module.UnsafeContentPath("post-create validation failure")
 
     monkeypatch.setattr(service_module, "write_contained_atomic", write_then_reject)
-    monkeypatch.setattr(
-        service_module,
-        "remove_contained_regular",
-        lambda _root, relative, **_kwargs: removed.append(relative) or True,
-    )
 
     with pytest.raises(ContentValidationError, match="post-create validation failure"):
         service.add_material(item.product_id, payload)
 
-    assert len(removed) == 1
+    with service.database.session() as session:
+        cleanup = session.scalar(select(ArtifactCleanupRecord))
+        assert cleanup is not None
+        assert cleanup.state == "pending"
+        assert (tmp_path / cleanup.relative_path).exists()
 
 
 @pytest.mark.parametrize("conflict_kind", ["material", "ready", "building", "failed"])
@@ -248,12 +238,15 @@ def test_package_finalizer_cas_rejects_mid_build_takeover_without_overwriting_ow
         service.export_package(item.id, request)
 
     assert len(built_paths) == 1
-    if mutation in {"path", "item"}:
-        assert not (tmp_path / built_paths[0]).exists()
-    else:
-        assert (tmp_path / built_paths[0]).exists()
+    assert (tmp_path / built_paths[0]).exists()
     with service.database.session() as session:
         packages = session.query(ContentPackageRecord).all()
         assert all(package.status != "ready" for package in packages)
         expected_item_status = "rejected" if mutation == "item" else "approved"
         assert session.get(ContentItemRecord, item.id).status == expected_item_status
+        cleanup = session.scalar(
+            select(ArtifactCleanupRecord).where(
+                ArtifactCleanupRecord.relative_path == built_paths[0]
+            )
+        )
+        assert cleanup is not None

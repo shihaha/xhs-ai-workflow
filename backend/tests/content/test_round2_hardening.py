@@ -75,7 +75,7 @@ def test_crc_valid_but_undecodable_png_is_rejected(tmp_path: Path) -> None:
         ))
 
 
-def test_corrupt_package_reexport_has_one_builder_and_removes_old_contained_artifact(tmp_path: Path) -> None:
+def test_corrupt_package_reexport_has_one_builder_and_queues_old_artifact(tmp_path: Path) -> None:
     service, item, image = _image_item(tmp_path)
     approved = service.review(item.id, _approval(item, image))
     request = ExportCreate(expected_revision_id=approved.current_revision.id)
@@ -92,7 +92,16 @@ def test_corrupt_package_reexport_has_one_builder_and_removes_old_contained_arti
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [future.result() for future in [pool.submit(export), pool.submit(export)]]
     assert {value for value in results if value != "conflict"} == {original.id}
-    assert not old_path.exists()
+    assert old_path.exists()
+    with service.database.engine.connect() as connection:
+        cleanup = connection.exec_driver_sql(
+            "SELECT state, relative_path, reason FROM artifact_gc_queue "
+            "WHERE owner_type='content_package' AND owner_id=?",
+            (original.id,),
+        ).mappings().one()
+    assert cleanup["state"] == "pending"
+    assert cleanup["relative_path"] == original.path
+    assert cleanup["reason"] == "package_replaced"
     assert service.get_package(original.id).availability == "available"
 
 

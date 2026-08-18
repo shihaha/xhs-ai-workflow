@@ -12,27 +12,18 @@ from backend.app.features.content.service import ContentStateError
 from backend.tests.content.test_hardening import PNG_1X1, _approval, _image_item
 
 
-def test_material_conflict_cleanup_uses_identity_safe_runtime_delete(
+def test_material_conflict_cleanup_never_deletes_during_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import backend.app.features.content.service as service_module
-
     service, item, _ = _image_item(tmp_path)
     source = tmp_path / "incoming" / "facts.txt"
     source.write_text("facts", encoding="utf-8")
-    safe_delete_calls: list[tuple[Path, str]] = []
-
-    def safe_delete(root: Path, relative: str, **_kwargs: object) -> bool:
-        safe_delete_calls.append((root, relative))
-        return False
-
     def reject_path_unlink(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("cleanup must not perform a path-based unlink")
 
     def fail_commit(_session: Session) -> None:
         raise IntegrityError("forced material version conflict", {}, Exception("forced"))
 
-    monkeypatch.setattr(service_module, "remove_contained_regular", safe_delete)
     monkeypatch.setattr(Path, "unlink", reject_path_unlink)
     monkeypatch.setattr(Session, "commit", fail_commit)
 
@@ -47,10 +38,9 @@ def test_material_conflict_cleanup_uses_identity_safe_runtime_delete(
             ),
         )
 
-    assert len(safe_delete_calls) == 1
-    root, relative = safe_delete_calls[0]
-    assert root == tmp_path
-    assert relative.startswith(f"content-materials/{item.product_id}/")
+    retained = list((tmp_path / "content-materials" / item.product_id).rglob("source.txt"))
+    assert len(retained) == 1
+    assert retained[0].read_text(encoding="utf-8") == "facts"
 
 
 def test_startup_preserves_building_path_owned_by_managed_material(tmp_path: Path) -> None:
