@@ -24,6 +24,8 @@ from backend.app.features.xhs.constants import (
     ACCOUNT_COLLECTION_JOB_TYPE,
 )
 from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
+from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
+from backend.app.features.xhs.redaction import redact_credentials
 from backend.app.features.xhs.schemas import AccountEvidenceBinding, persist_exact_account_result
 from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 from backend.app.services.jobs import InvalidJobTransition, Job, JobService
@@ -37,10 +39,6 @@ XHS_RESERVED_ARTIFACT_KINDS = (
     SEARCH_COLLECTION_ARTIFACT_KIND,
 )
 _SAFE_SUBJECT = re.compile(r"^[A-Za-z0-9_-]{1,500}$")
-_SENSITIVE_KEY = re.compile(
-    r"(?:cookie|token|credential|authorization|password|secret|session|api[_-]?key)",
-    re.IGNORECASE,
-)
 
 
 class CollectionServiceClosed(RuntimeError):
@@ -252,6 +250,8 @@ class XhsCollectionService:
             else:
                 raise ValueError("Unsupported XHS reserved job type.")
             result = _redacted_result(result)
+            if job.type == SEARCH_COLLECTION_JOB_TYPE:
+                _validate_search_owners(result)
         except Exception as error:
             if self._shutdown_requested():
                 return None
@@ -325,6 +325,7 @@ class XhsCollectionService:
                 or any(item.kind != "note" for item in result.items)
             ):
                 raise ValueError("search facts are not exact")
+            _validate_search_owners(result)
         except (OSError, ValueError, KeyError, TypeError, UnicodeError, json.JSONDecodeError) as error:
             raise CollectionFactNotFound(
                 f"Search results for job {job_id} do not exist."
@@ -420,22 +421,26 @@ class XhsCollectionService:
                         ),
                     )
                 now = self.clock()
-                changed = session.execute(
-                    update(JobRecord)
-                    .where(JobRecord.id == job.id, JobRecord.state == JobState.running.value)
-                    .values(
-                        state=target_state.value, progress_current=progress,
-                        progress_total=job.progress_total,
-                        current_stage=("xhs_collection_complete" if target_state is JobState.succeeded else "xhs_collection_incomplete"),
-                        error_category=None if target_state is JobState.succeeded else (result.detail or result.status),
-                        lease_expires_at=None, completed_at=now if target_state in {JobState.succeeded, JobState.failed} else None,
-                        updated_at=now,
+                with self._lock:
+                    if not self._accepting:
+                        session.rollback()
+                        return None
+                    changed = session.execute(
+                        update(JobRecord)
+                        .where(JobRecord.id == job.id, JobRecord.state == JobState.running.value)
+                        .values(
+                            state=target_state.value, progress_current=progress,
+                            progress_total=job.progress_total,
+                            current_stage=("xhs_collection_complete" if target_state is JobState.succeeded else "xhs_collection_incomplete"),
+                            error_category=None if target_state is JobState.succeeded else (result.detail or result.status),
+                            lease_expires_at=None, completed_at=now if target_state in {JobState.succeeded, JobState.failed} else None,
+                            updated_at=now,
+                        )
                     )
-                )
-                if changed.rowcount != 1:
-                    session.rollback()
-                    return None
-                session.commit()
+                    if changed.rowcount != 1:
+                        session.rollback()
+                        return None
+                    session.commit()
         except Exception:
             if self._committed_result(job.id, digest=digest):
                 return self.job_service.get(job.id)
@@ -444,13 +449,15 @@ class XhsCollectionService:
 
     def _finalize_failure(self, job_id: str, *, category: str, error_type: str) -> Job | None:
         job = self.job_service.get(job_id)
+        if job.state is not JobState.running:
+            return job
         payload = {
             "schema_version": 1, "job_id": job_id, "job_type": job.type,
             "status": "failed", "error_category": category, "error_type": error_type,
             "collected_at": self.clock().isoformat(),
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        relative, digest = self._write_artifact(job_id, encoded)
+        relative, digest = self._write_artifact(job_id, encoded, suffix="-failure")
         kind = ACCOUNT_COLLECTION_ARTIFACT_KIND if job.type == ACCOUNT_COLLECTION_JOB_TYPE else SEARCH_COLLECTION_ARTIFACT_KIND
         now = self.clock()
         with self.database.session() as session:
@@ -474,23 +481,29 @@ class XhsCollectionService:
             session.add(artifact)
             session.flush()
             artifact.metadata_json = {**artifact.metadata_json, "artifact_id": artifact.id}
-            changed = session.execute(
-                update(JobRecord)
-                .where(JobRecord.id == job_id, JobRecord.state == JobState.running.value)
-                .values(
-                    state=JobState.failed.value, current_stage="xhs_collection_failed",
-                    error_category=category, lease_expires_at=None,
-                    completed_at=now, updated_at=now,
+            with self._lock:
+                if not self._accepting:
+                    session.rollback()
+                    return None
+                changed = session.execute(
+                    update(JobRecord)
+                    .where(JobRecord.id == job_id, JobRecord.state == JobState.running.value)
+                    .values(
+                        state=JobState.failed.value, current_stage="xhs_collection_failed",
+                        error_category=category, lease_expires_at=None,
+                        completed_at=now, updated_at=now,
+                    )
                 )
-            )
-            if changed.rowcount != 1:
-                session.rollback()
-                return None
-            session.commit()
+                if changed.rowcount != 1:
+                    session.rollback()
+                    return None
+                session.commit()
         return self.job_service.get(job_id)
 
-    def _write_artifact(self, job_id: str, encoded: bytes) -> tuple[Path, str]:
-        relative = Path("evidence") / "xhs" / f"{job_id}.json"
+    def _write_artifact(
+        self, job_id: str, encoded: bytes, *, suffix: str = ""
+    ) -> tuple[Path, str]:
+        relative = Path("evidence") / "xhs" / f"{job_id}{suffix}.json"
         absolute = (self.runtime_dir / relative).resolve()
         absolute.relative_to(self.runtime_dir)
         absolute.parent.mkdir(parents=True, exist_ok=True)
@@ -566,24 +579,25 @@ def _search_read(item: CollectionItem) -> SearchNoteRead:
     note_id = data.get("note_id")
     if not isinstance(note_id, str) or not note_id:
         note_id = item.id.removeprefix("note:")
+    try:
+        owner_id = canonical_owner_id(item.data, item.raw_evidence)
+    except OwnerIdentityError as error:
+        raise ValueError("search note owner aliases conflict") from error
     return SearchNoteRead(
         note_id=note_id, source_url=str(item.source_url),
         title=data.get("title") if isinstance(data.get("title"), str) else None,
         summary=next((data[name] for name in ("summary", "description", "desc") if isinstance(data.get(name), str)), None),
-        user_id=next((data[name] for name in ("user_id", "userId") if isinstance(data.get(name), str)), None),
+        user_id=owner_id,
     )
 
 
+def _validate_search_owners(result: CollectionResult) -> None:
+    for item in result.items:
+        if item.kind == "note":
+            canonical_owner_id(item.data, item.raw_evidence)
+
+
 def _redacted_result(result: CollectionResult) -> CollectionResult:
-    return CollectionResult.model_validate(_redact_sensitive(result.model_dump(mode="python")))
-
-
-def _redact_sensitive(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): "[redacted]" if _SENSITIVE_KEY.search(str(key)) else _redact_sensitive(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [_redact_sensitive(item) for item in value]
-    return value
+    return CollectionResult.model_validate(
+        redact_credentials(result.model_dump(mode="python"))
+    )

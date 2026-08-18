@@ -102,3 +102,70 @@ Python 3.12 sqlite datetime adapter deprecations in content tests.
   running subprocess is bounded by the trusted adapter timeout and its late
   return cannot write success; the service does not attempt unsafe thread or
   process termination.
+
+## Fix round 1/5 — secret shapes, transaction outcome and lifecycle fences
+
+Commit: `HEAD` (`fix: harden xhs collection finalization`; one fix-round commit).
+
+### RED
+
+```text
+python -m pytest backend/tests/xhs/test_cli_adapter.py backend/tests/xhs/test_collection_service.py -q -k "structured_header or search_rejects_conflicting or transient_read_failure or shutdown_fence_wins or conflicting_search_owner or historical_search_artifact"
+FFFFFFF
+7 failed, 62 deselected in 1.21s
+```
+
+The failures independently proved all four review findings:
+
+- `headers: [{"name": "Cookie", "value": ...}]` survived both adapter and
+  service redaction;
+- a committed success whose acknowledgement and next two reads failed was
+  followed by a failure payload overwrite of the successful artifact path;
+- shutdown could set its fence while account facts were pending, yet the final
+  CAS still committed `succeeded` and retained those facts;
+- conflicting search `user_id`/`userId` aliases passed adapter normalization,
+  service success finalization and historical artifact reads.
+
+### GREEN
+
+```text
+python -m pytest backend/tests/xhs/test_collection_service.py backend/tests/xhs/test_collection_api.py backend/tests/xhs/test_cli_adapter.py backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+106 passed in 8.77s
+```
+
+```text
+python -m pytest backend/tests/xhs backend/tests/test_jobs_hardening.py backend/tests/test_jobs_api.py -q
+122 passed in 10.74s
+```
+
+```text
+python -m pytest backend/tests -q
+744 passed, 1 skipped, 32 warnings in 95.37s
+```
+
+`python -m compileall -q backend/app` and `git diff --check` exited 0.
+The first two full-suite attempts each had only the existing shop asynchronous
+POST timing assertion above its 0.2 second wall-clock threshold (0.219 and
+0.203 seconds); that test passed alone, no shop code was changed, and the fresh
+third full run above passed all non-live tests.
+
+### Fixes and self-review
+
+- Adapter and service now share one recursive redactor. It recognizes direct
+  credential keys and semantic `name`/`value(s)` header entries while retaining
+  ordinary entries such as `{"name": "title", "value": ...}`.
+- Failure evidence uses a distinct `-failure.json` path and performs a durable
+  running-state preflight before any write. If transaction outcome/readback is
+  unknown it writes nothing; a later confirmed success is returned without
+  touching its bound bytes.
+- Final job CAS and commit now hold the same lifecycle lock that owns the
+  shutdown admission fence. Once close has set the fence, pending artifact and
+  account fact writes roll back and the close path can persist cancellation.
+- Search normalization, service finalization and historical search reads all
+  use `canonical_owner_id`; conflicting or malformed retained aliases fail
+  closed instead of selecting the first field.
+
+### Remaining live boundary
+
+No authenticated live `xhs-cli` command was run. The existing live gate remains
+Task 5 scope and is still truthfully `not_run` here.

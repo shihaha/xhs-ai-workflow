@@ -20,15 +20,12 @@ from backend.app.adapters.contracts import (
     RejectedCollectionItem,
 )
 from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
+from backend.app.features.xhs.redaction import redact_credentials
 
 
 _XHS_PUBLIC_ORIGIN = "https://www.xiaohongshu.com"
 _ALLOWED_COMMANDS = frozenset({"status", "whoami", "search", "read", "user", "user-posts"})
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9_-]{1,500}")
-_SENSITIVE_KEY = re.compile(
-    r"(?:cookie|token|credential|authorization|password|secret|session|api[_-]?key)",
-    re.IGNORECASE,
-)
 _HUMAN_FAILURES = frozenset({
     "login_required",
     "captcha_required",
@@ -102,7 +99,7 @@ def decode_bounded_json(
     category = _payload_human_failure_category(payload)
     if category is not None:
         raise XhsCliReadError(category)
-    return _redact_credentials(payload)
+    return redact_credentials(payload)
 
 
 class XhsCliReadAdapter:
@@ -301,7 +298,7 @@ def _normalize_note_rows(
     rejected: list[RejectedCollectionItem] = []
     for index, row in enumerate(rows, start=1):
         reference = f"xhs_cli:{source}:note:{index}"
-        evidence = {"response": payload, "row": _redact_credentials(row)}
+        evidence = {"response": payload, "row": redact_credentials(row)}
         if not isinstance(row, dict):
             rejected.append(
                 RejectedCollectionItem(reference=reference, reason="row_not_object", raw_evidence=evidence)
@@ -311,6 +308,21 @@ def _normalize_note_rows(
         if note_id is None:
             rejected.append(
                 RejectedCollectionItem(reference=reference, reason="note_identity_missing", raw_evidence=evidence)
+            )
+            continue
+        try:
+            canonical_owner_id(row)
+        except OwnerIdentityError:
+            rejected.append(
+                RejectedCollectionItem(
+                    reference=reference,
+                    reason=(
+                        "note_owner_conflict"
+                        if source == "search"
+                        else "note_owner_mismatch"
+                    ),
+                    raw_evidence=evidence,
+                )
             )
             continue
         item = CollectionItem(
@@ -336,7 +348,7 @@ def _normalize_note_rows(
 def _profile_row(payload: dict[str, Any]) -> dict[str, Any] | None:
     for candidate in (payload.get("user"), _nested(payload, "data", "user"), payload.get("data"), payload):
         if isinstance(candidate, dict):
-            return _redact_credentials(candidate)
+            return redact_credentials(candidate)
     return None
 
 
@@ -391,7 +403,7 @@ def _public_data(row: dict[str, Any], **identity: str) -> dict[str, Any]:
         "authorName", "liked_count", "likedCount", "liked_count", "collect_count", "collectCount",
         "comment_count", "commentCount", "publish_time", "publishTime", "type", "cover",
     }
-    data = {key: _redact_credentials(value) for key, value in row.items() if key in allowed}
+    data = {key: redact_credentials(value) for key, value in row.items() if key in allowed}
     data.update(identity)
     return data
 
@@ -539,16 +551,3 @@ def _error_category(value: Any) -> str | None:
     if isinstance(value, dict):
         return _payload_human_failure_category(value)
     return "response_unusable"
-
-
-def _redact_credentials(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): "[redacted]" if _SENSITIVE_KEY.search(str(key)) else _redact_credentials(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_credentials(item) for item in value]
-    if isinstance(value, tuple):
-        return [_redact_credentials(item) for item in value]
-    return value

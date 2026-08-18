@@ -1,8 +1,10 @@
 import json
+import hashlib
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
+from time import monotonic, sleep
 
 import pytest
 from sqlalchemy import select
@@ -11,8 +13,9 @@ from backend.app.adapters.contracts import CollectionItem, CollectionRequest, Co
 from backend.app.adapters.xhs_cli_read import XhsCliReadAdapter
 from backend.app.db import Database
 from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
+import backend.app.features.xhs.service as xhs_service_module
 from backend.app.features.xhs.service import CollectionServiceClosed, XhsCollectionService
-from backend.app.models.jobs import JobRecord, JobState
+from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 from backend.app.services.jobs import JobService
 
 
@@ -241,6 +244,37 @@ def test_success_result_is_redacted_again_before_artifact_and_fact_persistence(t
         assert "secret-sentinel" not in json.dumps(note.raw_evidence)
 
 
+def test_structured_header_credentials_are_redacted_before_artifact_and_facts(tmp_path: Path) -> None:
+    secret = "structured-secret-sentinel"
+    ordinary = "ordinary-value-sentinel"
+
+    class LeakyAdapter(_Adapter):
+        def fetch_account(self, request: CollectionRequest) -> CollectionResult:
+            result = super().fetch_account(request)
+            result.items[0].raw_evidence["transport"] = {"headers": [
+                {"name": "Cookie", "value": secret},
+                {"name": "token", "value": secret},
+                {"name": "title", "value": ordinary},
+            ]}
+            return result
+
+    service = _service(tmp_path, LeakyAdapter(), submitter=lambda *_args: None)
+    queued = service.submit_account("user-1", 1)
+
+    completed = service.execute(queued.id)
+
+    assert completed is not None and completed.state is JobState.succeeded
+    artifact_text = (service.runtime_dir / completed.artifacts[0].path).read_text(encoding="utf-8")
+    assert secret not in artifact_text
+    assert ordinary in artifact_text
+    with service.database.session() as session:
+        profile = session.get(XhsAccountProfileRecord, "user-1")
+        rendered = json.dumps(profile.raw_evidence)
+        assert secret not in rendered
+        assert ordinary in rendered
+    service.database.close()
+
+
 def test_commit_acknowledgement_error_reads_back_committed_success(tmp_path: Path) -> None:
     service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
     queued = service.submit_account("user-1", 1)
@@ -275,6 +309,134 @@ def test_commit_acknowledgement_error_reads_back_committed_success(tmp_path: Pat
     assert completed is not None and completed.state is JobState.succeeded
     assert len(completed.artifacts) == 1
     assert service.get_profile("user-1").collection_job_id == queued.id
+
+
+def test_commit_ack_and_transient_read_failure_never_overwrite_succeeded_artifact(tmp_path: Path) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    queued = service.submit_account("user-1", 1)
+    original_session = service.database.session
+    original_get = service.job_service.get
+    ack_lost = False
+    remaining_read_failures = 2
+
+    class CommitAckProxy:
+        def __init__(self, session):
+            self._session = session
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+        def commit(self):
+            nonlocal ack_lost
+            final_state = self._session.get(JobRecord, queued.id).state
+            self._session.commit()
+            if not ack_lost and JobState(final_state) is JobState.succeeded:
+                ack_lost = True
+                raise RuntimeError("commit acknowledgement lost")
+
+    @contextmanager
+    def uncertain_session():
+        with original_session() as session:
+            yield CommitAckProxy(session)
+
+    def transient_get(job_id: str):
+        nonlocal remaining_read_failures
+        if ack_lost and remaining_read_failures:
+            remaining_read_failures -= 1
+            raise RuntimeError("fresh read temporarily unavailable")
+        return original_get(job_id)
+
+    service.database.session = uncertain_session
+    service.job_service.get = transient_get
+
+    completed = service.execute(queued.id)
+    durable = original_get(queued.id)
+    artifact_path = service.runtime_dir / durable.artifacts[0].path
+
+    assert completed is not None and completed.state is JobState.succeeded
+    assert durable.state is JobState.succeeded
+    assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == durable.artifacts[0].metadata["sha256"]
+    service.database.close()
+
+
+def test_shutdown_fence_wins_before_final_commit_and_rolls_back_account_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    queued = service.submit_account("user-1", 1)
+    persisted, release = Event(), Event()
+    original_persist = xhs_service_module.persist_exact_account_result
+
+    def paused_persist(*args, **kwargs):
+        value = original_persist(*args, **kwargs)
+        persisted.set()
+        assert release.wait(10)
+        return value
+
+    monkeypatch.setattr(xhs_service_module, "persist_exact_account_result", paused_persist)
+    execution: list[object] = []
+    worker = Thread(target=lambda: execution.append(service.execute(queued.id)))
+    worker.start()
+    assert persisted.wait(2)
+    close_result: list[bool] = []
+    closer = Thread(target=lambda: close_result.append(service.close()))
+    closer.start()
+    deadline = monotonic() + 2
+    while not service._shutdown_requested() and monotonic() < deadline:
+        sleep(0.01)
+    assert service._shutdown_requested()
+    release.set()
+    worker.join(10)
+    closer.join(10)
+
+    assert not worker.is_alive() and not closer.is_alive()
+    assert close_result == [True]
+    assert service.job_service.get(queued.id).state is JobState.cancelled
+    with service.database.session() as session:
+        assert session.scalars(select(XhsAccountProfileRecord)).all() == []
+        assert session.scalars(select(XhsAccountNoteRecord)).all() == []
+    service.database.close()
+
+
+def test_conflicting_search_owner_aliases_cannot_finalize_success(tmp_path: Path) -> None:
+    class ConflictingAdapter(_Adapter):
+        def search_notes(self, request: CollectionRequest) -> CollectionResult:
+            result = super().search_notes(request)
+            result.items[0].data.update({"user_id": "user-1", "userId": "user-2"})
+            return result
+
+    service = _service(tmp_path, ConflictingAdapter(), submitter=lambda *_args: None)
+    queued = service.submit_search("收纳", 1)
+
+    completed = service.execute(queued.id)
+
+    assert completed is not None and completed.state is JobState.failed
+    assert completed.artifacts[0].metadata.get("complete") is not True
+    service.database.close()
+
+
+def test_historical_search_artifact_with_conflicting_owner_aliases_fails_closed(tmp_path: Path) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+    queued = service.submit_search("收纳", 1)
+    completed = service.execute(queued.id)
+    assert completed is not None
+    artifact_path = service.runtime_dir / completed.artifacts[0].path
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    payload["result"]["items"][0]["data"].update({"user_id": "user-1", "userId": "user-2"})
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    artifact_path.write_bytes(encoded)
+    with service.database.session() as session:
+        artifact = session.get(JobArtifactRecord, completed.artifacts[0].metadata["artifact_id"])
+        artifact.metadata_json = {
+            **artifact.metadata_json,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "size_bytes": len(encoded),
+        }
+        session.commit()
+
+    with pytest.raises(LookupError, match="do not exist"):
+        service.get_search_results(queued.id)
+    service.database.close()
 
 
 def test_submit_failure_leaves_a_durable_failed_reservation(tmp_path: Path) -> None:

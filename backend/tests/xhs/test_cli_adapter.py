@@ -216,6 +216,49 @@ def test_fetch_account_rejects_conflicting_profile_owner_aliases() -> None:
     assert result.rejected_items[0].reason == "profile_identity_conflict"
 
 
+def test_search_rejects_conflicting_owner_aliases() -> None:
+    fake_runner = FakeRunner([
+        _completed(["xhs"], {"notes": [{
+            "id": "note-1", "user_id": "user-1", "userId": "user-2"
+        }]})
+    ])
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.search_notes(CollectionRequest(
+        capability="search_notes",
+        parameters={"keyword": "收纳", "job_id": JOB_ID},
+        expected_count=1,
+    ))
+
+    assert result.status == "needs_human"
+    assert result.complete is False
+    assert [item.reason for item in result.rejected_items] == ["note_owner_conflict"]
+
+
+def test_structured_header_name_value_credentials_are_redacted_without_false_positive() -> None:
+    secret = "structured-secret-sentinel"
+    ordinary = "ordinary-value-sentinel"
+    fake_runner = FakeRunner([_completed(["xhs"], {"notes": [{
+        "id": "note-1",
+        "headers": [
+            {"name": "Cookie", "value": secret},
+            {"name": "Authorization", "value": secret},
+            {"name": "title", "value": ordinary},
+        ],
+    }]})])
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.search_notes(CollectionRequest(
+        capability="search_notes",
+        parameters={"keyword": "收纳", "job_id": JOB_ID},
+        expected_count=1,
+    ))
+
+    rendered = result.model_dump_json()
+    assert secret not in rendered
+    assert ordinary in rendered
+
+
 @pytest.mark.parametrize("field", ["keyword", "user_id"])
 @pytest.mark.parametrize("unsafe_value", ["--json", "-x", "line\nbreak", "nul\x00byte"])
 def test_positional_cli_values_reject_options_and_control_characters(
