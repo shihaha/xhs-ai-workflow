@@ -33,7 +33,11 @@ _HUMAN_FAILURES = frozenset({
     "captcha_required",
     "rate_limited",
     "account_visibility_restricted",
+    "response_unusable",
 })
+_ENVELOPE_MESSAGE_FIELDS = frozenset({"message", "msg", "detail", "reason"})
+_ENVELOPE_STATUS_FIELDS = frozenset({"status", "code"})
+_SUCCESS_STATUS_VALUES = frozenset({"0", "200", "ok", "success", "succeeded", "true"})
 
 
 class XhsCliSearchRequest(BaseModel):
@@ -430,34 +434,66 @@ def _failed_result(request: CollectionRequest, category: str) -> CollectionResul
 
 
 def _failure_category(stdout: bytes, stderr: bytes) -> str:
-    text = (stdout + b"\n" + stderr).decode("utf-8", errors="ignore").casefold()
-    if "captcha" in text or "verify" in text:
+    return _failure_category_from_text(
+        (stdout + b"\n" + stderr).decode("utf-8", errors="ignore")
+    )
+
+
+def _failure_category_from_text(value: str) -> str:
+    text = value.casefold()
+    if any(marker in text for marker in ("captcha", "verify", "需要验证", "验证码", "安全验证")):
         return "captcha_required"
-    if "rate limit" in text or "too many" in text or "429" in text:
+    if any(marker in text for marker in ("rate limit", "too many", "429", "请求频繁", "操作频繁")):
         return "rate_limited"
-    if "login" in text or "sign in" in text or "auth" in text:
+    if any(marker in text for marker in ("login", "sign in", "auth", "请先登录", "登录已过期", "登录过期", "未登录")):
         return "login_required"
-    if "private" in text or "not visible" in text or "forbidden" in text:
+    if any(marker in text for marker in ("private", "not visible", "forbidden", "访问受限", "无权访问", "权限不足")):
         return "account_visibility_restricted"
     return "cli_failed"
 
 
 def _payload_human_failure_category(value: Any) -> str | None:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if str(key).casefold() in {"message", "msg", "error", "detail", "reason"} and isinstance(child, str):
-                category = _failure_category(child.encode("utf-8"), b"")
-                if category in _HUMAN_FAILURES:
-                    return category
-            category = _payload_human_failure_category(child)
+    if not isinstance(value, dict):
+        return None
+    for key, child in value.items():
+        normalized_key = str(key).casefold()
+        if normalized_key in _ENVELOPE_MESSAGE_FIELDS and isinstance(child, str):
+            category = _failure_category_from_text(child)
+            if category in _HUMAN_FAILURES:
+                return category
+        if normalized_key in _ENVELOPE_STATUS_FIELDS and child not in (None, ""):
+            category = _structured_status_category(child)
             if category is not None:
                 return category
-    elif isinstance(value, list):
-        for child in value:
-            category = _payload_human_failure_category(child)
-            if category is not None:
-                return category
+        if normalized_key == "error" and child not in (None, "", {}, []):
+            category = _error_category(child)
+            return category or "response_unusable"
+    nested_data = value.get("data")
+    if isinstance(nested_data, dict):
+        return _payload_human_failure_category(nested_data)
     return None
+
+
+def _structured_status_category(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "response_unusable"
+    if isinstance(value, int):
+        return {0: None, 200: None, 401: "login_required", 403: "account_visibility_restricted", 429: "rate_limited"}.get(value, "response_unusable")
+    if isinstance(value, str):
+        category = _failure_category_from_text(value)
+        if category in _HUMAN_FAILURES:
+            return category
+        return None if value.strip().casefold() in _SUCCESS_STATUS_VALUES else "response_unusable"
+    return "response_unusable"
+
+
+def _error_category(value: Any) -> str | None:
+    if isinstance(value, str):
+        category = _failure_category_from_text(value)
+        return category if category in _HUMAN_FAILURES else "response_unusable"
+    if isinstance(value, dict):
+        return _payload_human_failure_category(value)
+    return "response_unusable"
 
 
 def _redact_credentials(value: Any) -> Any:

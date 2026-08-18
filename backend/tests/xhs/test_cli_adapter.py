@@ -163,6 +163,99 @@ def test_exit_zero_auth_envelopes_cannot_claim_empty_success(
     assert result.complete is False
 
 
+@pytest.mark.parametrize(
+    "payload, detail",
+    [
+        ({"notes": [], "message": "请先登录"}, "login_required"),
+        ({"notes": [], "message": "登录已过期"}, "login_required"),
+        ({"notes": [], "message": "需要验证"}, "captcha_required"),
+        ({"notes": [], "message": "验证码"}, "captcha_required"),
+        ({"notes": [], "message": "请求频繁"}, "rate_limited"),
+        ({"notes": [], "message": "访问受限"}, "account_visibility_restricted"),
+        ({"data": {"notes": [], "message": "请先登录"}}, "login_required"),
+        ({"data": {"notes": [], "status": "登录已过期"}}, "login_required"),
+        ({"data": {"notes": [], "error": "需要验证"}}, "captcha_required"),
+        ({"data": {"notes": [], "message": "验证码"}}, "captcha_required"),
+        ({"data": {"notes": [], "status": "请求频繁"}}, "rate_limited"),
+        ({"data": {"notes": [], "error": "访问受限"}}, "account_visibility_restricted"),
+    ],
+)
+def test_exit_zero_chinese_access_gates_are_needs_human_facts(
+    payload: dict[str, object], detail: str
+) -> None:
+    """An exit-zero Chinese platform gate must not be represented as an empty completed search."""
+    fake_runner = FakeRunner([_completed(["xhs"], payload)])
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.search_notes(
+        CollectionRequest(
+            capability="search_notes",
+            parameters={"keyword": "收纳", "job_id": JOB_ID},
+            expected_count=0,
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert result.detail == detail
+    assert result.complete is False
+
+
+@pytest.mark.parametrize(
+    "payload, detail",
+    [
+        ({"notes": [], "status": 401}, "login_required"),
+        ({"data": {"notes": [], "status": 429}}, "rate_limited"),
+        ({"data": {"notes": [], "error": {"code": 403}}}, "account_visibility_restricted"),
+        ({"notes": [], "error": "unrecognized provider failure"}, "response_unusable"),
+        ({"data": {"notes": [], "status": "unexpected"}}, "response_unusable"),
+    ],
+)
+def test_exit_zero_error_or_status_envelopes_fail_closed(
+    payload: dict[str, object], detail: str
+) -> None:
+    """An unknown non-success envelope must not become a fabricated 0/0 result."""
+    fake_runner = FakeRunner([_completed(["xhs"], payload)])
+    adapter = XhsCliReadAdapter(executable=Path("xhs"), runner=fake_runner)
+
+    result = adapter.search_notes(
+        CollectionRequest(
+            capability="search_notes",
+            parameters={"keyword": "收纳", "job_id": JOB_ID},
+            expected_count=0,
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert result.detail == detail
+    assert result.complete is False
+
+
+def test_normal_empty_search_and_benign_note_title_remain_successful() -> None:
+    """Access-gate detection must inspect envelope fields, never arbitrary note content."""
+    empty_runner = FakeRunner([_completed(["xhs"], {"notes": []})])
+    title_runner = FakeRunner(
+        [_completed(["xhs"], {"notes": [{"id": "note-1", "title": "请先登录"}]})]
+    )
+
+    empty = XhsCliReadAdapter(executable=Path("xhs"), runner=empty_runner).search_notes(
+        CollectionRequest(
+            capability="search_notes",
+            parameters={"keyword": "收纳", "job_id": JOB_ID},
+            expected_count=0,
+        )
+    )
+    titled = XhsCliReadAdapter(executable=Path("xhs"), runner=title_runner).search_notes(
+        CollectionRequest(
+            capability="search_notes",
+            parameters={"keyword": "收纳", "job_id": JOB_ID},
+            expected_count=1,
+        )
+    )
+
+    assert (empty.status, empty.complete) == ("succeeded", True)
+    assert (titled.status, titled.complete) == ("succeeded", True)
+
+
 def test_module_exposes_no_public_arbitrary_argv_runner() -> None:
     """A public argv runner would let future callers bypass the adapter's command allowlist."""
     assert not hasattr(cli_module, "run_xhs_json")
