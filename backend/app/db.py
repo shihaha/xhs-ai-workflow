@@ -1,5 +1,6 @@
 """SQLite database lifecycle for durable local workbench facts."""
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,6 +95,21 @@ def windows_artifact_reference_path_key(value: object) -> str | None:
     return "/".join(parts) if parts else None
 
 
+def canonical_raw_evidence_digest(value: object) -> str | None:
+    """Hash one non-empty JSON object using one byte-stable canonical form."""
+
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+        if not isinstance(parsed, dict) or not parsed:
+            return None
+        encoded = json.dumps(
+            parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class Database:
     """Own the local SQLite engine and initialize its durable schema."""
 
@@ -126,6 +142,10 @@ class Database:
             ProductRecord,
         )
         from backend.app.features.radar.models import RankItemRecord, RankSnapshotRecord
+        from backend.app.features.xhs.models import (
+            XhsAccountNoteRecord,
+            XhsAccountProfileRecord,
+        )
         from backend.app.models.jobs import JobArtifactRecord, JobLogRecord, JobRecord
 
         _ = (
@@ -143,6 +163,11 @@ class Database:
             JobRecord,
             RankItemRecord,
             RankSnapshotRecord,
+            XhsAccountNoteRecord,
+            XhsAccountProfileRecord,
+        )
+        xhs_account_note_marker_present = self._migration_marker_exists(
+            "xhs_account_note_evidence_v1"
         )
         quarantine_marker_present = self._migration_marker_exists(
             "task8_artifact_quarantine_v1"
@@ -168,6 +193,8 @@ class Database:
             )
         if quarantine_reference_guard_marker_present and quarantine_source_token_marker_present:
             self._require_artifact_quarantine_reference_guards()
+        if xhs_account_note_marker_present:
+            self._require_xhs_account_note_evidence_schema()
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
@@ -191,6 +218,9 @@ class Database:
         )
         self._migrate_artifact_quarantine_reference_guards(
             marker_present=quarantine_reference_guard_marker_present
+        )
+        self._migrate_xhs_account_note_evidence(
+            marker_present=xhs_account_note_marker_present
         )
         self._recover_stranded_content_regenerations()
 
@@ -250,6 +280,63 @@ class Database:
                 raise SchemaMigrationError(
                     "Task 8 artifact cleanup schema validation failed."
                 )
+
+    def _require_xhs_account_note_evidence_schema(self) -> None:
+        with self.engine.connect() as connection:
+            if not _xhs_account_note_evidence_schema_valid(
+                inspect(connection), connection
+            ) or not _xhs_account_note_evidence_data_valid(connection):
+                raise SchemaMigrationError(
+                    "XHS account note evidence schema validation failed."
+                )
+
+    def _migrate_xhs_account_note_evidence(self, *, marker_present: bool) -> None:
+        """Install only an empty or fully-valid evidence schema; never guess history."""
+        from backend.app.features.xhs.models import (
+            XhsAccountNoteRecord,
+            XhsAccountProfileRecord,
+        )
+
+        if marker_present:
+            self._require_xhs_account_note_evidence_schema()
+            return
+        with self.engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE IF NOT EXISTS workbench_schema_migrations ("
+                "name VARCHAR(200) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL)"
+            ))
+            inspector = inspect(connection)
+            if not _xhs_account_note_evidence_schema_valid(inspector, connection):
+                tables = set(inspector.get_table_names())
+                present = tables & {"xhs_account_profiles", "xhs_account_notes"}
+                populated = any(
+                    connection.scalar(text(f"SELECT COUNT(*) FROM {table}"))
+                    for table in present
+                )
+                if populated:
+                    raise SchemaMigrationError(
+                        "Historical XHS account note evidence requires isolated manual migration."
+                    )
+                for trigger in _XHS_ACCOUNT_NOTE_EVIDENCE_TRIGGER_SQL:
+                    connection.execute(text(f"DROP TRIGGER IF EXISTS {trigger}"))
+                if "xhs_account_notes" in tables:
+                    connection.execute(text("DROP TABLE xhs_account_notes"))
+                if "xhs_account_profiles" in tables:
+                    connection.execute(text("DROP TABLE xhs_account_profiles"))
+                XhsAccountProfileRecord.__table__.create(connection)
+                XhsAccountNoteRecord.__table__.create(connection)
+            _create_xhs_account_note_evidence_triggers(connection)
+            if not _xhs_account_note_evidence_schema_valid(
+                inspect(connection), connection
+            ) or not _xhs_account_note_evidence_data_valid(connection):
+                raise SchemaMigrationError(
+                    "XHS account note evidence schema validation failed."
+                )
+            connection.execute(text(
+                "INSERT INTO workbench_schema_migrations(name, applied_at) "
+                "VALUES ('xhs_account_note_evidence_v1', CURRENT_TIMESTAMP)"
+            ))
+        self._require_xhs_account_note_evidence_schema()
 
     def _migrate_content_schema(self) -> None:
         inspector = inspect(self.engine)
@@ -951,6 +1038,9 @@ def _configure_sqlite(connection: object, _: object) -> None:
         "windows_artifact_path_key", 1, windows_artifact_reference_path_key,
         deterministic=True,
     )
+    connection.create_function(  # type: ignore[union-attr]
+        "raw_evidence_digest", 1, canonical_raw_evidence_digest, deterministic=True
+    )
     cursor = connection.cursor()  # type: ignore[union-attr]
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
@@ -1176,6 +1266,221 @@ def _compact_sql(value: object) -> str:
         compact.append(char.lower())
         index += 1
     return "".join(compact)
+
+
+_XHS_ACCOUNT_NOTE_EVIDENCE_TRIGGER_SQL = {
+    "ck_xhs_profile_artifact_job_insert": """
+        CREATE TRIGGER ck_xhs_profile_artifact_job_insert
+        BEFORE INSERT ON xhs_account_profiles
+        WHEN NOT EXISTS (
+            SELECT 1 FROM job_artifacts
+            WHERE id=NEW.collection_artifact_id AND job_id=NEW.collection_job_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'XHS profile artifact must belong to its collection job');
+        END
+    """,
+    "ck_xhs_profile_artifact_job_update": """
+        CREATE TRIGGER ck_xhs_profile_artifact_job_update
+        BEFORE UPDATE OF collection_job_id, collection_artifact_id ON xhs_account_profiles
+        WHEN NOT EXISTS (
+            SELECT 1 FROM job_artifacts
+            WHERE id=NEW.collection_artifact_id AND job_id=NEW.collection_job_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'XHS profile artifact must belong to its collection job');
+        END
+    """,
+    "ck_xhs_note_artifact_job_insert": """
+        CREATE TRIGGER ck_xhs_note_artifact_job_insert
+        BEFORE INSERT ON xhs_account_notes
+        WHEN NOT EXISTS (
+            SELECT 1 FROM job_artifacts
+            WHERE id=NEW.collection_artifact_id AND job_id=NEW.collection_job_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'XHS note artifact must belong to its collection job');
+        END
+    """,
+    "ck_xhs_note_artifact_job_update": """
+        CREATE TRIGGER ck_xhs_note_artifact_job_update
+        BEFORE UPDATE OF collection_job_id, collection_artifact_id ON xhs_account_notes
+        WHEN NOT EXISTS (
+            SELECT 1 FROM job_artifacts
+            WHERE id=NEW.collection_artifact_id AND job_id=NEW.collection_job_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'XHS note artifact must belong to its collection job');
+        END
+    """,
+}
+
+
+def _create_xhs_account_note_evidence_triggers(connection: Connection) -> None:
+    for name, sql in _XHS_ACCOUNT_NOTE_EVIDENCE_TRIGGER_SQL.items():
+        connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+        connection.execute(text(sql))
+
+
+def _xhs_account_note_evidence_schema_valid(
+    inspector: object, connection: Connection
+) -> bool:
+    """Verify every durable XHS fact constraint instead of trusting its marker."""
+
+    expected_columns = {
+        "xhs_account_profiles": {
+            "user_id": "VARCHAR(500)",
+            "source_url": "TEXT",
+            "raw_evidence": "JSON",
+            "raw_digest": "VARCHAR(64)",
+            "collection_job_id": "VARCHAR(36)",
+            "collection_artifact_id": "INTEGER",
+            "collected_at": "DATETIME",
+        },
+        "xhs_account_notes": {
+            "id": "INTEGER",
+            "note_id": "VARCHAR(500)",
+            "user_id": "VARCHAR(500)",
+            "source_url": "TEXT",
+            "raw_evidence": "JSON",
+            "raw_digest": "VARCHAR(64)",
+            "collection_job_id": "VARCHAR(36)",
+            "collection_artifact_id": "INTEGER",
+            "collected_at": "DATETIME",
+        },
+    }
+    expected_checks = {
+        "xhs_account_profiles": {
+            "ck_xhs_profile_user_id": "length(user_id)between1and500",
+            "ck_xhs_profile_source_url": "length(source_url)<=2000andsource_urlglob'https://*'",
+            "ck_xhs_profile_raw_digest": (
+                "length(raw_digest)=64andraw_digestnotglob'*[^0-9a-f]*'and"
+                "raw_evidence_digest(raw_evidence)=raw_digest"
+            ),
+        },
+        "xhs_account_notes": {
+            "ck_xhs_note_id": "length(note_id)between1and500",
+            "ck_xhs_note_source_url": "length(source_url)<=2000andsource_urlglob'https://*'",
+            "ck_xhs_note_raw_digest": (
+                "length(raw_digest)=64andraw_digestnotglob'*[^0-9a-f]*'and"
+                "raw_evidence_digest(raw_evidence)=raw_digest"
+            ),
+        },
+    }
+    expected_fks = {
+        "xhs_account_profiles": {
+            (("collection_job_id",), "jobs", ("id",), "RESTRICT"),
+            (("collection_artifact_id",), "job_artifacts", ("id",), "RESTRICT"),
+        },
+        "xhs_account_notes": {
+            (("user_id",), "xhs_account_profiles", ("user_id",), "CASCADE"),
+            (("collection_job_id",), "jobs", ("id",), "RESTRICT"),
+            (("collection_artifact_id",), "job_artifacts", ("id",), "RESTRICT"),
+        },
+    }
+    expected_indexes = {
+        "xhs_account_profiles": {
+            "ix_xhs_account_profiles_collection_job_id": (("collection_job_id",), False, ""),
+            "ix_xhs_account_profiles_collection_artifact_id": (("collection_artifact_id",), False, ""),
+        },
+        "xhs_account_notes": {
+            "ix_xhs_account_notes_user_id": (("user_id",), False, ""),
+            "ix_xhs_account_notes_collection_job_id": (("collection_job_id",), False, ""),
+            "ix_xhs_account_notes_collection_artifact_id": (("collection_artifact_id",), False, ""),
+        },
+    }
+    try:
+        if not set(expected_columns).issubset(set(inspector.get_table_names())):
+            return False
+        for table, expected in expected_columns.items():
+            columns = {item["name"]: item for item in inspector.get_columns(table)}
+            if set(columns) != set(expected):
+                return False
+            if any(columns[name].get("nullable") is not False for name in expected):
+                return False
+            if {
+                name: str(column.get("type") or "").upper()
+                for name, column in columns.items()
+            } != expected:
+                return False
+            checks = {
+                item.get("name"): _compact_sql(item.get("sqltext"))
+                for item in inspector.get_check_constraints(table)
+            }
+            if checks != expected_checks[table]:
+                return False
+            foreign_keys = {
+                (
+                    tuple(item.get("constrained_columns") or ()),
+                    item.get("referred_table"),
+                    tuple(item.get("referred_columns") or ()),
+                    (item.get("options") or {}).get("ondelete"),
+                )
+                for item in inspector.get_foreign_keys(table)
+            }
+            if foreign_keys != expected_fks[table]:
+                return False
+            indexes = {
+                item.get("name"): (
+                    tuple(item.get("column_names") or ()),
+                    bool(item.get("unique")),
+                    _compact_sql((item.get("dialect_options") or {}).get("sqlite_where")),
+                )
+                for item in inspector.get_indexes(table)
+            }
+            if indexes != expected_indexes[table]:
+                return False
+        if tuple(inspector.get_pk_constraint("xhs_account_profiles").get("constrained_columns") or ()) != ("user_id",):
+            return False
+        if tuple(inspector.get_pk_constraint("xhs_account_notes").get("constrained_columns") or ()) != ("id",):
+            return False
+        if {
+            tuple(item.get("column_names") or ())
+            for item in inspector.get_unique_constraints("xhs_account_profiles")
+        } != set():
+            return False
+        if {
+            tuple(item.get("column_names") or ())
+            for item in inspector.get_unique_constraints("xhs_account_notes")
+        } != {("note_id", "user_id")}:
+            return False
+        triggers = {
+            row[0]: _compact_sql(row[1])
+            for row in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'ck_xhs_%'"
+            ))
+        }
+        if triggers != {
+            name: _compact_sql(sql)
+            for name, sql in _XHS_ACCOUNT_NOTE_EVIDENCE_TRIGGER_SQL.items()
+        }:
+            return False
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+    return True
+
+
+def _xhs_account_note_evidence_data_valid(connection: Connection) -> bool:
+    try:
+        for table in ("xhs_account_profiles", "xhs_account_notes"):
+            invalid = connection.scalar(text(
+                f"SELECT 1 FROM {table} AS fact "
+                "LEFT JOIN job_artifacts AS artifact "
+                "ON artifact.id=fact.collection_artifact_id "
+                "AND artifact.job_id=fact.collection_job_id "
+                "WHERE artifact.id IS NULL OR raw_evidence_digest(fact.raw_evidence) "
+                "IS NOT fact.raw_digest OR datetime(fact.collected_at) IS NULL LIMIT 1"
+            ))
+            if invalid is not None:
+                return False
+        return connection.scalar(text(
+            "SELECT 1 FROM xhs_account_notes AS note "
+            "LEFT JOIN xhs_account_profiles AS profile ON profile.user_id=note.user_id "
+            "WHERE profile.user_id IS NULL LIMIT 1"
+        )) is None
+    except SQLAlchemyError:
+        return False
 
 
 def _artifact_quarantine_schema_valid(
