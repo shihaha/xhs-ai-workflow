@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     browser_executable: str | None = None
     qianfan_browser_profile_dir: Path | None = None
     qianfan_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    xhs_cli_executable: str = "xhs"
+    xhs_cli_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
     bailian_api_key: str | None = Field(
         default=None,
         validation_alias="BAILIAN_API_KEY",

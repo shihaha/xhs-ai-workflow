@@ -18,6 +18,8 @@ from pydantic import (
 class CollectionRequest(BaseModel):
     """A third-party-neutral request for a supported collection capability."""
 
+    model_config = ConfigDict(extra="forbid")
+
     capability: str = Field(min_length=1, max_length=100)
     parameters: dict[str, Any] = Field(default_factory=dict)
     expected_count: int | None = Field(default=None, ge=0)
