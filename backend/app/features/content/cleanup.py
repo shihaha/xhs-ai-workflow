@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 import stat
-from threading import Lock
-from typing import Callable, Literal
+from threading import Event, Lock, Thread
+from typing import Callable, Literal, Protocol
 from uuid import uuid4
 
 from sqlalchemy import and_, or_, select, update
@@ -44,6 +44,63 @@ from backend.app.features.content.schemas import ArtifactCleanupRead
 CleanupOwnerType = Literal["material", "content_package"]
 OPEN_STATES = ("pending", "claimed", "quarantined", "needs_human")
 CLAIMABLE_STATES = ("pending", "quarantined")
+
+
+class _CleanupBatchService(Protocol):
+    def run_due_once(self, *, limit: int = 10) -> int: ...
+
+
+class ArtifactCleanupWorker:
+    """Run one bounded durable-cleanup batch per interruptible poll interval."""
+
+    def __init__(
+        self,
+        service: _CleanupBatchService,
+        *,
+        poll_seconds: float,
+        batch_size: int,
+    ) -> None:
+        if poll_seconds <= 0 or batch_size < 1:
+            raise ValueError("Cleanup worker settings must be positive.")
+        self.service = service
+        self.poll_seconds = poll_seconds
+        self.batch_size = batch_size
+        self.last_error_category: str | None = None
+        self._stop_event = Event()
+        self._lifecycle_lock = Lock()
+        self._thread: Thread | None = None
+
+    @property
+    def is_alive(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            if self._thread is not None:
+                return
+            self._thread = Thread(
+                target=self._run,
+                name="artifact-cleanup",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def close(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=0.25)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.service.run_due_once(limit=self.batch_size)
+            except Exception:
+                # The worker must keep polling without retaining sensitive exception text.
+                self.last_error_category = "cleanup_worker_error"
+            if self._stop_event.wait(self.poll_seconds):
+                return
 
 
 def _utc_now() -> datetime:

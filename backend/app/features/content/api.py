@@ -3,9 +3,11 @@
 from fastapi import APIRouter, HTTPException, Request, status
 
 from backend.app.features.content.schemas import (
+    ArtifactCleanupRead,
     ContentItemCreate, ContentItemRead, ContentPackageRead, MaterialCreate, MaterialRead,
     ExportCreate, ProductCreate, ProductRead, RegenerateCreate, ReviewCreate,
 )
+from backend.app.features.content.cleanup import ArtifactCleanupService
 from backend.app.features.content.service import (
     ContentModelFailure, ContentModelUnavailable, ContentNotFound, ContentService,
     ContentStateError, ContentValidationError,
@@ -17,6 +19,15 @@ router = APIRouter(prefix="/api/v1", tags=["content"])
 
 def _service(request: Request) -> ContentService:
     service: ContentService | None = request.app.state.content_service
+    if service is None:
+        raise HTTPException(status_code=503, detail="SQLite database is unavailable.")
+    return service
+
+
+def _cleanup_service(request: Request) -> ArtifactCleanupService:
+    service: ArtifactCleanupService | None = (
+        request.app.state.artifact_cleanup_service
+    )
     if service is None:
         raise HTTPException(status_code=503, detail="SQLite database is unavailable.")
     return service
@@ -122,3 +133,19 @@ def get_package(package_id: str, request: Request) -> ContentPackageRead:
         return _service(request).get_package(package_id)
     except (ContentNotFound, ContentStateError) as error:
         raise _translate(error) from error
+
+
+@router.get("/artifact-cleanups", response_model=list[ArtifactCleanupRead])
+def list_artifact_cleanups(request: Request) -> list[ArtifactCleanupRead]:
+    return _cleanup_service(request).list_records()
+
+
+@router.get("/artifact-cleanups/{cleanup_id}", response_model=ArtifactCleanupRead)
+def get_artifact_cleanup(cleanup_id: str, request: Request) -> ArtifactCleanupRead:
+    record = _cleanup_service(request).get_record(cleanup_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Artifact cleanup record does not exist.",
+        )
+    return record

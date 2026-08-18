@@ -1,6 +1,7 @@
 """FastAPI application factory for the local workbench."""
 
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -14,6 +15,10 @@ from backend.app.db import Database
 from backend.app.features.analysis.api import router as analysis_router
 from backend.app.features.analysis.service import AnalysisService
 from backend.app.features.content.api import router as content_router
+from backend.app.features.content.cleanup import (
+    ArtifactCleanupService,
+    ArtifactCleanupWorker,
+)
 from backend.app.features.content.service import ContentService
 from backend.app.features.radar.api import router as radar_router
 from backend.app.features.radar.service import RadarService
@@ -28,9 +33,14 @@ from backend.app.services.jobs import JobService
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    cleanup_worker: ArtifactCleanupWorker | None = app.state.artifact_cleanup_worker
     try:
+        if cleanup_worker is not None:
+            cleanup_worker.start()
         yield
     finally:
+        if cleanup_worker is not None:
+            cleanup_worker.close()
         shop_service: ShopCollectionService | None = app.state.shop_service
         if shop_service is not None:
             shop_service.close()
@@ -51,6 +61,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.shop_service = None
     app.state.analysis_service = None
     app.state.content_service = None
+    app.state.artifact_cleanup_service = None
+    app.state.artifact_cleanup_worker = None
     app.state.bailian_adapter = BailianModelAdapter(
         api_key=app.state.settings.bailian_api_key,
         base_url=app.state.settings.bailian_base_url,
@@ -74,10 +86,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.bailian_adapter,
             runtime_dir=app.state.settings.runtime_dir,
         )
+        app.state.artifact_cleanup_service = ArtifactCleanupService(
+            app.state.database,
+            runtime_dir=app.state.settings.runtime_dir,
+            grace_period=timedelta(
+                hours=app.state.settings.artifact_cleanup_grace_hours
+            ),
+        )
+        app.state.artifact_cleanup_service.recover_expired_leases()
         app.state.content_service = ContentService(
             app.state.database,
             app.state.bailian_adapter,
             runtime_dir=app.state.settings.runtime_dir,
+            cleanup_service=app.state.artifact_cleanup_service,
+        )
+        app.state.artifact_cleanup_worker = ArtifactCleanupWorker(
+            app.state.artifact_cleanup_service,
+            poll_seconds=app.state.settings.artifact_cleanup_poll_seconds,
+            batch_size=app.state.settings.artifact_cleanup_batch_size,
         )
         app.state.job_service.recover_expired_running(
             worker_job_types=ANDROID_SHOP_JOB_TYPES
@@ -88,6 +114,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.radar_service = None
         app.state.analysis_service = None
         app.state.content_service = None
+        app.state.artifact_cleanup_service = None
+        app.state.artifact_cleanup_worker = None
         app.state.database_error = "SQLite database is unavailable."
     app.state.android_adapter = AndroidDeviceAdapter(
         runtime_dir=app.state.settings.runtime_dir,

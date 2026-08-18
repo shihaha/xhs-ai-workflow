@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     bailian_text_model: str = "deepseek-v4-flash"
     bailian_max_attempts: int = Field(default=3, ge=1, le=10)
     bailian_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    artifact_cleanup_poll_seconds: float = Field(
+        default=30.0, ge=1.0, le=3600.0
+    )
+    artifact_cleanup_batch_size: int = Field(default=10, ge=1, le=100)
+    artifact_cleanup_grace_hours: int = Field(default=24, ge=1, le=168)
 
     @model_validator(mode="after")
     def prepare_runtime_dir(self) -> "Settings":
