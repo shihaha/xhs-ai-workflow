@@ -31,3 +31,6 @@ Task 4: fix rounds 1-5 completed (commits 87d640c..bb5ea11)
 Task 4: complete (final independent review CLEAN; backend 1020 passed/1 live skip; account-note evidence enriches analysis but exact shop N/N gate remains required)
 Task 5: fix round 1/5 complete (3 Important addressed; commits b13d452..59e52c3)
 Task 5: complete (independent review CLEAN; frontend 47 passed; controlled E2E 1/1 and repeat-5 5/5; repository verify backend 1022 passed/2 live skips; npm audit clean; authenticated real xhs-cli remains not_run)
+Whole-plan final review: NOT CLEAN (3 Critical, 1 Important). User authorized continued stabilization.
+Stabilization S2A implementation complete; independent post-commit review pending (pinned real shapes, isolated external-auth state, actual credential redaction and bounded child output; controlled verification green; authenticated real xhs-cli remains not_run).
+Stabilization S2B pending: append-only/versioned note evidence and post-model pre-commit trust revalidation.

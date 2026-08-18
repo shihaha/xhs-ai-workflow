@@ -7,7 +7,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
 - [ ] Authenticated current Qianfan browser profile supplied and health checked.
 - [ ] Xiaohongshu login supplied without storing credentials in Git.
-- [ ] Trusted local `xhs-cli` session is authenticated outside the application; do not paste Cookie, token or password into HTTP, tests, logs or this checklist.
+- [ ] Trusted local `xhs-cli` state is prepared outside the application under an isolated directory inside the configured runtime. Set `XHS_LIVE_STATE_DIR` to that directory; do not paste Cookie, token or password into HTTP, tests, logs or this checklist.
 - [ ] One Android phone connected; ADB/device/app state reports actual availability.
 - [ ] Bailian API key supplied through environment only; configured model call succeeds.
 - [ ] Fresh runtime/database selected; all business lists are initially empty.
@@ -41,7 +41,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 ## Current execution status (2026-08-18)
 
 - Qianfan authenticated live collection: **not_run** — no authenticated verified profile/selectors were supplied.
-- Xiaohongshu account/note live collection: **not_run** — `XHS_LIVE_TEST=1` and a trusted authenticated local `xhs-cli` session/targets were not supplied. The opt-in gate accepts only user ID, keyword and expected counts; it performs fixed read-only commands and never changes login state.
+- Xiaohongshu account/note live collection: **not_run** — `XHS_LIVE_TEST=1`, `XHS_LIVE_STATE_DIR` and trusted authenticated local `xhs-cli` state/targets were not supplied. The opt-in gate accepts only the isolated state path, user ID, keyword and expected counts; it performs fixed read-only commands and never changes login state.
 - Android real-device collection: **not_run: device unavailable**.
 - Bailian live contract: **not_run: BAILIAN_API_KEY unavailable**.
 - Seven-day real UAT: **not_run**.
@@ -52,6 +52,6 @@ real UAT”, not “same effect as the tutorial proven”.
 ## Controlled Task 5 evidence
 
 - Frontend unit tests cover account/search empty, queued, terminal, needs-human, stale-read, single-flight, bounded polling, explicit same-job resume, lock release and unmount cancellation behavior.
-- A fake authenticated CLI contract executes `status` without `--json`, validates identity through `whoami --json`, and then reaches the exact `user`, `user-posts` and `search` read path. A fake unauthenticated session remains `not_run` and creates no database.
-- The Playwright fixture starts with no account profile/note rows. Each run creates a unique ranked account, starts the real Task 3 account collection route from the UI, persists its profile/note through the reserved job/artifact/database path, selects the resulting `account-note:*` evidence for analysis, then completes the existing shop N/N, opportunity, product, content review and available ZIP path.
+- A fake authenticated CLI contract executes `status` without `--json`, validates identity through real-shape `whoami --json`, and then reaches exact `user`, `user-posts` and `search` commands using pinned top-level-list, `userPageData/userInfo` and nested `noteCard` shapes. Missing external state remains `not_run` and creates no database.
+- The Playwright fixture starts with no account profile/note rows. Each run creates a unique ranked account, starts the real Task 3 account collection route from the UI, runs the production XHS adapter against pinned-CLI shapes, persists its profile/note through the reserved job/artifact/database path, confirms xsec material is absent from returned job facts, selects the resulting `account-note:*` evidence for analysis, then completes the existing shop N/N, opportunity, product, content review and available ZIP path.
 - The controlled E2E passed once and with `--repeat-each=5`; this is software evidence only and does not satisfy the live gates above.

@@ -79,6 +79,17 @@ def _service(tmp_path: Path, adapter: object, *, submitter=None) -> XhsCollectio
     )
 
 
+def _prepared_cli_state(tmp_path: Path) -> Path:
+    state_dir = tmp_path / "runtime" / "xhs-cli-state"
+    config_dir = state_dir / ".xhs-cli"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "cookies.json").write_text(
+        json.dumps({"cookies": {"a1": "prepared-a1", "web_session": "prepared-session"}}),
+        encoding="utf-8",
+    )
+    return state_dir
+
+
 def test_account_uses_profile_plus_n_expected_count_and_atomic_success(tmp_path: Path) -> None:
     adapter = _Adapter()
     service = _service(tmp_path, adapter, submitter=lambda *_args: None)
@@ -211,7 +222,12 @@ def test_subprocess_timeout_becomes_a_durable_failed_job(tmp_path: Path) -> None
     def timed_out(argv, **_kwargs):
         raise subprocess.TimeoutExpired(argv, timeout=0.01)
 
-    adapter = XhsCliReadAdapter(executable="xhs", timeout_seconds=0.01, runner=timed_out)
+    adapter = XhsCliReadAdapter(
+        executable="xhs",
+        state_dir=_prepared_cli_state(tmp_path),
+        timeout_seconds=0.01,
+        runner=timed_out,
+    )
     service = _service(tmp_path, adapter, submitter=lambda *_args: None)
     queued = service.submit_search("收纳", 1)
 
@@ -348,7 +364,11 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
     def runner(_argv, **_kwargs):
         return next(responses)
 
-    adapter = XhsCliReadAdapter(executable="xhs", runner=runner)
+    adapter = XhsCliReadAdapter(
+        executable="xhs",
+        state_dir=_prepared_cli_state(tmp_path),
+        runner=runner,
+    )
     service = _service(tmp_path, adapter, submitter=lambda *_args: None)
     queued = service.submit_account("user-1", 1)
 
@@ -375,13 +395,12 @@ def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_fact
 ) -> None:
     secrets = [
         f"real-search-alias-secret-sentinel-{index:02d}-end"
-        for index in range(30)
+        for index in range(36)
     ]
     response = subprocess.CompletedProcess(
         ["xhs"], 0,
-        stdout=json.dumps({"notes": [{
+        stdout=json.dumps([{
             "id": "note-1",
-            "title": "收纳",
             "auth_token": secrets[0],
             "csrfToken": secrets[1],
             "xsrfToken": secrets[2],
@@ -414,11 +433,25 @@ def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_fact
                 {"name": "bearerToken", "value": secrets[16]},
                 {"name": "jwtToken", "value": secrets[17]},
             ],
-        }]}).encode(),
+            "Headers": [
+                {"Name": "Cookie", "Value": secrets[30]},
+                {"NAME": "Authorization", "VALUE": secrets[31]},
+            ],
+            "Cookies": {"arbitrary_cookie_name": secrets[32]},
+            "tokens": {"provider_specific_name": secrets[33]},
+            "xsecToken": secrets[34],
+            "xsec_token": secrets[35],
+            "noteCard": {
+                "displayTitle": "收纳",
+                "user": {"userId": "user-1"},
+            },
+        }]).encode(),
         stderr=b"",
     )
     adapter = XhsCliReadAdapter(
-        executable="xhs", runner=lambda _argv, **_kwargs: response
+        executable="xhs",
+        state_dir=_prepared_cli_state(tmp_path),
+        runner=lambda _argv, **_kwargs: response,
     )
     service = _service(tmp_path, adapter, submitter=lambda *_args: None)
     queued = service.submit_search("收纳", 1)

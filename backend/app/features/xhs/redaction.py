@@ -37,6 +37,7 @@ _TOKEN_QUALIFIERS = frozenset({
     "session",
     "url",
     "xsrf",
+    "xsec",
 })
 _TOKEN_QUALIFIER_CHAINS = frozenset({("personal", "access")})
 _CARRIER_QUALIFIERS = {
@@ -49,6 +50,7 @@ _CARRIER_QUALIFIERS = {
     "string": frozenset({"cookie"}),
 }
 _STRUCTURED_VALUE_KEYS = frozenset({"value", "values"})
+_CREDENTIAL_CONTAINER_NAMES = frozenset({"cookies", "tokens"})
 _ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
 _NAME_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
@@ -59,15 +61,17 @@ _JOINED_IDENTIFIER_WORDS = frozenset({"oauth"})
 def redact_credentials(value: Any) -> Any:
     """Redact both credential keys and ``{name, value}`` header entries."""
     if isinstance(value, dict):
-        semantic_name = value.get("name")
-        semantic_secret = (
-            isinstance(semantic_name, str)
-            and _is_credential_name(semantic_name)
+        semantic_secret = any(
+            str(key).casefold() == "name"
+            and isinstance(item, str)
+            and _is_credential_name(item)
+            for key, item in value.items()
         )
         return {
             str(key): (
                 "[redacted]"
                 if _is_credential_name(str(key))
+                or str(key).casefold() in _CREDENTIAL_CONTAINER_NAMES
                 or (
                     semantic_secret
                     and str(key).casefold() in _STRUCTURED_VALUE_KEYS

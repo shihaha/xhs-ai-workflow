@@ -5,11 +5,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import subprocess
 import tempfile
 from pathlib import Path
 
 from backend.app.adapters.contracts import CollectionItem, CollectionResult, DeviceHealth, ModelResult
 from backend.app.adapters.qianfan_playwright import QIANFAN_RANK_URL, QianfanSelectorProfile
+from backend.app.adapters.xhs_cli_read import XhsCliReadAdapter
 from backend.app.features.analysis.service import AnalysisService
 from backend.app.features.content.service import ContentService
 from backend.app.features.radar.qianfan_service import QianfanCollectionService
@@ -85,40 +87,49 @@ class ControlledDevice:
         return CollectionResult(status="succeeded", evidence_artifacts=["fixtures/shop-account"], items=[item], expected_count_known=True, expected_count=1, succeeded_count=1, raw_observation_count=1, missing_items=[], overflow_count=0, complete=True)
 
 
-class ControlledXhs:
-    """Deterministic provider-neutral adapter; Task 3 still owns jobs/artifacts/DB."""
-
-    def fetch_account(self, request):
-        user_id = str(request.parameters["user_id"])
-        assert request.expected_count == 2
-        note_id = f"note-{user_id}"
-        return CollectionResult(
-            status="succeeded",
-            items=[
-                CollectionItem(
-                    id=f"profile:{user_id}", kind="profile",
-                    source_url=f"https://www.xiaohongshu.com/user/profile/{user_id}",
-                    raw_evidence={"fixture": "task5-xhs-profile", "user_id": user_id},
-                    data={"user_id": user_id, "nickname": f"受控账号资料-{user_id}", "bio": "受控公开简介", "followers_count": 12},
-                ),
-                CollectionItem(
-                    id=f"note:{note_id}", kind="note",
-                    source_url=f"https://www.xiaohongshu.com/explore/{note_id}",
-                    raw_evidence={"fixture": "task5-xhs-note", "note_id": note_id, "user_id": user_id},
-                    data={"note_id": note_id, "user_id": user_id, "title": "受控露营收纳笔记", "summary": "受控公开笔记摘要", "published_at": "2026-08-18T10:00:00Z", "liked_count": 7},
-                ),
-            ],
-            expected_count_known=True, expected_count=2, succeeded_count=2,
-            raw_observation_count=2, missing_items=[], overflow_count=0, complete=True,
-        )
-
-    def search_notes(self, request):
-        assert request.expected_count == 0
-        return CollectionResult(
-            status="succeeded", items=[], expected_count_known=True,
-            expected_count=0, succeeded_count=0, raw_observation_count=0,
-            missing_items=[], overflow_count=0, complete=True,
-        )
+def controlled_xhs_cli(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+    """Return the pinned CLI's real JSON shapes without any live process or network."""
+    assert kwargs["shell"] is False
+    assert Path(str(kwargs["cwd"])).resolve() == settings.xhs_cli_state_dir
+    child_env = kwargs["env"]
+    assert isinstance(child_env, dict) and "PARENT_SECRET_SENTINEL" not in child_env
+    command = argv[1:]
+    if command[:1] == ["user"] and command[-1:] == ["--json"]:
+        user_id = command[1]
+        payload: object = {
+            "userPageData": {
+                "basicInfo": {
+                    "userId": user_id,
+                    "nickname": f"受控账号资料-{user_id}",
+                    "desc": "受控公开简介",
+                },
+                "interactions": [{"name": "fans", "count": 12}],
+            },
+            "userInfo": {"userId": user_id, "guest": False},
+        }
+    elif command[:1] == ["user-posts"] and command[-1:] == ["--json"]:
+        user_id = command[1]
+        payload = [{
+            "id": f"note-{user_id}",
+            "xsecToken": "controlled-xsec-must-not-persist",
+            "noteCard": {
+                "displayTitle": "受控露营收纳笔记",
+                "desc": "受控公开笔记摘要",
+                "publishTime": "2026-08-18T10:00:00Z",
+                "user": {"userId": user_id, "nickname": f"受控账号资料-{user_id}"},
+                "interactInfo": {"likedCount": 7},
+            },
+        }]
+    elif command[:1] == ["search"] and command[-1:] == ["--json"]:
+        payload = []
+    else:
+        raise AssertionError(f"unexpected controlled xhs command: {command!r}")
+    return subprocess.CompletedProcess(
+        argv,
+        0,
+        stdout=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        stderr=b"",
+    )
 
 
 CONTROLLED_QIANFAN_PROFILE = QianfanSelectorProfile(
@@ -157,6 +168,13 @@ class ControlledQianfan:
 
 
 settings = Settings(runtime_dir=RUNTIME, database_path=RUNTIME / "task9.sqlite3", bailian_api_key="controlled-not-live")
+assert settings.xhs_cli_state_dir is not None
+xhs_config = settings.xhs_cli_state_dir / ".xhs-cli"
+xhs_config.mkdir(parents=True, exist_ok=True)
+(xhs_config / "cookies.json").write_text(
+    json.dumps({"cookies": {"a1": "controlled-a1", "web_session": "controlled-session"}}),
+    encoding="utf-8",
+)
 app = create_app(settings)
 model = ControlledModel()
 app.state.bailian_adapter = model
@@ -167,7 +185,11 @@ if app.state.xhs_collection_service is not None:
 app.state.xhs_collection_service = XhsCollectionService(
     database=app.state.database,
     job_service=app.state.job_service,
-    adapter=ControlledXhs(),
+    adapter=XhsCliReadAdapter(
+        executable="controlled-xhs",
+        state_dir=settings.xhs_cli_state_dir,
+        runner=controlled_xhs_cli,
+    ),
     runtime_dir=RUNTIME,
 )
 if app.state.qianfan_collection_service is not None:

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
+from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
 
-from backend.app.adapters.xhs_cli_read import XhsCliReadAdapter, XhsCliReadError, decode_bounded_json
+import backend.app.adapters.xhs_cli_read as cli_module
+from backend.app.adapters.xhs_cli_read import XhsCliReadAdapter, XhsCliReadError
 from backend.app.db import Database
 from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
 from backend.app.features.xhs.service import XhsCollectionService
@@ -38,58 +39,23 @@ def _count(name: str) -> int:
 
 
 def _trusted_session_identity(settings: Settings) -> str:
-    status = subprocess.run(
-        [str(settings.xhs_cli_executable), "status"],
-        shell=False,
-        capture_output=True,
-        timeout=settings.xhs_cli_timeout_seconds,
-        check=False,
-    )
-    if not isinstance(status.stdout, bytes) or not isinstance(status.stderr, bytes):
-        raise XhsCliReadError("malformed_output")
-    if len(status.stdout) > 64 * 1024 or len(status.stderr) > 64 * 1024:
-        raise XhsCliReadError("output_too_large")
-    if status.returncode != 0:
-        raise XhsCliReadError("login_required")
-    try:
-        status_text = (status.stdout + b"\n" + status.stderr).decode("utf-8", errors="strict").casefold()
-    except UnicodeDecodeError as error:
-        raise XhsCliReadError("malformed_output") from error
-    if "not logged in" in status_text or "logged in" not in status_text:
-        raise XhsCliReadError("login_required")
+    return XhsCliReadAdapter.from_settings(settings).probe_session_identity()
 
-    whoami = subprocess.run(
-        [str(settings.xhs_cli_executable), "whoami", "--json"],
-        shell=False,
-        capture_output=True,
-        timeout=settings.xhs_cli_timeout_seconds,
-        check=False,
+
+def _prepare_external_state(settings: Settings) -> None:
+    assert settings.xhs_cli_state_dir is not None
+    config_dir = settings.xhs_cli_state_dir / ".xhs-cli"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "cookies.json").write_text(
+        json.dumps({"cookies": {"a1": "prepared-a1", "web_session": "prepared-session"}}),
+        encoding="utf-8",
     )
-    payload = decode_bounded_json(whoami)
-    candidates = [payload]
-    for key in ("userInfo", "basicInfo", "basic_info"):
-        candidate = payload.get(key)
-        if isinstance(candidate, dict):
-            candidates.append(candidate)
-    user_page = payload.get("userPageData")
-    if isinstance(user_page, dict):
-        for key in ("basicInfo", "basic_info"):
-            candidate = user_page.get(key)
-            if isinstance(candidate, dict):
-                candidates.append(candidate)
-    for candidate in candidates:
-        for key in ("userId", "user_id", "id"):
-            value = candidate.get(key)
-            if isinstance(value, (str, int)) and not isinstance(value, bool):
-                identity = str(value).strip()
-                if re.fullmatch(r"[A-Za-z0-9_-]{1,500}", identity, re.ASCII):
-                    return identity
-    raise XhsCliReadError("login_required")
 
 
 def test_authenticated_fake_cli_runs_the_exact_read_only_contract(tmp_path, monkeypatch) -> None:
     """Adding --json to status, changing arguments, or invoking a write command must fail."""
     settings = Settings(runtime_dir=tmp_path, database_path=tmp_path / "live.sqlite3")
+    _prepare_external_state(settings)
     expected = [
         [str(settings.xhs_cli_executable), "status"],
         [str(settings.xhs_cli_executable), "whoami", "--json"],
@@ -99,10 +65,31 @@ def test_authenticated_fake_cli_runs_the_exact_read_only_contract(tmp_path, monk
     ]
     payloads: list[bytes] = [
         "Logged in (from saved cookies)".encode(),
-        json.dumps({"userInfo": {"userId": "session-user"}}).encode(),
-        json.dumps({"user": {"id": "user-1", "nickname": "Alice"}}).encode(),
-        json.dumps({"notes": [{"id": "note-1", "title": "First", "user_id": "user-1"}]}).encode(),
-        json.dumps({"notes": [{"id": "search-1", "title": "收纳"}]}).encode(),
+        json.dumps({
+            "userPageData": {"basicInfo": {"userId": "session-user", "nickname": "Operator"}},
+            "userInfo": {"userId": "session-user", "guest": False},
+        }).encode(),
+        json.dumps({
+            "userPageData": {
+                "basicInfo": {"userId": "user-1", "redId": "red-1", "nickname": "Alice", "desc": "公开简介"},
+                "interactions": [{"name": "fans", "count": 12}],
+            },
+            "userInfo": {"userId": "user-1", "guest": False},
+        }).encode(),
+        json.dumps([{
+            "id": "note-1",
+            "xsecToken": "live-fake-xsec-secret",
+            "noteCard": {
+                "displayTitle": "First",
+                "user": {"userId": "user-1", "nickname": "Alice"},
+                "interactInfo": {"likedCount": 7},
+            },
+        }]).encode(),
+        json.dumps([{
+            "id": "search-1",
+            "xsec_token": "live-fake-search-xsec-secret",
+            "noteCard": {"displayTitle": "收纳", "user": {"userId": "user-2"}},
+        }]).encode(),
     ]
     calls: list[tuple[list[str], dict[str, object]]] = []
 
@@ -112,12 +99,13 @@ def test_authenticated_fake_cli_runs_the_exact_read_only_contract(tmp_path, monk
         calls.append((list(argv), kwargs))
         return subprocess.CompletedProcess(argv, 0, stdout=payloads[index], stderr=b"")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_module, "_run_bounded_process", fake_run)
     for name, value in {
         "XHS_LIVE_USER_ID": "user-1",
         "XHS_LIVE_KEYWORD": "收纳",
         "XHS_LIVE_EXPECTED_NOTE_COUNT": "1",
         "XHS_LIVE_EXPECTED_SEARCH_COUNT": "1",
+        "XHS_LIVE_STATE_DIR": str(settings.xhs_cli_state_dir),
     }.items():
         monkeypatch.setenv(name, value)
 
@@ -125,10 +113,12 @@ def test_authenticated_fake_cli_runs_the_exact_read_only_contract(tmp_path, monk
 
     assert [argv for argv, _ in calls] == expected
     assert all(kwargs.get("shell") is False for _, kwargs in calls)
+    assert all(Path(str(kwargs["cwd"])).resolve() == settings.xhs_cli_state_dir for _, kwargs in calls)
+    assert all("PARENT_SECRET_SENTINEL" not in kwargs["env"] for _, kwargs in calls)
     assert not any(token in {"login", "logout", "post", "delete", "cookie", "token"} for argv, _ in calls for token in argv[1:])
 
 
-def test_unauthenticated_fake_cli_is_not_run_and_writes_no_facts(tmp_path, monkeypatch) -> None:
+def test_missing_external_state_is_not_run_and_writes_no_facts(tmp_path, monkeypatch) -> None:
     settings = Settings(runtime_dir=tmp_path, database_path=tmp_path / "live.sqlite3")
     calls: list[list[str]] = []
 
@@ -136,19 +126,20 @@ def test_unauthenticated_fake_cli_is_not_run_and_writes_no_facts(tmp_path, monke
         calls.append(list(argv))
         return subprocess.CompletedProcess(argv, 1, stdout=b"Not logged in", stderr=b"")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_module, "_run_bounded_process", fake_run)
     for name, value in {
         "XHS_LIVE_USER_ID": "user-1",
         "XHS_LIVE_KEYWORD": "收纳",
         "XHS_LIVE_EXPECTED_NOTE_COUNT": "1",
         "XHS_LIVE_EXPECTED_SEARCH_COUNT": "1",
+        "XHS_LIVE_STATE_DIR": str(settings.xhs_cli_state_dir),
     }.items():
         monkeypatch.setenv(name, value)
 
     with pytest.raises(pytest.skip.Exception, match="not_run"):
         test_live_xhs_cli_account_and_search_contract_opt_in(tmp_path)
 
-    assert calls == [[str(settings.xhs_cli_executable), "status"]]
+    assert calls == []
     assert not settings.database_path.exists()
 
 
@@ -162,11 +153,16 @@ def test_live_xhs_cli_account_and_search_contract_opt_in(tmp_path) -> None:
     keyword = _required("XHS_LIVE_KEYWORD")
     expected_notes = _count("XHS_LIVE_EXPECTED_NOTE_COUNT")
     expected_search = _count("XHS_LIVE_EXPECTED_SEARCH_COUNT")
-    settings = Settings(runtime_dir=tmp_path, database_path=tmp_path / "live.sqlite3")
+    state_dir = Path(_required("XHS_LIVE_STATE_DIR")).resolve()
+    settings = Settings(
+        runtime_dir=state_dir.parent,
+        database_path=tmp_path / "live.sqlite3",
+        xhs_cli_state_dir=state_dir,
+    )
 
     try:
         _trusted_session_identity(settings)
-    except (OSError, subprocess.TimeoutExpired, XhsCliReadError) as error:
+    except (OSError, XhsCliReadError) as error:
         assert not settings.database_path.exists()
         category = error.category if isinstance(error, XhsCliReadError) else type(error).__name__
         pytest.skip(f"not_run: trusted local xhs-cli session unavailable ({category})")
@@ -176,7 +172,7 @@ def test_live_xhs_cli_account_and_search_contract_opt_in(tmp_path) -> None:
     service = XhsCollectionService(
         database=database,
         job_service=jobs,
-        adapter=XhsCliReadAdapter.from_settings(settings, runner=subprocess.run),
+        adapter=XhsCliReadAdapter.from_settings(settings),
         runtime_dir=tmp_path,
         submitter=lambda *_args: None,
     )

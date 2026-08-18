@@ -25,7 +25,8 @@ flag as true; false entries are disabled and require human verification.
 
 The controlled Playwright flow begins with a fresh temporary SQLite database and
 runs ranking collection through an available ZIP using deterministic test-only
-Qianfan/XHS/device/model adapters. It creates a unique ranked account on every
+Qianfan/device/model adapters and the production XHS adapter fed pinned-CLI JSON
+shapes. It creates a unique ranked account on every
 run, starts account-note collection from the UI through the production Task 3
 job/artifact/database service, selects the newly persisted `account-note:*`
 identity for analysis, and does not pre-seed account notes or substitute a
@@ -36,6 +37,14 @@ environment-only.
 
 ## Release hardening decisions
 
+- `xhs-cli` reads require an externally prepared cookie file in an app-owned
+  state directory. The child gets an allowlisted environment whose profile and
+  cache paths all resolve under that directory; missing state is
+  `needs_human/login_required` and no CLI process starts.
+- The XHS child uses fixed argv with `shell=False`. Stdout and stderr are bounded
+  while the process runs; timeout or overflow terminates/reaps the child and
+  yields only a sanitized category. Real top-level list, `userPageData`,
+  `userInfo`, nested `noteCard`, profile-stat and xsec shapes are covered.
 - Job evidence is fail-safe retained on cancellation, rollback and uncertain
   commit acknowledgement; no job failure path permanently unlinks the only copy.
 - Ambiguous source URL literals (empty query/fragment markers and doubled
@@ -58,7 +67,7 @@ environment-only.
 | Reserved worker APIs and read-only cleanup API | `backend/tests/test_jobs_api.py`, `backend/tests/content/test_cleanup_api.py` |
 | Account/note collection states, polling release/resume and audit history | `frontend/src/pages/AccountPage.test.tsx`, `frontend/src/pages/RadarPage.test.tsx` |
 | Account-note trust through fresh empty runtime and ZIP | `backend/tests/analysis/test_account_note_grounding.py`, `frontend/e2e/empty-to-package.spec.ts` |
-| Guarded local XHS CLI contract | `backend/tests/xhs/test_live_cli_contract.py` (real `status` text shape, JSON `whoami` identity, exact read-only commands, explicit opt-in; default `not_run`) |
+| Guarded local XHS CLI contract | `backend/tests/xhs/test_live_cli_contract.py` (isolated externally prepared state, real `status` text shape, JSON `whoami` identity, exact read-only commands, explicit opt-in; default `not_run`) |
 | Fresh empty runtime through ZIP | recovery-matrix empty-state test and `frontend/e2e/empty-to-package.spec.ts` |
 
 ## Not verified live

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from threading import Event, Thread
+from time import monotonic, sleep
+from typing import Any, BinaryIO
 from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -36,6 +39,19 @@ _HUMAN_FAILURES = frozenset({
 _ENVELOPE_MESSAGE_FIELDS = frozenset({"message", "msg", "detail", "reason"})
 _ENVELOPE_STATUS_FIELDS = frozenset({"status", "code"})
 _SUCCESS_STATUS_VALUES = frozenset({"0", "200", "ok", "success", "succeeded", "true"})
+_REQUIRED_EXTERNAL_COOKIES = frozenset({"a1", "web_session"})
+_MAX_STATE_FILE_BYTES = 1024 * 1024
+_MAX_STATUS_BYTES = 64 * 1024
+_ENV_PASSTHROUGH = (
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "SYSTEMDRIVE",
+)
+JsonPayload = dict[str, Any] | list[Any]
 
 
 class XhsCliSearchRequest(BaseModel):
@@ -77,15 +93,151 @@ class XhsCliReadError(RuntimeError):
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
 
 
+def _run_bounded_process(
+    argv: Sequence[str],
+    *,
+    shell: bool,
+    cwd: Path | str,
+    env: dict[str, str],
+    timeout: float,
+    max_stdout_bytes: int,
+    max_stderr_bytes: int,
+) -> subprocess.CompletedProcess[bytes]:
+    """Capture both pipes with hard in-flight bounds and always reap the child."""
+    if shell:
+        raise ValueError("The XHS process boundary never permits a shell.")
+    if timeout <= 0 or max_stdout_bytes < 1 or max_stderr_bytes < 1:
+        raise ValueError("The XHS process bounds must be positive.")
+    process = subprocess.Popen(
+        list(argv),
+        shell=False,
+        cwd=str(cwd),
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    overflow = Event()
+    stdout = bytearray()
+    stderr = bytearray()
+    reader_errors: list[BaseException] = []
+
+    def read_bounded(stream: BinaryIO, target: bytearray, limit: int) -> None:
+        try:
+            while not overflow.is_set():
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                remaining = limit - len(target)
+                if remaining > 0:
+                    target.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    overflow.set()
+                    return
+        except (OSError, ValueError) as error:
+            reader_errors.append(error)
+
+    readers = (
+        Thread(
+            target=read_bounded,
+            args=(process.stdout, stdout, max_stdout_bytes),
+            name="xhs-cli-stdout",
+            daemon=True,
+        ),
+        Thread(
+            target=read_bounded,
+            args=(process.stderr, stderr, max_stderr_bytes),
+            name="xhs-cli-stderr",
+            daemon=True,
+        ),
+    )
+    for reader in readers:
+        reader.start()
+
+    deadline = monotonic() + timeout
+    timed_out = False
+    cleanup_failed = False
+    try:
+        while process.poll() is None:
+            if overflow.is_set():
+                break
+            if monotonic() >= deadline:
+                timed_out = True
+                break
+            sleep(0.01)
+        if not overflow.is_set() and not timed_out:
+            process.wait()
+    except OSError:
+        cleanup_failed = True
+    finally:
+        if process.poll() is None and not _terminate_and_reap(process):
+            cleanup_failed = True
+        for reader in readers:
+            reader.join(timeout=1.0)
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+        for reader in readers:
+            reader.join(timeout=1.0)
+
+    if cleanup_failed or any(reader.is_alive() for reader in readers) or reader_errors:
+        raise XhsCliReadError("process_cleanup_failed")
+    if overflow.is_set():
+        raise XhsCliReadError("output_too_large")
+    if timed_out:
+        raise XhsCliReadError("timeout")
+    return subprocess.CompletedProcess(
+        list(argv),
+        int(process.returncode or 0),
+        stdout=bytes(stdout),
+        stderr=bytes(stderr),
+    )
+
+
+def _terminate_and_reap(process: subprocess.Popen[bytes]) -> bool:
+    """Terminate, escalate to kill, and synchronously reap one owned child."""
+    if process.poll() is not None:
+        try:
+            process.wait()
+            return True
+        except OSError:
+            return False
+    try:
+        process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=0.5)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1.0)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def decode_bounded_json(
-    completed: subprocess.CompletedProcess[bytes], *, max_stdout_bytes: int = 5 * 1024 * 1024
-) -> dict[str, Any]:
-    """Reject failed, oversized, non-UTF-8 and non-object CLI output without retaining it."""
+    completed: subprocess.CompletedProcess[bytes],
+    *,
+    max_stdout_bytes: int = 5 * 1024 * 1024,
+    max_stderr_bytes: int | None = None,
+) -> JsonPayload:
+    """Decode a bounded CLI JSON object or the pinned CLI's top-level list."""
     stdout = completed.stdout
     stderr = completed.stderr
     if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
         raise XhsCliReadError("malformed_output")
-    if len(stdout) > max_stdout_bytes or len(stderr) > max_stdout_bytes:
+    stderr_limit = max_stdout_bytes if max_stderr_bytes is None else max_stderr_bytes
+    if len(stdout) > max_stdout_bytes or len(stderr) > stderr_limit:
         raise XhsCliReadError("output_too_large")
     if completed.returncode != 0:
         raise XhsCliReadError(_failure_category(stdout, stderr))
@@ -94,12 +246,61 @@ def decode_bounded_json(
         payload = json.loads(decoded)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise XhsCliReadError("malformed_output") from error
-    if not isinstance(payload, dict):
+    if not isinstance(payload, (dict, list)):
         raise XhsCliReadError("malformed_output")
     category = _payload_human_failure_category(payload)
     if category is not None:
         raise XhsCliReadError(category)
     return redact_credentials(payload)
+
+
+def _isolated_child_environment(state_dir: Path) -> dict[str, str]:
+    """Build an allowlisted environment whose browser/profile paths are app-owned."""
+    isolated_paths = {
+        "APPDATA": state_dir / "appdata" / "roaming",
+        "LOCALAPPDATA": state_dir / "appdata" / "local",
+        "TEMP": state_dir / "tmp",
+        "TMP": state_dir / "tmp",
+        "XDG_CONFIG_HOME": state_dir / "xdg" / "config",
+        "XDG_CACHE_HOME": state_dir / "xdg" / "cache",
+        "XDG_DATA_HOME": state_dir / "xdg" / "data",
+    }
+    for path in set(isolated_paths.values()):
+        path.mkdir(parents=True, exist_ok=True)
+    environment = {
+        key: value
+        for key in _ENV_PASSTHROUGH
+        if (value := os.environ.get(key))
+    }
+    environment.update({
+        "HOME": str(state_dir),
+        "USERPROFILE": str(state_dir),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "NO_COLOR": "1",
+        **{key: str(path) for key, path in isolated_paths.items()},
+    })
+    return environment
+
+
+def _has_prepared_external_state(state_dir: Path) -> bool:
+    """Require a bounded saved-cookie file before upstream can attempt any auth fallback."""
+    cookie_file = state_dir / ".xhs-cli" / "cookies.json"
+    try:
+        resolved_cookie = cookie_file.resolve(strict=True)
+        resolved_cookie.relative_to(state_dir)
+        if not resolved_cookie.is_file() or resolved_cookie.stat().st_size > _MAX_STATE_FILE_BYTES:
+            return False
+        payload = json.loads(resolved_cookie.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("cookies"), dict):
+        return False
+    cookies = payload["cookies"]
+    return all(
+        isinstance(cookies.get(name), str) and bool(cookies[name].strip())
+        for name in _REQUIRED_EXTERNAL_COOKIES
+    )
 
 
 class XhsCliReadAdapter:
@@ -111,8 +312,9 @@ class XhsCliReadAdapter:
         self,
         *,
         executable: Path | str,
+        state_dir: Path | str,
         timeout_seconds: float = 20.0,
-        runner: Runner = subprocess.run,
+        runner: Runner | None = None,
         max_stdout_bytes: int = 5 * 1024 * 1024,
     ) -> None:
         executable_text = str(executable)
@@ -122,18 +324,27 @@ class XhsCliReadAdapter:
             raise ValueError("xhs CLI timeout must be positive.")
         if max_stdout_bytes < 1:
             raise ValueError("xhs CLI stdout limit must be positive.")
+        state_path = Path(state_dir).resolve()
+        if state_path == Path.home().resolve():
+            raise ValueError("xhs CLI state must not use the normal user profile.")
         self._executable = executable_text
+        self._state_dir = state_path
         self._timeout_seconds = timeout_seconds
-        self._runner = runner
+        self._runner = runner or _run_bounded_process
         self._max_stdout_bytes = max_stdout_bytes
+        self._child_env = _isolated_child_environment(state_path)
 
     @classmethod
-    def from_settings(cls, settings: Any, *, runner: Runner = subprocess.run) -> "XhsCliReadAdapter":
+    def from_settings(
+        cls, settings: Any, *, runner: Runner | None = None
+    ) -> "XhsCliReadAdapter":
         """Construct the executable boundary from application Settings, never request input."""
         return cls(
             executable=settings.xhs_cli_executable,
+            state_dir=settings.xhs_cli_state_dir,
             timeout_seconds=settings.xhs_cli_timeout_seconds,
             runner=runner,
+            max_stdout_bytes=settings.xhs_cli_max_output_bytes,
         )
 
     def search_notes(self, request: CollectionRequest) -> CollectionResult:
@@ -148,6 +359,8 @@ class XhsCliReadAdapter:
         parameters = self._account_parameters(request)
         try:
             profile = self._invoke(["user", parameters.user_id])
+            if not isinstance(profile, dict):
+                raise XhsCliReadError("malformed_output")
             notes = self._invoke(["user-posts", parameters.user_id])
         except XhsCliReadError as error:
             return _failed_result(request, error.category)
@@ -157,6 +370,48 @@ class XhsCliReadAdapter:
             request=request,
             requested_user_id=parameters.user_id,
         )
+
+    def probe_session_identity(self) -> str:
+        """Prove a prepared saved-cookie session without invoking upstream login fallbacks."""
+        completed = self._run_command(
+            ["status"],
+            json_output=False,
+            max_output_bytes=min(self._max_stdout_bytes, _MAX_STATUS_BYTES),
+        )
+        if not isinstance(completed.stdout, bytes) or not isinstance(
+            completed.stderr, bytes
+        ):
+            raise XhsCliReadError("malformed_output")
+        status_limit = min(self._max_stdout_bytes, _MAX_STATUS_BYTES)
+        if len(completed.stdout) > status_limit or len(completed.stderr) > status_limit:
+            raise XhsCliReadError("output_too_large")
+        if completed.returncode != 0:
+            raise XhsCliReadError(_failure_category(completed.stdout, completed.stderr))
+        try:
+            status = (completed.stdout + b"\n" + completed.stderr).decode(
+                "utf-8", errors="strict"
+            ).casefold()
+        except UnicodeDecodeError as error:
+            raise XhsCliReadError("malformed_output") from error
+        if "not logged in" in status or "logged in" not in status:
+            raise XhsCliReadError("login_required")
+
+        payload = self._invoke(["whoami"])
+        if not isinstance(payload, dict):
+            raise XhsCliReadError("response_unusable")
+        user_info = payload.get("userInfo")
+        if isinstance(user_info, dict) and user_info.get("guest") is True:
+            raise XhsCliReadError("login_required")
+        profile = _profile_row(payload)
+        if profile is None:
+            raise XhsCliReadError("response_unusable")
+        try:
+            identity = canonical_owner_id(profile, include_record_id=True)
+        except OwnerIdentityError as error:
+            raise XhsCliReadError("response_unusable") from error
+        if identity is None:
+            raise XhsCliReadError("response_unusable")
+        return identity
 
     def _search_parameters(self, request: CollectionRequest) -> XhsCliSearchRequest:
         if request.capability != "search_notes":
@@ -168,29 +423,53 @@ class XhsCliReadAdapter:
             raise ValueError("fetch_account requires the fetch_account capability.")
         return XhsCliAccountRequest.model_validate(request.parameters)
 
-    def _invoke(self, command: Sequence[str]) -> dict[str, Any]:
+    def _invoke(self, command: Sequence[str]) -> JsonPayload:
+        completed = self._run_command(command, json_output=True)
+        return decode_bounded_json(
+            completed,
+            max_stdout_bytes=self._max_stdout_bytes,
+            max_stderr_bytes=self._max_stdout_bytes,
+        )
+
+    def _run_command(
+        self,
+        command: Sequence[str],
+        *,
+        json_output: bool,
+        max_output_bytes: int | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
         if not command or command[0] not in _ALLOWED_COMMANDS:
             raise ValueError("xhs command is not in the read-only allowlist.")
-        argv = [self._executable, *command, "--json"]
+        if not _has_prepared_external_state(self._state_dir):
+            raise XhsCliReadError("login_required")
+        argv = [self._executable, *command]
+        if json_output:
+            argv.append("--json")
+        output_limit = (
+            self._max_stdout_bytes
+            if max_output_bytes is None
+            else max_output_bytes
+        )
         try:
-            completed = self._runner(
+            return self._runner(
                 argv,
                 shell=False,
-                capture_output=True,
+                cwd=self._state_dir,
+                env=self._child_env,
                 timeout=self._timeout_seconds,
-                check=False,
+                max_stdout_bytes=output_limit,
+                max_stderr_bytes=output_limit,
             )
         except subprocess.TimeoutExpired as error:
             raise XhsCliReadError("timeout") from error
         except OSError as error:
             raise XhsCliReadError("executable_unavailable") from error
-        return decode_bounded_json(completed, max_stdout_bytes=self._max_stdout_bytes)
 
 
 def _normalize_account(
     *,
     profile: dict[str, Any],
-    notes: dict[str, Any],
+    notes: JsonPayload,
     request: CollectionRequest,
     requested_user_id: str,
 ) -> CollectionResult:
@@ -237,7 +516,7 @@ def _normalize_account(
                 kind="profile",
                 source_url=f"{_XHS_PUBLIC_ORIGIN}/user/profile/{quote(profile_user_id)}",
                 raw_evidence={"response": profile, "profile": profile_row},
-                data=_public_data(profile_row, user_id=profile_user_id),
+                data=_profile_public_data(profile_row, user_id=profile_user_id),
             )
         )
     note_items, note_rejected = _normalize_note_rows(notes, source="user-posts")
@@ -277,13 +556,14 @@ def _normalize_account(
 
 
 def _normalize_notes(
-    payload: dict[str, Any], *, request: CollectionRequest, source: str) -> CollectionResult:
+    payload: JsonPayload, *, request: CollectionRequest, source: str
+) -> CollectionResult:
     items, rejected = _normalize_note_rows(payload, source=source)
     return _accounted_result(request=request, items=items, rejected_items=rejected)
 
 
 def _normalize_note_rows(
-    payload: dict[str, Any], *, source: str
+    payload: JsonPayload, *, source: str
 ) -> tuple[list[CollectionItem], list[RejectedCollectionItem]]:
     rows = _note_rows(payload)
     if rows is None:
@@ -304,14 +584,18 @@ def _normalize_note_rows(
                 RejectedCollectionItem(reference=reference, reason="row_not_object", raw_evidence=evidence)
             )
             continue
-        note_id = _identity(row, "id", "note_id", "noteId")
+        clean_row = redact_credentials(row)
+        note_card = _note_card(clean_row)
+        note_id = _consistent_identity(
+            (clean_row, note_card), "id", "note_id", "noteId"
+        )
         if note_id is None:
             rejected.append(
                 RejectedCollectionItem(reference=reference, reason="note_identity_missing", raw_evidence=evidence)
             )
             continue
         try:
-            canonical_owner_id(row)
+            owner_id = canonical_owner_id(clean_row, note_card)
         except OwnerIdentityError:
             rejected.append(
                 RejectedCollectionItem(
@@ -330,7 +614,12 @@ def _normalize_note_rows(
             kind="note",
             source_url=f"{_XHS_PUBLIC_ORIGIN}/explore/{quote(note_id)}",
             raw_evidence=evidence,
-            data=_public_data(row, note_id=note_id),
+            data=_note_public_data(
+                clean_row,
+                note_card=note_card,
+                note_id=note_id,
+                owner_id=owner_id,
+            ),
         )
         if item.id in chosen:
             rejected.append(
@@ -346,13 +635,30 @@ def _normalize_note_rows(
 
 
 def _profile_row(payload: dict[str, Any]) -> dict[str, Any] | None:
-    for candidate in (payload.get("user"), _nested(payload, "data", "user"), payload.get("data"), payload):
+    clean = redact_credentials(payload)
+    user_page = clean.get("userPageData")
+    user_info = clean.get("userInfo")
+    if isinstance(user_page, dict):
+        basic = user_page.get("basicInfo", user_page.get("basic_info"))
+        if isinstance(basic, dict):
+            row = _normalized_profile_data(basic, user_info=user_info)
+            _merge_profile_interactions(row, user_page.get("interactions"))
+            return row or None
+    for candidate in (
+        clean.get("user"),
+        _nested(clean, "data", "user"),
+        clean.get("data"),
+        clean,
+    ):
         if isinstance(candidate, dict):
-            return redact_credentials(candidate)
+            row = _normalized_profile_data(candidate, user_info=user_info)
+            return row or candidate
     return None
 
 
-def _note_rows(payload: dict[str, Any]) -> list[Any] | None:
+def _note_rows(payload: JsonPayload) -> list[Any] | None:
+    if isinstance(payload, list):
+        return payload
     for candidate in (
         payload.get("notes"),
         payload.get("items"),
@@ -363,6 +669,156 @@ def _note_rows(payload: dict[str, Any]) -> list[Any] | None:
         if isinstance(candidate, list):
             return candidate
     return None
+
+
+def _note_card(row: dict[str, Any]) -> dict[str, Any]:
+    for key in ("noteCard", "note_card"):
+        candidate = row.get(key)
+        if isinstance(candidate, dict):
+            return candidate
+    return row
+
+
+def _consistent_identity(
+    sources: Sequence[dict[str, Any]], *keys: str
+) -> str | None:
+    identities = {
+        identity
+        for source in sources
+        for key in keys
+        if (identity := _safe_token(source.get(key))) is not None
+    }
+    if len(identities) != 1:
+        return None
+    return next(iter(identities))
+
+
+def _normalized_profile_data(
+    basic: dict[str, Any], *, user_info: Any
+) -> dict[str, Any]:
+    row: dict[str, Any] = {}
+    for source_key, target_key in (
+        ("nickname", "nickname"),
+        ("desc", "bio"),
+        ("description", "bio"),
+        ("redId", "red_id"),
+        ("red_id", "red_id"),
+    ):
+        value = basic.get(source_key)
+        if isinstance(value, str) and value and target_key not in row:
+            row[target_key] = value
+    basic_identity = _identity(basic, "userId", "user_id", "id")
+    user_info_identity = (
+        _identity(user_info, "userId", "user_id", "id")
+        if isinstance(user_info, dict)
+        else None
+    )
+    if basic_identity is not None:
+        row["userId"] = basic_identity
+    if user_info_identity is not None:
+        if basic_identity is None:
+            row["userId"] = user_info_identity
+        elif user_info_identity != basic_identity:
+            row["user_id"] = user_info_identity
+    for key in ("user_id", "userId", "id"):
+        if key in basic and key not in row:
+            row[key] = basic[key]
+    return row
+
+
+def _merge_profile_interactions(row: dict[str, Any], interactions: Any) -> None:
+    if not isinstance(interactions, list):
+        return
+    stat_names = {
+        "fans": "followers_count",
+        "粉丝": "followers_count",
+        "follows": "following_count",
+        "关注": "following_count",
+        "interaction": "liked_count",
+        "获赞与收藏": "liked_count",
+    }
+    for interaction in interactions:
+        if not isinstance(interaction, dict):
+            continue
+        name = interaction.get("name", interaction.get("type"))
+        target = stat_names.get(str(name).strip().casefold()) if name is not None else None
+        count = _public_count(interaction.get("count", interaction.get("value")))
+        if target is not None and count is not None:
+            row[target] = count
+
+
+def _note_public_data(
+    row: dict[str, Any],
+    *,
+    note_card: dict[str, Any],
+    note_id: str,
+    owner_id: str | None,
+) -> dict[str, Any]:
+    data = _public_data(row, note_id=note_id)
+    field_sources = (
+        ("title", ("displayTitle", "display_title", "title")),
+        ("description", ("desc", "description", "summary")),
+        ("publish_time", ("publishTime", "publish_time", "published_at")),
+        ("type", ("type", "noteType", "note_type")),
+        ("cover", ("cover",)),
+    )
+    for target, names in field_sources:
+        value = _first_public_value((note_card, row), names)
+        if value is not None:
+            data[target] = value
+    user = note_card.get("user")
+    if isinstance(user, dict):
+        nickname = _first_public_value((user,), ("nickname", "nick_name"))
+        if isinstance(nickname, str):
+            data["author_name"] = nickname
+    if owner_id is not None:
+        data["user_id"] = owner_id
+    interact = note_card.get("interactInfo", note_card.get("interact_info"))
+    if isinstance(interact, dict):
+        for target, names in (
+            ("liked_count", ("likedCount", "liked_count")),
+            ("collect_count", ("collectedCount", "collectCount", "collected_count", "collect_count")),
+            ("comment_count", ("commentCount", "comment_count")),
+        ):
+            count = _public_count(_first_public_value((interact,), names))
+            if count is not None:
+                data[target] = count
+    return data
+
+
+def _first_public_value(
+    sources: Sequence[dict[str, Any]], names: Sequence[str]
+) -> Any:
+    for source in sources:
+        for name in names:
+            value = source.get(name)
+            if isinstance(value, (str, int, dict)) and not isinstance(value, bool):
+                if not isinstance(value, str) or value:
+                    return value
+    return None
+
+
+def _public_count(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 else None
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().replace(",", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([万亿kKmM]?)", normalized)
+    if match is None:
+        return None
+    multiplier = {
+        "": 1,
+        "万": 10_000,
+        "亿": 100_000_000,
+        "k": 1_000,
+        "m": 1_000_000,
+    }[match.group(2).casefold()]
+    return int(float(match.group(1)) * multiplier)
 
 
 def _nested(value: dict[str, Any], *path: str) -> Any:
@@ -399,12 +855,20 @@ def _safe_cli_positional(value: str) -> str:
 
 def _public_data(row: dict[str, Any], **identity: str) -> dict[str, Any]:
     allowed = {
-        "title", "desc", "description", "nickname", "user_id", "userId", "author_name",
+        "title", "desc", "description", "bio", "nickname", "user_id", "userId",
+        "red_id", "redId", "author_name", "followers_count", "following_count",
         "authorName", "liked_count", "likedCount", "liked_count", "collect_count", "collectCount",
         "comment_count", "commentCount", "publish_time", "publishTime", "type", "cover",
     }
     data = {key: redact_credentials(value) for key, value in row.items() if key in allowed}
     data.update(identity)
+    return data
+
+
+def _profile_public_data(row: dict[str, Any], *, user_id: str) -> dict[str, Any]:
+    data = _public_data(row, user_id=user_id)
+    data.pop("userId", None)
+    data.pop("redId", None)
     return data
 
 

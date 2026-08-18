@@ -29,6 +29,8 @@ test("fresh temporary database reaches an available pending-publication package"
   await expect(collectedNoteEvidence).toBeVisible();
   const accountNoteEvidenceId = await collectedNoteEvidence.getAttribute("aria-label");
   expect(accountNoteEvidenceId).toBeTruthy();
+  const accountJobs = await request.get("http://127.0.0.1:8000/api/v1/jobs").then(response => response.json());
+  expect(JSON.stringify(accountJobs)).not.toContain("controlled-xsec-must-not-persist");
   await page.getByLabel("Expected shop products").fill("1");
   await page.getByLabel("Verification evidence directory").fill("fixtures/shop-account");
   await page.getByRole("button", { name: "Queue device collection" }).click();
