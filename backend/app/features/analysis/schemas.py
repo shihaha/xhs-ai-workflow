@@ -16,7 +16,9 @@ _MAX_SQLITE_ID = 9_223_372_036_854_775_807
 def _canonical_evidence_ids(value: list[str]) -> list[str]:
     import re
 
-    pattern = re.compile(r"^(?:artifact|rank-item):([1-9][0-9]*)$", re.ASCII)
+    pattern = re.compile(
+        r"^(?:account-note|artifact|rank-item):([1-9][0-9]*)$", re.ASCII
+    )
     if len(value) != len(set(value)):
         raise ValueError("evidence ids must be unique")
     for evidence_id in value:

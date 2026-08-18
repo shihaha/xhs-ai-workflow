@@ -15,8 +15,13 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from backend.app.adapters.contracts import ModelAdapterError, StructuredModelRequest
-from backend.app.db import Database
+from backend.app.adapters.contracts import (
+    CollectionItem,
+    CollectionResult,
+    ModelAdapterError,
+    StructuredModelRequest,
+)
+from backend.app.db import Database, canonical_raw_evidence_digest
 from backend.app.features.analysis.models import AnalysisRecord, OpportunityRecord
 from backend.app.features.analysis.schemas import (
     AnalysisCreate,
@@ -27,12 +32,20 @@ from backend.app.features.analysis.schemas import (
 )
 from backend.app.features.radar.models import RankItemRecord
 from backend.app.features.shops.service import ANDROID_SHOP_JOB_TYPES, ShopCollectionRead
+from backend.app.features.xhs.constants import (
+    ACCOUNT_COLLECTION_ARTIFACT_KIND,
+    ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+    ACCOUNT_COLLECTION_JOB_TYPE,
+)
+from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
+from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
 from backend.app.models.jobs import JobArtifactRecord
 from backend.app.models.jobs import JobState
 
 
 PROMPT_VERSION = "tutorial-demand-radar-grounded-v1"
 MAX_TRUSTED_RESULT_BYTES = 5 * 1024 * 1024
+MAX_TRUSTED_ACCOUNT_RESULT_BYTES = 20 * 1024 * 1024
 
 
 class EvidenceNotFound(ValueError):
@@ -199,6 +212,10 @@ class AnalysisService:
                 .order_by(JobArtifactRecord.id)
             ).all()
             for artifact in artifacts:
+                if artifact.kind == ACCOUNT_COLLECTION_ARTIFACT_KIND:
+                    # The raw snapshot is a trust anchor, not a selectable model
+                    # fact. Its public notes are exposed through account-note IDs.
+                    continue
                 job_input = dict(artifact.job.input_data)
                 artifact_account = job_input.get("account_user_id")
                 if account_user_id is not None and artifact_account != account_user_id:
@@ -241,6 +258,24 @@ class AnalysisService:
                         kind="rank_item",
                         account_user_id=item.user_id,
                         eligible_for_opportunity=False,
+                    )
+                )
+            account_note_query = select(XhsAccountNoteRecord)
+            if account_user_id is not None:
+                account_note_query = account_note_query.where(
+                    XhsAccountNoteRecord.user_id == account_user_id
+                )
+            account_notes = session.scalars(
+                account_note_query.order_by(XhsAccountNoteRecord.id)
+            ).all()
+            for note in account_notes:
+                trusted = self._trusted_account_note(session, note)
+                rows.append(
+                    AnalysisEvidenceRead(
+                        evidence_id=f"account-note:{note.id}",
+                        kind="account_note",
+                        account_user_id=note.user_id,
+                        eligible_for_opportunity=trusted is not None,
                     )
                 )
         return rows
@@ -344,9 +379,183 @@ class AnalysisService:
                             "raw_evidence": dict(item.raw_evidence),
                         }
                     )
+                elif prefix == "account-note":
+                    note = session.get(XhsAccountNoteRecord, int(raw_id))
+                    if note is None:
+                        raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
+                    if note.user_id not in account_scope:
+                        raise EvidenceAccountMismatch(
+                            f"Evidence {evidence_id} has no matching account ownership."
+                        )
+                    trusted_note = self._trusted_account_note(session, note)
+                    if trusted_note is None:
+                        raise EvidenceNotFound(
+                            f"Evidence {evidence_id} is no longer trusted."
+                        )
+                    facts.append(trusted_note)
                 else:
                     raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
         return facts
+
+    def _trusted_account_note(
+        self, session: Any, note: XhsAccountNoteRecord
+    ) -> dict[str, Any] | None:
+        profile = session.get(XhsAccountProfileRecord, note.user_id)
+        artifact = session.get(JobArtifactRecord, note.collection_artifact_id)
+        if profile is None or artifact is None:
+            return None
+        job = artifact.job
+        if (
+            job is None
+            or job.id != note.collection_job_id
+            or job.id != profile.collection_job_id
+            or job.type != ACCOUNT_COLLECTION_JOB_TYPE
+            or JobState(job.state) is not JobState.succeeded
+            or artifact.job_id != job.id
+            or artifact.id != profile.collection_artifact_id
+            or artifact.kind != ACCOUNT_COLLECTION_ARTIFACT_KIND
+            or artifact.producer != ACCOUNT_COLLECTION_ARTIFACT_PRODUCER
+        ):
+            return None
+        expected_path = Path("evidence") / "xhs" / f"{job.id}.json"
+        if artifact.path != expected_path.as_posix():
+            return None
+        try:
+            raw_payload = _read_contained_regular_file(
+                self.runtime_dir,
+                expected_path,
+                limit=MAX_TRUSTED_ACCOUNT_RESULT_BYTES,
+            )
+            if raw_payload is None:
+                return None
+            metadata = artifact.metadata_json
+            if not isinstance(metadata, dict):
+                return None
+            if not _strict_value(metadata.get("size_bytes"), len(raw_payload)):
+                return None
+            file_digest = sha256(raw_payload).hexdigest()
+            if metadata.get("sha256") != file_digest:
+                return None
+            payload_document = json.loads(raw_payload.decode("utf-8", errors="strict"))
+            if (
+                not isinstance(payload_document, dict)
+                or set(payload_document)
+                != {"schema_version", "job_id", "job_type", "collected_at", "result"}
+                or payload_document.get("schema_version") != 1
+                or payload_document.get("job_id") != job.id
+                or payload_document.get("job_type") != ACCOUNT_COLLECTION_JOB_TYPE
+            ):
+                return None
+            collected_at = datetime.fromisoformat(payload_document["collected_at"])
+            result = CollectionResult.model_validate(payload_document["result"])
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            TypeError,
+            ValueError,
+            AttributeError,
+            ValidationError,
+        ):
+            return None
+        job_user_id = job.input_data.get("user_id")
+        expected_note_count = job.input_data.get("expected_note_count")
+        if (
+            not isinstance(job_user_id, str)
+            or not job_user_id
+            or job_user_id != note.user_id
+            or job_user_id != profile.user_id
+            or isinstance(expected_note_count, bool)
+            or not isinstance(expected_note_count, int)
+            or expected_note_count < 0
+            or job.progress_total != expected_note_count
+            or job.progress_current != expected_note_count
+            or job.current_stage != "xhs_collection_complete"
+            or job.error_category is not None
+            or collected_at != artifact.created_at
+            or collected_at != note.collected_at
+            or collected_at != profile.collected_at
+        ):
+            return None
+        expected_item_count = expected_note_count + 1
+        if not _exact_account_result(result, expected_item_count=expected_item_count):
+            return None
+        metadata_expected = {
+            "artifact_id": artifact.id,
+            "capability": "fetch_account",
+            "complete": True,
+            "expected_count": expected_item_count,
+            "expected_item_count": expected_item_count,
+            "expected_note_count": expected_note_count,
+            "job_id": job.id,
+            "missing_count": 0,
+            "observed_count": expected_item_count,
+            "overflow_count": 0,
+            "rejected_count": 0,
+            "sha256": file_digest,
+            "size_bytes": len(raw_payload),
+            "source": "xhs-cli",
+            "succeeded_count": expected_item_count,
+            "succeeded_item_count": expected_item_count,
+            "succeeded_note_count": expected_note_count,
+            "user_id": job_user_id,
+        }
+        if any(
+            key not in metadata
+            or not _strict_value(metadata[key], expected_value)
+            for key, expected_value in metadata_expected.items()
+        ):
+            return None
+        try:
+            profile_item, note_items = _account_result_items(result, job_user_id)
+        except (ValueError, OwnerIdentityError):
+            return None
+        persisted_notes = session.scalars(
+            select(XhsAccountNoteRecord)
+            .where(XhsAccountNoteRecord.user_id == job_user_id)
+            .order_by(XhsAccountNoteRecord.id)
+        ).all()
+        items_by_note_id = {
+            str(item.data["note_id"]): item for item in note_items
+        }
+        if (
+            len(persisted_notes) != expected_note_count
+            or len(items_by_note_id) != expected_note_count
+            or {row.note_id for row in persisted_notes} != set(items_by_note_id)
+            or not _profile_matches_item(profile, profile_item, artifact.id, job.id)
+        ):
+            return None
+        for persisted_note in persisted_notes:
+            if not _note_matches_item(
+                persisted_note,
+                items_by_note_id[persisted_note.note_id],
+                artifact.id,
+                job.id,
+            ):
+                return None
+        return {
+            "evidence_id": f"account-note:{note.id}",
+            "kind": "account_note",
+            "account_user_id": note.user_id,
+            "facts": {
+                "profile": {
+                    "user_id": profile.user_id,
+                    "source_url": profile.source_url,
+                    "nickname": profile.nickname,
+                    "bio": profile.bio,
+                    "public_stats": dict(profile.public_stats_json),
+                },
+                "note": {
+                    "note_id": note.note_id,
+                    "source_url": note.source_url,
+                    "title": note.title,
+                    "summary": note.summary,
+                    "published_at": note.published_at,
+                    "public_interactions": dict(note.public_interactions_json),
+                },
+            },
+        }
 
     def _trusted_shop_result(
         self, artifact: JobArtifactRecord
@@ -401,6 +610,151 @@ class AnalysisService:
         ):
             return None
         return parsed.model_dump(mode="json")
+
+
+def _strict_value(actual: object, expected: object) -> bool:
+    return type(actual) is type(expected) and actual == expected
+
+
+def _exact_account_result(
+    result: CollectionResult, *, expected_item_count: int
+) -> bool:
+    return (
+        result.status == "succeeded"
+        and result.complete
+        and result.expected_count_known
+        and result.expected_count == expected_item_count
+        and result.succeeded_count == expected_item_count
+        and result.observed_count == expected_item_count
+        and result.raw_observation_count == expected_item_count
+        and result.duplicate_observation_count == 0
+        and len(result.items) == expected_item_count
+        and not result.rejected_items
+        and not result.missing_items
+        and result.overflow_count == 0
+    )
+
+
+def _account_result_items(
+    result: CollectionResult, account_user_id: str
+) -> tuple[CollectionItem, list[CollectionItem]]:
+    profiles = [item for item in result.items if item.kind == "profile"]
+    notes = [item for item in result.items if item.kind == "note"]
+    if len(profiles) != 1 or len(profiles) + len(notes) != len(result.items):
+        raise ValueError("account result shape is not exact")
+    profile = profiles[0]
+    profile_owner = canonical_owner_id(
+        profile.data, profile.raw_evidence, include_record_id=True
+    )
+    if (
+        profile_owner != account_user_id
+        or profile.id != f"profile:{account_user_id}"
+    ):
+        raise ValueError("profile identity is not exact")
+    note_ids: list[str] = []
+    for item in notes:
+        note_id = item.data.get("note_id")
+        note_owner = canonical_owner_id(item.data, item.raw_evidence)
+        if (
+            not isinstance(note_id, str)
+            or not note_id
+            or note_owner != account_user_id
+            or item.id != f"note:{note_id}"
+        ):
+            raise ValueError("note identity is not exact")
+        note_ids.append(note_id)
+    if len(note_ids) != len(set(note_ids)):
+        raise ValueError("note identities are not unique")
+    return profile, notes
+
+
+def _profile_matches_item(
+    record: XhsAccountProfileRecord,
+    item: CollectionItem,
+    artifact_id: int,
+    job_id: str,
+) -> bool:
+    return (
+        record.collection_job_id == job_id
+        and record.collection_artifact_id == artifact_id
+        and record.source_url == str(item.source_url)
+        and record.nickname == _public_text(item.data, "nickname")
+        and record.bio == _public_text(item.data, "bio", "description", "desc")
+        and dict(record.public_stats_json)
+        == _public_numbers(
+            item.data,
+            "followers_count",
+            "following_count",
+            "liked_count",
+            "fans",
+            "follows",
+        )
+        and _raw_evidence_matches(record.raw_evidence, record.raw_digest, item)
+    )
+
+
+def _note_matches_item(
+    record: XhsAccountNoteRecord,
+    item: CollectionItem,
+    artifact_id: int,
+    job_id: str,
+) -> bool:
+    return (
+        record.collection_job_id == job_id
+        and record.collection_artifact_id == artifact_id
+        and record.note_id == item.data.get("note_id")
+        and record.source_url == str(item.source_url)
+        and record.title == _public_text(item.data, "title")
+        and record.summary
+        == _public_text(item.data, "summary", "description", "desc")
+        and record.published_at
+        == _public_text(
+            item.data, "published_at", "publish_time", "publishTime"
+        )
+        and dict(record.public_interactions_json)
+        == _public_numbers(
+            item.data,
+            "liked_count",
+            "collect_count",
+            "comment_count",
+            "likedCount",
+            "collectCount",
+            "commentCount",
+        )
+        and _raw_evidence_matches(record.raw_evidence, record.raw_digest, item)
+    )
+
+
+def _raw_evidence_matches(
+    persisted: dict[str, Any], persisted_digest: str, item: CollectionItem
+) -> bool:
+    item_digest = canonical_raw_evidence_digest(item.raw_evidence)
+    persisted_recomputed = canonical_raw_evidence_digest(persisted)
+    return (
+        item_digest is not None
+        and persisted_recomputed is not None
+        and persisted == item.raw_evidence
+        and persisted_digest == item_digest
+        and persisted_digest == persisted_recomputed
+    )
+
+
+def _public_text(data: dict[str, Any], *names: str) -> str | None:
+    for name in names:
+        value = data.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _public_numbers(data: dict[str, Any], *names: str) -> dict[str, int]:
+    return {
+        name: value
+        for name in names
+        if isinstance((value := data.get(name)), int)
+        and not isinstance(value, bool)
+        and value >= 0
+    }
 
 
 def _eligible_for_opportunity(
