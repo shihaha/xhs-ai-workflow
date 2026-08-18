@@ -203,6 +203,22 @@ def _historical_parent_tamper(
             ))
 
 
+@contextmanager
+def _historical_note_fact_tamper(fixture: _Fixture):
+    """Model note-row corruption that predates the content-freeze trigger."""
+
+    trigger_name = "ck_xhs_note_immutable_update"
+    with fixture.database.engine.begin() as connection:
+        connection.execute(text(f"DROP TRIGGER {trigger_name}"))
+    try:
+        yield
+    finally:
+        with fixture.database.engine.begin() as connection:
+            connection.execute(text(
+                db_module._XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS[trigger_name]
+            ))
+
+
 def test_discovery_returns_only_account_notes_owned_by_requested_account(
     tmp_path: Path,
 ) -> None:
@@ -388,18 +404,19 @@ def test_persisted_raw_digest_must_match_the_bound_artifact_item(
 ) -> None:
     fixture = _Fixture(tmp_path)
     _, note_id = fixture.collect("u1")
-    with fixture.database.session() as session:
-        note = session.get(XhsAccountNoteRecord, note_id)
-        assert note is not None
-        replacement = {
-            "row": {"note_id": note.note_id, "user_id": note.user_id},
-            "opaque": "database-only-replacement",
-        }
-        digest = canonical_raw_evidence_digest(replacement)
-        assert digest is not None
-        note.raw_evidence = replacement
-        note.raw_digest = digest
-        session.commit()
+    with _historical_note_fact_tamper(fixture):
+        with fixture.database.session() as session:
+            note = session.get(XhsAccountNoteRecord, note_id)
+            assert note is not None
+            replacement = {
+                "row": {"note_id": note.note_id, "user_id": note.user_id},
+                "opaque": "database-only-replacement",
+            }
+            digest = canonical_raw_evidence_digest(replacement)
+            assert digest is not None
+            note.raw_evidence = replacement
+            note.raw_digest = digest
+            session.commit()
     model = _ModelSpy()
 
     with pytest.raises(EvidenceNotFound):
@@ -606,12 +623,13 @@ def test_noncanonical_persisted_note_id_is_never_discovered_or_used(
 ) -> None:
     fixture = _Fixture(tmp_path)
     _, note_row_id = fixture.collect("u1")
-    with fixture.database.engine.begin() as connection:
-        connection.execute(text("PRAGMA ignore_check_constraints=ON"))
-        connection.execute(
-            text("UPDATE xhs_account_notes SET id=:poison_id WHERE id=:note_id"),
-            {"poison_id": poison_id, "note_id": note_row_id},
-        )
+    with _historical_note_fact_tamper(fixture):
+        with fixture.database.engine.begin() as connection:
+            connection.execute(text("PRAGMA ignore_check_constraints=ON"))
+            connection.execute(
+                text("UPDATE xhs_account_notes SET id=:poison_id WHERE id=:note_id"),
+                {"poison_id": poison_id, "note_id": note_row_id},
+            )
     model = _ModelSpy()
     service = fixture.analysis(model)
     payload = AnalysisCreate.model_construct(

@@ -69,6 +69,43 @@ class PersistedAccountResult(_StrictRead):
     notes: list[XhsAccountNoteRead]
 
 
+class NormalizedAccountProfile(_StrictRead):
+    """Every durable profile value derivable from one formal artifact."""
+
+    user_id: str
+    source_url: str
+    nickname: str | None
+    bio: str | None
+    public_stats_json: dict[str, int]
+    raw_evidence: dict[str, Any]
+    raw_digest: str
+    collection_job_id: str
+    collection_artifact_id: int
+    collected_at: datetime
+
+
+class NormalizedAccountNote(_StrictRead):
+    """Every durable note value, in the exact artifact order."""
+
+    note_id: str
+    user_id: str
+    source_url: str
+    title: str | None
+    summary: str | None
+    published_at: str | None
+    public_interactions_json: dict[str, int]
+    raw_evidence: dict[str, Any]
+    raw_digest: str
+    collection_job_id: str
+    collection_artifact_id: int
+    collected_at: datetime
+
+
+class NormalizedAccountSnapshot(_StrictRead):
+    profile: NormalizedAccountProfile
+    notes: list[NormalizedAccountNote]
+
+
 class AccountEvidencePersistenceError(ValueError):
     """The caller did not present an exact result tied to a reserved artifact."""
 
@@ -86,7 +123,7 @@ def persist_exact_account_result(
     belongs to the passed job before replacing the account's complete note snapshot.
     """
 
-    profile_item, note_items = _exact_account_items(result)
+    normalized = normalize_exact_account_result(result=result, binding=binding)
     artifact = session.get(JobArtifactRecord, binding.collection_artifact_id)
     job = session.get(JobRecord, binding.collection_job_id)
     if (
@@ -100,18 +137,17 @@ def persist_exact_account_result(
         raise AccountEvidencePersistenceError(
             "Account evidence requires a reserved artifact belonging to its collection job."
         )
-    user_id = _profile_user_id(profile_item)
-    profile = session.get(XhsAccountProfileRecord, user_id)
-    if profile is None:
-        profile = XhsAccountProfileRecord(user_id=user_id)
-        session.add(profile)
-    _apply_profile_item(profile, profile_item, binding)
-    session.execute(delete(XhsAccountNoteRecord).where(XhsAccountNoteRecord.user_id == user_id))
+    user_id = normalized.profile.user_id
+    previous = session.get(XhsAccountProfileRecord, user_id)
+    if previous is not None:
+        session.delete(previous)
+        session.flush()
+    profile = XhsAccountProfileRecord(**normalized.profile.model_dump())
+    session.add(profile)
     session.flush()
     notes: list[XhsAccountNoteRecord] = []
-    for item in note_items:
-        note = XhsAccountNoteRecord(note_id=_note_id(item, user_id), user_id=user_id)
-        _apply_note_item(note, item, binding)
+    for normalized_note in normalized.notes:
+        note = XhsAccountNoteRecord(**normalized_note.model_dump())
         session.add(note)
         notes.append(note)
     session.flush()
@@ -119,6 +155,71 @@ def persist_exact_account_result(
         profile=XhsAccountProfileRead.model_validate(profile),
         notes=[XhsAccountNoteRead.model_validate(note) for note in notes],
     )
+
+
+def normalize_exact_account_result(
+    *,
+    result: CollectionResult,
+    binding: AccountEvidenceBinding,
+) -> NormalizedAccountSnapshot:
+    """Derive the complete immutable fact snapshot from verified artifact data."""
+
+    profile_item, note_items = _exact_account_items(result)
+    user_id = _profile_user_id(profile_item)
+    profile_digest = canonical_raw_evidence_digest(profile_item.raw_evidence)
+    if profile_digest is None:
+        raise AccountEvidencePersistenceError(
+            "Raw collection evidence must be a non-empty JSON object."
+        )
+    profile = NormalizedAccountProfile(
+        user_id=user_id,
+        source_url=str(profile_item.source_url),
+        nickname=_public_text(profile_item.data, "nickname"),
+        bio=_public_text(profile_item.data, "bio", "description", "desc"),
+        public_stats_json=_public_numbers(
+            profile_item.data,
+            "followers_count",
+            "following_count",
+            "liked_count",
+            "fans",
+            "follows",
+        ),
+        raw_evidence=dict(profile_item.raw_evidence),
+        raw_digest=profile_digest,
+        **binding.model_dump(),
+    )
+    notes: list[NormalizedAccountNote] = []
+    for item in note_items:
+        digest = canonical_raw_evidence_digest(item.raw_evidence)
+        if digest is None:
+            raise AccountEvidencePersistenceError(
+                "Raw collection evidence must be a non-empty JSON object."
+            )
+        notes.append(
+            NormalizedAccountNote(
+                note_id=_note_id(item, user_id),
+                user_id=user_id,
+                source_url=str(item.source_url),
+                title=_public_text(item.data, "title"),
+                summary=_public_text(item.data, "summary", "description", "desc"),
+                published_at=_public_text(
+                    item.data, "published_at", "publish_time", "publishTime"
+                ),
+                public_interactions_json=_public_numbers(
+                    item.data,
+                    "liked_count",
+                    "collect_count",
+                    "comment_count",
+                    "likedCount",
+                    "collectCount",
+                    "commentCount",
+                ),
+                raw_evidence=dict(item.raw_evidence),
+                raw_digest=digest,
+                **binding.model_dump(),
+            )
+        )
+    return NormalizedAccountSnapshot(profile=profile, notes=notes)
 
 
 def _exact_account_items(result: CollectionResult) -> tuple[CollectionItem, list[CollectionItem]]:

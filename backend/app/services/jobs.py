@@ -420,7 +420,7 @@ class JobService:
                     XhsArtifactPromotionJournalRecord.recovery_lease_expires_at
                     > func.current_timestamp(),
                     XhsArtifactPromotionJournalRecord.state.in_(
-                        ("allocating", "prepared", "promoted")
+                        ("prepared", "promoted")
                     ),
                 )
             )

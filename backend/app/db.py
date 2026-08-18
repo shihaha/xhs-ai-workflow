@@ -24,6 +24,53 @@ from backend.app.features.xhs.constants import (
 XHS_ARTIFACT_PROMOTION_JOURNAL_MIGRATION = (
     "xhs_artifact_promotion_journal_v2"
 )
+XHS_ACCOUNT_FACT_CONTENT_BINDING_MIGRATION = (
+    "xhs_account_fact_content_binding_v4"
+)
+_XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS = {
+    "ck_xhs_profile_immutable_update": """
+        CREATE TRIGGER ck_xhs_profile_immutable_update
+        BEFORE UPDATE ON xhs_account_profiles
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM job_artifacts AS artifact
+            WHERE artifact.id=OLD.collection_artifact_id
+            AND artifact.job_id=OLD.collection_job_id
+            AND json_valid(artifact.metadata_json) IS 1
+            AND json_type(artifact.metadata_json) IS 'object'
+            AND json_type(artifact.metadata_json, '$.artifact_id') IS 'integer'
+            AND json_extract(artifact.metadata_json, '$.artifact_id') IS artifact.id
+            AND json_type(artifact.metadata_json, '$.job_id') IS 'text'
+            AND json_extract(artifact.metadata_json, '$.job_id') IS artifact.job_id
+            AND json_type(artifact.metadata_json, '$.sha256') IS 'text'
+            AND json_type(artifact.metadata_json, '$.size_bytes') IS 'integer'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account profile facts are immutable');
+        END
+    """,
+    "ck_xhs_note_immutable_update": """
+        CREATE TRIGGER ck_xhs_note_immutable_update
+        BEFORE UPDATE ON xhs_account_notes
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM job_artifacts AS artifact
+            WHERE artifact.id=OLD.collection_artifact_id
+            AND artifact.job_id=OLD.collection_job_id
+            AND json_valid(artifact.metadata_json) IS 1
+            AND json_type(artifact.metadata_json) IS 'object'
+            AND json_type(artifact.metadata_json, '$.artifact_id') IS 'integer'
+            AND json_extract(artifact.metadata_json, '$.artifact_id') IS artifact.id
+            AND json_type(artifact.metadata_json, '$.job_id') IS 'text'
+            AND json_extract(artifact.metadata_json, '$.job_id') IS artifact.job_id
+            AND json_type(artifact.metadata_json, '$.sha256') IS 'text'
+            AND json_type(artifact.metadata_json, '$.size_bytes') IS 'integer'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account note facts are immutable');
+        END
+    """,
+}
 _XHS_ARTIFACT_PROMOTION_JOURNAL_LEGACY_MIGRATION = (
     "xhs_artifact_promotion_journal_v1"
 )
@@ -469,6 +516,11 @@ class Database:
         xhs_account_note_canonical_id_marker_present = self._migration_marker_exists(
             "xhs_account_note_canonical_id_v3"
         )
+        xhs_account_fact_content_binding_marker_present = (
+            self._migration_marker_exists(
+                XHS_ACCOUNT_FACT_CONTENT_BINDING_MIGRATION
+            )
+        )
         xhs_artifact_journal_marker_present = self._migration_marker_exists(
             XHS_ARTIFACT_PROMOTION_JOURNAL_MIGRATION
         )
@@ -505,8 +557,18 @@ class Database:
             self._require_xhs_account_note_identity_schema()
         if xhs_account_note_canonical_id_marker_present:
             self._require_xhs_account_note_canonical_id_schema()
+        xhs_account_fact_content_binding_prerequisites_present = all((
+            xhs_account_note_marker_present,
+            xhs_account_note_identity_marker_present,
+            xhs_account_note_canonical_id_marker_present,
+        ))
         if xhs_artifact_journal_marker_present:
             self._require_xhs_artifact_promotion_journal_schema()
+        if (
+            xhs_account_fact_content_binding_marker_present
+            and xhs_account_fact_content_binding_prerequisites_present
+        ):
+            self._require_xhs_account_fact_content_binding()
         Base.metadata.create_all(self.engine)
         self._migrate_artifact_provenance()
         self._migrate_analysis_scope()
@@ -542,6 +604,12 @@ class Database:
         )
         self._migrate_xhs_artifact_promotion_journal(
             marker_present=xhs_artifact_journal_marker_present
+        )
+        self._migrate_xhs_account_fact_content_binding(
+            marker_present=(
+                xhs_account_fact_content_binding_marker_present
+                and xhs_account_fact_content_binding_prerequisites_present
+            )
         )
         self._recover_stranded_content_regenerations()
 
@@ -623,6 +691,19 @@ class Database:
             if not _xhs_account_note_canonical_id_schema_valid(connection):
                 raise SchemaMigrationError(
                     "XHS account note canonical id schema validation failed."
+                )
+
+    def _require_xhs_account_fact_content_binding(self) -> None:
+        with self.engine.connect() as connection:
+            if (
+                not _xhs_account_fact_immutability_triggers_valid(connection)
+                or not _xhs_account_fact_content_data_valid(
+                    connection,
+                    runtime_dir=self.runtime_dir,
+                )
+            ):
+                raise SchemaMigrationError(
+                    "XHS account fact content binding validation failed."
                 )
 
     def _require_xhs_artifact_promotion_journal_schema(self) -> None:
@@ -771,6 +852,41 @@ class Database:
                 "VALUES ('xhs_account_note_canonical_id_v3', CURRENT_TIMESTAMP)"
             ))
         self._require_xhs_account_note_canonical_id_schema()
+
+    def _migrate_xhs_account_fact_content_binding(
+        self,
+        *,
+        marker_present: bool,
+    ) -> None:
+        """Freeze normalized facts after verifying every readable formal snapshot."""
+
+        if marker_present:
+            self._require_xhs_account_fact_content_binding()
+            return
+        with self.engine.begin() as connection:
+            if not _xhs_account_note_canonical_id_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "XHS account fact content binding prerequisites failed."
+                )
+            if not _xhs_account_fact_content_data_valid(
+                connection,
+                runtime_dir=self.runtime_dir,
+            ):
+                raise SchemaMigrationError(
+                    "XHS account fact content binding validation failed."
+                )
+            for name, definition in _XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS.items():
+                connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+                connection.execute(text(definition))
+            if not _xhs_account_fact_immutability_triggers_valid(connection):
+                raise SchemaMigrationError(
+                    "XHS account fact content binding trigger validation failed."
+                )
+            connection.execute(text(
+                "INSERT OR IGNORE INTO workbench_schema_migrations(name, applied_at) "
+                "VALUES (:name, CURRENT_TIMESTAMP)"
+            ), {"name": XHS_ACCOUNT_FACT_CONTENT_BINDING_MIGRATION})
+        self._require_xhs_account_fact_content_binding()
 
     def _migrate_xhs_artifact_promotion_journal(
         self,
@@ -2909,12 +3025,15 @@ def _xhs_account_note_evidence_schema_valid(
             for item in inspector.get_unique_constraints("xhs_account_notes")
         } != {("note_id", "user_id")}:
             return False
+        evidence_trigger_names = ",".join(
+            f"'{name}'" for name in _XHS_ACCOUNT_NOTE_EVIDENCE_TRIGGER_SQL
+        )
         triggers = {
             row[0]: _compact_sql(row[1])
             for row in connection.execute(text(
                 "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
                 "AND tbl_name IN ('xhs_account_profiles','xhs_account_notes') "
-                "AND name LIKE 'ck_xhs_%'"
+                f"AND name IN ({evidence_trigger_names})"
             ))
         }
         if triggers != {
@@ -2956,6 +3075,234 @@ def _xhs_account_note_evidence_data_valid(connection: Connection) -> bool:
             "WHERE profile.user_id IS NULL LIMIT 1"
         )) is None
     except SQLAlchemyError:
+        return False
+
+
+def _xhs_account_fact_immutability_triggers_valid(
+    connection: Connection,
+) -> bool:
+    names = ",".join(
+        f"'{name}'" for name in _XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS
+    )
+    try:
+        rows = connection.execute(text(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+            f"AND name IN ({names})"
+        )).all()
+        actual = {name: _compact_sql(sql) for name, sql in rows}
+        expected = {
+            name: _compact_sql(definition)
+            for name, definition in _XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS.items()
+        }
+        return actual == expected
+    except SQLAlchemyError:
+        return False
+
+
+def _xhs_account_fact_content_data_valid(
+    connection: Connection,
+    *,
+    runtime_dir: Path | None,
+) -> bool:
+    """Compare every current normalized value with readable journal-owned bytes."""
+
+    try:
+        profiles = connection.execute(text(
+            "SELECT user_id, source_url, nickname, bio, public_stats_json, "
+            "raw_evidence, raw_digest, collection_job_id, "
+            "collection_artifact_id, collected_at "
+            "FROM xhs_account_profiles ORDER BY user_id"
+        )).mappings().all()
+    except SQLAlchemyError:
+        return False
+    if not profiles or runtime_dir is None:
+        return True
+
+    from backend.app.adapters.contracts import CollectionResult
+    from backend.app.features.xhs.schemas import (
+        AccountEvidenceBinding,
+        AccountEvidencePersistenceError,
+        normalize_exact_account_result,
+    )
+    from backend.app.features.xhs.staging_cleanup import (
+        TrustedXhsArtifactStore,
+        UnsafeXhsArtifactStore,
+        XhsArtifactIdentity,
+    )
+
+    try:
+        with TrustedXhsArtifactStore(
+            runtime_dir,
+            max_bytes=20 * 1024 * 1024,
+        ) as store:
+            for profile in profiles:
+                provenance = connection.execute(text(
+                    "SELECT journal.stage_path, journal.final_path, "
+                    "journal.sha256, journal.size_bytes, journal.file_dev, "
+                    "journal.file_ino, journal.file_mtime_ns, "
+                    "artifact.id AS artifact_id, artifact.job_id, artifact.kind, "
+                    "artifact.producer, artifact.path, artifact.metadata_json, "
+                    "job.type AS job_type, job.state AS job_state, "
+                    "job.input_data "
+                    "FROM xhs_artifact_promotion_journal AS journal "
+                    "JOIN job_artifacts AS artifact ON artifact.id=journal.artifact_id "
+                    "JOIN jobs AS job ON job.id=journal.job_id "
+                    "WHERE journal.job_id=:job_id "
+                    "AND journal.artifact_id=:artifact_id "
+                    "AND journal.state='completed' "
+                    "AND journal.resolution='committed'"
+                ), {
+                    "job_id": profile["collection_job_id"],
+                    "artifact_id": profile["collection_artifact_id"],
+                }).mappings().all()
+                if len(provenance) != 1:
+                    job_state = connection.scalar(text(
+                        "SELECT state FROM jobs WHERE id=:job_id"
+                    ), {"job_id": profile["collection_job_id"]})
+                    # Recovery-invalidated snapshots are already unavailable
+                    # to reads; their missing formal bytes remain owned by the
+                    # artifact recovery state machine, not this content scan.
+                    if job_state != "succeeded":
+                        continue
+                    return False
+                bound = provenance[0]
+                if (
+                    bound["job_type"] != ACCOUNT_COLLECTION_JOB_TYPE
+                    or bound["job_state"] != "succeeded"
+                    or bound["kind"] != ACCOUNT_COLLECTION_ARTIFACT_KIND
+                    or bound["producer"] != ACCOUNT_COLLECTION_ARTIFACT_PRODUCER
+                    or bound["path"] != bound["final_path"]
+                    or bound["file_dev"] is None
+                    or bound["file_ino"] is None
+                    or bound["file_mtime_ns"] is None
+                ):
+                    return False
+                identity = XhsArtifactIdentity(
+                    int(bound["file_dev"]),
+                    int(bound["file_ino"]),
+                    int(bound["size_bytes"]),
+                    int(bound["file_mtime_ns"]),
+                )
+                encoded: bytes | None = None
+                try:
+                    encoded = store.read_final(
+                        Path(bound["final_path"]).name,
+                        identity,
+                    )
+                except (OSError, TypeError, ValueError):
+                    try:
+                        encoded = store.read_stage(
+                            Path(bound["stage_path"]).name,
+                            identity,
+                        )
+                    except (OSError, TypeError, ValueError):
+                        # Artifact recovery owns missing/ambiguous formal bytes.
+                        continue
+                if (
+                    len(encoded) != bound["size_bytes"]
+                    or hashlib.sha256(encoded).hexdigest() != bound["sha256"]
+                ):
+                    continue
+                try:
+                    payload = json.loads(encoded.decode("utf-8"))
+                    if (
+                        not isinstance(payload, dict)
+                        or set(payload) != {
+                            "schema_version",
+                            "job_id",
+                            "job_type",
+                            "collected_at",
+                            "result",
+                        }
+                        or payload["schema_version"] != 1
+                        or payload["job_id"] != bound["job_id"]
+                        or payload["job_type"] != ACCOUNT_COLLECTION_JOB_TYPE
+                    ):
+                        continue
+                    job_input = json.loads(bound["input_data"])
+                    metadata = json.loads(bound["metadata_json"])
+                    if (
+                        not isinstance(job_input, dict)
+                        or not isinstance(metadata, dict)
+                        or job_input.get("user_id") != profile["user_id"]
+                        or metadata.get("user_id") != profile["user_id"]
+                        or metadata.get("artifact_id") != bound["artifact_id"]
+                        or metadata.get("job_id") != bound["job_id"]
+                        or metadata.get("sha256") != bound["sha256"]
+                        or metadata.get("size_bytes") != bound["size_bytes"]
+                    ):
+                        return False
+                    collected_at = datetime.fromisoformat(payload["collected_at"])
+                    normalized = normalize_exact_account_result(
+                        result=CollectionResult.model_validate(payload["result"]),
+                        binding=AccountEvidenceBinding(
+                            collection_job_id=bound["job_id"],
+                            collection_artifact_id=bound["artifact_id"],
+                            collected_at=collected_at,
+                        ),
+                    )
+                except (
+                    AccountEvidencePersistenceError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                ):
+                    continue
+                actual_profile = {
+                    "user_id": profile["user_id"],
+                    "source_url": profile["source_url"],
+                    "nickname": profile["nickname"],
+                    "bio": profile["bio"],
+                    "public_stats_json": json.loads(profile["public_stats_json"]),
+                    "raw_evidence": json.loads(profile["raw_evidence"]),
+                    "raw_digest": profile["raw_digest"],
+                    "collection_job_id": profile["collection_job_id"],
+                    "collection_artifact_id": profile["collection_artifact_id"],
+                    "collected_at": datetime.fromisoformat(profile["collected_at"]),
+                }
+                notes = connection.execute(text(
+                    "SELECT note_id, user_id, source_url, title, summary, "
+                    "published_at, public_interactions_json, raw_evidence, "
+                    "raw_digest, collection_job_id, collection_artifact_id, "
+                    "collected_at FROM xhs_account_notes "
+                    "WHERE user_id=:user_id ORDER BY id"
+                ), {"user_id": profile["user_id"]}).mappings().all()
+                actual_notes = [
+                    {
+                        "note_id": note["note_id"],
+                        "user_id": note["user_id"],
+                        "source_url": note["source_url"],
+                        "title": note["title"],
+                        "summary": note["summary"],
+                        "published_at": note["published_at"],
+                        "public_interactions_json": json.loads(
+                            note["public_interactions_json"]
+                        ),
+                        "raw_evidence": json.loads(note["raw_evidence"]),
+                        "raw_digest": note["raw_digest"],
+                        "collection_job_id": note["collection_job_id"],
+                        "collection_artifact_id": note["collection_artifact_id"],
+                        "collected_at": datetime.fromisoformat(note["collected_at"]),
+                    }
+                    for note in notes
+                ]
+                if (
+                    actual_profile != normalized.profile.model_dump()
+                    or actual_notes
+                    != [note.model_dump() for note in normalized.notes]
+                ):
+                    return False
+        return True
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        SQLAlchemyError,
+        UnsafeXhsArtifactStore,
+    ):
         return False
 
 

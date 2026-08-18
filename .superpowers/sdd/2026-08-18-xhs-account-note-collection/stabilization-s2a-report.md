@@ -475,3 +475,104 @@ not_run
 No external authenticated state was supplied and `XHS_LIVE_TEST=1` was not
 enabled. This round makes no claim about a real account, search result, identity,
 or live persisted fact.
+
+# Stabilization S2A report — fix round 5/5
+
+Date: 2026-08-19
+
+## Scope and decisions
+
+This final S2A round closes the two remaining review findings: normalized
+account facts were not yet content-bound to their verified artifact, and the
+initial allocating-journal commit acknowledgement was not yet covered by the
+same three-state recovery contract. S2B analysis semantics, Bailian, and the
+untracked `research/` tree remain outside this commit.
+
+### C1 — exact normalized-fact content binding and physical freeze
+
+- Account persistence, runtime reads, and restart certification now share one
+  strict normalization function. It derives every persisted profile and note
+  field from the exact verified artifact: identifiers, owners, source URLs,
+  text, public counters, raw evidence, raw digest, collection job/artifact,
+  timestamp, note order, and note count.
+- A runtime account read holds one database snapshot, reopens the exact
+  journal-owned artifact through its recorded physical identity, validates its
+  digest and envelope, normalizes it again, and compares the complete profile
+  and ordered note rows. Any changed field, owner, order, count, or raw evidence
+  fails closed.
+- Migration `xhs_account_fact_content_binding_v4` validates populated snapshots
+  against readable formal artifacts before certification, validates its exact
+  trigger definitions on every marked restart, and rejects historical content
+  tampering. Missing or recovery-invalidated evidence remains unavailable to
+  normal reads and is left to the existing artifact recovery state machine.
+- Two physical update triggers freeze all fields of formally metadata-bound
+  profile and note rows. A legitimate recollection replaces the complete
+  snapshot by delete-and-insert; it never mutates a previously verified row.
+
+### I1 — initial allocation acknowledgement and no-stage recovery
+
+- The first allocating-journal insert is represented by one exact allocation
+  binding. If its commit raises, a bounded fresh read classifies the result as
+  `committed`, `rolled_back`, or `unknown`. Only an exact committed row proceeds
+  to staging; all other outcomes stop at the service boundary as
+  `ArtifactCommitUnknown`, without leaking SQLAlchemy exceptions or creating a
+  second journal.
+- A durable rolled-back/unknown allocation is converged with a guarded update;
+  another allocator's journal is never overwritten. Concurrent initial
+  allocators therefore leave one durable owner and one journal.
+- Startup can reclaim an `allocating` row whose job is no longer queued/running,
+  even if the abandoned lease has not expired. An absent stage closes the row as
+  `completed/rolled_back` and leaves the job explicitly `needs_human`; a present
+  or ambiguous stage is retained and escalated.
+- Worker restart protection now covers only `prepared` and `promoted` physical
+  finalizers. This `jobs.py` change is required so an allocating/no-stage job is
+  not kept running forever. If recovery wins just before the original creator
+  writes its stage, the original process recognizes the exact rolled-back row
+  and removes the late stage through its still-held identity-safe handle.
+
+## TDD and integration evidence
+
+The rescued handoff already had `31 passed`, so it was not treated as proof that
+the review findings were fully closed. A semantic audit added regressions that
+were observed RED before the final fixes:
+
+- six physical-freeze cases for profile/note collection job, artifact, and
+  timestamp fields, plus one recovery-before-stage race:
+  `7 failed, 16 passed, 31 deselected`;
+- after the fixes, the same targeted selection was `23 passed, 31 deselected`;
+- the final dedicated round-5 suite is `59 passed`, repeated three fresh times
+  (`59 passed` each run).
+
+The first repository verification then exposed three older analysis tests that
+attempted direct post-freeze note mutation (`1168 passed, 2 skipped, 3 failed`).
+Those fixtures now explicitly model corruption predating the freeze by
+temporarily removing and exactly restoring the production trigger. The
+production analysis implementation was not changed. The affected selection is
+`3 passed, 24 deselected`, and the complete analysis suite is
+`90 passed, 1 skipped`.
+
+## Final controlled verification
+
+- Focused XHS, Settings, and health suites: `494 passed, 1 skipped`.
+- Dedicated round-5 suite: `59 passed`; three consecutive repeat runs also
+  produced `59 passed` each.
+- Analysis regression: `90 passed, 1 skipped`.
+- Guarded live contract: `2 passed, 1 skipped`; the skip remains exactly the
+  opt-in live gate and no external authenticated state was supplied.
+- `scripts/verify.ps1`: exit 0; full backend `1171 passed, 2 skipped`; Python
+  compile passed; frontend `47 passed`; production build passed; controlled
+  fresh-runtime E2E `1 passed`; npm audit found `0 vulnerabilities`;
+  tracked-secret and release-boundary scans passed.
+- Independent `git diff --check`, trigger, journal, scope, and staged-file scans
+  passed. No S2B/Bailian implementation or `research/` file is included.
+
+## Live status
+
+Real authenticated XHS execution remains exactly:
+
+```text
+not_run
+```
+
+`XHS_LIVE_TEST=1`, the target inputs, and trusted external authenticated state
+were not supplied. This round makes no real-account or live-persisted-fact claim.
