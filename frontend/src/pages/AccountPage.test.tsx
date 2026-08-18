@@ -81,4 +81,80 @@ describe("AccountPage", () => {
     resolve({ job_id: "job-1", status: "queued" });
     await waitFor(() => expect(button).toBeEnabled());
   });
+
+  it("does not submit a second account collection while the first request is pending", async () => {
+    let resolve!: (value: { job_id: string; status: "queued" }) => void;
+    const startAccountCollection = vi.fn(() => new Promise<{ job_id: string; status: "queued" }>(done => { resolve = done; }));
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({ account, profile: null, notes: [], evidence: [], analyses: [], jobs: [], devices: [] })} startAccountCollection={startAccountCollection} pollIntervalMs={60_000} />);
+    await screen.findByRole("heading", { name: "真实账号" });
+
+    const start = screen.getByRole("button", { name: "Collect account and notes" });
+    fireEvent.click(start); fireEvent.click(start);
+
+    expect(startAccountCollection).toHaveBeenCalledTimes(1);
+    expect(start).toBeDisabled();
+    resolve({ job_id: "xhs-job-1", status: "queued" });
+    await waitFor(() => expect(screen.getByText("xhs-job-1")).toBeVisible());
+    expect(start).toBeDisabled();
+  });
+
+  it("shows needs-human detail and preserves the old job before retry", async () => {
+    const startAccountCollection = vi.fn()
+      .mockResolvedValueOnce({ job_id: "xhs-job-old", status: "queued" })
+      .mockResolvedValueOnce({ job_id: "xhs-job-new", status: "queued" });
+    const loadCollectionJob = vi.fn()
+      .mockResolvedValueOnce({ id: "xhs-job-old", type: "xhs_account_collection", input: { user_id: "author-1", expected_note_count: 1 }, state: "needs_human", progress_current: 0, progress_total: 1, current_stage: "xhs_collection_result", error_category: "login_required", retry_count: 0, created_at: "2026-08-18T00:00:00Z", updated_at: "2026-08-18T00:00:01Z", started_at: null, completed_at: null, lease_expires_at: null, logs: [], artifacts: [] })
+      .mockResolvedValueOnce({ id: "xhs-job-new", type: "xhs_account_collection", input: { user_id: "author-1", expected_note_count: 1 }, state: "succeeded", progress_current: 1, progress_total: 1, current_stage: "xhs_collection_result", error_category: null, retry_count: 0, created_at: "2026-08-18T00:01:00Z", updated_at: "2026-08-18T00:01:01Z", started_at: null, completed_at: null, lease_expires_at: null, logs: [], artifacts: [] });
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({ account, profile: null, notes: [], evidence: [], analyses: [], jobs: [], devices: [] })} startAccountCollection={startAccountCollection} loadCollectionJob={loadCollectionJob} pollIntervalMs={1} />);
+    await screen.findByRole("heading", { name: "真实账号" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Collect account and notes" }));
+    expect(await screen.findByText(/login_required/)).toBeVisible();
+    expect(screen.getByText("xhs-job-old")).toBeVisible();
+    expect(screen.getAllByText(/local xhs-cli session/i)).not.toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Collect account and notes" }));
+    expect(await screen.findByText("xhs-job-new")).toBeVisible();
+    expect(screen.getByText("xhs-job-old")).toBeVisible();
+  });
+
+  it("renders trusted profile, public note source links and canonical evidence ids without claiming opportunity eligibility", async () => {
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({
+      account,
+      profile: { user_id: "author-1", source_url: "https://www.xiaohongshu.com/user/profile/author-1", nickname: "真实账号资料", bio: "公开简介", public_stats: { followers_count: 400 }, collection_job_id: "xhs-job-1", collection_artifact_id: 7, collected_at: "2026-08-18T00:00:00Z" },
+      notes: [{ note_id: "note-1", user_id: "author-1", source_url: "https://www.xiaohongshu.com/explore/note-1", title: "露营收纳笔记", summary: "公开摘要", published_at: "2026-08-18", public_interactions: { liked_count: 7 }, collection_job_id: "xhs-job-1", collection_artifact_id: 7, collected_at: "2026-08-18T00:00:00Z" }],
+      evidence: [{ evidence_id: "account-note:17", kind: "account_note", account_user_id: "author-1", eligible_for_opportunity: true }],
+      analyses: [], jobs: [], devices: [],
+    })} />);
+
+    expect(await screen.findByText("真实账号资料")).toBeVisible();
+    expect(screen.getByRole("link", { name: "Open note source" })).toHaveAttribute("href", "https://www.xiaohongshu.com/explore/note-1");
+    expect(screen.getAllByText("account-note:17", { exact: false })).not.toHaveLength(0);
+    expect(screen.getByText(/does not replace exact shop N\/N verification/i)).toBeVisible();
+    expect(screen.queryByText(/notes make this opportunity eligible/i)).not.toBeInTheDocument();
+  });
+
+  it("surfaces a stale collection read and bounds automatic polling", async () => {
+    const startAccountCollection = vi.fn().mockResolvedValue({ job_id: "xhs-job-stale", status: "queued" });
+    const loadCollectionJob = vi.fn().mockRejectedValue(new Error("job read offline"));
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({ account, profile: null, notes: [], evidence: [], analyses: [], jobs: [], devices: [] })} startAccountCollection={startAccountCollection} loadCollectionJob={loadCollectionJob} pollIntervalMs={1} maxPolls={2} />);
+    await screen.findByRole("heading", { name: "真实账号" });
+    fireEvent.click(screen.getByRole("button", { name: "Collect account and notes" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/job read offline.*stale/i);
+    await waitFor(() => expect(loadCollectionJob).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/Automatic account refresh stopped after 2 checks/)).toBeVisible();
+  });
+
+  it("cancels scheduled account polling when the page unmounts", async () => {
+    const startAccountCollection = vi.fn().mockResolvedValue({ job_id: "xhs-job-unmount", status: "queued" });
+    const loadCollectionJob = vi.fn();
+    const view = render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({ account, profile: null, notes: [], evidence: [], analyses: [], jobs: [], devices: [] })} startAccountCollection={startAccountCollection} loadCollectionJob={loadCollectionJob} pollIntervalMs={20} />);
+    await screen.findByRole("heading", { name: "真实账号" });
+    fireEvent.click(screen.getByRole("button", { name: "Collect account and notes" }));
+    await waitFor(() => expect(startAccountCollection).toHaveBeenCalledTimes(1));
+    view.unmount();
+    await new Promise(resolve => window.setTimeout(resolve, 40));
+    expect(loadCollectionJob).not.toHaveBeenCalled();
+  });
 });

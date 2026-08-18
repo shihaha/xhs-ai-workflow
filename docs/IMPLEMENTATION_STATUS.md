@@ -10,11 +10,21 @@ grounded Bailian analysis, reviewed content production, quarantined cleanup, and
 the complete operator UI. Task 10 supplies release/recovery/security checks and
 Windows runbooks.
 
+The account-note collection extension now adds the production read-only
+`xhs-cli` adapter path, reserved account/search jobs, exact profile-plus-note N/N
+persistence, hash-bound evidence, account-note analysis grounding, and truthful
+Account/Radar operator states. Account notes can ground analysis claims; they do
+not replace the existing exact shop N/N gate for opportunity creation.
+
 The controlled Playwright flow begins with a fresh temporary SQLite database and
 runs ranking collection through an available ZIP using deterministic test-only
-Qianfan/device/model adapters. A fresh production database inserts no demo
-business records. The cleanup API is read-only; reserved worker jobs reject
-public result/log/artifact forgery; paths are runtime-contained; credentials are
+Qianfan/XHS/device/model adapters. It creates a unique ranked account on every
+run, starts account-note collection from the UI through the production Task 3
+job/artifact/database service, selects the newly persisted `account-note:*`
+identity for analysis, and does not pre-seed account notes or substitute a
+manual-import account. A fresh production database inserts no demo business
+records. The cleanup API is read-only; reserved worker jobs reject public
+result/log/artifact forgery; paths are runtime-contained; credentials are
 environment-only.
 
 ## Release hardening decisions
@@ -39,10 +49,14 @@ environment-only.
 | Job evidence commit ambiguity | `backend/tests/test_release_hardening.py` |
 | Traversal/containment and Windows-equivalent artifact paths | jobs/content hardening and quarantine suites |
 | Reserved worker APIs and read-only cleanup API | `backend/tests/test_jobs_api.py`, `backend/tests/content/test_cleanup_api.py` |
+| Account/note collection states, polling and audit history | `frontend/src/pages/AccountPage.test.tsx`, `frontend/src/pages/RadarPage.test.tsx` |
+| Account-note trust through fresh empty runtime and ZIP | `backend/tests/analysis/test_account_note_grounding.py`, `frontend/e2e/empty-to-package.spec.ts` |
+| Guarded local XHS CLI contract | `backend/tests/xhs/test_live_cli_contract.py` (explicit opt-in; default `not_run`) |
 | Fresh empty runtime through ZIP | recovery-matrix empty-state test and `frontend/e2e/empty-to-package.spec.ts` |
 
 ## Not verified live
 
-Authenticated Qianfan, a real Android phone, Bailian using a user key, and the
-seven-day run remain `not_run`. See `docs/UAT_CHECKLIST.md`. Therefore the honest
-release label is **software implemented / awaiting real UAT**.
+Authenticated Qianfan, an authenticated local `xhs-cli` account/search run, a
+real Android phone, Bailian using a user key, and the seven-day run remain
+`not_run`. See `docs/UAT_CHECKLIST.md`. Therefore the honest release label is
+**software implemented / awaiting real UAT**.

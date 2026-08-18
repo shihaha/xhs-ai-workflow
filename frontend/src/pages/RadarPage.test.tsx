@@ -94,4 +94,57 @@ describe("RadarPage", () => {
     resolve({ collection_id: "collection-1", scopes });
     await waitFor(() => expect(start).toBeEnabled());
   });
+
+  it("starts keyword note search once and renders only normalized public results", async () => {
+    let resolve!: (value: { job_id: string; status: "queued" }) => void;
+    const startNoteSearch = vi.fn(() => new Promise<{ job_id: string; status: "queued" }>(done => { resolve = done; }));
+    const loadSearchJob = vi.fn().mockResolvedValue({ id: "search-job-1", type: "xhs_note_search", input: { keyword: "露营收纳", expected_count: 1 }, state: "succeeded", progress_current: 1, progress_total: 1, current_stage: "xhs_collection_result", error_category: null, retry_count: 0, created_at: "2026-08-18T00:00:00Z", updated_at: "2026-08-18T00:00:01Z", started_at: null, completed_at: null, lease_expires_at: null, logs: [], artifacts: [] });
+    const loadSearchResults = vi.fn().mockResolvedValue({ job_id: "search-job-1", keyword: "露营收纳", expected_count: 1, succeeded_count: 1, artifact_id: 9, collected_at: "2026-08-18T00:00:01Z", items: [{ note_id: "note-1", source_url: "https://www.xiaohongshu.com/explore/note-1", title: "露营装备收纳", summary: "公开摘要", user_id: "author-1" }] });
+    render(<RadarPage loadRadar={vi.fn().mockResolvedValue({ snapshots: [], accounts: [] })} startNoteSearch={startNoteSearch} loadSearchJob={loadSearchJob} loadSearchResults={loadSearchResults} pollIntervalMs={1} />);
+    await screen.findByText("No ranking evidence recorded");
+    fireEvent.change(screen.getByLabelText("Note search keyword"), { target: { value: "露营收纳" } });
+    const button = screen.getByRole("button", { name: "Search public notes" });
+    fireEvent.click(button); fireEvent.click(button);
+    expect(startNoteSearch).toHaveBeenCalledTimes(1);
+    expect(button).toBeDisabled();
+    resolve({ job_id: "search-job-1", status: "queued" });
+
+    expect(await screen.findByText("露营装备收纳")).toBeVisible();
+    expect(screen.getByRole("link", { name: "Open search result" })).toHaveAttribute("href", "https://www.xiaohongshu.com/explore/note-1");
+    expect(screen.getByText("1 / 1 public notes returned")).toBeVisible();
+    expect(screen.queryByText(/artifact_id|evidence\/xhs\/|secret-sentinel/i)).not.toBeInTheDocument();
+  });
+
+  it("shows needs-human search audit and stale polling errors without discarding the old job", async () => {
+    const startNoteSearch = vi.fn()
+      .mockResolvedValueOnce({ job_id: "search-old", status: "queued" })
+      .mockResolvedValueOnce({ job_id: "search-new", status: "queued" });
+    const loadSearchJob = vi.fn()
+      .mockResolvedValueOnce({ id: "search-old", type: "xhs_note_search", input: { keyword: "收纳", expected_count: 1 }, state: "needs_human", progress_current: 0, progress_total: 1, current_stage: "xhs_collection_result", error_category: "captcha_required", retry_count: 0, created_at: "2026-08-18T00:00:00Z", updated_at: "2026-08-18T00:00:01Z", started_at: null, completed_at: null, lease_expires_at: null, logs: [], artifacts: [] })
+      .mockRejectedValue(new Error("search job read offline"));
+    render(<RadarPage loadRadar={vi.fn().mockResolvedValue({ snapshots: [], accounts: [] })} startNoteSearch={startNoteSearch} loadSearchJob={loadSearchJob} pollIntervalMs={1} searchMaxPolls={1} />);
+    await screen.findByText("No ranking evidence recorded");
+    fireEvent.change(screen.getByLabelText("Note search keyword"), { target: { value: "收纳" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search public notes" }));
+    expect(await screen.findByText(/captcha_required/)).toBeVisible();
+    expect(screen.getByText("search-old")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Search public notes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/search job read offline.*stale/i);
+    expect(screen.getByText("search-old")).toBeVisible();
+    expect(screen.getByText("search-new")).toBeVisible();
+  });
+
+  it("cancels scheduled search polling when the page unmounts", async () => {
+    const startNoteSearch = vi.fn().mockResolvedValue({ job_id: "search-unmount", status: "queued" });
+    const loadSearchJob = vi.fn();
+    const view = render(<RadarPage loadRadar={vi.fn().mockResolvedValue({ snapshots: [], accounts: [] })} startNoteSearch={startNoteSearch} loadSearchJob={loadSearchJob} pollIntervalMs={20} />);
+    await screen.findByText("No ranking evidence recorded");
+    fireEvent.change(screen.getByLabelText("Note search keyword"), { target: { value: "收纳" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search public notes" }));
+    await waitFor(() => expect(startNoteSearch).toHaveBeenCalledTimes(1));
+    view.unmount();
+    await new Promise(resolve => window.setTimeout(resolve, 40));
+    expect(loadSearchJob).not.toHaveBeenCalled();
+  });
 });

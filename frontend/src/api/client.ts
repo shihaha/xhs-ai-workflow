@@ -100,6 +100,23 @@ export interface Account {
 }
 export interface DeviceHealth { status: "available" | "unavailable" | "needs_human"; device_id: string | null; detail: string; raw_evidence: Record<string, unknown>; }
 export interface AnalysisEvidence { evidence_id: string; kind: string; account_user_id: string | null; eligible_for_opportunity: boolean; }
+export interface CollectionQueued { job_id: string; status: "queued"; }
+export interface AccountProfile {
+  user_id: string; source_url: string; nickname: string | null; bio: string | null;
+  public_stats: Record<string, number>; collection_job_id: string; collection_artifact_id: number; collected_at: string;
+}
+export interface AccountNote {
+  note_id: string; user_id: string; source_url: string; title: string | null; summary: string | null;
+  published_at: string | null; public_interactions: Record<string, number>; collection_job_id: string;
+  collection_artifact_id: number; collected_at: string;
+}
+export interface SearchNote {
+  note_id: string; source_url: string; title: string | null; summary: string | null; user_id: string | null;
+}
+export interface NoteSearchResults {
+  job_id: string; keyword: string; expected_count: number; succeeded_count: number;
+  artifact_id: number; collected_at: string; items: SearchNote[];
+}
 export interface Analysis { id: string; analysis_type: string; account_user_id: string | null; account_user_ids: string[]; status: "succeeded" | "failed" | "needs_human"; evidence_ids: string[]; output?: Record<string, unknown> | null; error_category?: string | null; error_detail?: string | null; provider?: string; model?: string; prompt_version?: string; created_at?: string; }
 export interface Opportunity { id: string; analysis_id: string; title: string; status: string; summary: string; evidence_ids: string[]; next_action: string; created_at: string; }
 export interface Material { id: string; product_id: string; logical_name: string; version: number; path: string; sha256: string; size_bytes: number; media_type: string; kind: "source" | "output_image"; availability: "available" | "missing" | "corrupt"; created_at: string; }
@@ -124,6 +141,12 @@ export const fetchAccounts = () => getAllPages<Account>("/api/v1/radar/accounts"
 export const ingestRankSnapshot = (payload: Record<string, unknown>) => postJson<RankSnapshot>("/api/v1/radar/rank-snapshots", payload);
 export const startQianfanCollection = (payload: { expected_count_per_scope: number }) => postJson<QianfanCollectionQueued>("/api/v1/radar/qianfan-collections", payload);
 export const fetchDevices = () => getJson<DeviceHealth[]>("/api/v1/devices");
+export const fetchJob = (jobId: string) => getJson<Job>(`/api/v1/jobs/${encodeURIComponent(jobId)}`);
+export const startAccountCollection = (userId: string, payload: { expected_note_count: number }) => postJson<CollectionQueued>(`/api/v1/accounts/${encodeURIComponent(userId)}/collections`, payload);
+export const fetchAccountProfile = (userId: string) => getJson<AccountProfile>(`/api/v1/accounts/${encodeURIComponent(userId)}/profile`);
+export const fetchAccountNotes = (userId: string) => getJson<AccountNote[]>(`/api/v1/accounts/${encodeURIComponent(userId)}/notes`);
+export const startNoteSearch = (payload: { keyword: string; expected_count: number }) => postJson<CollectionQueued>("/api/v1/notes/search-collections", payload);
+export const fetchNoteSearchResults = (jobId: string) => getJson<NoteSearchResults>(`/api/v1/note-search-results?job_id=${encodeURIComponent(jobId)}`);
 export const fetchAnalysisEvidence = (accountId?: string) => getJson<AnalysisEvidence[]>(`/api/v1/analysis-evidence${accountId ? `?account_user_id=${encodeURIComponent(accountId)}` : ""}`);
 export const fetchAnalyses = () => getJson<Analysis[]>("/api/v1/analyses");
 export const fetchOpportunities = () => getJson<Opportunity[]>("/api/v1/opportunities");

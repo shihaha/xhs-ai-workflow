@@ -15,6 +15,7 @@ from backend.app.features.content.service import ContentService
 from backend.app.features.radar.qianfan_service import QianfanCollectionService
 from backend.app.features.radar.service import RadarService
 from backend.app.features.shops.service import ShopCollectionService
+from backend.app.features.xhs.service import XhsCollectionService
 from backend.app.main import create_app
 from backend.app.settings import Settings
 
@@ -54,10 +55,11 @@ class ControlledModel:
             context = json.loads(request.user_prompt)
             account_ids = context.get("account_user_ids") or [context.get("account_user_id")]
             account_suffix = f"{account_ids[0]}-{request.evidence_ids[0]}"
+            shop_evidence_ids = [item for item in request.evidence_ids if item.startswith("artifact:")]
             output = {
                 "claims": [{"claim": "受控证据证明需求存在", "evidence_ids": request.evidence_ids}],
                 "product_clusters": [{"name": "露营收纳", "summary": "受控聚类", "evidence_ids": request.evidence_ids}],
-                "opportunities": [{"title": f"受控露营收纳机会-{account_suffix}", "status": "升温", "summary": "深度核验商品证据支持", "evidence_ids": request.evidence_ids, "next_action": "创建受控产品任务"}],
+                "opportunities": [{"title": f"受控露营收纳机会-{account_suffix}", "status": "升温", "summary": "深度核验商品证据支持", "evidence_ids": shop_evidence_ids, "next_action": "创建受控产品任务"}],
             }
         else:
             context = json.loads(request.user_prompt)
@@ -83,6 +85,42 @@ class ControlledDevice:
         return CollectionResult(status="succeeded", evidence_artifacts=["fixtures/shop-account"], items=[item], expected_count_known=True, expected_count=1, succeeded_count=1, raw_observation_count=1, missing_items=[], overflow_count=0, complete=True)
 
 
+class ControlledXhs:
+    """Deterministic provider-neutral adapter; Task 3 still owns jobs/artifacts/DB."""
+
+    def fetch_account(self, request):
+        user_id = str(request.parameters["user_id"])
+        assert request.expected_count == 2
+        note_id = f"note-{user_id}"
+        return CollectionResult(
+            status="succeeded",
+            items=[
+                CollectionItem(
+                    id=f"profile:{user_id}", kind="profile",
+                    source_url=f"https://www.xiaohongshu.com/user/profile/{user_id}",
+                    raw_evidence={"fixture": "task5-xhs-profile", "user_id": user_id},
+                    data={"user_id": user_id, "nickname": f"受控账号资料-{user_id}", "bio": "受控公开简介", "followers_count": 12},
+                ),
+                CollectionItem(
+                    id=f"note:{note_id}", kind="note",
+                    source_url=f"https://www.xiaohongshu.com/explore/{note_id}",
+                    raw_evidence={"fixture": "task5-xhs-note", "note_id": note_id, "user_id": user_id},
+                    data={"note_id": note_id, "user_id": user_id, "title": "受控露营收纳笔记", "summary": "受控公开笔记摘要", "published_at": "2026-08-18T10:00:00Z", "liked_count": 7},
+                ),
+            ],
+            expected_count_known=True, expected_count=2, succeeded_count=2,
+            raw_observation_count=2, missing_items=[], overflow_count=0, complete=True,
+        )
+
+    def search_notes(self, request):
+        assert request.expected_count == 0
+        return CollectionResult(
+            status="succeeded", items=[], expected_count_known=True,
+            expected_count=0, succeeded_count=0, raw_observation_count=0,
+            missing_items=[], overflow_count=0, complete=True,
+        )
+
+
 CONTROLLED_QIANFAN_PROFILE = QianfanSelectorProfile(
     version="controlled-qianfan-v1", supported=True,
     ready_selector="#ready", login_selector="#login", captcha_selector="#captcha",
@@ -100,6 +138,8 @@ class ControlledQianfan:
 
     def collect_scope(self, request, *, board, dimension, selector_profile):
         job_id = request.parameters["job_id"]
+        collection_id = str(self.job_service.get(job_id).input["collection_id"])
+        account_id = f"controlled-account-{collection_id}"
         payload = json.dumps({"scope": {"board": board, "dimension": dimension}, "fixture": "task9"}, ensure_ascii=False).encode("utf-8")
         relative = Path("evidence") / "qianfan" / f"{job_id}.json"
         absolute = RUNTIME / relative
@@ -110,7 +150,7 @@ class ControlledQianfan:
             "selector_profile_version": selector_profile.version, "board": board, "dimension": dimension,
         })
         item = CollectionItem(id=f"{board}-{dimension}", kind="ranking_item", source_url=f"https://www.xiaohongshu.com/explore/{job_id}", raw_evidence={"fixture": "task9-qianfan"}, data={
-            "rank": 1, "author_name": "受控千帆账号", "user_id": "controlled-qianfan-account", "note_id": job_id,
+            "rank": 1, "author_name": f"受控千帆账号-{collection_id}", "user_id": account_id, "note_id": job_id,
             "read_range": "10万以上", "pay_rate_range": "70%-90%", "gmv_range": "1万-5万",
         })
         return CollectionResult(status="succeeded", evidence_artifacts=[relative.as_posix()], items=[item], expected_count_known=True, expected_count=1, succeeded_count=1, raw_observation_count=1, missing_items=[], overflow_count=0, complete=True)
@@ -122,6 +162,14 @@ model = ControlledModel()
 app.state.bailian_adapter = model
 app.state.analysis_service = AnalysisService(app.state.database, model, runtime_dir=RUNTIME)
 app.state.content_service = ContentService(app.state.database, model, runtime_dir=RUNTIME, cleanup_service=app.state.artifact_cleanup_service)
+if app.state.xhs_collection_service is not None:
+    app.state.xhs_collection_service.close()
+app.state.xhs_collection_service = XhsCollectionService(
+    database=app.state.database,
+    job_service=app.state.job_service,
+    adapter=ControlledXhs(),
+    runtime_dir=RUNTIME,
+)
 if app.state.qianfan_collection_service is not None:
     app.state.qianfan_collection_service.close()
 app.state.qianfan_collection_service = QianfanCollectionService(
