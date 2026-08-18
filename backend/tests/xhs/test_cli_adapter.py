@@ -18,6 +18,11 @@ from backend.app.features.xhs.redaction import redact_credentials
 
 
 JOB_ID = "89e3c727-47cb-417c-b59e-e32b24b15917"
+WRAPPER = str(Path(cli_module.__file__).with_name("xhs_cli_readonly_wrapper.py").resolve())
+
+
+def _wrapper_argv(*command: str) -> list[str]:
+    return [sys.executable, "-I", WRAPPER, *command]
 
 
 class FakeRunner:
@@ -63,9 +68,11 @@ def adapter_factory(tmp_path: Path):
     state_dir = _prepared_state(tmp_path)
 
     def create(runner: FakeRunner, **kwargs: object) -> XhsCliReadAdapter:
+        kwargs.pop("executable", None)
         return XhsCliReadAdapter(
-            executable=kwargs.pop("executable", "xhs"),
+            python_executable=kwargs.pop("python_executable", sys.executable),
             state_dir=state_dir,
+            runtime_dir=tmp_path,
             runner=runner,
             **kwargs,
         )
@@ -168,8 +175,9 @@ def test_missing_isolated_external_state_fails_closed_without_starting_cli(tmp_p
     """A missing state file must not let upstream fall back to normal-browser cookie extraction."""
     fake_runner = FakeRunner([_completed(["xhs"], [])])
     adapter = XhsCliReadAdapter(
-        executable="xhs",
+        python_executable=sys.executable,
         state_dir=tmp_path / "isolated-state",
+        runtime_dir=tmp_path,
         runner=fake_runner,
     )
 
@@ -192,7 +200,12 @@ def test_child_receives_only_explicit_isolated_state_environment(
     state_dir = _prepared_state(tmp_path)
     monkeypatch.setenv("PARENT_SECRET_SENTINEL", "must-not-reach-child")
     fake_runner = FakeRunner([_completed(["xhs"], [])])
-    adapter = XhsCliReadAdapter(executable="xhs", state_dir=state_dir, runner=fake_runner)
+    adapter = XhsCliReadAdapter(
+        python_executable=sys.executable,
+        state_dir=state_dir,
+        runtime_dir=tmp_path,
+        runner=fake_runner,
+    )
 
     result = adapter.search_notes(CollectionRequest(
         capability="search_notes",
@@ -203,11 +216,12 @@ def test_child_receives_only_explicit_isolated_state_environment(
     assert result.complete is True
     _, kwargs = fake_runner.calls[0]
     assert kwargs["shell"] is False
-    assert Path(str(kwargs["cwd"])).resolve() == state_dir.resolve()
+    private_runtime = state_dir.resolve() / "private-runtime"
+    assert Path(str(kwargs["cwd"])).resolve() == private_runtime
     child_env = kwargs["env"]
     assert isinstance(child_env, dict)
-    assert child_env["HOME"] == str(state_dir.resolve())
-    assert child_env["USERPROFILE"] == str(state_dir.resolve())
+    assert child_env["HOME"] == str(private_runtime)
+    assert child_env["USERPROFILE"] == str(private_runtime)
     assert Path(child_env["APPDATA"]).is_relative_to(state_dir.resolve())
     assert Path(child_env["LOCALAPPDATA"]).is_relative_to(state_dir.resolve())
     assert "PARENT_SECRET_SENTINEL" not in child_env
@@ -328,7 +342,7 @@ def test_search_uses_argument_array_and_json_allowlist(adapter_factory) -> None:
         )
     )
 
-    assert fake_runner.argv == ["xhs", "search", "收纳", "--json"]
+    assert fake_runner.argv == _wrapper_argv("search", "收纳", "--json")
     assert fake_runner.shell is False
     assert result.status == "succeeded"
 
@@ -346,7 +360,7 @@ def test_fixed_xhs_search_syntax_keeps_json_flag_after_a_safe_query(adapter_fact
         )
     )
 
-    assert fake_runner.argv == ["xhs", "search", "storage boxes", "--json"]
+    assert fake_runner.argv == _wrapper_argv("search", "storage boxes", "--json")
 
 
 @pytest.mark.parametrize("field", ["command", "executable", "cookie", "url", "env"])
@@ -386,8 +400,8 @@ def test_fetch_account_returns_one_profile_and_requested_notes(adapter_factory) 
     assert result.status == "succeeded"
     assert result.complete is True
     assert fake_runner.argvs == [
-        ["xhs", "user", "user-1", "--json"],
-        ["xhs", "user-posts", "user-1", "--json"],
+        _wrapper_argv("user", "user-1", "--json"),
+        _wrapper_argv("user-posts", "user-1", "--json"),
     ]
 
 

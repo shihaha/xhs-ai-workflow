@@ -69,6 +69,7 @@ class CollectionResult(BaseModel):
     status: Literal["succeeded", "partial", "needs_human", "failed"] = "partial"
     detail: str | None = Field(default=None, max_length=1000)
     evidence_artifacts: list[str] = Field(default_factory=list)
+    raw_evidence: dict[str, Any] = Field(default_factory=dict)
     items: list[CollectionItem] = Field(default_factory=list)
     rejected_items: list[RejectedCollectionItem] = Field(default_factory=list)
     expected_count_known: bool

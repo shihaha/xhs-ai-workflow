@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -56,12 +57,14 @@ def test_authenticated_fake_cli_runs_the_exact_read_only_contract(tmp_path, monk
     """Adding --json to status, changing arguments, or invoking a write command must fail."""
     settings = Settings(runtime_dir=tmp_path, database_path=tmp_path / "live.sqlite3")
     _prepare_external_state(settings)
+    wrapper = str(Path(cli_module.__file__).with_name("xhs_cli_readonly_wrapper.py").resolve())
+    prefix = [sys.executable, "-I", wrapper]
     expected = [
-        [str(settings.xhs_cli_executable), "status"],
-        [str(settings.xhs_cli_executable), "whoami", "--json"],
-        [str(settings.xhs_cli_executable), "user", "user-1", "--json"],
-        [str(settings.xhs_cli_executable), "user-posts", "user-1", "--json"],
-        [str(settings.xhs_cli_executable), "search", "收纳", "--json"],
+        [*prefix, "status"],
+        [*prefix, "whoami", "--json"],
+        [*prefix, "user", "user-1", "--json"],
+        [*prefix, "user-posts", "user-1", "--json"],
+        [*prefix, "search", "收纳", "--json"],
     ]
     payloads: list[bytes] = [
         "Logged in (from saved cookies)".encode(),
@@ -113,7 +116,12 @@ def test_authenticated_fake_cli_runs_the_exact_read_only_contract(tmp_path, monk
 
     assert [argv for argv, _ in calls] == expected
     assert all(kwargs.get("shell") is False for _, kwargs in calls)
-    assert all(Path(str(kwargs["cwd"])).resolve() == settings.xhs_cli_state_dir for _, kwargs in calls)
+    assert all(
+        Path(str(kwargs["cwd"])).resolve()
+        == settings.xhs_cli_state_dir / "private-runtime"
+        for _, kwargs in calls
+    )
+    assert all("prepared-a1" in kwargs["input_bytes"].decode("utf-8") for _, kwargs in calls)
     assert all("PARENT_SECRET_SENTINEL" not in kwargs["env"] for _, kwargs in calls)
     assert not any(token in {"login", "logout", "post", "delete", "cookie", "token"} for argv, _ in calls for token in argv[1:])
 

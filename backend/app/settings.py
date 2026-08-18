@@ -1,5 +1,7 @@
 """Configuration for the local workbench process."""
 
+import os
+import sys
 from pathlib import Path
 
 from pydantic import Field, model_validator
@@ -27,8 +29,10 @@ class Settings(BaseSettings):
     browser_executable: str | None = None
     qianfan_browser_profile_dir: Path | None = None
     qianfan_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
-    xhs_cli_executable: str = Field(
-        default="xhs", validation_alias="XHS_CLI_EXECUTABLE"
+    xhs_cli_python_executable: str = Field(
+        default=sys.executable,
+        min_length=1,
+        validation_alias="XHS_CLI_PYTHON_EXECUTABLE",
     )
     xhs_cli_timeout_seconds: float = Field(
         default=20.0,
@@ -62,14 +66,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def prepare_runtime_dir(self) -> "Settings":
-        self.runtime_dir = self.runtime_dir.resolve()
+        self.runtime_dir = Path(os.path.abspath(self.runtime_dir))
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         if self.database_path is None:
             self.database_path = self.runtime_dir / "workbench.sqlite3"
         state_dir = (
-            self.xhs_cli_state_dir.resolve()
+            Path(os.path.abspath(self.xhs_cli_state_dir))
             if self.xhs_cli_state_dir is not None
-            else (self.runtime_dir / "xhs-cli-state").resolve()
+            else self.runtime_dir / "xhs-cli-state"
         )
         try:
             state_dir.relative_to(self.runtime_dir)

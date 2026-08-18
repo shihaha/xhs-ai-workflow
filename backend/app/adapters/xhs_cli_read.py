@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from threading import Event, Thread
-from time import monotonic, sleep
-from typing import Any, BinaryIO
+from threading import Condition, Event, RLock
+from time import monotonic
+from typing import Any
 from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -22,12 +23,21 @@ from backend.app.adapters.contracts import (
     MissingCollectionItem,
     RejectedCollectionItem,
 )
+from backend.app.adapters.bounded_process import (
+    BoundedProcessError,
+    run_bounded_process,
+)
+from backend.app.adapters.xhs_cli_isolation import (
+    PreparedStateError,
+    isolated_environment,
+    prepare_xhs_execution,
+)
 from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
 from backend.app.features.xhs.redaction import redact_credentials
 
 
 _XHS_PUBLIC_ORIGIN = "https://www.xiaohongshu.com"
-_ALLOWED_COMMANDS = frozenset({"status", "whoami", "search", "read", "user", "user-posts"})
+_ALLOWED_COMMANDS = frozenset({"status", "whoami", "search", "user", "user-posts"})
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9_-]{1,500}")
 _HUMAN_FAILURES = frozenset({
     "login_required",
@@ -35,22 +45,12 @@ _HUMAN_FAILURES = frozenset({
     "rate_limited",
     "account_visibility_restricted",
     "response_unusable",
+    "external_state_untrusted",
 })
 _ENVELOPE_MESSAGE_FIELDS = frozenset({"message", "msg", "detail", "reason"})
 _ENVELOPE_STATUS_FIELDS = frozenset({"status", "code"})
 _SUCCESS_STATUS_VALUES = frozenset({"0", "200", "ok", "success", "succeeded", "true"})
-_REQUIRED_EXTERNAL_COOKIES = frozenset({"a1", "web_session"})
-_MAX_STATE_FILE_BYTES = 1024 * 1024
 _MAX_STATUS_BYTES = 64 * 1024
-_ENV_PASSTHROUGH = (
-    "PATH",
-    "PATHEXT",
-    "SYSTEMROOT",
-    "SystemRoot",
-    "WINDIR",
-    "COMSPEC",
-    "SYSTEMDRIVE",
-)
 JsonPayload = dict[str, Any] | list[Any]
 
 
@@ -102,127 +102,23 @@ def _run_bounded_process(
     timeout: float,
     max_stdout_bytes: int,
     max_stderr_bytes: int,
+    input_bytes: bytes = b"",
+    cancel_event: Event | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    """Capture both pipes with hard in-flight bounds and always reap the child."""
-    if shell:
-        raise ValueError("The XHS process boundary never permits a shell.")
-    if timeout <= 0 or max_stdout_bytes < 1 or max_stderr_bytes < 1:
-        raise ValueError("The XHS process bounds must be positive.")
-    process = subprocess.Popen(
-        list(argv),
-        shell=False,
-        cwd=str(cwd),
-        env=dict(env),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert process.stdout is not None and process.stderr is not None
-    overflow = Event()
-    stdout = bytearray()
-    stderr = bytearray()
-    reader_errors: list[BaseException] = []
-
-    def read_bounded(stream: BinaryIO, target: bytearray, limit: int) -> None:
-        try:
-            while not overflow.is_set():
-                chunk = stream.read(64 * 1024)
-                if not chunk:
-                    return
-                remaining = limit - len(target)
-                if remaining > 0:
-                    target.extend(chunk[:remaining])
-                if len(chunk) > remaining:
-                    overflow.set()
-                    return
-        except (OSError, ValueError) as error:
-            reader_errors.append(error)
-
-    readers = (
-        Thread(
-            target=read_bounded,
-            args=(process.stdout, stdout, max_stdout_bytes),
-            name="xhs-cli-stdout",
-            daemon=True,
-        ),
-        Thread(
-            target=read_bounded,
-            args=(process.stderr, stderr, max_stderr_bytes),
-            name="xhs-cli-stderr",
-            daemon=True,
-        ),
-    )
-    for reader in readers:
-        reader.start()
-
-    deadline = monotonic() + timeout
-    timed_out = False
-    cleanup_failed = False
     try:
-        while process.poll() is None:
-            if overflow.is_set():
-                break
-            if monotonic() >= deadline:
-                timed_out = True
-                break
-            sleep(0.01)
-        if not overflow.is_set() and not timed_out:
-            process.wait()
-    except OSError:
-        cleanup_failed = True
-    finally:
-        if process.poll() is None and not _terminate_and_reap(process):
-            cleanup_failed = True
-        for reader in readers:
-            reader.join(timeout=1.0)
-        for stream in (process.stdout, process.stderr):
-            try:
-                stream.close()
-            except (OSError, ValueError):
-                pass
-        for reader in readers:
-            reader.join(timeout=1.0)
-
-    if cleanup_failed or any(reader.is_alive() for reader in readers) or reader_errors:
-        raise XhsCliReadError("process_cleanup_failed")
-    if overflow.is_set():
-        raise XhsCliReadError("output_too_large")
-    if timed_out:
-        raise XhsCliReadError("timeout")
-    return subprocess.CompletedProcess(
-        list(argv),
-        int(process.returncode or 0),
-        stdout=bytes(stdout),
-        stderr=bytes(stderr),
-    )
-
-
-def _terminate_and_reap(process: subprocess.Popen[bytes]) -> bool:
-    """Terminate, escalate to kill, and synchronously reap one owned child."""
-    if process.poll() is not None:
-        try:
-            process.wait()
-            return True
-        except OSError:
-            return False
-    try:
-        process.terminate()
-    except OSError:
-        pass
-    try:
-        process.wait(timeout=0.5)
-        return True
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    try:
-        process.kill()
-    except OSError:
-        pass
-    try:
-        process.wait(timeout=1.0)
-        return True
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+        return run_bounded_process(
+            argv,
+            shell=shell,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+            input_bytes=input_bytes,
+            cancel_event=cancel_event,
+        )
+    except BoundedProcessError as error:
+        raise XhsCliReadError(error.category) from error
 
 
 def decode_bounded_json(
@@ -254,85 +150,47 @@ def decode_bounded_json(
     return redact_credentials(payload)
 
 
-def _isolated_child_environment(state_dir: Path) -> dict[str, str]:
-    """Build an allowlisted environment whose browser/profile paths are app-owned."""
-    isolated_paths = {
-        "APPDATA": state_dir / "appdata" / "roaming",
-        "LOCALAPPDATA": state_dir / "appdata" / "local",
-        "TEMP": state_dir / "tmp",
-        "TMP": state_dir / "tmp",
-        "XDG_CONFIG_HOME": state_dir / "xdg" / "config",
-        "XDG_CACHE_HOME": state_dir / "xdg" / "cache",
-        "XDG_DATA_HOME": state_dir / "xdg" / "data",
-    }
-    for path in set(isolated_paths.values()):
-        path.mkdir(parents=True, exist_ok=True)
-    environment = {
-        key: value
-        for key in _ENV_PASSTHROUGH
-        if (value := os.environ.get(key))
-    }
-    environment.update({
-        "HOME": str(state_dir),
-        "USERPROFILE": str(state_dir),
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONUTF8": "1",
-        "NO_COLOR": "1",
-        **{key: str(path) for key, path in isolated_paths.items()},
-    })
-    return environment
-
-
-def _has_prepared_external_state(state_dir: Path) -> bool:
-    """Require a bounded saved-cookie file before upstream can attempt any auth fallback."""
-    cookie_file = state_dir / ".xhs-cli" / "cookies.json"
-    try:
-        resolved_cookie = cookie_file.resolve(strict=True)
-        resolved_cookie.relative_to(state_dir)
-        if not resolved_cookie.is_file() or resolved_cookie.stat().st_size > _MAX_STATE_FILE_BYTES:
-            return False
-        payload = json.loads(resolved_cookie.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
-        return False
-    if not isinstance(payload, dict) or not isinstance(payload.get("cookies"), dict):
-        return False
-    cookies = payload["cookies"]
-    return all(
-        isinstance(cookies.get(name), str) and bool(cookies[name].strip())
-        for name in _REQUIRED_EXTERNAL_COOKIES
-    )
-
-
 class XhsCliReadAdapter:
-    """Read public account/note observations through a settings-owned executable only."""
+    """Read public observations through the pinned, read-only wrapper only."""
 
     capabilities = frozenset({"search_notes", "fetch_account"})
 
     def __init__(
         self,
         *,
-        executable: Path | str,
+        python_executable: Path | str,
         state_dir: Path | str,
+        runtime_dir: Path | str,
         timeout_seconds: float = 20.0,
         runner: Runner | None = None,
         max_stdout_bytes: int = 5 * 1024 * 1024,
     ) -> None:
-        executable_text = str(executable)
+        executable_text = str(python_executable)
         if not executable_text.strip():
-            raise ValueError("xhs executable must be configured by trusted Settings.")
+            raise ValueError("Python executable must be configured by trusted Settings.")
         if timeout_seconds <= 0:
             raise ValueError("xhs CLI timeout must be positive.")
         if max_stdout_bytes < 1:
             raise ValueError("xhs CLI stdout limit must be positive.")
-        state_path = Path(state_dir).resolve()
-        if state_path == Path.home().resolve():
+        runtime_path = Path(os.path.abspath(runtime_dir))
+        state_path = Path(os.path.abspath(state_dir))
+        try:
+            state_path.relative_to(runtime_path)
+        except ValueError as error:
+            raise ValueError("xhs CLI state must be inside the runtime directory.") from error
+        if state_path == Path.home().absolute():
             raise ValueError("xhs CLI state must not use the normal user profile.")
-        self._executable = executable_text
+        self._python_executable = executable_text
         self._state_dir = state_path
+        self._runtime_dir = runtime_path
+        self._wrapper = Path(__file__).with_name("xhs_cli_readonly_wrapper.py").resolve()
         self._timeout_seconds = timeout_seconds
         self._runner = runner or _run_bounded_process
         self._max_stdout_bytes = max_stdout_bytes
-        self._child_env = _isolated_child_environment(state_path)
+        self._cancel_event = Event()
+        self._lifecycle = Condition(RLock())
+        self._active_commands = 0
+        self._closed = False
 
     @classmethod
     def from_settings(
@@ -340,22 +198,26 @@ class XhsCliReadAdapter:
     ) -> "XhsCliReadAdapter":
         """Construct the executable boundary from application Settings, never request input."""
         return cls(
-            executable=settings.xhs_cli_executable,
+            python_executable=settings.xhs_cli_python_executable,
             state_dir=settings.xhs_cli_state_dir,
+            runtime_dir=settings.runtime_dir,
             timeout_seconds=settings.xhs_cli_timeout_seconds,
             runner=runner,
             max_stdout_bytes=settings.xhs_cli_max_output_bytes,
         )
 
     def search_notes(self, request: CollectionRequest) -> CollectionResult:
+        _require_bounded_expected_count(request, maximum=1000)
         parameters = self._search_parameters(request)
         try:
             payload = self._invoke(["search", parameters.keyword])
         except XhsCliReadError as error:
             return _failed_result(request, error.category)
-        return _normalize_notes(payload, request=request, source="search")
+        result = _normalize_notes(payload, request=request, source="search")
+        return self._bounded_result(request, result)
 
     def fetch_account(self, request: CollectionRequest) -> CollectionResult:
+        _require_bounded_expected_count(request, maximum=1001)
         parameters = self._account_parameters(request)
         try:
             profile = self._invoke(["user", parameters.user_id])
@@ -364,12 +226,26 @@ class XhsCliReadAdapter:
             notes = self._invoke(["user-posts", parameters.user_id])
         except XhsCliReadError as error:
             return _failed_result(request, error.category)
-        return _normalize_account(
+        result = _normalize_account(
             profile=profile,
             notes=notes,
             request=request,
             requested_user_id=parameters.user_id,
         )
+        return self._bounded_result(request, result)
+
+    def close(self, *, timeout: float = 0.25) -> bool:
+        """Cancel active process trees and wait only within the caller's budget."""
+        deadline = monotonic() + max(timeout, 0)
+        with self._lifecycle:
+            self._closed = True
+            self._cancel_event.set()
+            while self._active_commands:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return False
+                self._lifecycle.wait(remaining)
+            return True
 
     def probe_session_identity(self) -> str:
         """Prove a prepared saved-cookie session without invoking upstream login fallbacks."""
@@ -440,9 +316,7 @@ class XhsCliReadAdapter:
     ) -> subprocess.CompletedProcess[bytes]:
         if not command or command[0] not in _ALLOWED_COMMANDS:
             raise ValueError("xhs command is not in the read-only allowlist.")
-        if not _has_prepared_external_state(self._state_dir):
-            raise XhsCliReadError("login_required")
-        argv = [self._executable, *command]
+        argv = [self._python_executable, "-I", str(self._wrapper), *command]
         if json_output:
             argv.append("--json")
         output_limit = (
@@ -450,20 +324,52 @@ class XhsCliReadAdapter:
             if max_output_bytes is None
             else max_output_bytes
         )
+        with self._lifecycle:
+            if self._closed:
+                raise XhsCliReadError("cancelled")
+            self._active_commands += 1
         try:
-            return self._runner(
-                argv,
-                shell=False,
-                cwd=self._state_dir,
-                env=self._child_env,
-                timeout=self._timeout_seconds,
-                max_stdout_bytes=output_limit,
-                max_stderr_bytes=output_limit,
-            )
+            try:
+                execution = prepare_xhs_execution(
+                    runtime_dir=self._runtime_dir, state_dir=self._state_dir
+                )
+            except PreparedStateError as error:
+                raise XhsCliReadError(error.category) from error
+            with execution:
+                if self._cancel_event.is_set():
+                    raise XhsCliReadError("cancelled")
+                return self._runner(
+                    argv,
+                    shell=False,
+                    cwd=execution.runtime_dir,
+                    env=isolated_environment(execution.runtime_dir),
+                    timeout=self._timeout_seconds,
+                    max_stdout_bytes=output_limit,
+                    max_stderr_bytes=output_limit,
+                    input_bytes=execution.cookie_bytes,
+                    cancel_event=self._cancel_event,
+                )
         except subprocess.TimeoutExpired as error:
             raise XhsCliReadError("timeout") from error
         except OSError as error:
             raise XhsCliReadError("executable_unavailable") from error
+        finally:
+            with self._lifecycle:
+                self._active_commands -= 1
+                self._lifecycle.notify_all()
+
+    def _bounded_result(
+        self, request: CollectionRequest, result: CollectionResult
+    ) -> CollectionResult:
+        encoder = json.JSONEncoder(
+            ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        size = 0
+        for chunk in encoder.iterencode(result.model_dump(mode="json")):
+            size += len(chunk.encode("utf-8"))
+            if size > self._max_stdout_bytes:
+                return _failed_result(request, "result_too_large")
+        return result
 
 
 def _normalize_account(
@@ -473,6 +379,17 @@ def _normalize_account(
     request: CollectionRequest,
     requested_user_id: str,
 ) -> CollectionResult:
+    clean_profile = redact_credentials(profile)
+    clean_notes = redact_credentials(notes)
+    profile_response_ref = _response_ref("user", clean_profile)
+    notes_response_ref = _response_ref("user-posts", clean_notes)
+    shared_raw = {
+        "responses": {"profile": clean_profile, "notes": clean_notes},
+        "response_refs": {
+            "profile": profile_response_ref,
+            "notes": notes_response_ref,
+        },
+    }
     items: list[CollectionItem] = []
     rejected: list[RejectedCollectionItem] = []
     profile_row = _profile_row(profile)
@@ -488,7 +405,10 @@ def _normalize_account(
             RejectedCollectionItem(
                 reference=profile_reference,
                 reason="profile_identity_conflict",
-                raw_evidence={"response": profile},
+                raw_evidence={
+                    "response_ref": profile_response_ref,
+                    "profile": profile_row or {},
+                },
             )
         )
     requested_identity = _safe_token(requested_user_id)
@@ -498,7 +418,10 @@ def _normalize_account(
                 RejectedCollectionItem(
                     reference=profile_reference,
                     reason="profile_identity_missing",
-                    raw_evidence={"response": profile},
+                    raw_evidence={
+                        "response_ref": profile_response_ref,
+                        "profile": profile_row or {},
+                    },
                 )
             )
     elif requested_identity is None or profile_user_id != requested_identity:
@@ -506,7 +429,10 @@ def _normalize_account(
             RejectedCollectionItem(
                 reference=profile_reference,
                 reason="profile_identity_mismatch",
-                raw_evidence={"response": profile},
+                raw_evidence={
+                    "response_ref": profile_response_ref,
+                    "profile": profile_row or {},
+                },
             )
         )
     else:
@@ -515,11 +441,16 @@ def _normalize_account(
                 id=f"profile:{profile_user_id}",
                 kind="profile",
                 source_url=f"{_XHS_PUBLIC_ORIGIN}/user/profile/{quote(profile_user_id)}",
-                raw_evidence={"response": profile, "profile": profile_row},
+                raw_evidence={
+                    "response_ref": profile_response_ref,
+                    "profile": profile_row,
+                },
                 data=_profile_public_data(profile_row, user_id=profile_user_id),
             )
         )
-    note_items, note_rejected = _normalize_note_rows(notes, source="user-posts")
+    note_items, note_rejected = _normalize_note_rows(
+        notes, source="user-posts", response_ref=notes_response_ref
+    )
     verified_note_items: list[CollectionItem] = []
     for note in note_items:
         try:
@@ -552,18 +483,35 @@ def _normalize_account(
             verified_note_items.append(note)
     items.extend(verified_note_items)
     rejected.extend(note_rejected)
-    return _accounted_result(request=request, items=items, rejected_items=rejected)
+    return _accounted_result(
+        request=request,
+        items=items,
+        rejected_items=rejected,
+        raw_evidence=shared_raw,
+    )
 
 
 def _normalize_notes(
     payload: JsonPayload, *, request: CollectionRequest, source: str
 ) -> CollectionResult:
-    items, rejected = _normalize_note_rows(payload, source=source)
-    return _accounted_result(request=request, items=items, rejected_items=rejected)
+    clean_payload = redact_credentials(payload)
+    response_ref = _response_ref(source, clean_payload)
+    items, rejected = _normalize_note_rows(
+        clean_payload, source=source, response_ref=response_ref
+    )
+    return _accounted_result(
+        request=request,
+        items=items,
+        rejected_items=rejected,
+        raw_evidence={
+            "responses": {source: clean_payload},
+            "response_refs": {source: response_ref},
+        },
+    )
 
 
 def _normalize_note_rows(
-    payload: JsonPayload, *, source: str
+    payload: JsonPayload, *, source: str, response_ref: str
 ) -> tuple[list[CollectionItem], list[RejectedCollectionItem]]:
     rows = _note_rows(payload)
     if rows is None:
@@ -571,14 +519,18 @@ def _normalize_note_rows(
             RejectedCollectionItem(
                 reference=f"xhs_cli:{source}:response",
                 reason="notes_not_list",
-                raw_evidence={"response": payload},
+                raw_evidence={"response_ref": response_ref},
             )
         ]
     chosen: dict[str, CollectionItem] = {}
     rejected: list[RejectedCollectionItem] = []
-    for index, row in enumerate(rows, start=1):
-        reference = f"xhs_cli:{source}:note:{index}"
-        evidence = {"response": payload, "row": redact_credentials(row)}
+    for index, row in enumerate(rows):
+        reference = f"xhs_cli:{source}:note:{index + 1}"
+        evidence = {
+            "response_ref": response_ref,
+            "row_index": index,
+            "row": redact_credentials(row),
+        }
         if not isinstance(row, dict):
             rejected.append(
                 RejectedCollectionItem(reference=reference, reason="row_not_object", raw_evidence=evidence)
@@ -853,6 +805,20 @@ def _safe_cli_positional(value: str) -> str:
     return value
 
 
+def _require_bounded_expected_count(
+    request: CollectionRequest, *, maximum: int
+) -> None:
+    if request.expected_count is not None and request.expected_count > maximum:
+        raise ValueError("XHS expected count exceeds the bounded collection limit.")
+
+
+def _response_ref(source: str, payload: JsonPayload) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return f"xhs_cli:{source}:sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def _public_data(row: dict[str, Any], **identity: str) -> dict[str, Any]:
     allowed = {
         "title", "desc", "description", "bio", "nickname", "user_id", "userId",
@@ -873,7 +839,11 @@ def _profile_public_data(row: dict[str, Any], *, user_id: str) -> dict[str, Any]
 
 
 def _accounted_result(
-    *, request: CollectionRequest, items: list[CollectionItem], rejected_items: list[RejectedCollectionItem]
+    *,
+    request: CollectionRequest,
+    items: list[CollectionItem],
+    rejected_items: list[RejectedCollectionItem],
+    raw_evidence: dict[str, Any],
 ) -> CollectionResult:
     duplicate_count = sum(item.reason == "duplicate_source_url" for item in rejected_items)
     has_nonduplicate_rejection = len(rejected_items) != duplicate_count
@@ -883,6 +853,7 @@ def _accounted_result(
         return CollectionResult(
             status="needs_human" if rejected_items else "partial",
             detail="response_unusable" if rejected_items else "expected_count_unknown",
+            raw_evidence=raw_evidence,
             items=items,
             rejected_items=rejected_items,
             expected_count_known=False,
@@ -917,6 +888,7 @@ def _accounted_result(
     return CollectionResult(
         status=status,
         detail=detail,
+        raw_evidence=raw_evidence,
         items=items,
         rejected_items=rejected_items,
         expected_count_known=True,

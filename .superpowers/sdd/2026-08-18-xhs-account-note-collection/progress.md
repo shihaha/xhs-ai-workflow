@@ -5,7 +5,7 @@
 | Tasks / interface | Producer → consumer | Check | Ruling |
 |---|---|---|---|
 | Task 1 → Task 3 | `XhsCliReadAdapter` → `XhsCollectionService` | Adapter returns provider-neutral `CollectionResult`; service owns jobs/artifacts/DB. | Clean. |
-| Task 1 → Task 5 | `Settings.xhs_cli_executable` → operator prerequisite copy | UI must never receive executable/Cookie values. | Clean; health exposes only configured/available facts. |
+| Task 1 → Task 5 | `Settings.xhs_cli_python_executable` → pinned read-only wrapper | UI must never receive interpreter/Cookie values. | Clean; the interpreter is trusted Settings state, while credentials use only the wrapper stdin channel. |
 | Task 2 → Task 3 | account/note records → atomic service finalizer | Schema owns uniqueness/FK; service may write only exact-complete facts. | Clean. |
 | Task 2 → Task 4 | note/evidence identity → analysis trust resolver | Analysis must verify producer/path/hash/account ownership rather than trust rows alone. | Clean. |
 | Task 3 → Task 4 | reserved job + raw artifact → trusted evidence | Job type, producer and exact artifact contract are load-bearing. | Clean. |
@@ -13,7 +13,7 @@
 | Task 4 → Task 5 | `account-note:<id>` discovery → analysis UI/E2E | Controlled E2E must use note evidence before analysis. | Clean. |
 | Task 1 internal | `fetch_account` must persist one profile and N notes with honest N/N. | The plan's `expected_note_count` does not state whether the profile counts as an item. | Ruling: adapter `fetch_account` returns one profile item plus exactly N note items; service passes `expected_count = expected_note_count + 1`, persists both counts, and UI labels them separately. Cost if wrong: displayed total differs from a user expectation that N refers to notes only, but no fact is hidden or fabricated. |
 | Task 2 internal | Migration marker and direct SQL constraints | Marker-present startup is validation-only; marker-absent migration must validate before certification. | Clean. |
-| Task 3 internal | Worker close and external process | A blocked subprocess cannot be allowed to hang Python exit or late-finalize success. | Ruling: use a daemon worker plus admission/cancellation fences; subprocess timeout is bounded by Settings. Cost if wrong: an OS child may outlive app shutdown until its timeout, but cannot write a late success. |
+| Task 3 internal | Worker close and external process tree | A blocked CLI or spawned browser cannot outlive shutdown or late-finalize success. | Ruling: service close fences admission and signals adapter cancellation; Windows creates the process atomically inside a kill-on-close Job Object and owns all pipes/handles through bounded cleanup. Lifespan fails loudly if the 0.25-second safe-close contract is not met. |
 | Task 4 internal | Note evidence and opportunity eligibility | Existing opportunity creation still requires trusted complete shop evidence. | Ruling: note evidence enriches/cites analysis but does not replace the shop N/N gate. Cost if wrong: a note-rich account without complete shop evidence remains ineligible for a verified opportunity. |
 | Task 5 internal | Live login gate | Controlled fixtures prove software; real local session remains separate. | Clean; no successful live fact without opt-in local login. |
 
@@ -33,4 +33,5 @@ Task 5: fix round 1/5 complete (3 Important addressed; commits b13d452..59e52c3)
 Task 5: complete (independent review CLEAN; frontend 47 passed; controlled E2E 1/1 and repeat-5 5/5; repository verify backend 1022 passed/2 live skips; npm audit clean; authenticated real xhs-cli remains not_run)
 Whole-plan final review: NOT CLEAN (3 Critical, 1 Important). User authorized continued stabilization.
 Stabilization S2A implementation complete; independent post-commit review pending (pinned real shapes, isolated external-auth state, actual credential redaction and bounded child output; controlled verification green; authenticated real xhs-cli remains not_run).
+Stabilization S2A fix round 1/5 complete in this commit after review RED 12/12: pinned read-only wrapper and stdin credentials; handle-pinned/reparse-and-hardlink-rejecting state; Windows whole-tree Job Object lifecycle; 0.25-second service-to-runner cancellation; one shared raw response with linear item evidence; adapter/result artifact hard caps. Final hardening 17 passed; focused 374 passed/1 skipped; repository verify 1050 passed/2 skipped; controlled E2E repeat-5 5/5; authenticated live remains not_run.
 Stabilization S2B pending: append-only/versioned note evidence and post-model pre-commit trust revalidation.

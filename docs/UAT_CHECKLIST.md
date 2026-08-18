@@ -38,10 +38,10 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [ ] Cleanup quarantine survives restart and respects the 24-hour grace period.
 - [ ] Each day: reconcile page state, DB rows, logs, evidence files and package hashes.
 
-## Current execution status (2026-08-18)
+## Current execution status (2026-08-19)
 
 - Qianfan authenticated live collection: **not_run** — no authenticated verified profile/selectors were supplied.
-- Xiaohongshu account/note live collection: **not_run** — `XHS_LIVE_TEST=1`, `XHS_LIVE_STATE_DIR` and trusted authenticated local `xhs-cli` state/targets were not supplied. The opt-in gate accepts only the isolated state path, user ID, keyword and expected counts; it performs fixed read-only commands and never changes login state.
+- Xiaohongshu account/note live collection: **not_run** — `XHS_LIVE_TEST=1`, `XHS_LIVE_STATE_DIR`, target counts and a Python interpreter containing the exact pinned `xhs-cli@3ce7141` sources were not supplied. The adapter reads a non-reparse, single-link prepared cookie file through a held OS handle, passes it only over stdin to the repository read-only wrapper, disables browser-cookie/login and xsec-cache hooks, and runs only fixed read commands inside a private runtime. Credentials never enter argv or the inherited environment.
 - Android real-device collection: **not_run: device unavailable**.
 - Bailian live contract: **not_run: BAILIAN_API_KEY unavailable**.
 - Seven-day real UAT: **not_run**.
@@ -52,6 +52,6 @@ real UAT”, not “same effect as the tutorial proven”.
 ## Controlled Task 5 evidence
 
 - Frontend unit tests cover account/search empty, queued, terminal, needs-human, stale-read, single-flight, bounded polling, explicit same-job resume, lock release and unmount cancellation behavior.
-- A fake authenticated CLI contract executes `status` without `--json`, validates identity through real-shape `whoami --json`, and then reaches exact `user`, `user-posts` and `search` commands using pinned top-level-list, `userPageData/userInfo` and nested `noteCard` shapes. Missing external state remains `not_run` and creates no database.
+- A fake authenticated CLI contract executes the fixed `python -I <repo-readonly-wrapper>` argv, sends prepared cookies only on stdin, runs `status` without `--json`, validates identity through real-shape `whoami --json`, and then reaches exact `user`, `user-posts` and `search` commands using pinned top-level-list, `userPageData/userInfo` and nested `noteCard` shapes. Missing or untrusted external state remains non-success and creates no database facts.
 - The Playwright fixture starts with no account profile/note rows. Each run creates a unique ranked account, starts the real Task 3 account collection route from the UI, runs the production XHS adapter against pinned-CLI shapes, persists its profile/note through the reserved job/artifact/database path, confirms xsec material is absent from returned job facts, selects the resulting `account-note:*` evidence for analysis, then completes the existing shop N/N, opportunity, product, content review and available ZIP path.
 - The controlled E2E passed once and with `--repeat-each=5`; this is software evidence only and does not satisfy the live gates above.

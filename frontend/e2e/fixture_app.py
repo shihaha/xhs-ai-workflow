@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -90,10 +91,14 @@ class ControlledDevice:
 def controlled_xhs_cli(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
     """Return the pinned CLI's real JSON shapes without any live process or network."""
     assert kwargs["shell"] is False
-    assert Path(str(kwargs["cwd"])).resolve() == settings.xhs_cli_state_dir
+    assert Path(str(kwargs["cwd"])).resolve() == settings.xhs_cli_state_dir / "private-runtime"
     child_env = kwargs["env"]
     assert isinstance(child_env, dict) and "PARENT_SECRET_SENTINEL" not in child_env
-    command = argv[1:]
+    wrapper = Path(__import__("backend.app.adapters.xhs_cli_readonly_wrapper", fromlist=["__file__"]).__file__).resolve()
+    assert argv[:3] == [sys.executable, "-I", str(wrapper)]
+    assert "controlled-a1" in kwargs["input_bytes"].decode("utf-8")
+    assert "controlled-a1" not in " ".join(argv)
+    command = argv[3:]
     if command[:1] == ["user"] and command[-1:] == ["--json"]:
         user_id = command[1]
         payload: object = {
@@ -186,8 +191,9 @@ app.state.xhs_collection_service = XhsCollectionService(
     database=app.state.database,
     job_service=app.state.job_service,
     adapter=XhsCliReadAdapter(
-        executable="controlled-xhs",
+        python_executable=sys.executable,
         state_dir=settings.xhs_cli_state_dir,
+        runtime_dir=RUNTIME,
         runner=controlled_xhs_cli,
     ),
     runtime_dir=RUNTIME,

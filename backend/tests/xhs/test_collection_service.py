@@ -1,6 +1,7 @@
 import json
 import hashlib
 import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Thread
@@ -223,8 +224,9 @@ def test_subprocess_timeout_becomes_a_durable_failed_job(tmp_path: Path) -> None
         raise subprocess.TimeoutExpired(argv, timeout=0.01)
 
     adapter = XhsCliReadAdapter(
-        executable="xhs",
+        python_executable=sys.executable,
         state_dir=_prepared_cli_state(tmp_path),
+        runtime_dir=tmp_path / "runtime",
         timeout_seconds=0.01,
         runner=timed_out,
     )
@@ -365,8 +367,9 @@ def test_real_adapter_account_alias_credentials_never_reach_artifact_or_facts(
         return next(responses)
 
     adapter = XhsCliReadAdapter(
-        executable="xhs",
+        python_executable=sys.executable,
         state_dir=_prepared_cli_state(tmp_path),
+        runtime_dir=tmp_path / "runtime",
         runner=runner,
     )
     service = _service(tmp_path, adapter, submitter=lambda *_args: None)
@@ -449,8 +452,9 @@ def test_real_adapter_search_alias_credentials_never_reach_artifact_or_read_fact
         stderr=b"",
     )
     adapter = XhsCliReadAdapter(
-        executable="xhs",
+        python_executable=sys.executable,
         state_dir=_prepared_cli_state(tmp_path),
+        runtime_dir=tmp_path / "runtime",
         runner=lambda _argv, **_kwargs: response,
     )
     service = _service(tmp_path, adapter, submitter=lambda *_args: None)

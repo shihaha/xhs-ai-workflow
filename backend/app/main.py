@@ -47,9 +47,10 @@ async def _lifespan(app: FastAPI):
             cleanup_worker.start()
         yield
     finally:
+        xhs_safe = True
         xhs_service: XhsCollectionService | None = app.state.xhs_collection_service
         if xhs_service is not None:
-            xhs_service.close()
+            xhs_safe = xhs_service.close()
         qianfan_service: QianfanCollectionService | None = (
             app.state.qianfan_collection_service
         )
@@ -63,6 +64,8 @@ async def _lifespan(app: FastAPI):
             cleanup_worker.close()
         elif database is not None:
             database.close()
+        if not xhs_safe:
+            raise RuntimeError("XHS collection process tree did not stop safely.")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -105,6 +108,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             job_service=app.state.job_service,
             adapter=app.state.adapter_registry.resolve("fetch_account"),
             runtime_dir=app.state.settings.runtime_dir,
+            max_artifact_bytes=app.state.settings.xhs_cli_max_output_bytes,
         )
         app.state.radar_service = RadarService(app.state.database)
         page_factory = persistent_qianfan_page_factory(

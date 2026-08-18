@@ -24,11 +24,11 @@ def test_xhs_cli_settings_are_trusted_and_bounded(tmp_path: Path) -> None:
     """A missing bound would allow a stuck external CLI to hold collection workers forever."""
     settings = Settings(
         runtime_dir=tmp_path / "runtime",
-        xhs_cli_executable="C:/trusted-tools/xhs.exe",
+        xhs_cli_python_executable="C:/trusted-tools/python.exe",
         xhs_cli_timeout_seconds=12.5,
     )
 
-    assert settings.xhs_cli_executable == "C:/trusted-tools/xhs.exe"
+    assert settings.xhs_cli_python_executable == "C:/trusted-tools/python.exe"
     assert settings.xhs_cli_timeout_seconds == 12.5
     assert settings.xhs_cli_state_dir == (tmp_path / "runtime" / "xhs-cli-state").resolve()
     assert settings.xhs_cli_state_dir.is_dir()
@@ -50,14 +50,14 @@ def test_xhs_cli_settings_use_explicit_nonduplicated_environment_names(
 ) -> None:
     runtime_dir = tmp_path / "runtime"
     state_dir = runtime_dir / "prepared-xhs-state"
-    monkeypatch.setenv("XHS_CLI_EXECUTABLE", "C:/trusted/xhs.exe")
+    monkeypatch.setenv("XHS_CLI_PYTHON_EXECUTABLE", "C:/trusted/python.exe")
     monkeypatch.setenv("XHS_CLI_TIMEOUT_SECONDS", "7.5")
     monkeypatch.setenv("XHS_CLI_STATE_DIR", str(state_dir))
     monkeypatch.setenv("XHS_CLI_MAX_OUTPUT_BYTES", "4096")
 
     settings = Settings(runtime_dir=runtime_dir)
 
-    assert settings.xhs_cli_executable == "C:/trusted/xhs.exe"
+    assert settings.xhs_cli_python_executable == "C:/trusted/python.exe"
     assert settings.xhs_cli_timeout_seconds == 7.5
     assert settings.xhs_cli_state_dir == state_dir.resolve()
     assert settings.xhs_cli_max_output_bytes == 4096

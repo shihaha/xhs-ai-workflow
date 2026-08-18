@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Condition, RLock, Thread
+from time import monotonic
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -39,6 +40,8 @@ XHS_RESERVED_ARTIFACT_KINDS = (
     SEARCH_COLLECTION_ARTIFACT_KIND,
 )
 _SAFE_SUBJECT = re.compile(r"^[A-Za-z0-9_-]{1,500}$")
+DEFAULT_XHS_ARTIFACT_MAX_BYTES = 5 * 1024 * 1024
+_CLOSE_BUDGET_SECONDS = 0.25
 
 
 class CollectionServiceClosed(RuntimeError):
@@ -47,6 +50,10 @@ class CollectionServiceClosed(RuntimeError):
 
 class CollectionFactNotFound(LookupError):
     """A requested normalized collection fact does not exist."""
+
+
+class CollectionResultTooLarge(ValueError):
+    """The transformed collection artifact crossed its configured hard cap."""
 
 
 class _ReadModel(BaseModel):
@@ -166,12 +173,16 @@ class XhsCollectionService:
         runtime_dir: Path,
         submitter: Callable[..., Any] | None = None,
         clock: Callable[[], datetime] | None = None,
+        max_artifact_bytes: int = DEFAULT_XHS_ARTIFACT_MAX_BYTES,
     ) -> None:
+        if max_artifact_bytes < 1024:
+            raise ValueError("XHS artifact cap must be at least 1024 bytes.")
         self.database = database
         self.job_service = job_service
         self.adapter = adapter
         self.runtime_dir = runtime_dir.resolve()
         self.clock = clock or (lambda: datetime.now(UTC).replace(tzinfo=None))
+        self._max_artifact_bytes = max_artifact_bytes
         for job_type in XHS_RESERVED_JOB_TYPES:
             self.job_service.recover_interrupted_workers(job_type=job_type)
         self._worker = _DaemonSerialWorker() if submitter is None else None
@@ -281,6 +292,12 @@ class XhsCollectionService:
             return None
         try:
             return self._finalize_result(job, result)
+        except CollectionResultTooLarge as error:
+            return self._finalize_failure(
+                job.id,
+                category="xhs_collection_result_too_large",
+                error_type=type(error).__name__,
+            )
         except Exception as error:
             if self._committed_result(job.id):
                 return self.job_service.get(job.id)
@@ -331,9 +348,11 @@ class XhsCollectionService:
         try:
             absolute = (self.runtime_dir / artifact.path).resolve()
             absolute.relative_to(self.runtime_dir)
-            encoded = absolute.read_bytes()
+            with absolute.open("rb") as artifact_stream:
+                encoded = artifact_stream.read(self._max_artifact_bytes + 1)
             if (
-                len(encoded) != artifact.metadata["size_bytes"]
+                len(encoded) > self._max_artifact_bytes
+                or len(encoded) != artifact.metadata["size_bytes"]
                 or hashlib.sha256(encoded).hexdigest() != artifact.metadata["sha256"]
             ):
                 raise ValueError("artifact identity mismatch")
@@ -361,13 +380,20 @@ class XhsCollectionService:
         )
 
     def close(self) -> bool:
+        deadline = monotonic() + _CLOSE_BUDGET_SECONDS
         with self._admission_condition:
             if self._accepting:
                 self._accepting = False
                 self._admission_generation += 1
-            while self._active_admissions:
-                self._admission_condition.wait()
             futures = tuple(self._futures.values())
+        adapter_safe = True
+        adapter_close = getattr(self.adapter, "close", None)
+        if callable(adapter_close):
+            remaining = max(deadline - monotonic(), 0)
+            try:
+                adapter_safe = bool(adapter_close(timeout=remaining))
+            except (OSError, TypeError, ValueError):
+                adapter_safe = False
         for future in futures:
             future.cancel()
         for job in self.job_service.list():
@@ -375,10 +401,19 @@ class XhsCollectionService:
                 continue
             if job.state in {JobState.queued, JobState.running}:
                 self._cancel_running(job.id)
-        if self._worker is None:
-            return not any(not future.done() for future in futures)
-        self._worker.close()
-        return self._worker.join(0.25)
+        worker_safe = True
+        if self._worker is not None:
+            self._worker.close()
+            worker_safe = self._worker.join(max(deadline - monotonic(), 0))
+        with self._admission_condition:
+            while self._active_admissions:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                self._admission_condition.wait(remaining)
+            admissions_safe = self._active_admissions == 0
+        futures_safe = all(future.done() for future in futures)
+        return adapter_safe and worker_safe and admissions_safe and futures_safe
 
     def wait_for_idle(self, *, timeout: float) -> bool:
         if self._worker is not None:
@@ -387,7 +422,12 @@ class XhsCollectionService:
 
     def _finalize_result(self, job: Job, result: CollectionResult) -> Job | None:
         collected_at = self.clock()
-        encoded = _result_bytes(job, result, collected_at)
+        encoded = _result_bytes(
+            job,
+            result,
+            collected_at,
+            max_bytes=self._max_artifact_bytes,
+        )
         relative, digest = self._write_artifact(job.id, encoded)
         artifact_kind = (
             ACCOUNT_COLLECTION_ARTIFACT_KIND
@@ -574,12 +614,27 @@ class XhsCollectionService:
             self._futures.pop(job_id, None)
 
 
-def _result_bytes(job: Job, result: CollectionResult, collected_at: datetime) -> bytes:
+def _result_bytes(
+    job: Job,
+    result: CollectionResult,
+    collected_at: datetime,
+    *,
+    max_bytes: int = DEFAULT_XHS_ARTIFACT_MAX_BYTES,
+) -> bytes:
     payload = {
         "schema_version": 1, "job_id": job.id, "job_type": job.type,
         "collected_at": collected_at.isoformat(), "result": result.model_dump(mode="json"),
     }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoder = json.JSONEncoder(
+        ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    encoded = bytearray()
+    for text in encoder.iterencode(payload):
+        chunk = text.encode("utf-8")
+        if len(encoded) + len(chunk) > max_bytes:
+            raise CollectionResultTooLarge("XHS result artifact exceeds its hard cap.")
+        encoded.extend(chunk)
+    return bytes(encoded)
 
 
 def _is_exact(result: CollectionResult, *, expected_count: int) -> bool:
