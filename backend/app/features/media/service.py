@@ -255,6 +255,10 @@ class ContentMediaService:
                 ),
                 VisualAssessment,
             )
+            if result.model != run.model:
+                raise MediaValidationError(
+                    "Visual result model does not match the reserved run model."
+                )
             facts_after = self._current_analysis_facts(
                 run.content_item_id, run.revision_id, run.allowed_material_ids
             )

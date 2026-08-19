@@ -63,6 +63,27 @@ git diff --check
 
 Both commands exited successfully. `ruff` was not available in the existing environment and was not installed. Live Bailian vision/image validation remains `not_run`.
 
+## Review fix round 1 — returned vision model identity
+
+The independent review found that a vision adapter could declare the reserved model as `declared-model-v1` but return a valid `VisionResult` naming `actual-provider-model-v2`; the service persisted the assessment while attributing it to the reserved model.
+
+A single RED test reproduced that exact mismatch. The service now compares `VisionResult.model` with `ContentMediaRunRead.model` immediately after the provider returns and before post-call trust checks or persistence. A mismatch raises the fixed validation boundary, leaves no visual-assessment artifact, stores only the existing sanitized `validation_failed` run/job fact, and leaves the content status unchanged.
+
+Fix verification:
+
+```text
+python -m pytest backend/tests/media/test_visual_service.py -q
+7 passed in 2.66s
+
+python -m pytest backend/tests/media backend/tests/content -q
+346 passed, 136 warnings in 90.67s
+
+python -m pytest backend/tests -q
+1352 passed, 2 skipped, 144 warnings in 267.89s
+```
+
+Live Bailian remains `not_run`; no worker, API, frontend, XHS or research file was touched.
+
 ## Deferred by the approved scope boundary
 
 - Reserved worker execution, HTTP routes, health and application lifecycle belong to Task 4.

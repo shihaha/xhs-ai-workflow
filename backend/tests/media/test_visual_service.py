@@ -49,6 +49,14 @@ class FakeVisionAdapter:
         )
 
 
+class MismatchedVisionAdapter(FakeVisionAdapter):
+    model = "declared-model-v1"
+
+    def analyze_images(self, request: VisionRequest, schema) -> VisionResult:
+        result = super().analyze_images(request, schema)
+        return result.model_copy(update={"model": "actual-provider-model-v2"})
+
+
 def _visual_service(tmp_path: Path):
     base, item, original = _media_service(tmp_path)
     service = ContentMediaService(
@@ -84,6 +92,38 @@ def test_visual_assessment_is_durable_advice_and_never_approves_content(
     assert assessment.model == "controlled-vision-v1"
     assert assessment.run_id == run.id
     assert service.content_service.get_content_item(item.id).status == before == "review"
+
+
+def test_visual_result_model_must_match_reserved_run_model(tmp_path: Path) -> None:
+    """Persisting advice from a model other than the reserved model must fail."""
+
+    base, item, original = _media_service(tmp_path)
+    service = ContentMediaService(
+        base.database,
+        content_service=base.content_service,
+        image_adapter=FakeImageAdapter(),
+        vision_adapter=MismatchedVisionAdapter(),
+        runtime_dir=tmp_path,
+    )
+    before = service.content_service.get_content_item(item.id).status
+    run = service.submit_analysis(
+        item.id,
+        expected_revision_id=item.current_revision.id,
+        material_ids=[original.id],
+    )
+
+    with pytest.raises(MediaValidationError, match="model"):
+        service.run_analysis(run.id)
+
+    failed = service.get_run(run.id)
+    assert failed.status == "failed"
+    assert failed.error_category == "validation_failed"
+    assert failed.analysis_artifact_id is None
+    assert service.content_service.get_content_item(item.id).status == before == "review"
+    with service.database.session() as session:
+        assert session.query(JobArtifactRecord).filter_by(
+            job_id=run.job_id, kind="visual_assessment"
+        ).count() == 0
 
 
 def test_visual_read_fails_closed_after_managed_material_drift(tmp_path: Path) -> None:
