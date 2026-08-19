@@ -405,6 +405,79 @@ def test_fetch_account_returns_one_profile_and_requested_notes(adapter_factory) 
     ]
 
 
+def test_fetch_account_uses_verified_whoami_when_current_profile_page_fails(
+    adapter_factory,
+) -> None:
+    """The authenticated account remains collectable when its public profile page fails."""
+    fake_runner = FakeRunner(
+        [
+            _completed(["xhs"], {"error": "profile unavailable"}, returncode=1),
+            _completed(
+                ["xhs"],
+                {
+                    "userPageData": {
+                        "basicInfo": {"userId": "user-1", "nickname": "Alice"}
+                    },
+                    "userInfo": {"userId": "user-1", "guest": False},
+                },
+            ),
+            _completed(
+                ["xhs"],
+                [{"id": "note-1", "userId": "user-1", "title": "First"}],
+            ),
+        ]
+    )
+    adapter = adapter_factory(fake_runner)
+
+    result = adapter.fetch_account(
+        CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "user-1", "job_id": JOB_ID},
+            expected_count=2,
+        )
+    )
+
+    assert (result.status, result.complete) == ("succeeded", True)
+    assert [item.kind for item in result.items] == ["profile", "note"]
+    assert fake_runner.argvs == [
+        _wrapper_argv("user", "user-1", "--json"),
+        _wrapper_argv("whoami", "--json"),
+        _wrapper_argv("user-posts", "user-1", "--json"),
+    ]
+
+
+def test_fetch_account_does_not_use_whoami_for_a_different_account(
+    adapter_factory,
+) -> None:
+    fake_runner = FakeRunner(
+        [
+            _completed(["xhs"], {"error": "profile unavailable"}, returncode=1),
+            _completed(
+                ["xhs"],
+                {
+                    "userPageData": {"basicInfo": {"userId": "current-user"}},
+                    "userInfo": {"userId": "current-user", "guest": False},
+                },
+            ),
+        ]
+    )
+    adapter = adapter_factory(fake_runner)
+
+    result = adapter.fetch_account(
+        CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "different-user", "job_id": JOB_ID},
+            expected_count=1,
+        )
+    )
+
+    assert (result.status, result.complete) == ("failed", False)
+    assert fake_runner.argvs == [
+        _wrapper_argv("user", "different-user", "--json"),
+        _wrapper_argv("whoami", "--json"),
+    ]
+
+
 def test_fetch_account_binds_each_note_to_the_verified_profile_owner(adapter_factory) -> None:
     fake_runner = FakeRunner(
         [

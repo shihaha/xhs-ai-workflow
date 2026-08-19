@@ -47,6 +47,11 @@ _HUMAN_FAILURES = frozenset({
     "response_unusable",
     "external_state_untrusted",
 })
+_CURRENT_PROFILE_FALLBACK_FAILURES = frozenset({
+    "cli_failed",
+    "malformed_output",
+    "response_unusable",
+})
 _ENVELOPE_MESSAGE_FIELDS = frozenset({"message", "msg", "detail", "reason"})
 _ENVELOPE_STATUS_FIELDS = frozenset({"status", "code"})
 _SUCCESS_STATUS_VALUES = frozenset({"0", "200", "ok", "success", "succeeded", "true"})
@@ -227,6 +232,13 @@ class XhsCliReadAdapter:
             profile = self._invoke(["user", parameters.user_id])
             if not isinstance(profile, dict):
                 raise XhsCliReadError("malformed_output")
+        except XhsCliReadError as error:
+            if error.category not in _CURRENT_PROFILE_FALLBACK_FAILURES:
+                return _failed_result(request, error.category)
+            profile = self._verified_current_profile(parameters.user_id)
+            if profile is None:
+                return _failed_result(request, error.category)
+        try:
             notes = self._invoke(["user-posts", parameters.user_id])
         except XhsCliReadError as error:
             return _failed_result(request, error.category)
@@ -302,6 +314,27 @@ class XhsCliReadAdapter:
         if request.capability != "fetch_account":
             raise ValueError("fetch_account requires the fetch_account capability.")
         return XhsCliAccountRequest.model_validate(request.parameters)
+
+    def _verified_current_profile(self, requested_user_id: str) -> dict[str, Any] | None:
+        try:
+            payload = self._invoke(["whoami"])
+        except XhsCliReadError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        user_info = payload.get("userInfo")
+        if isinstance(user_info, dict) and user_info.get("guest") is True:
+            return None
+        profile = _profile_row(payload)
+        if profile is None:
+            return None
+        try:
+            identity = canonical_owner_id(profile, include_record_id=True)
+        except OwnerIdentityError:
+            return None
+        if identity != requested_user_id:
+            return None
+        return payload
 
     def _invoke(self, command: Sequence[str]) -> JsonPayload:
         completed = self._run_command(command, json_output=True)
