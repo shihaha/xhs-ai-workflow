@@ -94,8 +94,13 @@ successful canonical `POST` response (`sortBy`, `noteType=0`, `pageNo=1`,
 `pageSize=10`) establishes a scope. The prior `layout_changed` and
 `scope_unverified` UAT attempts remain preserved debugging evidence.
 
-A non-empty live XHS keyword search and ranked-account UI workflow, a real
-Android phone, and the seven-day run remain `not_run`. The bounded authenticated local `xhs-cli` gate passed for the current profile, 3
+A non-empty live XHS keyword search, the ranked-account analysis continuation,
+deep verification of the two Android-observed products, and the seven-day run
+remain pending. A real Vivo V2303 / Android 16 device completed a bounded
+read-only ranked-account shop pass on 2026-08-20 with exact device counts 2/2
+and 16 screen/UI evidence files; the durable job remains honestly
+`needs_human/product_evidence_verification_pending` because no contained
+product-image verification directory was supplied. The bounded authenticated local `xhs-cli` gate passed for the current profile, 3
 notes and an exact empty search on 2026-08-19. Bailian text was attempted with
 real credentials and HTTP 200 but failed strict `AnalysisOutput` validation as
 `model_output_invalid`; it is not a live success.

@@ -5,10 +5,12 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Timer
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from PIL import Image
 
 from backend.app.adapters.android_device import (
     DEFAULT_SELECTOR_PROFILE_VERSION,
@@ -226,6 +228,62 @@ def test_tutorial_shop_parser_keeps_title_price_sales_rank_and_coordinates() -> 
     assert product.sold == "1.2万+"
     assert product.rank == "当月热销第3名"
     assert (product.center_x, product.center_y) == (310, 150)
+
+
+def test_live_uiautomator_screenshot_default_pillow_shape_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """The pinned uiautomator2 API defaults to Pillow and rejects the old raw format."""
+
+    class PillowScreenshotDevice(_FakeU2Device):
+        def screenshot(self, *, format: str = "pillow") -> Image.Image:
+            if format != "pillow":
+                raise ValueError(("Unsupported format:", format))
+            return Image.new("RGB", (2, 2), color="red")
+
+    result = _adapter(tmp_path, PillowScreenshotDevice()).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.complete is True
+
+
+def test_profile_navigation_targets_xhs_package_when_device_shell_is_available(
+    tmp_path: Path,
+) -> None:
+    """A system browser must not intercept the trusted XHS profile deep link."""
+
+    class PackageBoundNavigationDevice(_FakeU2Device):
+        def shell(self, argv: list[str]) -> None:
+            self.actions.append(("shell", *argv))
+            self.screen = "profile"
+
+    device = PackageBoundNavigationDevice()
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert device.actions[0] == (
+        "shell",
+        "am",
+        "start",
+        "-a",
+        "android.intent.action.VIEW",
+        "-d",
+        "https://www.xiaohongshu.com/user/profile/account-1",
+        "-p",
+        "com.xingin.xhs",
+    )
 
 
 @pytest.mark.parametrize(
@@ -544,6 +602,70 @@ def test_collection_waits_for_a_changed_clipboard_product_url(tmp_path: Path) ->
     assert result.status == "succeeded"
     assert str(result.items[0].source_url) == current
     assert device.clipboard_reads >= 4
+
+
+def test_collection_temporarily_uses_input_ime_for_restricted_clipboard(
+    tmp_path: Path,
+) -> None:
+    """Android clipboard restrictions may require InputIME, but the user's IME is restored."""
+
+    class RestrictedClipboardDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__()
+            self.input_ime_active = False
+            self.clipboard_broadcasts = 0
+
+        def current_ime(self) -> str:
+            return "com.vivo.inputmethod/.ImeService"
+
+        def set_input_ime(self, enable: bool = True) -> None:
+            assert enable is True
+            self.actions.append(("set_input_ime",))
+            self.input_ime_active = True
+
+        def shell(self, argv: list[str]) -> SimpleNamespace:
+            self.actions.append(("shell", *argv))
+            if argv[:2] == ["ime", "set"]:
+                self.input_ime_active = False
+            elif argv[:2] == ["am", "start"]:
+                self.screen = "profile"
+            if argv == ["am", "broadcast", "-a", "ADB_KEYBOARD_GET_CLIPBOARD"]:
+                self.clipboard_broadcasts += 1
+                if self.clipboard_broadcasts == 1:
+                    return SimpleNamespace(
+                        output="Broadcast completed: result=0"
+                    )
+                encoded = (
+                    "c2hhcmUgaHR0cHM6Ly94aHNsaW5rLmNvbS9wcm9kdWN0LWEgb3Blbg=="
+                    if self._copy_clicked
+                    else ""
+                )
+                return SimpleNamespace(
+                    output=(
+                        'Broadcast completed: result=-1, '
+                        f'data="{encoded}"'
+                    )
+                )
+            return SimpleNamespace(output="")
+
+        @property
+        def clipboard(self) -> str:
+            raise RuntimeError("clipboard SecurityException")
+
+    device = RestrictedClipboardDevice()
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.complete is True
+    assert device.clipboard_broadcasts >= 2
+    assert device.input_ime_active is False
+    assert ("shell", "ime", "set", "com.vivo.inputmethod/.ImeService") in device.actions
 
 
 def test_collection_rejects_an_unchanged_valid_clipboard_url(tmp_path: Path) -> None:

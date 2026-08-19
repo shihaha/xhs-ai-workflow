@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.metadata
 import re
 import time
@@ -1268,14 +1269,26 @@ class AndroidDeviceAdapter:
     @staticmethod
     def _open_profile(device: Any, account_user_id: str) -> None:
         url = f"https://www.xiaohongshu.com/user/profile/{account_user_id}"
+        shell = getattr(device, "shell", None)
+        if callable(shell):
+            shell(
+                [
+                    "am",
+                    "start",
+                    "-a",
+                    "android.intent.action.VIEW",
+                    "-d",
+                    url,
+                    "-p",
+                    "com.xingin.xhs",
+                ]
+            )
+            return
         open_url = getattr(device, "open_url", None)
         if callable(open_url):
             open_url(url)
             return
-        shell = getattr(device, "shell", None)
-        if not callable(shell):
-            raise RuntimeError("uiautomator2 device cannot open a profile URL.")
-        shell(["am", "start", "-a", "android.intent.action.VIEW", "-d", url])
+        raise RuntimeError("uiautomator2 device cannot open a profile URL.")
 
     def _is_cancelled(self, job_id: str | None) -> bool:
         callback = getattr(self._cancellation_context, "callback", None)
@@ -1490,6 +1503,34 @@ def _click_first(
 
 
 def _read_clipboard(device: Any) -> Any:
+    try:
+        return _read_clipboard_once(device)
+    except Exception as original_error:
+        current_ime = getattr(device, "current_ime", None)
+        set_input_ime = getattr(device, "set_input_ime", None)
+        shell = getattr(device, "shell", None)
+        if not all(callable(method) for method in (current_ime, set_input_ime, shell)):
+            raise
+        previous_ime = current_ime()
+        if not isinstance(previous_ime, str) or not previous_ime.strip():
+            raise original_error
+        try:
+            set_input_ime()
+            return _read_clipboard_via_input_ime(device)
+        finally:
+            shell(["ime", "set", previous_ime])
+            shell(
+                [
+                    "settings",
+                    "put",
+                    "secure",
+                    "default_input_method",
+                    previous_ime,
+                ]
+            )
+
+
+def _read_clipboard_once(device: Any) -> Any:
     value = getattr(device, "clipboard", None)
     if callable(value):
         value = value()
@@ -1499,12 +1540,40 @@ def _read_clipboard(device: Any) -> Any:
     return getter() if callable(getter) else None
 
 
+def _read_clipboard_via_input_ime(device: Any) -> str:
+    last_error: ValueError | None = None
+    for _ in range(3):
+        response = device.shell(
+            ["am", "broadcast", "-a", "ADB_KEYBOARD_GET_CLIPBOARD"]
+        )
+        output = str(getattr(response, "output", ""))
+        result_match = re.search(r"result=(-?\d+)", output)
+        data_match = re.search(r'data="([^"]*)"', output)
+        if (
+            result_match is None
+            or int(result_match.group(1)) != -1
+            or data_match is None
+        ):
+            last_error = ValueError("Android InputIME clipboard broadcast failed.")
+            continue
+        try:
+            return base64.b64decode(data_match.group(1), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            last_error = ValueError("Android InputIME clipboard payload was invalid.")
+    raise last_error or ValueError("Android InputIME clipboard broadcast failed.")
+
+
 def _canonical_product_url(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     candidate = value.strip()
-    if not candidate or "\\" in candidate or any(char.isspace() for char in candidate):
+    if not candidate or "\\" in candidate:
         return None
+    if any(char.isspace() for char in candidate):
+        embedded_urls = re.findall(r"https://[^\s]+", candidate)
+        if len(embedded_urls) != 1:
+            return None
+        candidate = embedded_urls[0]
     try:
         parts = urlsplit(candidate)
         hostname = (parts.hostname or "").lower().rstrip(".")
@@ -1549,7 +1618,7 @@ def _rejected_product(
 
 
 def _screenshot_bytes(device: Any) -> bytes:
-    value = device.screenshot(format="raw")
+    value = device.screenshot()
     if isinstance(value, bytes):
         return value
     if isinstance(value, bytearray):
