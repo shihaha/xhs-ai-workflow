@@ -657,3 +657,76 @@ not_run
 No external authenticated state or target inputs were supplied, and
 `XHS_LIVE_TEST=1` was not enabled. This revision makes no real-account or
 live-persisted-fact claim.
+
+# Stabilization S2A report — Type Stabilization fix round 1/5
+
+Date: 2026-08-19
+
+## Review finding and scope
+
+The independent review found one Important remaining consumer-side gap. The
+analysis XHS trust gate duplicated the public-counter field lists and extractor,
+then compared ordinary Python dictionaries. Therefore `float`/`bool` database
+drift that had become fail-closed in runtime and restart paths could still pass
+analysis matching through Python numeric equality and reach the model prompt.
+
+This round changes only the S2A public-counter trust contract consumed by
+analysis. It does not implement or alter S2B append-only/versioned note evidence,
+post-model revalidation, Bailian, or the untracked `research/` tree.
+
+## Fix
+
+- `_profile_matches_item` and `_note_matches_item` now import and use
+  `PROFILE_PUBLIC_COUNTER_FIELDS`, `NOTE_PUBLIC_COUNTER_FIELDS`, and
+  `public_counter_json_matches` from XHS schemas. They no longer copy field
+  names or coerce persisted JSON through `dict()` before ordinary equality.
+- The duplicated analysis `_public_numbers` helper was removed. XHS schemas now
+  exposes one `public_counter_values` extractor, used by XHS persistence,
+  normalization, and analysis before the shared type-stable comparison.
+- The dependency remains one-way from analysis to XHS schemas; direct imports of
+  both modules succeed without a circular import.
+- Any profile or note counter type/shape/field-set mismatch makes discovery
+  ineligible and causes `AnalysisService.create` to reject the whole request as
+  untrusted evidence before a model call or analysis record write. Exact JSON
+  integers above JavaScript's safe-integer boundary remain admitted and are
+  preserved in the model prompt.
+
+## TDD evidence
+
+Before implementation, the new analysis XHS-gate selection produced
+`22 failed, 9 passed, 27 deselected`. The 22 failures cover `float` and `bool`
+drift for all five profile and all six note counter fields. The nine controls
+show that `null`, nested values, missing/extra field sets, and exact large
+integers already followed the intended outward behavior.
+
+After the shared contract was wired into analysis, the identical selection
+produced `31 passed, 27 deselected`, and three consecutive fresh-process repeat
+runs also produced `31 passed, 27 deselected` each. The combined affected
+analysis, round-5, and collection-API files produced `176 passed`; the unified
+public-counter target produced `86 passed, 90 deselected`.
+
+## Final controlled verification
+
+- Complete analysis suite: `121 passed, 1 skipped`.
+- Focused XHS, analysis, Settings, and health suites:
+  `670 passed, 2 skipped`.
+- `scripts/verify.ps1`: exit 0; full backend `1257 passed, 2 skipped`; Python
+  compile passed; frontend `47 passed`; production build passed; controlled
+  fresh-runtime E2E `1 passed`; npm audit found `0 vulnerabilities`;
+  tracked-secret and release-boundary scans passed.
+- Guarded live contract: `2 passed, 1 skipped`; the skip is exactly
+  `not_run: XHS_LIVE_TEST=1 was not supplied`.
+- Independent diff, dependency, duplicate-helper, counter-field, and staged-
+  scope scans passed. No S2B, Bailian, or `research/` file is included.
+
+## Live status
+
+Real authenticated XHS execution remains exactly:
+
+```text
+not_run
+```
+
+No external authenticated state or target inputs were supplied, and
+`XHS_LIVE_TEST=1` was not enabled. This round makes no real-account or
+live-persisted-fact claim.

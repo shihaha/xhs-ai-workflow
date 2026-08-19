@@ -101,6 +101,34 @@ class _RotatingAccountAdapter(_AccountAdapter):
         return next(self.note_ids)
 
 
+class _CompleteCounterAccountAdapter(_AccountAdapter):
+    def __init__(self, value: int = 1) -> None:
+        self.value = value
+
+    def fetch_account(self, request: CollectionRequest) -> CollectionResult:
+        result = super().fetch_account(request)
+        result.items[0].data.update(
+            {
+                "followers_count": self.value,
+                "following_count": self.value,
+                "liked_count": self.value,
+                "fans": self.value,
+                "follows": self.value,
+            }
+        )
+        result.items[1].data.update(
+            {
+                "liked_count": self.value,
+                "collect_count": self.value,
+                "comment_count": self.value,
+                "likedCount": self.value,
+                "collectCount": self.value,
+                "commentCount": self.value,
+            }
+        )
+        return result
+
+
 class _ModelSpy:
     provider = "provider-neutral-spy"
     model = "structured-model"
@@ -217,6 +245,50 @@ def _historical_note_fact_tamper(fixture: _Fixture):
             connection.execute(text(
                 db_module._XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS[trigger_name]
             ))
+
+
+@contextmanager
+def _historical_counter_tamper(fixture: _Fixture, entity: str):
+    trigger_name = (
+        "ck_xhs_profile_immutable_update"
+        if entity == "profile"
+        else "ck_xhs_note_immutable_update"
+    )
+    with fixture.database.engine.begin() as connection:
+        connection.execute(text(f"DROP TRIGGER {trigger_name}"))
+    try:
+        yield
+    finally:
+        with fixture.database.engine.begin() as connection:
+            connection.execute(text(
+                db_module._XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS[trigger_name]
+            ))
+
+
+_PROFILE_PUBLIC_COUNTER_FIELDS = (
+    "followers_count",
+    "following_count",
+    "liked_count",
+    "fans",
+    "follows",
+)
+_NOTE_PUBLIC_COUNTER_FIELDS = (
+    "liked_count",
+    "collect_count",
+    "comment_count",
+    "likedCount",
+    "collectCount",
+    "commentCount",
+)
+_PUBLIC_COUNTER_TYPE_DRIFT_CASES = [
+    ("profile", _PROFILE_PUBLIC_COUNTER_FIELDS, field, replacement)
+    for field in _PROFILE_PUBLIC_COUNTER_FIELDS
+    for replacement in (1.0, True)
+] + [
+    ("note", _NOTE_PUBLIC_COUNTER_FIELDS, field, replacement)
+    for field in _NOTE_PUBLIC_COUNTER_FIELDS
+    for replacement in (1.0, True)
+]
 
 
 def test_discovery_returns_only_account_notes_owned_by_requested_account(
@@ -425,6 +497,133 @@ def test_persisted_raw_digest_must_match_the_bound_artifact_item(
         )
 
     assert model.calls == []
+
+
+@pytest.mark.parametrize(
+    ("entity", "fields", "changed_field", "replacement"),
+    _PUBLIC_COUNTER_TYPE_DRIFT_CASES,
+)
+def test_analysis_xhs_gate_rejects_public_counter_type_drift_before_model(
+    tmp_path: Path,
+    entity: str,
+    fields: tuple[str, ...],
+    changed_field: str,
+    replacement: object,
+) -> None:
+    fixture = _Fixture(tmp_path, adapter=_CompleteCounterAccountAdapter())
+    _, note_id = fixture.collect("u1")
+    payload: dict[str, object] = {field: 1 for field in fields}
+    payload[changed_field] = replacement
+    table = "xhs_account_profiles" if entity == "profile" else "xhs_account_notes"
+    column = "public_stats_json" if entity == "profile" else "public_interactions_json"
+    predicate = "user_id='u1'" if entity == "profile" else "note_id='note-u1'"
+    with _historical_counter_tamper(fixture, entity):
+        with fixture.database.engine.begin() as connection:
+            connection.execute(
+                text(f"UPDATE {table} SET {column}=:value WHERE {predicate}"),
+                {"value": json.dumps(payload)},
+            )
+    model = _ModelSpy()
+    service = fixture.analysis(model)
+    evidence_id = f"account-note:{note_id}"
+
+    discovered = service.list_evidence(account_user_id="u1")
+    with pytest.raises(EvidenceNotFound):
+        service.create(_account_payload("u1", evidence_id))
+
+    assert [row.evidence_id for row in discovered] == [evidence_id]
+    assert discovered[0].eligible_for_opportunity is False
+    assert service.list() == []
+    assert model.calls == []
+
+
+@pytest.mark.parametrize(
+    ("entity", "fields", "mutation"),
+    [
+        ("profile", _PROFILE_PUBLIC_COUNTER_FIELDS, "null"),
+        ("profile", _PROFILE_PUBLIC_COUNTER_FIELDS, "nested"),
+        ("profile", _PROFILE_PUBLIC_COUNTER_FIELDS, "missing"),
+        ("profile", _PROFILE_PUBLIC_COUNTER_FIELDS, "extra"),
+        ("note", _NOTE_PUBLIC_COUNTER_FIELDS, "null"),
+        ("note", _NOTE_PUBLIC_COUNTER_FIELDS, "nested"),
+        ("note", _NOTE_PUBLIC_COUNTER_FIELDS, "missing"),
+        ("note", _NOTE_PUBLIC_COUNTER_FIELDS, "extra"),
+    ],
+)
+def test_analysis_xhs_gate_rejects_malformed_public_counter_shapes_before_model(
+    tmp_path: Path,
+    entity: str,
+    fields: tuple[str, ...],
+    mutation: str,
+) -> None:
+    fixture = _Fixture(tmp_path, adapter=_CompleteCounterAccountAdapter())
+    _, note_id = fixture.collect("u1")
+    payload: dict[str, object] = {field: 1 for field in fields}
+    if mutation == "null":
+        payload[fields[0]] = None
+    elif mutation == "nested":
+        payload[fields[0]] = {"value": 1}
+    elif mutation == "missing":
+        payload.pop(fields[0])
+    else:
+        payload["unexpected_count"] = 1
+    table = "xhs_account_profiles" if entity == "profile" else "xhs_account_notes"
+    column = "public_stats_json" if entity == "profile" else "public_interactions_json"
+    predicate = "user_id='u1'" if entity == "profile" else "note_id='note-u1'"
+    with _historical_counter_tamper(fixture, entity):
+        with fixture.database.engine.begin() as connection:
+            connection.execute(
+                text(f"UPDATE {table} SET {column}=:value WHERE {predicate}"),
+                {"value": json.dumps(payload)},
+            )
+    model = _ModelSpy()
+    service = fixture.analysis(model)
+    evidence_id = f"account-note:{note_id}"
+
+    discovered = service.list_evidence(account_user_id="u1")
+    with pytest.raises(EvidenceNotFound):
+        service.create(_account_payload("u1", evidence_id))
+
+    assert [row.evidence_id for row in discovered] == [evidence_id]
+    assert discovered[0].eligible_for_opportunity is False
+    assert service.list() == []
+    assert model.calls == []
+
+
+def test_analysis_xhs_gate_accepts_exact_large_integer_public_counters(
+    tmp_path: Path,
+) -> None:
+    large_integer = 9_007_199_254_740_993
+    fixture = _Fixture(
+        tmp_path,
+        adapter=_CompleteCounterAccountAdapter(large_integer),
+    )
+    _, note_id = fixture.collect("u1")
+    model = _ModelSpy()
+
+    created = fixture.analysis(model).create(
+        _account_payload("u1", f"account-note:{note_id}")
+    )
+
+    assert created.status == "succeeded"
+    assert len(model.calls) == 1
+    prompt = json.loads(model.calls[0].user_prompt)
+    facts = prompt["allowed_evidence"][0]["facts"]
+    assert facts["profile"]["public_stats"] == {
+        "followers_count": large_integer,
+        "following_count": large_integer,
+        "liked_count": large_integer,
+        "fans": large_integer,
+        "follows": large_integer,
+    }
+    assert facts["note"]["public_interactions"] == {
+        "liked_count": large_integer,
+        "collect_count": large_integer,
+        "comment_count": large_integer,
+        "likedCount": large_integer,
+        "collectCount": large_integer,
+        "commentCount": large_integer,
+    }
 
 
 def test_account_note_model_facts_are_public_normalized_and_claims_can_cite_them(

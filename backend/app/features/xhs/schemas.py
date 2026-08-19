@@ -245,9 +245,9 @@ def normalize_exact_account_result(
         source_url=str(profile_item.source_url),
         nickname=_public_text(profile_item.data, "nickname"),
         bio=_public_text(profile_item.data, "bio", "description", "desc"),
-        public_stats_json=_public_numbers(
+        public_stats_json=public_counter_values(
             profile_item.data,
-            *PROFILE_PUBLIC_COUNTER_FIELDS,
+            allowed_fields=PROFILE_PUBLIC_COUNTER_FIELDS,
         ),
         raw_evidence=dict(profile_item.raw_evidence),
         raw_digest=profile_digest,
@@ -270,9 +270,9 @@ def normalize_exact_account_result(
                 published_at=_public_text(
                     item.data, "published_at", "publish_time", "publishTime"
                 ),
-                public_interactions_json=_public_numbers(
+                public_interactions_json=public_counter_values(
                     item.data,
-                    *NOTE_PUBLIC_COUNTER_FIELDS,
+                    allowed_fields=NOTE_PUBLIC_COUNTER_FIELDS,
                 ),
                 raw_evidence=dict(item.raw_evidence),
                 raw_digest=digest,
@@ -356,8 +356,9 @@ def _apply_profile_item(
 ) -> None:
     record.nickname = _public_text(item.data, "nickname")
     record.bio = _public_text(item.data, "bio", "description", "desc")
-    record.public_stats_json = _public_numbers(
-        item.data, *PROFILE_PUBLIC_COUNTER_FIELDS
+    record.public_stats_json = public_counter_values(
+        item.data,
+        allowed_fields=PROFILE_PUBLIC_COUNTER_FIELDS,
     )
     _apply_evidence(record, item, binding)
 
@@ -370,8 +371,9 @@ def _apply_note_item(
     record.title = _public_text(item.data, "title")
     record.summary = _public_text(item.data, "summary", "description", "desc")
     record.published_at = _public_text(item.data, "published_at", "publish_time", "publishTime")
-    record.public_interactions_json = _public_numbers(
-        item.data, *NOTE_PUBLIC_COUNTER_FIELDS
+    record.public_interactions_json = public_counter_values(
+        item.data,
+        allowed_fields=NOTE_PUBLIC_COUNTER_FIELDS,
     )
     _apply_evidence(record, item, binding)
 
@@ -400,9 +402,13 @@ def _public_text(data: dict[str, Any], *names: str) -> str | None:
     return None
 
 
-def _public_numbers(data: dict[str, Any], *names: str) -> dict[str, int]:
+def public_counter_values(
+    data: dict[str, Any],
+    *,
+    allowed_fields: tuple[str, ...],
+) -> dict[str, int]:
     return {
         name: value
-        for name in names
-        if isinstance((value := data.get(name)), int) and not isinstance(value, bool) and value >= 0
+        for name in allowed_fields
+        if type(value := data.get(name)) is int and value >= 0
     }

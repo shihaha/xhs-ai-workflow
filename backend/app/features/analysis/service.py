@@ -39,6 +39,12 @@ from backend.app.features.xhs.constants import (
 )
 from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
 from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
+from backend.app.features.xhs.schemas import (
+    NOTE_PUBLIC_COUNTER_FIELDS,
+    PROFILE_PUBLIC_COUNTER_FIELDS,
+    public_counter_json_matches,
+    public_counter_values,
+)
 from backend.app.models.jobs import JobArtifactRecord
 from backend.app.models.jobs import JobState
 
@@ -713,14 +719,13 @@ def _profile_matches_item(
         and record.source_url == str(item.source_url)
         and record.nickname == _public_text(item.data, "nickname")
         and record.bio == _public_text(item.data, "bio", "description", "desc")
-        and dict(record.public_stats_json)
-        == _public_numbers(
-            item.data,
-            "followers_count",
-            "following_count",
-            "liked_count",
-            "fans",
-            "follows",
+        and public_counter_json_matches(
+            record.public_stats_json,
+            public_counter_values(
+                item.data,
+                allowed_fields=PROFILE_PUBLIC_COUNTER_FIELDS,
+            ),
+            allowed_fields=PROFILE_PUBLIC_COUNTER_FIELDS,
         )
         and _raw_evidence_matches(record.raw_evidence, record.raw_digest, item)
     )
@@ -744,15 +749,13 @@ def _note_matches_item(
         == _public_text(
             item.data, "published_at", "publish_time", "publishTime"
         )
-        and dict(record.public_interactions_json)
-        == _public_numbers(
-            item.data,
-            "liked_count",
-            "collect_count",
-            "comment_count",
-            "likedCount",
-            "collectCount",
-            "commentCount",
+        and public_counter_json_matches(
+            record.public_interactions_json,
+            public_counter_values(
+                item.data,
+                allowed_fields=NOTE_PUBLIC_COUNTER_FIELDS,
+            ),
+            allowed_fields=NOTE_PUBLIC_COUNTER_FIELDS,
         )
         and _raw_evidence_matches(record.raw_evidence, record.raw_digest, item)
     )
@@ -778,16 +781,6 @@ def _public_text(data: dict[str, Any], *names: str) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
-
-
-def _public_numbers(data: dict[str, Any], *names: str) -> dict[str, int]:
-    return {
-        name: value
-        for name in names
-        if isinstance((value := data.get(name)), int)
-        and not isinstance(value, bool)
-        and value >= 0
-    }
 
 
 def _eligible_for_opportunity(
