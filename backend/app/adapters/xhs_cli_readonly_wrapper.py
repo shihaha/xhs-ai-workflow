@@ -174,6 +174,9 @@ def _install_readonly_boundary(
     cli_module: ModuleType | Any,
     auth_module: ModuleType | Any,
     cookies: dict[str, str],
+    *,
+    client_module: ModuleType | Any | None = None,
+    command: list[str] | None = None,
 ) -> None:
     """Replace every audited browser/persistence hook before command dispatch."""
     cookie_string = "; ".join(f"{name}={value}" for name, value in sorted(cookies.items()))
@@ -202,6 +205,8 @@ def _install_readonly_boundary(
     cli_module.clear_cookies = disabled
     cli_module.load_xsec_token = disabled
     cli_module._cache_note_tokens = no_cache
+    if client_module is not None and command == ["whoami", "--json"]:
+        client_module.XhsClient.get_user_info = lambda _self, _user_id: {}
 
 
 def _validated_cli_args(argv: list[str]) -> list[str]:
@@ -230,8 +235,15 @@ def main() -> int:
         if getattr(package, "__version__", None) != PINNED_XHS_CLI_VERSION:
             raise RuntimeError("pinned_source_mismatch")
         auth_module = modules["xhs_cli.auth"]
+        client_module = modules["xhs_cli.client"]
         cli_module = modules["xhs_cli.cli"]
-        _install_readonly_boundary(cli_module, auth_module, cookies)
+        _install_readonly_boundary(
+            cli_module,
+            auth_module,
+            cookies,
+            client_module=client_module,
+            command=command,
+        )
         cli_module.cli.main(args=command, prog_name="xhs", standalone_mode=True)
         return 0
     except SystemExit as error:

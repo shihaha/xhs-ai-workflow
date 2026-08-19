@@ -6,8 +6,8 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 ## Prerequisites
 
 - [ ] Authenticated current Qianfan browser profile supplied and health checked.
-- [ ] Xiaohongshu login supplied without storing credentials in Git.
-- [ ] Trusted local `xhs-cli` state is prepared outside the application under an isolated directory inside the configured runtime. Set `XHS_LIVE_STATE_DIR` to that directory; do not paste Cookie, token or password into HTTP, tests, logs or this checklist.
+- [x] Xiaohongshu login supplied without storing credentials in Git.
+- [x] Trusted local `xhs-cli` state is prepared outside the application under an isolated directory inside the configured runtime. Set `XHS_LIVE_STATE_DIR` to that directory; do not paste Cookie, token or password into HTTP, tests, logs or this checklist.
 - [ ] One Android phone connected; ADB/device/app state reports actual availability.
 - [x] Bailian API key supplied through environment only; the configured image and vision model calls succeeded in the bounded media gate.
 - [x] Explicit `BAILIAN_MEDIA_LIVE_TEST=1`, `XHS_BAILIAN_IMAGE_MODEL` and `XHS_BAILIAN_VISION_MODEL` were supplied only to the one-off test process. The key was not pasted into chat, HTTP payloads or logs.
@@ -43,7 +43,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 ## Current execution status (2026-08-19)
 
 - Qianfan authenticated live collection: **not_run** — no authenticated verified profile/selectors were supplied.
-- Xiaohongshu account/note live collection: **not_run** — `XHS_LIVE_TEST=1`, `XHS_LIVE_STATE_DIR`, target counts and a Python interpreter containing the exact pinned `xhs-cli@3ce7141` sources were not supplied. The adapter reads a non-reparse, single-link prepared cookie file through a held OS handle, passes it only over stdin to the repository read-only wrapper, disables browser-cookie/login and xsec-cache hooks, and runs only fixed read commands inside a private runtime. Credentials never enter argv or the inherited environment.
+- Xiaohongshu account/note bounded live gate: **passed (2026-08-19)** — the isolated opt-in run completed `1 passed in 89.83s`. It verified the authenticated current-account profile, exactly 3 public notes, the reserved job/raw artifact/database path, and an exact empty keyword-search result (0/0), using only fixed `status`, `whoami`, `user`, `user-posts` and `search` reads. The real `user-posts` response used nested page slots and was normalized without treating empty slots as notes. Credentials remained outside argv, logs and project files. A non-empty live search and the ranked-account UI-to-analysis workflow remain pending and are not implied by this bounded pass.
 - Android real-device collection: **not_run: device unavailable**.
 - Bailian text live contract: **not_run** — this bounded validation exercised only image generation and visual assessment, not the text model.
 - Bailian image/vision live gate: **passed (2026-08-19)** — the final isolated opt-in run completed `2 passed in 19.25s` against the configured `wan2.6-t2i` and `qwen-vl-max` models. It proved real remote image generation and download, full local image decoding/validation, managed `output_image` persistence, strict visual-assessment parsing, provider request-ID presence and numeric usage projection. The content remained in human `review`; the advisory result did not auto-approve it. No credential value was printed or persisted in project files.

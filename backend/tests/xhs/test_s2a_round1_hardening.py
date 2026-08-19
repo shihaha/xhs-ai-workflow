@@ -128,6 +128,37 @@ def test_readonly_wrapper_disables_browser_auth_and_token_cache_writes() -> None
         cli.qrcode_login()
 
 
+def test_readonly_wrapper_skips_profile_navigation_only_for_whoami() -> None:
+    wrapper = importlib.import_module("backend.app.adapters.xhs_cli_readonly_wrapper")
+    calls: list[str] = []
+
+    class Client:
+        def get_user_info(self, user_id: str) -> dict[str, str]:
+            calls.append(user_id)
+            return {"user_id": user_id}
+
+    def boundary(command: list[str]) -> type[Client]:
+        client_module = SimpleNamespace(XhsClient=type("CommandClient", (Client,), {}))
+        cli = SimpleNamespace()
+        auth = SimpleNamespace()
+        wrapper._install_readonly_boundary(
+            cli,
+            auth,
+            {"a1": "prepared-a1", "web_session": "prepared-session"},
+            client_module=client_module,
+            command=command,
+        )
+        return client_module.XhsClient
+
+    whoami_client = boundary(["whoami", "--json"])()
+    assert whoami_client.get_user_info("current-user") == {}
+    assert calls == []
+
+    user_client = boundary(["user", "current-user", "--json"])()
+    assert user_client.get_user_info("current-user") == {"user_id": "current-user"}
+    assert calls == ["current-user"]
+
+
 def test_cookie_hardlink_fails_closed_before_process_start(tmp_path: Path) -> None:
     state_dir, cookie_file = _state(tmp_path)
     os.link(cookie_file, cookie_file.with_name("cookies-hardlink.json"))

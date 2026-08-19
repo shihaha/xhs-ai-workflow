@@ -134,3 +134,18 @@ Repository verify: 1022 backend passed, 2 skipped; 47 frontend passed;
 build, controlled E2E, dependency audit, secret scan and boundary scan passed
 npm audit: 0 vulnerabilities
 ```
+
+## Authenticated live addendum — 2026-08-19
+
+The isolated opt-in gate completed `1 passed in 89.83s` against the prepared
+local authenticated state. It persisted one current-account profile and exactly
+3 public notes through the reserved job, raw artifact and normalized database
+path, then verified an exact empty keyword-search result (0/0). No login,
+publish, comment or other platform write command was invoked.
+
+The live response exposed two production-shape gaps that were fixed with direct
+RED/GREEN tests: `whoami` redundantly retried the known-failing profile page
+after homepage identity was already available, and `user-posts` returned nested
+page slots whose first slot contained the notes while the remaining slots were
+empty. The bounded pass does not prove a non-empty live search or the complete
+ranked-account UI-to-analysis workflow; those remain separate UAT items.

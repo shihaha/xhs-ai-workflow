@@ -77,13 +77,15 @@ environment-only.
 | Account-note trust through fresh empty runtime and ZIP | `backend/tests/analysis/test_account_note_grounding.py`, `frontend/e2e/empty-to-package.spec.ts` |
 | Generated PNG through API/worker/DB/file/UI, advisory vision and human-gated ZIP | media backend suites, `frontend/src/pages/ContentStudioPage.test.tsx`, `frontend/e2e/empty-to-package.spec.ts` |
 | Guarded Bailian image/vision live gate | `backend/tests/integration/test_bailian_media_live.py` (explicit isolated opt-in passed on 2026-08-19 with real `wan2.6-t2i` and `qwen-vl-max`; default without opt-in remains exact `not_run`) |
-| Guarded local XHS CLI contract | `backend/tests/xhs/test_live_cli_contract.py` (isolated externally prepared state, real `status` text shape, JSON `whoami` identity, exact read-only commands, explicit opt-in; default `not_run`) |
+| Guarded local XHS CLI contract | `backend/tests/xhs/test_live_cli_contract.py` (isolated externally prepared state, real `status` text shape, JSON `whoami` identity, exact read-only commands; bounded live gate passed on 2026-08-19 for current profile + 3 notes + empty search 0/0; default without opt-in remains `not_run`) |
 | Fresh empty runtime through ZIP | recovery-matrix empty-state test and `frontend/e2e/empty-to-package.spec.ts` |
 
 ## Not verified live
 
-Authenticated Qianfan, an authenticated local `xhs-cli` account/search run, a
-real Android phone, Bailian text, and the seven-day run remain `not_run`.
+Authenticated Qianfan, a non-empty live XHS keyword search and ranked-account UI
+workflow, a real Android phone, Bailian text, and the seven-day run remain
+`not_run`. The bounded authenticated local `xhs-cli` gate passed for the current
+profile, 3 notes and an exact empty search on 2026-08-19.
 Bailian image generation and visual assessment passed their bounded real-model
 gate on 2026-08-19. See `docs/UAT_CHECKLIST.md`. Therefore the honest release label is
 **software implemented / awaiting real UAT**.

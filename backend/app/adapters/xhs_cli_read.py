@@ -647,6 +647,8 @@ def _profile_row(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 def _note_rows(payload: JsonPayload) -> list[Any] | None:
     if isinstance(payload, list):
+        if payload and all(isinstance(page, list) for page in payload):
+            return [row for page in payload for row in page]
         return payload
     for candidate in (
         payload.get("notes"),

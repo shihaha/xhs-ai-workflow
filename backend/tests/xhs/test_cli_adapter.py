@@ -171,6 +171,36 @@ def test_pinned_user_page_and_user_posts_list_normalize_profile_stats(adapter_fa
     assert result.items[1].data["user_id"] == "user-1"
 
 
+def test_pinned_user_posts_page_slots_are_flattened_into_note_rows(adapter_factory) -> None:
+    fake_runner = FakeRunner([
+        _completed(["xhs"], {"user": {"id": "user-1", "nickname": "Alice"}}),
+        _completed(["xhs"], [
+            [
+                {"id": "note-1", "noteCard": {"user": {"userId": "user-1"}}},
+                {"id": "note-2", "noteCard": {"user": {"userId": "user-1"}}},
+            ],
+            [],
+            [{"id": "note-3", "noteCard": {"user": {"userId": "user-1"}}}],
+        ]),
+    ])
+    adapter = adapter_factory(fake_runner)
+
+    result = adapter.fetch_account(CollectionRequest(
+        capability="fetch_account",
+        parameters={"user_id": "user-1", "job_id": JOB_ID},
+        expected_count=4,
+    ))
+
+    assert (result.status, result.complete) == ("succeeded", True)
+    assert [item.id for item in result.items] == [
+        "profile:user-1",
+        "note:note-1",
+        "note:note-2",
+        "note:note-3",
+    ]
+    assert result.rejected_items == []
+
+
 def test_missing_isolated_external_state_fails_closed_without_starting_cli(tmp_path: Path) -> None:
     """A missing state file must not let upstream fall back to normal-browser cookie extraction."""
     fake_runner = FakeRunner([_completed(["xhs"], [])])
