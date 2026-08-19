@@ -50,6 +50,21 @@ def health(request: Request) -> dict[str, object]:
                 settings.bailian_api_key and settings.bailian_api_key.strip()
             )
         },
+        "bailian_text": {
+            "healthy": bool(
+                settings.bailian_api_key and settings.bailian_api_key.strip()
+            )
+        },
+        "bailian_vision": {
+            "healthy": bool(
+                settings.bailian_api_key and settings.bailian_api_key.strip()
+            )
+        },
+        "bailian_image": {
+            "healthy": bool(
+                settings.bailian_api_key and settings.bailian_api_key.strip()
+            )
+        },
     }
     is_healthy = all(check["healthy"] for check in checks.values())
     return {"status": "healthy" if is_healthy else "degraded", "checks": checks}

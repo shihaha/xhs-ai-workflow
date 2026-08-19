@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
@@ -68,6 +69,14 @@ _EXTENSION_BY_MIME = {
     "image/jpeg": ".jpg",
     "image/webp": ".webp",
 }
+MEDIA_RESERVED_JOB_TYPES = {
+    "content_image_generation",
+    "content_image_analysis",
+}
+MEDIA_RESERVED_ARTIFACT_KINDS = {
+    "generated_image_provenance",
+    "visual_assessment",
+}
 
 
 class MediaError(RuntimeError):
@@ -83,6 +92,10 @@ class MediaStateError(MediaError):
 
 
 class MediaValidationError(MediaError):
+    pass
+
+
+class MediaExecutionCancelled(MediaError):
     pass
 
 
@@ -115,6 +128,10 @@ class ContentMediaService:
         return run
 
     def list_runs(self, content_item_id: str) -> list[ContentMediaRunRead]:
+        try:
+            self.content_service.get_content_item(content_item_id)
+        except ContentError as error:
+            raise MediaNotFound("Content item does not exist.") from error
         return self.run_store.list_for_item(content_item_id)
 
     def submit_generation(
@@ -208,9 +225,15 @@ class ContentMediaService:
                 pass
             raise
 
-    def run_generation(self, run_id: str) -> ContentMediaRunRead:
+    def run_generation(
+        self,
+        run_id: str,
+        *,
+        admission_check: Callable[[], bool] | None = None,
+    ) -> ContentMediaRunRead:
         run = self._claim_for_execution(run_id, "generate")
         try:
+            self._require_execution_admission(admission_check)
             facts = self._current_generation_facts(
                 run.content_item_id, run.revision_id, run.plan_entry_id or ""
             )
@@ -220,6 +243,7 @@ class ContentMediaService:
             images = self.image_adapter.generate_images(ImageGenerationRequest(
                 prompt=prompt, prompt_version=run.prompt_version
             ))
+            self._require_execution_admission(admission_check)
             if len(images) != 1:
                 raise MediaValidationError("Generation must return exactly one image.")
             facts_after = self._current_generation_facts(
@@ -228,6 +252,9 @@ class ContentMediaService:
             if self._digest(facts_after) != run.input_digest:
                 raise MediaStateError("Generation trust facts changed after provider call.")
             return self._persist_generated_image(run, images[0])
+        except MediaExecutionCancelled:
+            self._cancel_claimed_run(run)
+            raise
         except (MediaError, ContentError, ModelAdapterError) as error:
             self._record_failure(run, error)
             raise
@@ -235,9 +262,15 @@ class ContentMediaService:
             self._record_failure(run, error)
             raise
 
-    def run_analysis(self, run_id: str) -> ContentMediaRunRead:
+    def run_analysis(
+        self,
+        run_id: str,
+        *,
+        admission_check: Callable[[], bool] | None = None,
+    ) -> ContentMediaRunRead:
         run = self._claim_for_execution(run_id, "analyze")
         try:
+            self._require_execution_admission(admission_check)
             facts = self._current_analysis_facts(
                 run.content_item_id, run.revision_id, run.allowed_material_ids
             )
@@ -255,6 +288,7 @@ class ContentMediaService:
                 ),
                 VisualAssessment,
             )
+            self._require_execution_admission(admission_check)
             if result.model != run.model:
                 raise MediaValidationError(
                     "Visual result model does not match the reserved run model."
@@ -271,6 +305,9 @@ class ContentMediaService:
             ):
                 raise MediaStateError("Visual-analysis inputs changed after provider call.")
             return self._persist_analysis(run, result, identities)
+        except MediaExecutionCancelled:
+            self._cancel_claimed_run(run)
+            raise
         except (MediaError, ContentError, ModelAdapterError) as error:
             self._record_failure(run, error)
             raise
@@ -365,6 +402,33 @@ class ContentMediaService:
             lease_token=token,
             lease_expires_at=_now() + timedelta(minutes=5),
         )
+
+    def cancel_run(self, run_id: str) -> ContentMediaRunRead:
+        run = self.get_run(run_id)
+        if run.status not in {"queued", "running"}:
+            return run
+        return self.run_store.cancel(
+            run.id,
+            expected_version=run.state_version,
+            lease_token=run.lease_token,
+        )
+
+    def _cancel_claimed_run(self, run: ContentMediaRunRead) -> None:
+        try:
+            self.run_store.cancel(
+                run.id,
+                expected_version=run.state_version,
+                lease_token=run.lease_token,
+            )
+        except (MediaRunConflict, MediaRunTransactionUnknown):
+            pass
+
+    @staticmethod
+    def _require_execution_admission(
+        admission_check: Callable[[], bool] | None,
+    ) -> None:
+        if admission_check is not None and not admission_check():
+            raise MediaExecutionCancelled("Media worker shutdown cancelled execution.")
 
     def _current_generation_facts(
         self, item_id: str, revision_id: str, plan_entry_id: str

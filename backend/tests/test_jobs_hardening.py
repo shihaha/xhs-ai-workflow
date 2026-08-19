@@ -146,3 +146,17 @@ async def test_lifespan_releases_database_file_handle(tmp_path: Path) -> None:
     replacement_path = runtime_dir / "replacement.sqlite3"
     database_path.rename(replacement_path)
     assert replacement_path.is_file()
+
+
+@pytest.mark.anyio
+async def test_application_owns_media_worker_lifecycle(tmp_path: Path) -> None:
+    """Omitting app startup/recovery or shutdown would orphan the media worker."""
+    runtime_dir = tmp_path / "runtime"
+    app = create_app(Settings(runtime_dir=runtime_dir))
+    worker = app.state.content_media_worker
+
+    async with app.router.lifespan_context(app):
+        assert worker is not None
+        assert worker.is_alive is True
+
+    assert worker.is_alive is False

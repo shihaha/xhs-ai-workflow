@@ -22,6 +22,10 @@ from backend.app.services.jobs import (
     JobService,
 )
 from backend.app.features.xhs.service import XHS_RESERVED_ARTIFACT_KINDS, XHS_RESERVED_JOB_TYPES
+from backend.app.features.media.service import (
+    MEDIA_RESERVED_ARTIFACT_KINDS,
+    MEDIA_RESERVED_JOB_TYPES,
+)
 
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
@@ -30,9 +34,11 @@ _RESERVED_JOB_TYPES = {
     "shop_collection",
     "qianfan_ranking_scope",
     *XHS_RESERVED_JOB_TYPES,
+    *MEDIA_RESERVED_JOB_TYPES,
 }
 _RESERVED_ARTIFACT_KINDS = {
-    "shop_collection_result", "qianfan_raw_capture", *XHS_RESERVED_ARTIFACT_KINDS
+    "shop_collection_result", "qianfan_raw_capture", *XHS_RESERVED_ARTIFACT_KINDS,
+    *MEDIA_RESERVED_ARTIFACT_KINDS,
 }
 
 
@@ -77,6 +83,8 @@ def claim_job(job_id: str, request: Request) -> JobRead:
 @router.post("/{job_id}/transition", response_model=JobRead)
 def transition_job(job_id: str, payload: JobTransition, request: Request) -> JobRead:
     job = _get_job_or_404(job_id, request)
+    if job.type in MEDIA_RESERVED_JOB_TYPES:
+        raise HTTPException(status_code=422, detail="Reserved media job is read-only.")
     if job.type in _RESERVED_JOB_TYPES:
         if (
             payload.state is not JobState.cancelled

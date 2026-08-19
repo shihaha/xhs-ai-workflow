@@ -49,6 +49,9 @@ async def test_health_reports_actual_unavailable_external_dependencies(
                 "executable": "definitely-not-a-browser-executable",
             },
             "bailian": {"healthy": False},
+            "bailian_text": {"healthy": False},
+            "bailian_vision": {"healthy": False},
+            "bailian_image": {"healthy": False},
         },
     }
 
@@ -90,6 +93,25 @@ async def test_health_reports_whitespace_bailian_key_as_unconfigured(
         response = await client.get("/api/v1/health")
 
     assert response.json()["checks"]["bailian"] == {"healthy": False}
+
+
+@pytest.mark.anyio
+async def test_health_reports_text_vision_and_image_configuration_separately(
+    tmp_path: Path,
+) -> None:
+    """Collapsing distinct media capabilities into one check hides partial outages."""
+    settings = Settings(runtime_dir=tmp_path / "runtime", bailian_api_key=None)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(settings)),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.get("/api/v1/health")
+
+    checks = response.json()["checks"]
+    assert checks["bailian_text"] == {"healthy": False}
+    assert checks["bailian_vision"] == {"healthy": False}
+    assert checks["bailian_image"] == {"healthy": False}
 
 
 @pytest.mark.anyio

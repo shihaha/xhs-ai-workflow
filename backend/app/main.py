@@ -12,6 +12,10 @@ from backend.app.api.jobs import router as jobs_router
 from backend.app.adapters.android_device import AndroidDeviceAdapter
 from backend.app.adapters.registry import build_default_registry
 from backend.app.adapters.bailian import BailianModelAdapter
+from backend.app.adapters.bailian_media import (
+    BailianImageGenerationAdapter,
+    BailianVisionAdapter,
+)
 from backend.app.adapters.qianfan_playwright import (
     QianfanPlaywrightAdapter,
     persistent_qianfan_page_factory,
@@ -25,6 +29,9 @@ from backend.app.features.content.cleanup import (
     ArtifactCleanupWorker,
 )
 from backend.app.features.content.service import ContentService
+from backend.app.features.media.api import router as media_router
+from backend.app.features.media.service import ContentMediaService
+from backend.app.features.media.worker import ContentMediaWorker
 from backend.app.features.radar.api import router as radar_router
 from backend.app.features.radar.service import RadarService
 from backend.app.features.radar.qianfan_service import QianfanCollectionService
@@ -42,11 +49,19 @@ from backend.app.services.jobs import JobService
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     cleanup_worker: ArtifactCleanupWorker | None = app.state.artifact_cleanup_worker
+    media_worker: ContentMediaWorker | None = getattr(
+        app.state, "content_media_worker", None
+    )
     try:
+        if media_worker is not None:
+            media_worker.start()
         if cleanup_worker is not None:
             cleanup_worker.start()
         yield
     finally:
+        media_safe = True
+        if media_worker is not None:
+            media_safe = media_worker.close()
         xhs_safe = True
         xhs_service: XhsCollectionService | None = app.state.xhs_collection_service
         if xhs_service is not None:
@@ -66,6 +81,8 @@ async def _lifespan(app: FastAPI):
             database.close()
         if not xhs_safe:
             raise RuntimeError("XHS collection process tree did not stop safely.")
+        if not media_safe:
+            raise RuntimeError("Content media worker did not stop safely.")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -85,6 +102,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.content_service = None
     app.state.artifact_cleanup_service = None
     app.state.artifact_cleanup_worker = None
+    app.state.bailian_vision_adapter = BailianVisionAdapter(
+        api_key=app.state.settings.bailian_api_key,
+        base_url=app.state.settings.bailian_vision_base_url,
+        model=app.state.settings.bailian_vision_model,
+        max_attempts=app.state.settings.bailian_vision_max_attempts,
+        timeout_seconds=app.state.settings.bailian_vision_timeout_seconds,
+    )
+    app.state.bailian_image_adapter = BailianImageGenerationAdapter(
+        api_key=app.state.settings.bailian_api_key,
+        base_url=app.state.settings.bailian_image_base_url,
+        model=app.state.settings.bailian_image_model,
+        max_attempts=app.state.settings.bailian_image_max_attempts,
+        timeout_seconds=app.state.settings.bailian_image_timeout_seconds,
+        poll_deadline_seconds=app.state.settings.bailian_image_poll_deadline_seconds,
+        poll_interval_seconds=app.state.settings.bailian_image_poll_interval_seconds,
+        max_image_bytes=app.state.settings.bailian_image_max_bytes,
+        max_image_pixels=app.state.settings.bailian_image_max_pixels,
+    )
+    app.state.content_media_service = None
+    app.state.content_media_worker = None
     app.state.bailian_adapter = BailianModelAdapter(
         api_key=app.state.settings.bailian_api_key,
         base_url=app.state.settings.bailian_base_url,
@@ -147,6 +184,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             runtime_dir=app.state.settings.runtime_dir,
             cleanup_service=app.state.artifact_cleanup_service,
         )
+        app.state.content_media_service = ContentMediaService(
+            app.state.database,
+            content_service=app.state.content_service,
+            image_adapter=app.state.bailian_image_adapter,
+            vision_adapter=app.state.bailian_vision_adapter,
+            runtime_dir=app.state.settings.runtime_dir,
+            cleanup_service=app.state.artifact_cleanup_service,
+        )
+        app.state.content_media_worker = ContentMediaWorker(
+            app.state.content_media_service
+        )
         app.state.artifact_cleanup_worker = ArtifactCleanupWorker(
             app.state.artifact_cleanup_service,
             poll_seconds=app.state.settings.artifact_cleanup_poll_seconds,
@@ -169,6 +217,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.content_service = None
         app.state.artifact_cleanup_service = None
         app.state.artifact_cleanup_worker = None
+        app.state.content_media_service = None
+        app.state.content_media_worker = None
         app.state.database_error = "SQLite database is unavailable."
     app.state.android_adapter = AndroidDeviceAdapter(
         runtime_dir=app.state.settings.runtime_dir,
@@ -186,6 +236,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(shops_router)
     app.include_router(analysis_router)
     app.include_router(content_router)
+    app.include_router(media_router)
     app.include_router(xhs_router)
 
     @app.exception_handler(SQLAlchemyError)
