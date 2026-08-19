@@ -27,6 +27,12 @@ class _LiveRequest:
         return self._data
 
 
+class _PropertyLiveRequest(_LiveRequest):
+    @property
+    def post_data_json(self) -> dict[str, Any]:
+        return self._data
+
+
 class _LiveResponse:
     status = 200
 
@@ -37,6 +43,12 @@ class _LiveResponse:
 
     def json(self) -> dict[str, Any]:
         return self._body
+
+
+class _PropertyLiveResponse(_LiveResponse):
+    def __init__(self, *, path: str, data: dict[str, Any], body: dict[str, Any]) -> None:
+        super().__init__(path=path, data=data, body=body)
+        self.request = _PropertyLiveRequest(url=self.url, data=data)
 
 
 class _LiveLocator:
@@ -224,6 +236,29 @@ def test_live_profile_accepts_only_canonical_content_response_bound_to_active_sc
     assert result.status == "succeeded"
     assert [item.id for item in result.items] == ["canonical-note"]
     assert "?" not in result.items[0].raw_evidence["response_url"]
+
+
+def test_live_profile_reads_real_playwright_post_data_json_property() -> None:
+    """A real Playwright request exposes JSON post data as a property, not a callable fake."""
+    page = _LivePage(
+        [
+            _PropertyLiveResponse(
+                path="/api/edith/business/data/note/rank/v2/list",
+                data={"sortBy": 1, "noteType": 0, "pageNo": 1, "pageSize": 10},
+                body={"code": 0, "data": {"dataList": [{"rank": 1, "noteId": "property"}]}},
+            )
+        ]
+    )
+
+    result = QianfanPlaywrightAdapter(page_factory=lambda: page, timeout_seconds=0).collect_scope(
+        CollectionRequest(capability="rankings", expected_count=1),
+        board="阅读榜",
+        dimension="优秀内容",
+        selector_profile=DEFAULT_QIANFAN_SELECTOR_PROFILE,
+    )
+
+    assert result.status == "succeeded"
+    assert [item.id for item in result.items] == ["property"]
 
 
 def test_live_profile_normalizes_account_endpoint_without_note_facts_or_tokens(

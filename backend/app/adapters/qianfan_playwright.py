@@ -923,7 +923,8 @@ def _record_request_scope(request: Any) -> dict[str, Any] | None:
         return None
     scope: dict[str, Any] = {"method": method, "path": _url_path(request_url)}
     try:
-        raw_post_data = request.post_data_json()
+        post_data_json = request.post_data_json
+        raw_post_data = post_data_json() if callable(post_data_json) else post_data_json
     except Exception:
         raw_post_data = None
     if isinstance(raw_post_data, dict):
