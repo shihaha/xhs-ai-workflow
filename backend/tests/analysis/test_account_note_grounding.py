@@ -2,6 +2,7 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Thread
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -16,6 +17,7 @@ from backend.app.adapters.contracts import (
     StructuredModelRequest,
 )
 import backend.app.db as db_module
+import backend.app.features.analysis.service as analysis_module
 from backend.app.db import Database, canonical_raw_evidence_digest
 from backend.app.features.analysis.schemas import AnalysisCreate
 from backend.app.features.analysis.service import (
@@ -27,6 +29,19 @@ from backend.app.features.xhs.models import XhsAccountNoteRecord
 from backend.app.features.xhs.service import XhsCollectionService
 from backend.app.models.jobs import JobArtifactRecord, JobState
 from backend.app.services.jobs import JobService
+
+
+def test_analysis_uses_the_sqlite_bounded_windows_volume_identity() -> None:
+    metadata = SimpleNamespace(
+        st_dev=12_692_409_288_425_916_732,
+        st_ino=17_732_923_534_538_552,
+        st_size=232_032,
+        st_mtime_ns=1_787_164_465_114_175_000,
+    )
+
+    identity = analysis_module._file_identity(metadata)
+
+    assert 0 <= identity[0] <= 9_223_372_036_854_775_807
 
 
 class _AccountAdapter:

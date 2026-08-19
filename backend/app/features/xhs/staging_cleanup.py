@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -36,6 +37,19 @@ _FINAL_NAME = re.compile(
 # Narrow fault-injection hook: tests raise only after the exact new file handle
 # has been retained by the store.
 _stage_creation_after_open_hook: Callable[[int], None] | None = None
+_SQLITE_MAX_INTEGER = (1 << 63) - 1
+
+
+def sqlite_file_device_identity(value: int) -> int:
+    """Keep Windows unsigned volume identities stable inside SQLite INTEGER."""
+
+    normalized = int(value)
+    if normalized < 0:
+        raise ValueError("file device identity must be non-negative")
+    if normalized <= _SQLITE_MAX_INTEGER:
+        return normalized
+    digest = hashlib.sha256(str(normalized).encode("ascii")).digest()
+    return int.from_bytes(digest[:8], "big") & _SQLITE_MAX_INTEGER
 
 
 class UnsafeXhsArtifactStore(OSError):
@@ -52,7 +66,7 @@ class XhsArtifactIdentity:
     @classmethod
     def from_stat(cls, metadata: os.stat_result) -> "XhsArtifactIdentity":
         return cls(
-            int(metadata.st_dev),
+            sqlite_file_device_identity(metadata.st_dev),
             int(metadata.st_ino),
             int(metadata.st_size),
             int(metadata.st_mtime_ns),

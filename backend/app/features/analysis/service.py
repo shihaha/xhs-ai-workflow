@@ -55,6 +55,7 @@ from backend.app.features.xhs.schemas import (
     public_counter_json_matches,
     public_counter_values,
 )
+from backend.app.features.xhs.staging_cleanup import sqlite_file_device_identity
 from backend.app.models.jobs import JobArtifactRecord
 from backend.app.models.jobs import JobState
 
@@ -1345,7 +1346,12 @@ def _read_contained_regular_file(
 
 
 def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
-    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+    return (
+        sqlite_file_device_identity(value.st_dev),
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+    )
 
 
 def _contained_regular_file_identity(

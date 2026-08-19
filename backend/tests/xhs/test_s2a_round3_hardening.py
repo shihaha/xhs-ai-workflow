@@ -9,6 +9,7 @@ import hashlib
 import os
 import sqlite3
 from threading import Thread
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -31,6 +32,23 @@ from backend.app.services.jobs import JobService
 
 JOURNAL_MIGRATION = "xhs_artifact_promotion_journal_v2"
 JOURNAL_TABLE = "xhs_artifact_promotion_journal"
+
+
+def test_windows_volume_identity_is_bounded_for_sqlite_journal() -> None:
+    """A real unsigned Windows volume id must remain usable as a DB identity."""
+
+    metadata = SimpleNamespace(
+        st_dev=12_692_409_288_425_916_732,
+        st_ino=17_732_923_534_538_552,
+        st_size=232_032,
+        st_mtime_ns=1_787_164_465_114_175_000,
+    )
+
+    first = staging_module.XhsArtifactIdentity.from_stat(metadata)
+    second = staging_module.XhsArtifactIdentity.from_stat(metadata)
+
+    assert 0 <= first.file_dev <= 9_223_372_036_854_775_807
+    assert first == second
 
 
 def _account_result(user_id: str = "round3-user") -> CollectionResult:

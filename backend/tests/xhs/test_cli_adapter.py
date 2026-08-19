@@ -476,7 +476,7 @@ def test_fetch_account_uses_verified_whoami_when_current_profile_page_fails(
     ]
 
 
-def test_fetch_account_does_not_use_whoami_for_a_different_account(
+def test_fetch_account_fails_without_a_matching_profile_or_post_author(
     adapter_factory,
 ) -> None:
     fake_runner = FakeRunner(
@@ -489,6 +489,7 @@ def test_fetch_account_does_not_use_whoami_for_a_different_account(
                     "userInfo": {"userId": "current-user", "guest": False},
                 },
             ),
+            _completed(["xhs"], []),
         ]
     )
     adapter = adapter_factory(fake_runner)
@@ -505,7 +506,106 @@ def test_fetch_account_does_not_use_whoami_for_a_different_account(
     assert fake_runner.argvs == [
         _wrapper_argv("user", "different-user", "--json"),
         _wrapper_argv("whoami", "--json"),
+        _wrapper_argv("user-posts", "different-user", "--json"),
     ]
+
+
+def test_fetch_account_uses_consistent_public_post_author_when_profile_page_is_unavailable(
+    adapter_factory,
+) -> None:
+    """Observed post authors may supply a minimal profile; request input alone may not."""
+    fake_runner = FakeRunner(
+        [
+            _completed(["xhs"], {"error": "profile unavailable"}, returncode=1),
+            _completed(
+                ["xhs"],
+                {
+                    "userPageData": {"basicInfo": {"userId": "current-user"}},
+                    "userInfo": {"userId": "current-user", "guest": False},
+                },
+            ),
+            _completed(
+                ["xhs"],
+                [[{
+                    "id": "note-1",
+                    "noteCard": {
+                        "displayTitle": "First",
+                        "user": {
+                            "userId": "ranked-user",
+                            "nickname": "Ranked Author",
+                        },
+                    },
+                }]],
+            ),
+        ]
+    )
+    adapter = adapter_factory(fake_runner)
+
+    result = adapter.fetch_account(
+        CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "ranked-user", "job_id": JOB_ID},
+            expected_count=2,
+        )
+    )
+
+    assert (result.status, result.complete) == ("succeeded", True)
+    assert [item.kind for item in result.items] == ["profile", "note"]
+    assert result.items[0].data == {
+        "nickname": "Ranked Author",
+        "user_id": "ranked-user",
+    }
+    assert result.items[0].raw_evidence["profile_source"] == (
+        "user-posts-author"
+    )
+    assert fake_runner.argvs == [
+        _wrapper_argv("user", "ranked-user", "--json"),
+        _wrapper_argv("whoami", "--json"),
+        _wrapper_argv("user-posts", "ranked-user", "--json"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "posts",
+    [
+        [],
+        [[{
+            "id": "note-1",
+            "noteCard": {
+                "user": {"userId": "foreign-user", "nickname": "Other"}
+            },
+        }]],
+    ],
+    ids=["empty", "foreign-owner"],
+)
+def test_fetch_account_does_not_synthesize_profile_without_matching_post_author(
+    adapter_factory, posts,
+) -> None:
+    fake_runner = FakeRunner(
+        [
+            _completed(["xhs"], {"error": "profile unavailable"}, returncode=1),
+            _completed(
+                ["xhs"],
+                {
+                    "userPageData": {"basicInfo": {"userId": "current-user"}},
+                    "userInfo": {"userId": "current-user", "guest": False},
+                },
+            ),
+            _completed(["xhs"], posts),
+        ]
+    )
+    adapter = adapter_factory(fake_runner)
+
+    result = adapter.fetch_account(
+        CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "ranked-user", "job_id": JOB_ID},
+            expected_count=2,
+        )
+    )
+
+    assert (result.status, result.complete) == ("failed", False)
+    assert result.items == []
 
 
 def test_fetch_account_binds_each_note_to_the_verified_profile_owner(adapter_factory) -> None:

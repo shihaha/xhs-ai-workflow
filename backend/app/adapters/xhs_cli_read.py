@@ -228,6 +228,9 @@ class XhsCliReadAdapter:
     def fetch_account(self, request: CollectionRequest) -> CollectionResult:
         _require_bounded_expected_count(request, maximum=1001)
         parameters = self._account_parameters(request)
+        profile: dict[str, Any] | None = None
+        profile_failure: XhsCliReadError | None = None
+        profile_source = "user"
         try:
             profile = self._invoke(["user", parameters.user_id])
             if not isinstance(profile, dict):
@@ -237,16 +240,27 @@ class XhsCliReadAdapter:
                 return _failed_result(request, error.category)
             profile = self._verified_current_profile(parameters.user_id)
             if profile is None:
-                return _failed_result(request, error.category)
+                profile_failure = error
         try:
             notes = self._invoke(["user-posts", parameters.user_id])
         except XhsCliReadError as error:
             return _failed_result(request, error.category)
+        if profile is None:
+            profile = _profile_from_consistent_post_authors(
+                notes, requested_user_id=parameters.user_id
+            )
+            if profile is None:
+                return _failed_result(
+                    request,
+                    profile_failure.category if profile_failure else "response_unusable",
+                )
+            profile_source = "user-posts-author"
         result = _normalize_account(
             profile=profile,
             notes=notes,
             request=request,
             requested_user_id=parameters.user_id,
+            profile_source=profile_source,
         )
         return self._bounded_result(request, result)
 
@@ -415,10 +429,11 @@ def _normalize_account(
     notes: JsonPayload,
     request: CollectionRequest,
     requested_user_id: str,
+    profile_source: str = "user",
 ) -> CollectionResult:
     clean_profile = redact_credentials(profile)
     clean_notes = redact_credentials(notes)
-    profile_response_ref = _response_ref("user", clean_profile)
+    profile_response_ref = _response_ref(profile_source, clean_profile)
     notes_response_ref = _response_ref("user-posts", clean_notes)
     shared_raw = {
         "responses": {"profile": clean_profile, "notes": clean_notes},
@@ -480,6 +495,7 @@ def _normalize_account(
                 source_url=f"{_XHS_PUBLIC_ORIGIN}/user/profile/{quote(profile_user_id)}",
                 raw_evidence={
                     "response_ref": profile_response_ref,
+                    "profile_source": profile_source,
                     "profile": profile_row,
                 },
                 data=_profile_public_data(profile_row, user_id=profile_user_id),
@@ -660,6 +676,48 @@ def _note_rows(payload: JsonPayload) -> list[Any] | None:
         if isinstance(candidate, list):
             return candidate
     return None
+
+
+def _profile_from_consistent_post_authors(
+    payload: JsonPayload, *, requested_user_id: str
+) -> dict[str, Any] | None:
+    """Build only the minimal profile facts observed on every public post row."""
+    requested_identity = _safe_token(requested_user_id)
+    rows = _note_rows(redact_credentials(payload))
+    if requested_identity is None or not rows:
+        return None
+    nicknames: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        note_card = _note_card(row)
+        try:
+            owner_id = canonical_owner_id(row, note_card)
+        except OwnerIdentityError:
+            return None
+        if owner_id != requested_identity:
+            return None
+        user = note_card.get("user")
+        if not isinstance(user, dict):
+            return None
+        nickname = _first_public_value(
+            (user,), ("nickname", "nickName", "nick_name")
+        )
+        if not isinstance(nickname, str) or not nickname.strip():
+            return None
+        nicknames.add(nickname.strip())
+    if len(nicknames) != 1:
+        return None
+    return {
+        "userPageData": {
+            "basicInfo": {
+                "userId": requested_identity,
+                "nickname": next(iter(nicknames)),
+            }
+        },
+        "userInfo": {"userId": requested_identity},
+        "evidenceSource": "user-posts-author",
+    }
 
 
 def _note_card(row: dict[str, Any]) -> dict[str, Any]:
