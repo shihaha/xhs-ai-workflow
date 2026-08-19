@@ -390,3 +390,10 @@ Status: physical-device collection passed its read-only navigation/link-capture 
 - `python -m compileall -q backend/app backend/tests` and `git diff --check` passed. The device's original `com.iflytek.inputmethod/.FlyIME` was confirmed restored after the live runs.
 
 Remaining live boundary: prepare contained image manifests for the two observed product URLs and rerun exact verification before using this shop evidence for opportunity creation.
+
+### Same-batch verification continuation
+
+- The two captured detail screenshots were visually confirmed as distinct real product pages, then copied into `android-live-uat-20260820-09/verification/ranked-account` with exact same-run source links and SHA-256 manifests.
+- The existing strict verifier returned expected/discovered/verified/missing `2/2/2/0` and `complete=true`; no placeholder image or fabricated URL was used.
+- This does not retroactively change job `4689ae2b-5021-408f-affe-45ed889688de`: its durable state remains `needs_human/product_evidence_verification_pending`. Live evidence showed why the current pre-collection verification input cannot close the job: each share pass returned different `xhslink.com` short links, and the account's visible product set also changed between runs.
+- The next ranked-account evidence step was also bounded and truthful. The authenticated session probe passed; two candidate `user-posts` calls each returned five public notes, while both paired `user` profile calls failed as `cli_failed` (after one initial 20-second timeout). No profile or note database facts were written, because the trust contract requires a verified profile and does not permit synthesizing it from request input.
