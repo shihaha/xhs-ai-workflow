@@ -66,7 +66,13 @@ def test_vision_uses_only_configured_model_and_returns_advisory_assessment() -> 
             headers={"x-request-id": "vision-request-1"},
             json={
                 "choices": [{"message": {"content": _assessment_json()}}],
-                "usage": {"total_tokens": 12},
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 4,
+                    "total_tokens": 12,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                    "completion_tokens_details": {"reasoning_tokens": 0},
+                },
             },
         )
 
@@ -101,6 +107,11 @@ def test_vision_uses_only_configured_model_and_returns_advisory_assessment() -> 
         "data:image/png;base64,"
     )
     assert result.output.plan_match is True
+    assert result.usage == {
+        "prompt_tokens": 8,
+        "completion_tokens": 4,
+        "total_tokens": 12,
+    }
     assert result.raw_evidence["provider_request_id"] == "vision-request-1"
     assert "top-secret" not in json.dumps(result.model_dump(mode="json"))
 

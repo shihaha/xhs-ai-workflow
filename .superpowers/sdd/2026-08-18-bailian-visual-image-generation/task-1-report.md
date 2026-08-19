@@ -125,3 +125,19 @@ python -m pytest backend/tests/media -q
 ```
 
 Real image generation is now proven through managed material. Real visual analysis remains failed/pending until a vision-only or complete live rerun passes.
+
+## Live-discovered vision usage projection fix
+
+The next vision live attempt proved the schema instruction worked: qwen-vl-max returned an object that passed strict `VisualAssessment`. Local completion then failed on the official OpenAI-compatible usage envelope, which contains integer `prompt_tokens`, `completion_tokens` and `total_tokens` plus nested `prompt_tokens_details` and `completion_tokens_details`. The shared validator is intentionally numeric-only and correctly rejected the nested dictionaries.
+
+MockTransport reproduced that exact usage shape before the fix. The vision adapter now selects only the three official numeric counters and passes them to the unchanged shared validator. Nested detail objects are ignored; arbitrary types are not accepted. Text and image adapters were not changed, and no additional provider shapes were added.
+
+```text
+python -m pytest backend/tests/media/test_bailian_media.py::test_vision_uses_only_configured_model_and_returns_advisory_assessment -q
+1 passed in 0.17s
+
+python -m pytest backend/tests/media -q
+57 passed in 13.45s
+```
+
+Real image generation remains proven. The vision schema is now proven against the live provider, but durable visual completion still requires one vision-only rerun after this usage fix.

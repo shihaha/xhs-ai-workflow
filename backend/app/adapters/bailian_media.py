@@ -41,6 +41,11 @@ _PENDING_STATUSES = {
     "SUSPENDED",
 }
 _MIME_BY_FORMAT = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
+_VISION_NUMERIC_USAGE_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+)
 _IMAGE_NUMERIC_USAGE_FIELDS = (
     "image_count",
     "input_tokens",
@@ -249,7 +254,17 @@ class BailianVisionAdapter(_BailianMediaClient):
             assessment = VisualAssessment.model_validate(
                 validated.model_dump(mode="json")
             )
-            usage = _validated_usage(envelope.get("usage", {}))
+            raw_usage = envelope.get("usage", {})
+            projected_usage = (
+                {
+                    key: raw_usage[key]
+                    for key in _VISION_NUMERIC_USAGE_FIELDS
+                    if key in raw_usage
+                }
+                if isinstance(raw_usage, dict)
+                else raw_usage
+            )
+            usage = _validated_usage(projected_usage)
         except (ValueError, TypeError, KeyError, IndexError, ValidationError) as error:
             raise BailianMediaOutputInvalid(
                 "Bailian returned invalid visual output.", attempts=attempts
