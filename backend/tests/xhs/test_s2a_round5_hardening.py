@@ -80,6 +80,47 @@ _FACT_IMMUTABILITY_TRIGGERS = {
     """,
 }
 
+_PROFILE_PUBLIC_COUNTER_FIELDS = (
+    "followers_count",
+    "following_count",
+    "liked_count",
+    "fans",
+    "follows",
+)
+_NOTE_PUBLIC_COUNTER_FIELDS = (
+    "liked_count",
+    "collect_count",
+    "comment_count",
+    "likedCount",
+    "collectCount",
+    "commentCount",
+)
+_PUBLIC_COUNTER_TYPE_DRIFT_CASES = [
+    (
+        "xhs_account_profiles",
+        "public_stats_json",
+        "user_id",
+        "round5-user",
+        _PROFILE_PUBLIC_COUNTER_FIELDS,
+        field,
+        replacement,
+    )
+    for field in _PROFILE_PUBLIC_COUNTER_FIELDS
+    for replacement in (1.0, True)
+] + [
+    (
+        "xhs_account_notes",
+        "public_interactions_json",
+        "note_id",
+        "note-1-0",
+        _NOTE_PUBLIC_COUNTER_FIELDS,
+        field,
+        replacement,
+    )
+    for field in _NOTE_PUBLIC_COUNTER_FIELDS
+    for replacement in (1.0, True)
+]
+
 
 class _VersionedAccountAdapter:
     def __init__(self) -> None:
@@ -109,9 +150,10 @@ class _VersionedAccountAdapter:
                     "title": f"Title {version}-{index}",
                     "summary": f"Summary {version}-{index}",
                     "published_at": f"2026-08-{18 + version:02d}T10:00:00Z",
-                    "liked_count": version * 10 + index,
-                    "collect_count": version * 20 + index,
-                    "comment_count": version * 30 + index,
+                    **{
+                        field: version + index
+                        for field in _NOTE_PUBLIC_COUNTER_FIELDS
+                    },
                 },
             )
             for index in range(2)
@@ -136,9 +178,10 @@ class _VersionedAccountAdapter:
                         "user_id": user_id,
                         "nickname": f"Name {version}",
                         "bio": f"Bio {version}",
-                        "followers_count": version * 100,
-                        "following_count": version * 10,
-                        "liked_count": version * 1000,
+                        **{
+                            field: version
+                            for field in _PROFILE_PUBLIC_COUNTER_FIELDS
+                        },
                     },
                 ),
                 *notes,
@@ -181,6 +224,250 @@ def _restore_fact_freeze_triggers(service: XhsCollectionService) -> None:
     with service.database.engine.begin() as connection:
         for definition in _FACT_IMMUTABILITY_TRIGGERS.values():
             connection.execute(text(definition))
+
+
+def _replace_public_counters(
+    service: XhsCollectionService,
+    *,
+    table: str,
+    column: str,
+    key_column: str,
+    key: str,
+    payload: dict[str, object],
+) -> None:
+    _drop_fact_freeze_triggers(service)
+    with service.database.engine.begin() as connection:
+        connection.execute(
+            text(
+                f"UPDATE {table} SET {column}=:value "
+                f"WHERE {key_column}=:key"
+            ),
+            {
+                "value": json.dumps(payload, ensure_ascii=False),
+                "key": key,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "table",
+        "column",
+        "key_column",
+        "key",
+        "fields",
+        "changed_field",
+        "replacement",
+    ),
+    _PUBLIC_COUNTER_TYPE_DRIFT_CASES,
+)
+def test_runtime_rejects_float_and_bool_drift_for_every_public_counter_field(
+    tmp_path: Path,
+    table: str,
+    column: str,
+    key_column: str,
+    key: str,
+    fields: tuple[str, ...],
+    changed_field: str,
+    replacement: object,
+) -> None:
+    service = _service(tmp_path)
+    _collect(service)
+    payload: dict[str, object] = {field: 1 for field in fields}
+    payload[changed_field] = replacement
+    _replace_public_counters(
+        service,
+        table=table,
+        column=column,
+        key_column=key_column,
+        key=key,
+        payload=payload,
+    )
+
+    with pytest.raises(CollectionFactNotFound):
+        service.get_profile("round5-user")
+    with pytest.raises(CollectionFactNotFound):
+        service.list_account_notes("round5-user")
+    service.database.close()
+
+
+@pytest.mark.parametrize(
+    (
+        "table",
+        "column",
+        "key_column",
+        "key",
+        "fields",
+        "mutation",
+    ),
+    [
+        (
+            "xhs_account_profiles",
+            "public_stats_json",
+            "user_id",
+            "round5-user",
+            _PROFILE_PUBLIC_COUNTER_FIELDS,
+            "nested",
+        ),
+        (
+            "xhs_account_profiles",
+            "public_stats_json",
+            "user_id",
+            "round5-user",
+            _PROFILE_PUBLIC_COUNTER_FIELDS,
+            "null",
+        ),
+        (
+            "xhs_account_profiles",
+            "public_stats_json",
+            "user_id",
+            "round5-user",
+            _PROFILE_PUBLIC_COUNTER_FIELDS,
+            "missing",
+        ),
+        (
+            "xhs_account_profiles",
+            "public_stats_json",
+            "user_id",
+            "round5-user",
+            _PROFILE_PUBLIC_COUNTER_FIELDS,
+            "extra",
+        ),
+        (
+            "xhs_account_notes",
+            "public_interactions_json",
+            "note_id",
+            "note-1-0",
+            _NOTE_PUBLIC_COUNTER_FIELDS,
+            "nested",
+        ),
+        (
+            "xhs_account_notes",
+            "public_interactions_json",
+            "note_id",
+            "note-1-0",
+            _NOTE_PUBLIC_COUNTER_FIELDS,
+            "null",
+        ),
+        (
+            "xhs_account_notes",
+            "public_interactions_json",
+            "note_id",
+            "note-1-0",
+            _NOTE_PUBLIC_COUNTER_FIELDS,
+            "missing",
+        ),
+        (
+            "xhs_account_notes",
+            "public_interactions_json",
+            "note_id",
+            "note-1-0",
+            _NOTE_PUBLIC_COUNTER_FIELDS,
+            "extra",
+        ),
+    ],
+)
+def test_runtime_rejects_nested_null_and_inexact_public_counter_fields(
+    tmp_path: Path,
+    table: str,
+    column: str,
+    key_column: str,
+    key: str,
+    fields: tuple[str, ...],
+    mutation: str,
+) -> None:
+    service = _service(tmp_path)
+    _collect(service)
+    payload: dict[str, object] = {field: 1 for field in fields}
+    if mutation == "nested":
+        payload[fields[0]] = {"value": 1}
+    elif mutation == "null":
+        payload[fields[0]] = None
+    elif mutation == "missing":
+        payload.pop(fields[0])
+    else:
+        payload["unexpected_count"] = 1
+    _replace_public_counters(
+        service,
+        table=table,
+        column=column,
+        key_column=key_column,
+        key=key,
+        payload=payload,
+    )
+
+    with pytest.raises(CollectionFactNotFound):
+        service.get_profile("round5-user")
+    with pytest.raises(CollectionFactNotFound):
+        service.list_account_notes("round5-user")
+    service.database.close()
+
+
+@pytest.mark.parametrize(
+    (
+        "table",
+        "column",
+        "key_column",
+        "key",
+        "fields",
+        "changed_field",
+        "replacement",
+    ),
+    _PUBLIC_COUNTER_TYPE_DRIFT_CASES,
+)
+def test_marker_restart_rejects_float_and_bool_public_counter_drift(
+    tmp_path: Path,
+    table: str,
+    column: str,
+    key_column: str,
+    key: str,
+    fields: tuple[str, ...],
+    changed_field: str,
+    replacement: object,
+) -> None:
+    service = _service(tmp_path)
+    _collect(service)
+    database_path = service.database.database_path
+    runtime = service.runtime_dir
+    payload: dict[str, object] = {field: 1 for field in fields}
+    payload[changed_field] = replacement
+    _replace_public_counters(
+        service,
+        table=table,
+        column=column,
+        key_column=key_column,
+        key=key,
+        payload=payload,
+    )
+    _restore_fact_freeze_triggers(service)
+    service.database.close()
+
+    with pytest.raises(SchemaMigrationError, match="content binding"):
+        Database(database_path, runtime_dir=runtime)
+
+
+def test_exact_integer_public_counters_survive_runtime_and_marker_restart(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    _collect(service)
+
+    assert service.get_profile("round5-user").public_stats == {
+        field: 1 for field in _PROFILE_PUBLIC_COUNTER_FIELDS
+    }
+    assert service.list_account_notes("round5-user")[0].public_interactions == {
+        field: 1 for field in _NOTE_PUBLIC_COUNTER_FIELDS
+    }
+    service.database.close()
+
+    restarted = _service(tmp_path)
+    assert restarted.get_profile("round5-user").public_stats == {
+        field: 1 for field in _PROFILE_PUBLIC_COUNTER_FIELDS
+    }
+    assert restarted.list_account_notes("round5-user")[0].public_interactions == {
+        field: 1 for field in _NOTE_PUBLIC_COUNTER_FIELDS
+    }
+    restarted.database.close()
 
 
 @pytest.mark.parametrize(

@@ -38,8 +38,11 @@ from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_own
 from backend.app.features.xhs.redaction import redact_credentials
 from backend.app.features.xhs.schemas import (
     AccountEvidenceBinding,
+    NOTE_PUBLIC_COUNTER_FIELDS,
+    PROFILE_PUBLIC_COUNTER_FIELDS,
     normalize_exact_account_result,
     persist_exact_account_result,
+    public_counter_json_matches,
 )
 from backend.app.features.xhs.staging_cleanup import (
     TrustedXhsArtifactStore,
@@ -459,7 +462,7 @@ class XhsCollectionService:
                 "source_url": profile.source_url,
                 "nickname": profile.nickname,
                 "bio": profile.bio,
-                "public_stats_json": dict(profile.public_stats_json),
+                "public_stats_json": profile.public_stats_json,
                 "raw_evidence": dict(profile.raw_evidence),
                 "raw_digest": profile.raw_digest,
                 "collection_job_id": profile.collection_job_id,
@@ -474,7 +477,7 @@ class XhsCollectionService:
                     "title": row.title,
                     "summary": row.summary,
                     "published_at": row.published_at,
-                    "public_interactions_json": dict(row.public_interactions_json),
+                    "public_interactions_json": row.public_interactions_json,
                     "raw_evidence": dict(row.raw_evidence),
                     "raw_digest": row.raw_digest,
                     "collection_job_id": row.collection_job_id,
@@ -483,9 +486,24 @@ class XhsCollectionService:
                 }
                 for row in records
             ]
+            expected_profile = expected.profile.model_dump()
+            expected_notes = [note.model_dump() for note in expected.notes]
+            counters_match = public_counter_json_matches(
+                actual_profile["public_stats_json"],
+                expected_profile["public_stats_json"],
+                allowed_fields=PROFILE_PUBLIC_COUNTER_FIELDS,
+            ) and len(actual_notes) == len(expected_notes) and all(
+                public_counter_json_matches(
+                    actual["public_interactions_json"],
+                    formal["public_interactions_json"],
+                    allowed_fields=NOTE_PUBLIC_COUNTER_FIELDS,
+                )
+                for actual, formal in zip(actual_notes, expected_notes, strict=True)
+            )
             if (
-                actual_profile != expected.profile.model_dump()
-                or actual_notes != [note.model_dump() for note in expected.notes]
+                not counters_match
+                or actual_profile != expected_profile
+                or actual_notes != expected_notes
             ):
                 raise CollectionFactNotFound(
                     f"Account facts for {user_id} do not match formal evidence."

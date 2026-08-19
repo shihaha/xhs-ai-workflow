@@ -576,3 +576,84 @@ not_run
 
 `XHS_LIVE_TEST=1`, the target inputs, and trusted external authenticated state
 were not supplied. This round makes no real-account or live-persisted-fact claim.
+
+# Stabilization S2A report — Type Stabilization
+
+Date: 2026-08-19
+
+## Scope and defect
+
+This user-approved S2A-only revision closes one Important type-stability defect
+in normalized public counters. Python mapping equality treated JSON integers,
+floats, and booleans as equal in cases such as `10 == 10.0` and `True == 1`.
+Consequently, a database counter object could differ from the verified artifact
+at the JSON type level yet pass the previous complete-snapshot comparison.
+Runtime reads could then return that drifted value through the API, and a marked
+restart could accept the same drift as certified content.
+
+The audit covers every public counter currently admitted by the S2A artifact
+schema, not one special case:
+
+- profile: `followers_count`, `following_count`, `liked_count`, `fans`, and
+  `follows`;
+- note: `liked_count`, `collect_count`, `comment_count`, `likedCount`,
+  `collectCount`, and `commentCount`.
+
+S2B analysis semantics, Bailian, and the untracked `research/` tree remain
+outside this revision.
+
+## Type-stable contract
+
+- One shared public-counter validator/comparator is used by both the runtime
+  formal-read gate and the marker-present migration/restart certification path.
+- A counter object must be a non-null JSON object. Every present key must be in
+  the exact profile or note allowlist, and every value must be a non-negative
+  Python `int` whose exact type is not `bool`. Nested objects, arrays, strings,
+  floats, booleans, and explicit `null` values are rejected.
+- Optional source counters remain represented by absence. Canonical sorted JSON
+  bytes preserve the admitted JSON type and require the persisted and
+  artifact-derived field sets and values to match exactly.
+- Runtime database type drift fails closed as `CollectionFactNotFound`; the
+  normal profile and note APIs return `404` and never serialize the drifted
+  counter payload. The same drift makes marked startup fail with a content-
+  binding `SchemaMigrationError`.
+
+## TDD evidence
+
+Before implementation, the new profile/note, runtime/restart, and HTTP API
+selection produced `46 failed, 9 passed, 63 deselected`. The 46 failures are the
+float/bool equality defects across all eleven fields; the nine already-passing
+controls show that older whole-object equality rejected nested, null, missing,
+and extra shapes and admitted exact integers.
+
+After the shared type-stable comparison was installed, the identical selection
+produced `55 passed, 63 deselected`. The complete affected round-5 and collection
+API files then produced `118 passed`.
+
+## Final controlled verification
+
+- Focused XHS, Settings, and health suites: `549 passed, 1 skipped`.
+- Dedicated round-5 suite: `112 passed`; three consecutive fresh-process repeat
+  runs also produced `112 passed` each.
+- Analysis fact-freeze regression: `90 passed, 1 skipped`; production analysis
+  code was not changed.
+- Guarded live contract: `2 passed, 1 skipped`; the skip is exactly
+  `not_run: XHS_LIVE_TEST=1 was not supplied`.
+- `scripts/verify.ps1`: exit 0; full backend `1226 passed, 2 skipped`; Python
+  compile passed; frontend `47 passed`; production build passed; controlled
+  fresh-runtime E2E `1 passed`; npm audit found `0 vulnerabilities`;
+  tracked-secret and release-boundary scans passed.
+- Independent diff, staged-scope, and counter-field scans passed. No S2B,
+  Bailian, analysis implementation, or `research/` file is included.
+
+## Live status
+
+Real authenticated XHS execution remains exactly:
+
+```text
+not_run
+```
+
+No external authenticated state or target inputs were supplied, and
+`XHS_LIVE_TEST=1` was not enabled. This revision makes no real-account or
+live-persisted-fact claim.

@@ -3122,7 +3122,10 @@ def _xhs_account_fact_content_data_valid(
     from backend.app.features.xhs.schemas import (
         AccountEvidenceBinding,
         AccountEvidencePersistenceError,
+        NOTE_PUBLIC_COUNTER_FIELDS,
+        PROFILE_PUBLIC_COUNTER_FIELDS,
         normalize_exact_account_result,
+        public_counter_json_matches,
     )
     from backend.app.features.xhs.staging_cleanup import (
         TrustedXhsArtifactStore,
@@ -3288,10 +3291,28 @@ def _xhs_account_fact_content_data_valid(
                     }
                     for note in notes
                 ]
+                expected_profile = normalized.profile.model_dump()
+                expected_notes = [note.model_dump() for note in normalized.notes]
+                counters_match = public_counter_json_matches(
+                    actual_profile["public_stats_json"],
+                    expected_profile["public_stats_json"],
+                    allowed_fields=PROFILE_PUBLIC_COUNTER_FIELDS,
+                ) and len(actual_notes) == len(expected_notes) and all(
+                    public_counter_json_matches(
+                        actual["public_interactions_json"],
+                        formal["public_interactions_json"],
+                        allowed_fields=NOTE_PUBLIC_COUNTER_FIELDS,
+                    )
+                    for actual, formal in zip(
+                        actual_notes,
+                        expected_notes,
+                        strict=True,
+                    )
+                )
                 if (
-                    actual_profile != normalized.profile.model_dump()
-                    or actual_notes
-                    != [note.model_dump() for note in normalized.notes]
+                    not counters_match
+                    or actual_profile != expected_profile
+                    or actual_notes != expected_notes
                 ):
                     return False
         return True

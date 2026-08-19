@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 
 import httpx
 import pytest
+from sqlalchemy import text
 
 from backend.app.adapters.contracts import CollectionItem, CollectionResult
 from backend.app.main import create_app
@@ -97,3 +99,116 @@ async def test_normalized_read_apis_never_return_raw_evidence(tmp_path: Path) ->
     assert notes.json()[0]["note_id"] == "n1"
     assert "raw_evidence" not in profile.json()
     assert "raw_evidence" not in notes.json()[0]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("table", "column", "key_column", "key", "payload", "endpoint"),
+    [
+        (
+            "xhs_account_profiles",
+            "public_stats_json",
+            "user_id",
+            "counter-user",
+            {"followers_count": 1.0},
+            "/api/v1/accounts/counter-user/profile",
+        ),
+        (
+            "xhs_account_notes",
+            "public_interactions_json",
+            "note_id",
+            "counter-note",
+            {"liked_count": True},
+            "/api/v1/accounts/counter-user/notes",
+        ),
+    ],
+)
+async def test_public_counter_json_type_drift_is_never_returned_by_api(
+    tmp_path: Path,
+    table: str,
+    column: str,
+    key_column: str,
+    key: str,
+    payload: dict[str, object],
+    endpoint: str,
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    app = create_app(Settings(
+        runtime_dir=runtime_dir,
+        database_path=runtime_dir / "db.sqlite3",
+    ))
+    app.state.xhs_collection_service._submitter = lambda *_args: None
+
+    class Adapter:
+        def fetch_account(self, request):
+            user_id = request.parameters["user_id"]
+            return CollectionResult(
+                status="succeeded",
+                items=[
+                    CollectionItem(
+                        id=f"profile:{user_id}",
+                        kind="profile",
+                        source_url=(
+                            f"https://www.xiaohongshu.com/user/profile/{user_id}"
+                        ),
+                        raw_evidence={"profile": {"user_id": user_id}},
+                        data={
+                            "user_id": user_id,
+                            "nickname": "Counter",
+                            "followers_count": 1,
+                        },
+                    ),
+                    CollectionItem(
+                        id="note:counter-note",
+                        kind="note",
+                        source_url=(
+                            "https://www.xiaohongshu.com/explore/counter-note"
+                        ),
+                        raw_evidence={
+                            "row": {
+                                "note_id": "counter-note",
+                                "user_id": user_id,
+                            }
+                        },
+                        data={
+                            "note_id": "counter-note",
+                            "user_id": user_id,
+                            "title": "Counter",
+                            "liked_count": 1,
+                        },
+                    ),
+                ],
+                expected_count_known=True,
+                expected_count=2,
+                succeeded_count=2,
+                observed_count=2,
+                overflow_count=0,
+                complete=True,
+            )
+
+    service = app.state.xhs_collection_service
+    service.adapter = Adapter()
+    queued = service.submit_account("counter-user", 1)
+    service.execute(queued.id)
+    with service.database.engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER ck_xhs_profile_immutable_update"))
+        connection.execute(text("DROP TRIGGER ck_xhs_note_immutable_update"))
+        connection.execute(
+            text(
+                f"UPDATE {table} SET {column}=:value "
+                f"WHERE {key_column}=:key"
+            ),
+            {
+                "value": json.dumps(payload),
+                "key": key,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.get(endpoint)
+
+    assert response.status_code == 404
+    service.database.close()

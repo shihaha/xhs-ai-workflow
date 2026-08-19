@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,6 +20,23 @@ from backend.app.features.xhs.constants import (
 from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
 from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
 from backend.app.models.jobs import JobArtifactRecord, JobRecord
+
+
+PROFILE_PUBLIC_COUNTER_FIELDS = (
+    "followers_count",
+    "following_count",
+    "liked_count",
+    "fans",
+    "follows",
+)
+NOTE_PUBLIC_COUNTER_FIELDS = (
+    "liked_count",
+    "collect_count",
+    "comment_count",
+    "likedCount",
+    "collectCount",
+    "commentCount",
+)
 
 
 class _StrictRead(BaseModel):
@@ -110,6 +128,57 @@ class AccountEvidencePersistenceError(ValueError):
     """The caller did not present an exact result tied to a reserved artifact."""
 
 
+def public_counter_json_matches(
+    actual: object,
+    expected: object,
+    *,
+    allowed_fields: tuple[str, ...],
+) -> bool:
+    """Compare one non-null public-counter object without Python numeric coercion.
+
+    Counter objects may omit fields that were absent from the source, but every
+    present key must be allowlisted and every value must be a non-negative,
+    non-bool JSON integer.  Canonical JSON bytes preserve the integer type and
+    make the persisted and artifact-derived field sets exact.
+    """
+
+    actual_json = _canonical_public_counter_json(
+        actual,
+        allowed_fields=allowed_fields,
+    )
+    expected_json = _canonical_public_counter_json(
+        expected,
+        allowed_fields=allowed_fields,
+    )
+    return (
+        actual_json is not None
+        and expected_json is not None
+        and actual_json == expected_json
+    )
+
+
+def _canonical_public_counter_json(
+    value: object,
+    *,
+    allowed_fields: tuple[str, ...],
+) -> bytes | None:
+    if not isinstance(value, dict):
+        return None
+    allowed = frozenset(allowed_fields)
+    if (
+        len(allowed) != len(allowed_fields)
+        or not set(value).issubset(allowed)
+        or any(type(counter) is not int or counter < 0 for counter in value.values())
+    ):
+        return None
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def persist_exact_account_result(
     session: Session,
     *,
@@ -178,11 +247,7 @@ def normalize_exact_account_result(
         bio=_public_text(profile_item.data, "bio", "description", "desc"),
         public_stats_json=_public_numbers(
             profile_item.data,
-            "followers_count",
-            "following_count",
-            "liked_count",
-            "fans",
-            "follows",
+            *PROFILE_PUBLIC_COUNTER_FIELDS,
         ),
         raw_evidence=dict(profile_item.raw_evidence),
         raw_digest=profile_digest,
@@ -207,12 +272,7 @@ def normalize_exact_account_result(
                 ),
                 public_interactions_json=_public_numbers(
                     item.data,
-                    "liked_count",
-                    "collect_count",
-                    "comment_count",
-                    "likedCount",
-                    "collectCount",
-                    "commentCount",
+                    *NOTE_PUBLIC_COUNTER_FIELDS,
                 ),
                 raw_evidence=dict(item.raw_evidence),
                 raw_digest=digest,
@@ -297,7 +357,7 @@ def _apply_profile_item(
     record.nickname = _public_text(item.data, "nickname")
     record.bio = _public_text(item.data, "bio", "description", "desc")
     record.public_stats_json = _public_numbers(
-        item.data, "followers_count", "following_count", "liked_count", "fans", "follows"
+        item.data, *PROFILE_PUBLIC_COUNTER_FIELDS
     )
     _apply_evidence(record, item, binding)
 
@@ -311,7 +371,7 @@ def _apply_note_item(
     record.summary = _public_text(item.data, "summary", "description", "desc")
     record.published_at = _public_text(item.data, "published_at", "publish_time", "publishTime")
     record.public_interactions_json = _public_numbers(
-        item.data, "liked_count", "collect_count", "comment_count", "likedCount", "collectCount", "commentCount"
+        item.data, *NOTE_PUBLIC_COUNTER_FIELDS
     )
     _apply_evidence(record, item, binding)
 
