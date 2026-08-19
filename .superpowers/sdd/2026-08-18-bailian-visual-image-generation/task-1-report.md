@@ -100,3 +100,28 @@ python -m pytest backend/tests/media -q
 ```
 
 The next complete real run must still prove managed image download/persistence and visual analysis. No live pass is claimed yet.
+
+## Live-discovered vision schema-instruction fix
+
+The third real run proved the complete image path: wan2.6 submission, polling, `SUCCEEDED`, remote download, byte validation and managed material persistence all completed. The subsequent qwen-vl-max call returned syntactically valid JSON, but used self-selected Chinese keys such as `匹配度`, `文字可读性`, `明显瑕疵` and `安全问题`. Strict `VisualAssessment` rejected that object, so real vision success is not claimed.
+
+The cause was request construction, not Pydantic: `response_format=json_object` requires JSON syntax but does not define field names. The vision request previously sent only the assessment prompt and no schema contract.
+
+TDD RED showed the outbound messages lacked a system schema instruction. The minimal fix prepends a fixed system message that:
+
+- explicitly requests JSON only;
+- embeds the exact `schema.model_json_schema()` object;
+- requires exact property names and types;
+- forbids translated, renamed and additional keys.
+
+The caller cannot supply or replace that system instruction. Response validation remains the same strict Pydantic path; no Chinese-key mapping or permissive parser was added.
+
+```text
+python -m pytest backend/tests/media/test_bailian_media.py::test_vision_uses_only_configured_model_and_returns_advisory_assessment -q
+1 passed in 0.15s
+
+python -m pytest backend/tests/media -q
+57 passed in 12.84s
+```
+
+Real image generation is now proven through managed material. Real visual analysis remains failed/pending until a vision-only or complete live rerun passes.

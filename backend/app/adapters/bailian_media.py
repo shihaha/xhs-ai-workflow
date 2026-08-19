@@ -211,9 +211,24 @@ class BailianVisionAdapter(_BailianMediaClient):
             }
             for image in request.images
         )
+        schema_instruction = (
+            "Return exactly one JSON object using the exact property names and types "
+            "in JSON_SCHEMA. Do not translate or rename keys. Additional properties "
+            "are forbidden. Return JSON only, without Markdown or explanation.\n"
+            "JSON_SCHEMA:\n"
+            + json.dumps(
+                schema.model_json_schema(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
         body = {
             "model": self.model,
-            "messages": [{"role": "user", "content": content}],
+            "messages": [
+                {"role": "system", "content": schema_instruction},
+                {"role": "user", "content": content},
+            ],
             "response_format": {"type": "json_object"},
         }
         with self._authorized_client() as client:

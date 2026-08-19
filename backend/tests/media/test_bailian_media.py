@@ -82,7 +82,22 @@ def test_vision_uses_only_configured_model_and_returns_advisory_assessment() -> 
     body = json.loads(seen[0].content)
     assert seen[0].url == "https://trusted.example/compatible-mode/v1/chat/completions"
     assert body["model"] == "qwen-vl-max"
-    assert body["messages"][0]["content"][1]["image_url"]["url"].startswith(
+    assert body["messages"][0]["role"] == "system"
+    system_instruction = body["messages"][0]["content"]
+    assert "JSON" in system_instruction
+    schema_payload = json.loads(system_instruction.split("JSON_SCHEMA:\n", 1)[1])
+    assert schema_payload == VisualAssessment.model_json_schema()
+    assert schema_payload["additionalProperties"] is False
+    assert set(schema_payload["properties"]) == {
+        "summary",
+        "plan_match",
+        "text_readability",
+        "defects",
+        "safety_issues",
+        "suggestions",
+    }
+    assert body["messages"][1]["role"] == "user"
+    assert body["messages"][1]["content"][1]["image_url"]["url"].startswith(
         "data:image/png;base64,"
     )
     assert result.output.plan_match is True
