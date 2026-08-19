@@ -61,3 +61,32 @@ def test_xhs_cli_settings_use_explicit_nonduplicated_environment_names(
     assert settings.xhs_cli_timeout_seconds == 7.5
     assert settings.xhs_cli_state_dir == state_dir.resolve()
     assert settings.xhs_cli_max_output_bytes == 4096
+
+
+def test_bailian_text_vision_and_image_settings_are_independent_and_bounded(
+    tmp_path: Path,
+) -> None:
+    """Changing one media capability must not silently redirect the other two."""
+    settings = Settings(
+        runtime_dir=tmp_path / "runtime",
+        bailian_text_model="text-model",
+        bailian_vision_model="vision-model",
+        bailian_image_model="image-model",
+        bailian_base_url="https://text.example/v1",
+        bailian_vision_base_url="https://vision.example/v1",
+        bailian_image_base_url="https://image.example/api/v1",
+        bailian_vision_timeout_seconds=11,
+        bailian_image_timeout_seconds=22,
+    )
+
+    assert settings.bailian_text_model == "text-model"
+    assert settings.bailian_vision_model == "vision-model"
+    assert settings.bailian_image_model == "image-model"
+    assert settings.bailian_base_url == "https://text.example/v1"
+    assert settings.bailian_vision_base_url == "https://vision.example/v1"
+    assert settings.bailian_image_base_url == "https://image.example/api/v1"
+    assert settings.bailian_vision_timeout_seconds == 11
+    assert settings.bailian_image_timeout_seconds == 22
+
+    with pytest.raises(ValidationError):
+        Settings(runtime_dir=tmp_path / "invalid", bailian_image_max_bytes=0)

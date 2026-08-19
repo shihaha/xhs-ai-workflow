@@ -58,6 +58,24 @@ class Settings(BaseSettings):
     bailian_text_model: str = "deepseek-v4-flash"
     bailian_max_attempts: int = Field(default=3, ge=1, le=10)
     bailian_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    bailian_vision_base_url: str = (
+        "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    bailian_vision_model: str = "qwen-vl-max"
+    bailian_vision_max_attempts: int = Field(default=3, ge=1, le=10)
+    bailian_vision_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    bailian_image_base_url: str = "https://dashscope.aliyuncs.com/api/v1"
+    bailian_image_model: str = "wan2.6-t2i"
+    bailian_image_max_attempts: int = Field(default=3, ge=1, le=10)
+    bailian_image_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    bailian_image_poll_deadline_seconds: float = Field(default=300.0, gt=0, le=1800)
+    bailian_image_poll_interval_seconds: float = Field(default=3.0, ge=0, le=30)
+    bailian_image_max_bytes: int = Field(
+        default=20 * 1024 * 1024, ge=1024, le=50 * 1024 * 1024
+    )
+    bailian_image_max_pixels: int = Field(
+        default=16_777_216, ge=1, le=67_108_864
+    )
     artifact_cleanup_poll_seconds: float = Field(
         default=30.0, ge=1.0, le=3600.0
     )

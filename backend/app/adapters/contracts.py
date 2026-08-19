@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
+import math
 from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
+from PIL import Image, UnidentifiedImageError
 from pydantic import (
     AnyHttpUrl,
     BaseModel,
@@ -223,6 +227,148 @@ class StructuredModelRequest(BaseModel):
     evidence_ids: list[str] = Field(min_length=1)
 
 
+SUPPORTED_MEDIA_MIME_TYPES = ("image/png", "image/jpeg", "image/webp")
+_PIL_FORMAT_TO_MIME = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "WEBP": "image/webp",
+}
+
+
+def _bounded_usage(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise ValueError("usage must be an object")
+    bounded: dict[str, int] = {}
+    for key, item in value.items():
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or (isinstance(item, float) and not math.isfinite(item))
+            or item < 0
+            or int(item) != item
+            or item > 1_000_000_000
+        ):
+            raise ValueError("usage values must be finite bounded non-negative integers")
+        normalized_key = str(key)
+        if not normalized_key or len(normalized_key) > 100:
+            raise ValueError("usage keys must be bounded")
+        bounded[normalized_key] = int(item)
+    return bounded
+
+
+class VisualAssessment(BaseModel):
+    """Strict model advice; this object has no approval capability."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1, max_length=4000)
+    plan_match: bool
+    text_readability: str = Field(min_length=1, max_length=1000)
+    defects: list[str] = Field(default_factory=list, max_length=100)
+    safety_issues: list[str] = Field(default_factory=list, max_length=100)
+    suggestions: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("defects", "safety_issues", "suggestions")
+    @classmethod
+    def bound_list_items(cls, value: list[str]) -> list[str]:
+        if any(not item or len(item) > 1000 for item in value):
+            raise ValueError("assessment list items must be non-empty and bounded")
+        return value
+
+
+class VisionImage(BaseModel):
+    """One already-authorized managed image supplied as bytes, never as a path or URL."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    material_id: str = Field(min_length=1, max_length=500)
+    mime_type: Literal["image/png", "image/jpeg", "image/webp"]
+    data: bytes = Field(min_length=1, max_length=20 * 1024 * 1024)
+
+
+class VisionRequest(BaseModel):
+    """Provider-neutral visual request bound to managed material identities."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1, max_length=20_000)
+    prompt_version: str = Field(min_length=1, max_length=100)
+    material_ids: list[str] = Field(min_length=1, max_length=20)
+    images: list[VisionImage] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def bind_images_to_material_ids(self) -> "VisionRequest":
+        if len(self.material_ids) != len(set(self.material_ids)):
+            raise ValueError("material_ids must be unique")
+        if [image.material_id for image in self.images] != self.material_ids:
+            raise ValueError("images must match the ordered material_ids exactly")
+        return self
+
+
+class VisionResult(BaseModel):
+    """Bounded visual advice and safe provider facts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1, max_length=300)
+    output: VisualAssessment
+    raw_evidence: dict[str, Any] = Field(min_length=1)
+    usage: dict[str, int] = Field(default_factory=dict)
+    duration_ms: int | None = Field(default=None, ge=0, le=86_400_000)
+
+    @field_validator("usage", mode="before")
+    @classmethod
+    def validate_usage(cls, value: Any) -> dict[str, int]:
+        return _bounded_usage(value)
+
+
+class ImageGenerationRequest(BaseModel):
+    """Provider-neutral prompt; provider routing and output paths are intentionally absent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1, max_length=20_000)
+    prompt_version: str = Field(min_length=1, max_length=100)
+
+
+class GeneratedImage(BaseModel):
+    """A fully decoded generated image with metadata proven from its bytes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    data: bytes = Field(min_length=1, max_length=20 * 1024 * 1024)
+    mime_type: Literal["image/png", "image/jpeg", "image/webp"]
+    width: int = Field(ge=1, le=16_384)
+    height: int = Field(ge=1, le=16_384)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_request_id: str | None = Field(default=None, max_length=500)
+    usage: dict[str, int] = Field(default_factory=dict)
+    duration_ms: int | None = Field(default=None, ge=0, le=86_400_000)
+    raw_evidence: dict[str, Any] = Field(min_length=1)
+
+    @field_validator("usage", mode="before")
+    @classmethod
+    def validate_usage(cls, value: Any) -> dict[str, int]:
+        return _bounded_usage(value)
+
+    @model_validator(mode="after")
+    def prove_metadata_from_bytes(self) -> "GeneratedImage":
+        if hashlib.sha256(self.data).hexdigest() != self.sha256:
+            raise ValueError("sha256 does not match generated bytes")
+        try:
+            with Image.open(io.BytesIO(self.data)) as image:
+                actual_mime = _PIL_FORMAT_TO_MIME.get(image.format or "")
+                actual_size = image.size
+                image.load()
+        except (OSError, ValueError, UnidentifiedImageError) as error:
+            raise ValueError("generated bytes are not a decodable supported image") from error
+        if actual_mime != self.mime_type:
+            raise ValueError("mime_type does not match generated bytes")
+        if actual_size != (self.width, self.height):
+            raise ValueError("dimensions do not match generated bytes")
+        return self
+
+
 class CollectorAdapter(Protocol):
     """Protocol implemented by collection sources without leaking their native shapes."""
 
@@ -253,3 +399,25 @@ class ModelAdapter(Protocol):
     def generate_structured(
         self, request: StructuredModelRequest, schema: type[BaseModel]
     ) -> ModelResult: ...
+
+
+class VisionAdapter(Protocol):
+    """Provider-neutral advisory image analysis."""
+
+    configured: bool
+    provider: str
+    model: str
+
+    def analyze_images(
+        self, request: VisionRequest, schema: type[BaseModel]
+    ) -> VisionResult: ...
+
+
+class ImageGenerationAdapter(Protocol):
+    """Provider-neutral generation returning validated image bytes."""
+
+    configured: bool
+    provider: str
+    model: str
+
+    def generate_images(self, request: ImageGenerationRequest) -> list[GeneratedImage]: ...
