@@ -5,7 +5,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.db import Base
@@ -48,14 +59,19 @@ class XhsAccountProfileRecord(Base):
     collected_at: Mapped[datetime] = mapped_column(nullable=False)
 
     notes: Mapped[list["XhsAccountNoteRecord"]] = relationship(
-        back_populates="profile", cascade="all, delete-orphan", passive_deletes=True
+        back_populates="profile", passive_deletes=True
     )
 
 
 class XhsAccountNoteRecord(Base):
     __tablename__ = "xhs_account_notes"
     __table_args__ = (
-        UniqueConstraint("note_id", "user_id", name="uq_xhs_note_account_identity"),
+        UniqueConstraint(
+            "note_id",
+            "user_id",
+            "collection_job_id",
+            name="uq_xhs_note_account_collection_identity",
+        ),
         CheckConstraint(
             "id BETWEEN 1 AND 9223372036854775807",
             name="ck_xhs_note_canonical_id",
@@ -73,7 +89,7 @@ class XhsAccountNoteRecord(Base):
     note_id: Mapped[str] = mapped_column(String(500), nullable=False)
     user_id: Mapped[str] = mapped_column(
         String(500),
-        ForeignKey("xhs_account_profiles.user_id", ondelete="CASCADE"),
+        ForeignKey("xhs_account_profiles.user_id", ondelete="RESTRICT"),
         nullable=False,
     )
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
@@ -94,6 +110,100 @@ class XhsAccountNoteRecord(Base):
     collected_at: Mapped[datetime] = mapped_column(nullable=False)
 
     profile: Mapped[XhsAccountProfileRecord] = relationship(back_populates="notes")
+
+
+class XhsAccountProfileSnapshotRecord(Base):
+    """One immutable, artifact-bound profile observation for one collection."""
+
+    __tablename__ = "xhs_account_profile_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "collection_job_id",
+            name="uq_xhs_profile_snapshot_collection_job",
+        ),
+        UniqueConstraint(
+            "collection_artifact_id",
+            name="uq_xhs_profile_snapshot_collection_artifact",
+        ),
+        CheckConstraint(
+            "id BETWEEN 1 AND 9223372036854775807",
+            name="ck_xhs_profile_snapshot_canonical_id",
+        ),
+        CheckConstraint(
+            "length(user_id) BETWEEN 1 AND 500",
+            name="ck_xhs_profile_snapshot_user_id",
+        ),
+        CheckConstraint(
+            _SOURCE_URL_CHECK,
+            name="ck_xhs_profile_snapshot_source_url",
+        ),
+        CheckConstraint(
+            _RAW_DIGEST_CHECK,
+            name="ck_xhs_profile_snapshot_raw_digest",
+        ),
+        Index(
+            "ix_xhs_profile_snapshots_user_version",
+            "user_id",
+            "id",
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(
+        String(500),
+        ForeignKey("xhs_account_profiles.user_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    nickname: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    public_stats_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default=text("'{}'")
+    )
+    raw_evidence: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    raw_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    collection_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    collection_artifact_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("job_artifacts.id", ondelete="RESTRICT"), nullable=False
+    )
+    collected_at: Mapped[datetime] = mapped_column(nullable=False)
+
+
+class XhsAccountSnapshotNoteRecord(Base):
+    """Immutable membership and artifact order for a canonical note row."""
+
+    __tablename__ = "xhs_account_snapshot_notes"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id",
+            "position",
+            name="uq_xhs_snapshot_note_position",
+        ),
+        CheckConstraint(
+            "note_record_id BETWEEN 1 AND 9223372036854775807",
+            name="ck_xhs_snapshot_note_canonical_id",
+        ),
+        CheckConstraint(
+            "position BETWEEN 0 AND 1000",
+            name="ck_xhs_snapshot_note_position",
+        ),
+        Index("ix_xhs_snapshot_notes_snapshot_id", "snapshot_id"),
+    )
+
+    note_record_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("xhs_account_notes.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("xhs_account_profile_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class XhsArtifactPromotionJournalRecord(Base):

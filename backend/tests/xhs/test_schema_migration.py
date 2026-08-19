@@ -4,9 +4,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
+import backend.app.db as db_module
 from backend.app.db import (
     Database,
     SchemaMigrationError,
@@ -27,6 +28,8 @@ from backend.app.features.xhs.constants import (
 from backend.app.features.xhs.models import (
     XhsAccountNoteRecord,
     XhsAccountProfileRecord,
+    XhsAccountProfileSnapshotRecord,
+    XhsAccountSnapshotNoteRecord,
 )
 from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 
@@ -34,6 +37,7 @@ from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 MIGRATION = "xhs_account_note_evidence_v1"
 IDENTITY_MIGRATION = "xhs_account_note_identity_v2"
 CANONICAL_ID_MIGRATION = "xhs_account_note_canonical_id_v3"
+SNAPSHOT_MIGRATION = "xhs_account_snapshot_evidence_v5"
 _KNOWN_IDENTITY_TEMPORARY_TABLES = (
     "xhs_account_notes_identity_v1",
     "xhs_account_notes_canonical_id_v2",
@@ -64,41 +68,77 @@ def _insert_trusted_note(
     profile_raw = {"profile": {"user_id": "u1"}}
     note_raw = {"row": {"note_id": note_id, "user_id": "u1"}}
     with database.session() as session:
-        job = JobRecord(
-            type=ACCOUNT_COLLECTION_JOB_TYPE,
-            input_data={"user_id": "u1", "expected_note_count": 1},
-            state=JobState.succeeded.value,
-            progress_current=1,
-            progress_total=1,
-            current_stage="xhs_collection_complete",
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(job)
-        session.flush()
-        artifact = JobArtifactRecord(
-            job_id=job.id,
-            kind=ACCOUNT_COLLECTION_ARTIFACT_KIND,
-            producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
-            path=f"evidence/xhs/{job.id}.json",
-            metadata_json={"source": "test"},
-            created_at=now,
-        )
-        session.add(artifact)
-        session.flush()
         profile = session.get(XhsAccountProfileRecord, "u1")
         if profile is None:
-            profile = XhsAccountProfileRecord(user_id="u1")
+            job = JobRecord(
+                type=ACCOUNT_COLLECTION_JOB_TYPE,
+                input_data={"user_id": "u1", "expected_note_count": 1},
+                state=JobState.succeeded.value,
+                progress_current=1,
+                progress_total=1,
+                current_stage="xhs_collection_complete",
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(job)
+            session.flush()
+            artifact = JobArtifactRecord(
+                job_id=job.id,
+                kind=ACCOUNT_COLLECTION_ARTIFACT_KIND,
+                producer=ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+                path=f"evidence/xhs/{job.id}.json",
+                metadata_json={"source": "test"},
+                created_at=now,
+            )
+            session.add(artifact)
+            session.flush()
+            profile = XhsAccountProfileRecord(
+                user_id="u1",
+                source_url="https://www.xiaohongshu.com/user/profile/u1",
+                nickname="U1",
+                bio=None,
+                public_stats_json={},
+                raw_evidence=profile_raw,
+                raw_digest=str(canonical_raw_evidence_digest(profile_raw)),
+                collection_job_id=job.id,
+                collection_artifact_id=artifact.id,
+                collected_at=now,
+            )
             session.add(profile)
-        profile.source_url = "https://www.xiaohongshu.com/user/profile/u1"
-        profile.nickname = "U1"
-        profile.bio = None
-        profile.public_stats_json = {}
-        profile.raw_evidence = profile_raw
-        profile.raw_digest = str(canonical_raw_evidence_digest(profile_raw))
-        profile.collection_job_id = job.id
-        profile.collection_artifact_id = artifact.id
-        profile.collected_at = now
+            session.flush()
+            snapshot = XhsAccountProfileSnapshotRecord(
+                user_id="u1",
+                source_url="https://www.xiaohongshu.com/user/profile/u1",
+                nickname="U1",
+                bio=None,
+                public_stats_json={},
+                raw_evidence=profile_raw,
+                raw_digest=str(canonical_raw_evidence_digest(profile_raw)),
+                collection_job_id=job.id,
+                collection_artifact_id=artifact.id,
+                collected_at=now,
+            )
+            session.add(snapshot)
+            session.flush()
+            position = 0
+        else:
+            job = session.get(JobRecord, profile.collection_job_id)
+            artifact = session.get(
+                JobArtifactRecord,
+                profile.collection_artifact_id,
+            )
+            snapshot = session.scalar(select(
+                XhsAccountProfileSnapshotRecord
+            ).where(
+                XhsAccountProfileSnapshotRecord.collection_job_id
+                == profile.collection_job_id
+            ))
+            assert job is not None and artifact is not None and snapshot is not None
+            position = len(session.scalars(select(
+                XhsAccountSnapshotNoteRecord
+            ).where(
+                XhsAccountSnapshotNoteRecord.snapshot_id == snapshot.id
+            )).all())
         note = XhsAccountNoteRecord(
             id=row_id,
             note_id=note_id,
@@ -112,14 +152,21 @@ def _insert_trusted_note(
             raw_digest=str(canonical_raw_evidence_digest(note_raw)),
             collection_job_id=job.id,
             collection_artifact_id=artifact.id,
-            collected_at=now,
+            collected_at=profile.collected_at,
         )
         session.add(note)
+        session.flush()
+        session.add(XhsAccountSnapshotNoteRecord(
+            note_record_id=note.id,
+            snapshot_id=snapshot.id,
+            position=position,
+        ))
         session.commit()
         return note.id
 
 
 def _downgrade_note_identity_to_v1(path: Path, *, keep_marker: bool) -> None:
+    _remove_snapshot_layer_for_legacy_migration(path)
     with sqlite3.connect(path) as connection:
         connection.create_function(
             "raw_evidence_digest",
@@ -248,6 +295,7 @@ def _downgrade_canonical_note_ids_to_v2(
     *,
     keep_marker: bool,
 ) -> None:
+    _remove_snapshot_layer_for_legacy_migration(path)
     with sqlite3.connect(path) as connection:
         table_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' "
@@ -279,6 +327,25 @@ def _downgrade_canonical_note_ids_to_v2(
             )
 
 
+def _remove_snapshot_layer_for_legacy_migration(path: Path) -> None:
+    """Turn a current fixture into a coherent pre-v5 disk image."""
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        for name in db_module._XHS_ACCOUNT_SNAPSHOT_BINDING_TRIGGERS:
+            connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+        for name in db_module._XHS_ACCOUNT_SNAPSHOT_IMMUTABILITY_TRIGGERS:
+            connection.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+        connection.execute("DROP TABLE IF EXISTS xhs_account_snapshot_notes")
+        connection.execute("DROP TABLE IF EXISTS xhs_account_profile_snapshots")
+        connection.execute(
+            "DELETE FROM workbench_schema_migrations WHERE name=?",
+            (SNAPSHOT_MIGRATION,),
+        )
+        for definition in db_module._XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS.values():
+            connection.execute(definition)
+
+
 def _foreign_key(
     database: Database, table: str, column: str
 ) -> tuple[str, str, str | None] | None:
@@ -296,14 +363,21 @@ def test_fresh_schema_has_bound_account_note_evidence_and_marker(tmp_path: Path)
     database = Database(tmp_path / "fresh.sqlite3")
     try:
         inspector = inspect(database.engine)
-        assert {"xhs_account_profiles", "xhs_account_notes"} <= set(
+        assert {
+            "xhs_account_profiles",
+            "xhs_account_notes",
+            "xhs_account_profile_snapshots",
+            "xhs_account_snapshot_notes",
+        } <= set(
             inspector.get_table_names()
         )
-        assert _unique_columns(database, "xhs_account_notes") == {("note_id", "user_id")}
+        assert _unique_columns(database, "xhs_account_notes") == {
+            ("note_id", "user_id", "collection_job_id")
+        }
         assert _foreign_key(database, "xhs_account_notes", "user_id") == (
             "xhs_account_profiles",
             "user_id",
-            "CASCADE",
+            "RESTRICT",
         )
         for table in ("xhs_account_profiles", "xhs_account_notes"):
             columns = {column["name"]: column for column in inspector.get_columns(table)}
@@ -331,6 +405,13 @@ def test_fresh_schema_has_bound_account_note_evidence_and_marker(tmp_path: Path)
                 ),
                 {"name": MIGRATION},
             ) == 1
+            assert connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM workbench_schema_migrations "
+                    "WHERE name=:name"
+                ),
+                {"name": SNAPSHOT_MIGRATION},
+            ) == 1
             table_sql = connection.scalar(
                 text(
                     "SELECT sql FROM sqlite_master WHERE type='table' "
@@ -356,6 +437,7 @@ def test_marker_present_with_missing_constraint_fails_closed(tmp_path: Path) -> 
     path = tmp_path / "tampered.sqlite3"
     database = Database(path)
     database.close()
+    _remove_snapshot_layer_for_legacy_migration(path)
 
     with sqlite3.connect(path) as connection:
         connection.executescript(
@@ -384,6 +466,7 @@ def test_marker_present_without_public_fact_columns_fails_closed(tmp_path: Path)
     path = tmp_path / "old-marker.sqlite3"
     database = Database(path)
     database.close()
+    _remove_snapshot_layer_for_legacy_migration(path)
 
     with sqlite3.connect(path) as connection:
         connection.executescript(
@@ -410,6 +493,7 @@ def test_marker_absent_repairs_only_an_empty_half_migration(tmp_path: Path) -> N
     path = tmp_path / "half.sqlite3"
     database = Database(path)
     database.close()
+    _remove_snapshot_layer_for_legacy_migration(path)
 
     with sqlite3.connect(path) as connection:
         connection.execute(
@@ -438,6 +522,7 @@ def test_marker_absent_populated_weakened_schema_requires_manual_migration(
     path = tmp_path / "legacy.sqlite3"
     database = Database(path)
     database.close()
+    _remove_snapshot_layer_for_legacy_migration(path)
 
     with sqlite3.connect(path) as connection:
         connection.execute(

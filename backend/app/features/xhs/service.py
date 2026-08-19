@@ -32,6 +32,8 @@ from backend.app.features.xhs.constants import (
 from backend.app.features.xhs.models import (
     XhsAccountNoteRecord,
     XhsAccountProfileRecord,
+    XhsAccountProfileSnapshotRecord,
+    XhsAccountSnapshotNoteRecord,
     XhsArtifactPromotionJournalRecord,
 )
 from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
@@ -428,21 +430,34 @@ class XhsCollectionService:
         """Verify all facts against one artifact while holding one DB snapshot."""
 
         with self.database.session() as session:
-            profile = session.get(XhsAccountProfileRecord, user_id)
-            if profile is None:
+            anchor = session.get(XhsAccountProfileRecord, user_id)
+            snapshot = session.scalar(
+                select(XhsAccountProfileSnapshotRecord)
+                .where(XhsAccountProfileSnapshotRecord.user_id == user_id)
+                .order_by(XhsAccountProfileSnapshotRecord.id.desc())
+                .limit(1)
+            )
+            if anchor is None or snapshot is None:
                 raise CollectionFactNotFound(
                     f"Account profile {user_id} does not exist."
                 )
             records = session.scalars(
                 select(XhsAccountNoteRecord)
-                .where(XhsAccountNoteRecord.user_id == user_id)
-                .order_by(XhsAccountNoteRecord.id)
+                .join(
+                    XhsAccountSnapshotNoteRecord,
+                    XhsAccountSnapshotNoteRecord.note_record_id
+                    == XhsAccountNoteRecord.id,
+                )
+                .where(
+                    XhsAccountSnapshotNoteRecord.snapshot_id == snapshot.id
+                )
+                .order_by(XhsAccountSnapshotNoteRecord.position)
             ).all()
             _job_input, _metadata, envelope = (
                 self._read_trusted_collection_result_in_session(
                     session,
-                    job_id=profile.collection_job_id,
-                    artifact_id=profile.collection_artifact_id,
+                    job_id=snapshot.collection_job_id,
+                    artifact_id=snapshot.collection_artifact_id,
                     expected_job_type=ACCOUNT_COLLECTION_JOB_TYPE,
                     expected_artifact_kind=ACCOUNT_COLLECTION_ARTIFACT_KIND,
                     binding_name="user_id",
@@ -452,22 +467,22 @@ class XhsCollectionService:
             expected = normalize_exact_account_result(
                 result=envelope.result,
                 binding=AccountEvidenceBinding(
-                    collection_job_id=profile.collection_job_id,
-                    collection_artifact_id=profile.collection_artifact_id,
+                    collection_job_id=snapshot.collection_job_id,
+                    collection_artifact_id=snapshot.collection_artifact_id,
                     collected_at=envelope.collected_at,
                 ),
             )
             actual_profile = {
-                "user_id": profile.user_id,
-                "source_url": profile.source_url,
-                "nickname": profile.nickname,
-                "bio": profile.bio,
-                "public_stats_json": profile.public_stats_json,
-                "raw_evidence": dict(profile.raw_evidence),
-                "raw_digest": profile.raw_digest,
-                "collection_job_id": profile.collection_job_id,
-                "collection_artifact_id": profile.collection_artifact_id,
-                "collected_at": profile.collected_at,
+                "user_id": snapshot.user_id,
+                "source_url": snapshot.source_url,
+                "nickname": snapshot.nickname,
+                "bio": snapshot.bio,
+                "public_stats_json": snapshot.public_stats_json,
+                "raw_evidence": dict(snapshot.raw_evidence),
+                "raw_digest": snapshot.raw_digest,
+                "collection_job_id": snapshot.collection_job_id,
+                "collection_artifact_id": snapshot.collection_artifact_id,
+                "collected_at": snapshot.collected_at,
             }
             actual_notes = [
                 {
@@ -508,16 +523,44 @@ class XhsCollectionService:
                 raise CollectionFactNotFound(
                     f"Account facts for {user_id} do not match formal evidence."
                 )
+            if (
+                anchor.collection_job_id == snapshot.collection_job_id
+                and anchor.collection_artifact_id
+                == snapshot.collection_artifact_id
+                and (
+                    not public_counter_json_matches(
+                        anchor.public_stats_json,
+                        expected_profile["public_stats_json"],
+                        allowed_fields=PROFILE_PUBLIC_COUNTER_FIELDS,
+                    )
+                    or {
+                        "user_id": anchor.user_id,
+                        "source_url": anchor.source_url,
+                        "nickname": anchor.nickname,
+                        "bio": anchor.bio,
+                        "public_stats_json": anchor.public_stats_json,
+                        "raw_evidence": dict(anchor.raw_evidence),
+                        "raw_digest": anchor.raw_digest,
+                        "collection_job_id": anchor.collection_job_id,
+                        "collection_artifact_id": anchor.collection_artifact_id,
+                        "collected_at": anchor.collected_at,
+                    }
+                    != expected_profile
+                )
+            ):
+                raise CollectionFactNotFound(
+                    f"Account facts for {user_id} do not match formal evidence."
+                )
             return (
                 AccountProfileRead(
-                    user_id=profile.user_id,
-                    source_url=profile.source_url,
-                    nickname=profile.nickname,
-                    bio=profile.bio,
-                    public_stats=dict(profile.public_stats_json),
-                    collection_job_id=profile.collection_job_id,
-                    collection_artifact_id=profile.collection_artifact_id,
-                    collected_at=profile.collected_at,
+                    user_id=snapshot.user_id,
+                    source_url=snapshot.source_url,
+                    nickname=snapshot.nickname,
+                    bio=snapshot.bio,
+                    public_stats=dict(snapshot.public_stats_json),
+                    collection_job_id=snapshot.collection_job_id,
+                    collection_artifact_id=snapshot.collection_artifact_id,
+                    collected_at=snapshot.collected_at,
                 ),
                 [
                     AccountNoteRead(

@@ -6,13 +6,14 @@ import json
 import os
 import re
 import stat
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import selectinload
 
 from backend.app.adapters.contracts import (
@@ -37,7 +38,13 @@ from backend.app.features.xhs.constants import (
     ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
     ACCOUNT_COLLECTION_JOB_TYPE,
 )
-from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
+from backend.app.features.xhs.models import (
+    XhsAccountNoteRecord,
+    XhsAccountProfileRecord,
+    XhsAccountProfileSnapshotRecord,
+    XhsAccountSnapshotNoteRecord,
+    XhsArtifactPromotionJournalRecord,
+)
 from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
 from backend.app.features.xhs.schemas import (
     NOTE_PUBLIC_COUNTER_FIELDS,
@@ -70,6 +77,14 @@ class AnalysisNotFound(LookupError):
     pass
 
 
+@dataclass(frozen=True)
+class _EvidenceResolution:
+    facts: list[dict[str, Any]]
+    trust_fingerprint: str
+    account_scope: tuple[str, ...]
+    allowed_ids: tuple[str, ...]
+
+
 class AnalysisService:
     def __init__(
         self, database: Database, model_adapter: Any, *, runtime_dir: Path
@@ -79,7 +94,8 @@ class AnalysisService:
         self.runtime_dir = runtime_dir.resolve()
 
     def create(self, payload: AnalysisCreate) -> AnalysisRead:
-        evidence = self._resolve_evidence(payload)
+        before_model = self._resolve_evidence(payload)
+        evidence = before_model.facts
         digest = _digest(payload, evidence)
         shop_evidence_present = any(
             fact["kind"] == "shop_collection_result" for fact in evidence
@@ -185,6 +201,39 @@ class AnalysisService:
                 )
             )
         with self.database.session() as session:
+            # Hold SQLite's single-writer reservation across the final resolve
+            # and insert so no mutable DB evidence can pass between the check
+            # and the success commit.
+            session.execute(text("BEGIN IMMEDIATE"))
+            try:
+                after_model = self._resolve_evidence_in_session(session, payload)
+            except (EvidenceNotFound, EvidenceAccountMismatch):
+                return self._persist_failure_in_session(
+                    session,
+                    payload,
+                    digest=digest,
+                    status="needs_human",
+                    error_category="evidence_changed_after_model",
+                    error_detail=(
+                        "Evidence trust changed while the model request was in flight."
+                    ),
+                )
+            if (
+                after_model.trust_fingerprint
+                != before_model.trust_fingerprint
+                or after_model.account_scope != before_model.account_scope
+                or after_model.allowed_ids != before_model.allowed_ids
+            ):
+                return self._persist_failure_in_session(
+                    session,
+                    payload,
+                    digest=digest,
+                    status="needs_human",
+                    error_category="evidence_changed_after_model",
+                    error_detail=(
+                        "Evidence trust changed while the model request was in flight."
+                    ),
+                )
             session.add(record)
             session.commit()
             return _analysis_read(_load_analysis(session, record.id))
@@ -270,7 +319,23 @@ class AnalysisService:
                         eligible_for_opportunity=False,
                     )
                 )
-            account_note_query = select(XhsAccountNoteRecord)
+            latest_snapshot_ids = (
+                select(func.max(XhsAccountProfileSnapshotRecord.id))
+                .group_by(XhsAccountProfileSnapshotRecord.user_id)
+            )
+            account_note_query = (
+                select(XhsAccountNoteRecord)
+                .join(
+                    XhsAccountSnapshotNoteRecord,
+                    XhsAccountSnapshotNoteRecord.note_record_id
+                    == XhsAccountNoteRecord.id,
+                )
+                .where(
+                    XhsAccountSnapshotNoteRecord.snapshot_id.in_(
+                        latest_snapshot_ids
+                    )
+                )
+            )
             if account_user_id is not None:
                 account_note_query = account_note_query.where(
                     XhsAccountNoteRecord.user_id == account_user_id
@@ -325,111 +390,216 @@ class AnalysisService:
             session.commit()
             return _analysis_read(_load_analysis(session, record.id))
 
-    def _resolve_evidence(self, payload: AnalysisCreate) -> list[dict[str, Any]]:
-        facts: list[dict[str, Any]] = []
-        account_scope = payload.account_scope
+    def _persist_failure_in_session(
+        self,
+        session: Any,
+        payload: AnalysisCreate,
+        *,
+        digest: str,
+        status: str,
+        error_category: str,
+        error_detail: str,
+    ) -> AnalysisRead:
+        record = AnalysisRecord(
+            analysis_type=payload.analysis_type,
+            account_user_id=payload.account_user_id,
+            account_user_ids_json=list(payload.account_user_ids),
+            status=status,
+            prompt_version=PROMPT_VERSION,
+            provider=self.model_adapter.provider,
+            model=self.model_adapter.model,
+            input_digest=digest,
+            evidence_ids_json=list(payload.evidence_ids),
+            output_json=None,
+            usage_json={},
+            duration_ms=None,
+            attempts_json=[],
+            error_category=error_category,
+            error_detail=error_detail,
+            created_at=_utc_now(),
+        )
+        session.add(record)
+        session.commit()
+        return _analysis_read(_load_analysis(session, record.id))
+
+    def _resolve_evidence(self, payload: AnalysisCreate) -> _EvidenceResolution:
         with self.database.session() as session:
-            for evidence_id in payload.evidence_ids:
-                prefix, separator, raw_id = evidence_id.partition(":")
-                identity = _parse_sqlite_identity(raw_id) if separator else None
-                if identity is None:
+            return self._resolve_evidence_in_session(session, payload)
+
+    def _resolve_evidence_in_session(
+        self,
+        session: Any,
+        payload: AnalysisCreate,
+    ) -> _EvidenceResolution:
+        facts: list[dict[str, Any]] = []
+        trust: list[dict[str, Any]] = []
+        account_scope = payload.account_scope
+        for evidence_id in payload.evidence_ids:
+            prefix, separator, raw_id = evidence_id.partition(":")
+            identity = _parse_sqlite_identity(raw_id) if separator else None
+            if identity is None:
+                raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
+            if prefix == "artifact":
+                artifact = session.scalar(
+                    select(JobArtifactRecord)
+                    .options(selectinload(JobArtifactRecord.job))
+                    .where(JobArtifactRecord.id == identity)
+                )
+                if artifact is None:
                     raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
-                if prefix == "artifact":
-                    artifact = session.scalar(
-                        select(JobArtifactRecord)
-                        .options(selectinload(JobArtifactRecord.job))
-                        .where(JobArtifactRecord.id == identity)
+                job_input = dict(artifact.job.input_data)
+                artifact_account = job_input.get("account_user_id")
+                if (
+                    not isinstance(artifact_account, str)
+                    or not artifact_account.strip()
+                    or artifact_account not in account_scope
+                ):
+                    raise EvidenceAccountMismatch(
+                        f"Evidence {evidence_id} has no matching account ownership."
                     )
-                    if artifact is None:
-                        raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
-                    job_input = dict(artifact.job.input_data)
-                    artifact_account = job_input.get("account_user_id")
-                    if (
-                        not isinstance(artifact_account, str)
-                        or not artifact_account.strip()
-                        or artifact_account not in account_scope
-                    ):
-                        raise EvidenceAccountMismatch(
-                            f"Evidence {evidence_id} has no matching account ownership."
-                        )
-                    facts.append(
-                        {
-                            "evidence_id": evidence_id,
-                            "kind": artifact.kind,
-                            "job_id": artifact.job_id,
-                            "job_state": JobState(artifact.job.state).value,
-                            "account_user_id": artifact_account,
-                            "job_input": job_input,
-                            "trusted_shop_result": self._trusted_shop_result(artifact),
-                        }
-                    )
-                elif prefix == "rank-item":
-                    item = session.get(RankItemRecord, identity)
-                    if item is None:
-                        raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
-                    if (
-                        not isinstance(item.user_id, str)
-                        or not item.user_id.strip()
-                        or item.user_id not in account_scope
-                    ):
-                        raise EvidenceAccountMismatch(
-                            f"Evidence {evidence_id} has no matching account ownership."
-                        )
-                    facts.append(
-                        {
-                            "evidence_id": evidence_id,
-                            "kind": "rank_item",
-                            "account_user_id": item.user_id,
-                            "user_id": item.user_id,
-                            "source_url": item.source_url,
-                            "facts": {
-                                "title": item.title,
-                                "author_name": item.author_name,
-                                "gmv_range": item.gmv_range,
-                                "pay_rate_range": item.pay_rate_range,
-                                "read_range": item.read_range,
-                            },
-                            "raw_evidence": dict(item.raw_evidence),
-                        }
-                    )
-                elif prefix == "account-note":
-                    note = session.get(XhsAccountNoteRecord, identity)
-                    if note is None:
-                        raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
-                    if note.user_id not in account_scope:
-                        raise EvidenceAccountMismatch(
-                            f"Evidence {evidence_id} has no matching account ownership."
-                        )
-                    trusted_note = self._trusted_account_note(session, note)
-                    if trusted_note is None:
-                        raise EvidenceNotFound(
-                            f"Evidence {evidence_id} is no longer trusted."
-                        )
-                    facts.append(trusted_note)
-                else:
+                facts.append(
+                    {
+                        "evidence_id": evidence_id,
+                        "kind": artifact.kind,
+                        "job_id": artifact.job_id,
+                        "job_state": JobState(artifact.job.state).value,
+                        "account_user_id": artifact_account,
+                        "job_input": job_input,
+                        "trusted_shop_result": self._trusted_shop_result(artifact),
+                    }
+                )
+                trust.append({
+                    "evidence_id": evidence_id,
+                    "artifact_id": artifact.id,
+                    "artifact_job_id": artifact.job_id,
+                    "artifact_kind": artifact.kind,
+                    "artifact_producer": artifact.producer,
+                    "artifact_path": artifact.path,
+                    "artifact_metadata": artifact.metadata_json,
+                    "job_type": artifact.job.type,
+                    "job_state": artifact.job.state,
+                    "job_input": artifact.job.input_data,
+                    "trusted_shop_result": facts[-1]["trusted_shop_result"],
+                })
+            elif prefix == "rank-item":
+                item = session.get(RankItemRecord, identity)
+                if item is None:
                     raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
-        return facts
+                if (
+                    not isinstance(item.user_id, str)
+                    or not item.user_id.strip()
+                    or item.user_id not in account_scope
+                ):
+                    raise EvidenceAccountMismatch(
+                        f"Evidence {evidence_id} has no matching account ownership."
+                    )
+                facts.append(
+                    {
+                        "evidence_id": evidence_id,
+                        "kind": "rank_item",
+                        "account_user_id": item.user_id,
+                        "user_id": item.user_id,
+                        "source_url": item.source_url,
+                        "facts": {
+                            "title": item.title,
+                            "author_name": item.author_name,
+                            "gmv_range": item.gmv_range,
+                            "pay_rate_range": item.pay_rate_range,
+                            "read_range": item.read_range,
+                        },
+                        "raw_evidence": dict(item.raw_evidence),
+                    }
+                )
+                trust.append({"evidence_id": evidence_id, "row": facts[-1]})
+            elif prefix == "account-note":
+                note = session.get(XhsAccountNoteRecord, identity)
+                if note is None:
+                    raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
+                if note.user_id not in account_scope:
+                    raise EvidenceAccountMismatch(
+                        f"Evidence {evidence_id} has no matching account ownership."
+                    )
+                trusted_note = self._trusted_account_note(session, note)
+                if trusted_note is None:
+                    raise EvidenceNotFound(
+                        f"Evidence {evidence_id} is no longer trusted."
+                    )
+                public_fact, trust_fact = trusted_note
+                facts.append(public_fact)
+                trust.append(trust_fact)
+            else:
+                raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
+        fingerprint_value = json.dumps(
+            {
+                "account_scope": sorted(account_scope),
+                "allowed_ids": list(payload.evidence_ids),
+                "facts": facts,
+                "trust": trust,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return _EvidenceResolution(
+            facts=facts,
+            trust_fingerprint=sha256(fingerprint_value.encode("utf-8")).hexdigest(),
+            account_scope=tuple(sorted(account_scope)),
+            allowed_ids=tuple(payload.evidence_ids),
+        )
 
     def _trusted_account_note(
         self, session: Any, note: XhsAccountNoteRecord
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         if not _canonical_sqlite_identity(note.id):
             return None
-        profile = session.get(XhsAccountProfileRecord, note.user_id)
+        member = session.get(XhsAccountSnapshotNoteRecord, note.id)
+        snapshot = (
+            session.get(XhsAccountProfileSnapshotRecord, member.snapshot_id)
+            if member is not None
+            else None
+        )
+        anchor = session.get(XhsAccountProfileRecord, note.user_id)
         artifact = session.get(JobArtifactRecord, note.collection_artifact_id)
-        if profile is None or artifact is None:
+        journals = session.scalars(
+            select(XhsArtifactPromotionJournalRecord).where(
+                XhsArtifactPromotionJournalRecord.job_id
+                == note.collection_job_id,
+                XhsArtifactPromotionJournalRecord.artifact_id
+                == note.collection_artifact_id,
+                XhsArtifactPromotionJournalRecord.state == "completed",
+                XhsArtifactPromotionJournalRecord.resolution == "committed",
+            )
+        ).all()
+        if (
+            member is None
+            or snapshot is None
+            or anchor is None
+            or artifact is None
+            or len(journals) != 1
+        ):
             return None
+        journal = journals[0]
         job = artifact.job
         if (
             job is None
             or job.id != note.collection_job_id
-            or job.id != profile.collection_job_id
+            or job.id != snapshot.collection_job_id
             or job.type != ACCOUNT_COLLECTION_JOB_TYPE
             or _safe_job_state(job.state) is not JobState.succeeded
             or artifact.job_id != job.id
-            or artifact.id != profile.collection_artifact_id
+            or artifact.id != snapshot.collection_artifact_id
             or artifact.kind != ACCOUNT_COLLECTION_ARTIFACT_KIND
             or artifact.producer != ACCOUNT_COLLECTION_ARTIFACT_PRODUCER
+            or note.user_id != snapshot.user_id
+            or journal.target_state != JobState.succeeded.value
+            or journal.artifact_kind != artifact.kind
+            or journal.producer != artifact.producer
+            or journal.final_path != artifact.path
+            or journal.owner_token is not None
+            or journal.recovery_lease_expires_at is not None
+            or journal.file_dev is None
+            or journal.file_ino is None
+            or journal.file_mtime_ns is None
         ):
             return None
         expected_path = Path("evidence") / "xhs" / f"{job.id}.json"
@@ -450,6 +620,21 @@ class AnalysisService:
                 return None
             file_digest = sha256(raw_payload).hexdigest()
             if metadata.get("sha256") != file_digest:
+                return None
+            physical_identity = _file_identity(
+                (self.runtime_dir / expected_path).stat()
+            )
+            if physical_identity != (
+                journal.file_dev,
+                journal.file_ino,
+                journal.size_bytes,
+                journal.file_mtime_ns,
+            ):
+                return None
+            if (
+                journal.sha256 != file_digest
+                or journal.size_bytes != len(raw_payload)
+            ):
                 return None
             payload_document = json.loads(raw_payload.decode("utf-8", errors="strict"))
             if (
@@ -480,7 +665,7 @@ class AnalysisService:
             not isinstance(job_user_id, str)
             or not job_user_id
             or job_user_id != note.user_id
-            or job_user_id != profile.user_id
+            or job_user_id != snapshot.user_id
             or isinstance(expected_note_count, bool)
             or not isinstance(expected_note_count, int)
             or expected_note_count < 0
@@ -490,7 +675,7 @@ class AnalysisService:
             or job.error_category is not None
             or collected_at != artifact.created_at
             or collected_at != note.collected_at
-            or collected_at != profile.collected_at
+            or collected_at != snapshot.collected_at
         ):
             return None
         expected_item_count = expected_note_count + 1
@@ -528,8 +713,13 @@ class AnalysisService:
             return None
         persisted_notes = session.scalars(
             select(XhsAccountNoteRecord)
-            .where(XhsAccountNoteRecord.user_id == job_user_id)
-            .order_by(XhsAccountNoteRecord.id)
+            .join(
+                XhsAccountSnapshotNoteRecord,
+                XhsAccountSnapshotNoteRecord.note_record_id
+                == XhsAccountNoteRecord.id,
+            )
+            .where(XhsAccountSnapshotNoteRecord.snapshot_id == snapshot.id)
+            .order_by(XhsAccountSnapshotNoteRecord.position)
         ).all()
         items_by_note_id = {
             str(item.data["note_id"]): item for item in note_items
@@ -538,7 +728,9 @@ class AnalysisService:
             len(persisted_notes) != expected_note_count
             or len(items_by_note_id) != expected_note_count
             or {row.note_id for row in persisted_notes} != set(items_by_note_id)
-            or not _profile_matches_item(profile, profile_item, artifact.id, job.id)
+            or [row.note_id for row in persisted_notes]
+            != [str(item.data["note_id"]) for item in note_items]
+            or not _profile_matches_item(snapshot, profile_item, artifact.id, job.id)
         ):
             return None
         for persisted_note in persisted_notes:
@@ -549,17 +741,28 @@ class AnalysisService:
                 job.id,
             ):
                 return None
-        return {
+        if (
+            anchor.collection_job_id == snapshot.collection_job_id
+            and anchor.collection_artifact_id == snapshot.collection_artifact_id
+            and not _profile_matches_item(
+                anchor,
+                profile_item,
+                artifact.id,
+                job.id,
+            )
+        ):
+            return None
+        public_fact = {
             "evidence_id": f"account-note:{note.id}",
             "kind": "account_note",
             "account_user_id": note.user_id,
             "facts": {
                 "profile": {
-                    "user_id": profile.user_id,
-                    "source_url": profile.source_url,
-                    "nickname": profile.nickname,
-                    "bio": profile.bio,
-                    "public_stats": dict(profile.public_stats_json),
+                    "user_id": snapshot.user_id,
+                    "source_url": snapshot.source_url,
+                    "nickname": snapshot.nickname,
+                    "bio": snapshot.bio,
+                    "public_stats": dict(snapshot.public_stats_json),
                 },
                 "note": {
                     "note_id": note.note_id,
@@ -571,6 +774,24 @@ class AnalysisService:
                 },
             },
         }
+        trust_fact = {
+            "evidence_id": public_fact["evidence_id"],
+            "note_record_id": note.id,
+            "snapshot_id": snapshot.id,
+            "snapshot_position": member.position,
+            "snapshot_note_record_ids": [row.id for row in persisted_notes],
+            "collection_job_id": job.id,
+            "collection_artifact_id": artifact.id,
+            "artifact_path": artifact.path,
+            "artifact_metadata": metadata,
+            "journal_id": journal.id,
+            "journal_sha256": journal.sha256,
+            "journal_size_bytes": journal.size_bytes,
+            "journal_file_identity": list(physical_identity),
+            "profile_raw_digest": snapshot.raw_digest,
+            "note_raw_digests": [row.raw_digest for row in persisted_notes],
+        }
+        return public_fact, trust_fact
 
     def _trusted_shop_result(
         self, artifact: JobArtifactRecord

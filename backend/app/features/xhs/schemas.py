@@ -7,7 +7,8 @@ import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import delete
+from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from backend.app.adapters.contracts import CollectionItem, CollectionResult
@@ -17,7 +18,12 @@ from backend.app.features.xhs.constants import (
     ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
     ACCOUNT_COLLECTION_JOB_TYPE,
 )
-from backend.app.features.xhs.models import XhsAccountNoteRecord, XhsAccountProfileRecord
+from backend.app.features.xhs.models import (
+    XhsAccountNoteRecord,
+    XhsAccountProfileRecord,
+    XhsAccountProfileSnapshotRecord,
+    XhsAccountSnapshotNoteRecord,
+)
 from backend.app.features.xhs.ownership import OwnerIdentityError, canonical_owner_id
 from backend.app.models.jobs import JobArtifactRecord, JobRecord
 
@@ -189,7 +195,7 @@ def persist_exact_account_result(
 
     Task3 owns the job state transition and artifact reservation. This primitive only
     accepts the exact `fetch_account` result and proves that the passed artifact
-    belongs to the passed job before replacing the account's complete note snapshot.
+    belongs to the passed job before appending one immutable account snapshot.
     """
 
     normalized = normalize_exact_account_result(result=result, binding=binding)
@@ -207,23 +213,122 @@ def persist_exact_account_result(
             "Account evidence requires a reserved artifact belonging to its collection job."
         )
     user_id = normalized.profile.user_id
-    previous = session.get(XhsAccountProfileRecord, user_id)
-    if previous is not None:
-        session.delete(previous)
-        session.flush()
-    profile = XhsAccountProfileRecord(**normalized.profile.model_dump())
-    session.add(profile)
+    profile_values = normalized.profile.model_dump()
+    session.execute(
+        sqlite_insert(XhsAccountProfileRecord)
+        .values(**profile_values)
+        .on_conflict_do_nothing(index_elements=["user_id"])
+    )
+    anchor = session.get(XhsAccountProfileRecord, user_id)
+    if anchor is None:
+        raise AccountEvidencePersistenceError(
+            "Account evidence anchor could not be established."
+        )
+
+    snapshot = session.scalar(
+        select(XhsAccountProfileSnapshotRecord).where(
+            XhsAccountProfileSnapshotRecord.collection_job_id
+            == binding.collection_job_id
+        )
+    )
+    if snapshot is not None:
+        notes = _snapshot_note_records(session, snapshot.id)
+        if not _persisted_snapshot_matches(snapshot, notes, normalized):
+            raise AccountEvidencePersistenceError(
+                "An existing collection snapshot does not match its exact artifact."
+            )
+        return PersistedAccountResult(
+            profile=XhsAccountProfileRead.model_validate(snapshot),
+            notes=[XhsAccountNoteRead.model_validate(note) for note in notes],
+        )
+
+    snapshot = XhsAccountProfileSnapshotRecord(**profile_values)
+    session.add(snapshot)
     session.flush()
     notes: list[XhsAccountNoteRecord] = []
-    for normalized_note in normalized.notes:
+    for position, normalized_note in enumerate(normalized.notes):
         note = XhsAccountNoteRecord(**normalized_note.model_dump())
         session.add(note)
+        session.flush()
+        session.add(
+            XhsAccountSnapshotNoteRecord(
+                note_record_id=note.id,
+                snapshot_id=snapshot.id,
+                position=position,
+            )
+        )
         notes.append(note)
     session.flush()
     return PersistedAccountResult(
-        profile=XhsAccountProfileRead.model_validate(profile),
+        profile=XhsAccountProfileRead.model_validate(snapshot),
         notes=[XhsAccountNoteRead.model_validate(note) for note in notes],
     )
+
+
+def _snapshot_note_records(
+    session: Session,
+    snapshot_id: int,
+) -> list[XhsAccountNoteRecord]:
+    return list(session.scalars(
+        select(XhsAccountNoteRecord)
+        .join(
+            XhsAccountSnapshotNoteRecord,
+            XhsAccountSnapshotNoteRecord.note_record_id
+            == XhsAccountNoteRecord.id,
+        )
+        .where(XhsAccountSnapshotNoteRecord.snapshot_id == snapshot_id)
+        .order_by(XhsAccountSnapshotNoteRecord.position)
+    ).all())
+
+
+def _persisted_snapshot_matches(
+    snapshot: XhsAccountProfileSnapshotRecord,
+    notes: list[XhsAccountNoteRecord],
+    normalized: NormalizedAccountSnapshot,
+) -> bool:
+    return (
+        len(notes) == len(normalized.notes)
+        and _canonical_snapshot_record(
+            snapshot,
+            tuple(type(normalized.profile).model_fields),
+        )
+        == _canonical_snapshot_value(normalized.profile.model_dump(mode="json"))
+        and all(
+            _canonical_snapshot_record(
+                note,
+                tuple(type(normalized_note).model_fields),
+            )
+            == _canonical_snapshot_value(
+                normalized_note.model_dump(mode="json")
+            )
+            for note, normalized_note in zip(
+                notes,
+                normalized.notes,
+                strict=True,
+            )
+        )
+    )
+
+
+def _canonical_snapshot_record(
+    record: object,
+    fields: tuple[str, ...],
+) -> bytes:
+    value: dict[str, Any] = {}
+    for field in fields:
+        item = getattr(record, field)
+        value[field] = item.isoformat() if isinstance(item, datetime) else item
+    return _canonical_snapshot_value(value)
+
+
+def _canonical_snapshot_value(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def normalize_exact_account_result(

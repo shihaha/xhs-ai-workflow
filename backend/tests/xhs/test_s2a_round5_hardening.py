@@ -18,6 +18,7 @@ from backend.app.adapters.contracts import (
     CollectionRequest,
     CollectionResult,
 )
+import backend.app.db as db_module
 from backend.app.db import Database, SchemaMigrationError, canonical_raw_evidence_digest
 import backend.app.features.xhs.staging_cleanup as staging_module
 from backend.app.features.xhs.models import (
@@ -79,6 +80,9 @@ _FACT_IMMUTABILITY_TRIGGERS = {
         END
     """,
 }
+_FACT_IMMUTABILITY_TRIGGERS = (
+    db_module._XHS_ACCOUNT_SNAPSHOT_IMMUTABILITY_TRIGGERS
+)
 
 _PROFILE_PUBLIC_COUNTER_FIELDS = (
     "followers_count",
@@ -593,6 +597,10 @@ def test_account_reads_bind_exact_note_owner_order_and_count(tmp_path: Path) -> 
     _collect(service)
     _drop_fact_freeze_triggers(service)
     with service.database.engine.begin() as connection:
+        connection.execute(text(
+            "DELETE FROM xhs_account_snapshot_notes WHERE note_record_id IN ("
+            "SELECT id FROM xhs_account_notes WHERE note_id='note-1-0')"
+        ))
         connection.execute(
             text("DELETE FROM xhs_account_notes WHERE note_id='note-1-0'")
         )
@@ -735,7 +743,10 @@ def test_content_binding_marker_requires_exact_freeze_triggers(
                 )
             ).scalars()
         )
-        assert names == set(_FACT_IMMUTABILITY_TRIGGERS)
+        assert names == {
+            "ck_xhs_profile_immutable_update",
+            "ck_xhs_note_immutable_update",
+        }
         assert connection.scalar(
             text(
                 "SELECT COUNT(*) FROM workbench_schema_migrations "
@@ -815,18 +826,26 @@ def test_restart_scan_rejects_raw_owner_order_and_count_tamper(
                 )
             ).scalars().all()
             assert len(ids) == 2
-            temporary = max(ids) + 100
             connection.execute(
-                text("UPDATE xhs_account_notes SET id=:new WHERE id=:old"),
-                {"new": temporary, "old": ids[0]},
+                text(
+                    "UPDATE xhs_account_snapshot_notes SET position=100 "
+                    "WHERE note_record_id=:note_id"
+                ),
+                {"note_id": ids[0]},
             )
             connection.execute(
-                text("UPDATE xhs_account_notes SET id=:new WHERE id=:old"),
-                {"new": ids[0], "old": ids[1]},
+                text(
+                    "UPDATE xhs_account_snapshot_notes SET position=0 "
+                    "WHERE note_record_id=:note_id"
+                ),
+                {"note_id": ids[1]},
             )
             connection.execute(
-                text("UPDATE xhs_account_notes SET id=:new WHERE id=:old"),
-                {"new": ids[1], "old": temporary},
+                text(
+                    "UPDATE xhs_account_snapshot_notes SET position=1 "
+                    "WHERE note_record_id=:note_id"
+                ),
+                {"note_id": ids[0]},
             )
         elif corruption == "note-owner":
             connection.execute(text(
@@ -845,6 +864,10 @@ def test_restart_scan_rejects_raw_owner_order_and_count_tamper(
                 "WHERE note_id='note-1-0'"
             ))
         else:
+            connection.execute(text(
+                "DELETE FROM xhs_account_snapshot_notes WHERE note_record_id IN ("
+                "SELECT id FROM xhs_account_notes WHERE note_id='note-1-0')"
+            ))
             connection.execute(
                 text("DELETE FROM xhs_account_notes WHERE note_id='note-1-0'")
             )

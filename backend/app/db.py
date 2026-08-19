@@ -27,6 +27,9 @@ XHS_ARTIFACT_PROMOTION_JOURNAL_MIGRATION = (
 XHS_ACCOUNT_FACT_CONTENT_BINDING_MIGRATION = (
     "xhs_account_fact_content_binding_v4"
 )
+XHS_ACCOUNT_SNAPSHOT_EVIDENCE_MIGRATION = (
+    "xhs_account_snapshot_evidence_v5"
+)
 _XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS = {
     "ck_xhs_profile_immutable_update": """
         CREATE TRIGGER ck_xhs_profile_immutable_update
@@ -484,6 +487,8 @@ class Database:
         from backend.app.features.xhs.models import (
             XhsAccountNoteRecord,
             XhsAccountProfileRecord,
+            XhsAccountProfileSnapshotRecord,
+            XhsAccountSnapshotNoteRecord,
             XhsArtifactPromotionJournalRecord,
         )
         from backend.app.models.jobs import JobArtifactRecord, JobLogRecord, JobRecord
@@ -505,6 +510,8 @@ class Database:
             RankSnapshotRecord,
             XhsAccountNoteRecord,
             XhsAccountProfileRecord,
+            XhsAccountProfileSnapshotRecord,
+            XhsAccountSnapshotNoteRecord,
             XhsArtifactPromotionJournalRecord,
         )
         xhs_account_note_marker_present = self._migration_marker_exists(
@@ -520,6 +527,9 @@ class Database:
             self._migration_marker_exists(
                 XHS_ACCOUNT_FACT_CONTENT_BINDING_MIGRATION
             )
+        )
+        xhs_account_snapshot_marker_present = self._migration_marker_exists(
+            XHS_ACCOUNT_SNAPSHOT_EVIDENCE_MIGRATION
         )
         xhs_artifact_journal_marker_present = self._migration_marker_exists(
             XHS_ARTIFACT_PROMOTION_JOURNAL_MIGRATION
@@ -539,9 +549,21 @@ class Database:
         review_audit_marker_present = self._migration_marker_exists(
             "task8_content_review_outcome_v1"
         )
+        xhs_account_snapshot_upgrade_started = False
         with self.engine.connect() as connection:
             _require_no_xhs_account_note_identity_leftovers(connection)
+            _require_no_xhs_account_snapshot_leftovers(connection)
             _require_no_xhs_artifact_promotion_leftovers(connection)
+            if not xhs_account_snapshot_marker_present:
+                _require_xhs_account_snapshot_precreate_state(connection)
+                tables = set(inspect(connection).get_table_names())
+                xhs_account_snapshot_upgrade_started = (
+                    _xhs_account_note_versioned_shape_valid(connection)
+                    or bool(tables & {
+                        "xhs_account_profile_snapshots",
+                        "xhs_account_snapshot_notes",
+                    })
+                )
         if review_audit_marker_present:
             self._require_content_review_audit_schema()
         if quarantine_marker_present:
@@ -564,9 +586,13 @@ class Database:
         ))
         if xhs_artifact_journal_marker_present:
             self._require_xhs_artifact_promotion_journal_schema()
+        if xhs_account_snapshot_marker_present:
+            self._require_xhs_account_snapshot_evidence()
         if (
             xhs_account_fact_content_binding_marker_present
             and xhs_account_fact_content_binding_prerequisites_present
+            and not xhs_account_snapshot_marker_present
+            and not xhs_account_snapshot_upgrade_started
         ):
             self._require_xhs_account_fact_content_binding()
         Base.metadata.create_all(self.engine)
@@ -605,11 +631,18 @@ class Database:
         self._migrate_xhs_artifact_promotion_journal(
             marker_present=xhs_artifact_journal_marker_present
         )
-        self._migrate_xhs_account_fact_content_binding(
-            marker_present=(
-                xhs_account_fact_content_binding_marker_present
-                and xhs_account_fact_content_binding_prerequisites_present
+        if (
+            not xhs_account_snapshot_marker_present
+            and not xhs_account_snapshot_upgrade_started
+        ):
+            self._migrate_xhs_account_fact_content_binding(
+                marker_present=(
+                    xhs_account_fact_content_binding_marker_present
+                    and xhs_account_fact_content_binding_prerequisites_present
+                )
             )
+        self._migrate_xhs_account_snapshot_evidence(
+            marker_present=xhs_account_snapshot_marker_present
         )
         self._recover_stranded_content_regenerations()
 
@@ -704,6 +737,22 @@ class Database:
             ):
                 raise SchemaMigrationError(
                     "XHS account fact content binding validation failed."
+                )
+
+    def _require_xhs_account_snapshot_evidence(self) -> None:
+        """Validate the complete v5 physical contract without repairing it."""
+
+        with self.engine.connect() as connection:
+            _require_no_xhs_account_snapshot_leftovers(connection)
+            if (
+                not _xhs_account_snapshot_schema_valid(connection)
+                or not _xhs_account_snapshot_data_valid(
+                    connection,
+                    runtime_dir=self.runtime_dir,
+                )
+            ):
+                raise SchemaMigrationError(
+                    "XHS account snapshot evidence content binding validation failed."
                 )
 
     def _require_xhs_artifact_promotion_journal_schema(self) -> None:
@@ -887,6 +936,132 @@ class Database:
                 "VALUES (:name, CURRENT_TIMESTAMP)"
             ), {"name": XHS_ACCOUNT_FACT_CONTENT_BINDING_MIGRATION})
         self._require_xhs_account_fact_content_binding()
+
+    def _migrate_xhs_account_snapshot_evidence(
+        self,
+        *,
+        marker_present: bool,
+    ) -> None:
+        """Install append-only snapshots while preserving every canonical note id."""
+
+        from backend.app.features.xhs.models import (
+            XhsAccountNoteRecord,
+            XhsAccountProfileSnapshotRecord,
+            XhsAccountSnapshotNoteRecord,
+        )
+
+        if marker_present:
+            self._require_xhs_account_snapshot_evidence()
+            return
+        with self.engine.connect() as connection:
+            _require_xhs_account_snapshot_precreate_state(connection)
+        with self.engine.begin() as connection:
+            _require_xhs_account_snapshot_precreate_state(connection)
+            if connection.scalar(text(
+                "SELECT 1 FROM workbench_schema_migrations WHERE name=:name"
+            ), {"name": XHS_ACCOUNT_SNAPSHOT_EVIDENCE_MIGRATION}) is not None:
+                if (
+                    not _xhs_account_snapshot_schema_valid(connection)
+                    or not _xhs_account_snapshot_data_valid(
+                        connection,
+                        runtime_dir=self.runtime_dir,
+                    )
+                ):
+                    raise SchemaMigrationError(
+                        "XHS account snapshot evidence validation failed."
+                    )
+                return
+            if (
+                _xhs_account_snapshot_schema_valid(connection)
+                and _xhs_account_snapshot_data_valid(
+                    connection,
+                    runtime_dir=self.runtime_dir,
+                )
+            ):
+                connection.execute(text(
+                    "INSERT INTO workbench_schema_migrations(name, applied_at) "
+                    "VALUES (:name, CURRENT_TIMESTAMP)"
+                ), {"name": XHS_ACCOUNT_SNAPSHOT_EVIDENCE_MIGRATION})
+                return
+            if (
+                not _xhs_account_note_canonical_id_schema_valid(connection)
+                or not _xhs_account_fact_content_data_valid(
+                    connection,
+                    runtime_dir=self.runtime_dir,
+                )
+            ):
+                raise SchemaMigrationError(
+                    "XHS account snapshot migration prerequisites failed."
+                )
+            for table in (
+                "xhs_account_snapshot_notes",
+                "xhs_account_profile_snapshots",
+            ):
+                if table in inspect(connection).get_table_names() and connection.scalar(
+                    text(f"SELECT COUNT(*) FROM {table}")
+                ):
+                    raise SchemaMigrationError(
+                        "Ambiguous populated XHS account snapshot migration must fail closed."
+                    )
+            definitions = {
+                **_XHS_ACCOUNT_SNAPSHOT_BINDING_TRIGGERS,
+                **_XHS_ACCOUNT_SNAPSHOT_IMMUTABILITY_TRIGGERS,
+            }
+            for name in definitions:
+                connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+            connection.execute(text("DROP TABLE IF EXISTS xhs_account_snapshot_notes"))
+            connection.execute(text("DROP TABLE IF EXISTS xhs_account_profile_snapshots"))
+            if not _xhs_account_note_versioned_shape_valid(connection):
+                _rebuild_xhs_account_notes_with_permanent_ids(
+                    connection,
+                    XhsAccountNoteRecord,
+                    temporary_table="xhs_account_notes_snapshot_v4",
+                )
+            XhsAccountProfileSnapshotRecord.__table__.create(connection)
+            XhsAccountSnapshotNoteRecord.__table__.create(connection)
+            connection.execute(text("""
+                INSERT INTO xhs_account_profile_snapshots (
+                    user_id, source_url, nickname, bio, public_stats_json,
+                    raw_evidence, raw_digest, collection_job_id,
+                    collection_artifact_id, collected_at
+                )
+                SELECT user_id, source_url, nickname, bio, public_stats_json,
+                    raw_evidence, raw_digest, collection_job_id,
+                    collection_artifact_id, collected_at
+                FROM xhs_account_profiles ORDER BY user_id
+            """))
+            connection.execute(text("""
+                INSERT INTO xhs_account_snapshot_notes (
+                    note_record_id, snapshot_id, position
+                )
+                SELECT note.id, snapshot.id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY snapshot.id ORDER BY note.id
+                    ) - 1
+                FROM xhs_account_notes AS note
+                JOIN xhs_account_profile_snapshots AS snapshot
+                  ON snapshot.user_id=note.user_id
+                 AND snapshot.collection_job_id=note.collection_job_id
+                 AND snapshot.collection_artifact_id=note.collection_artifact_id
+                ORDER BY note.id
+            """))
+            _advance_xhs_account_note_identity_sequence(connection)
+            _create_xhs_account_snapshot_triggers(connection)
+            if (
+                not _xhs_account_snapshot_schema_valid(connection)
+                or not _xhs_account_snapshot_data_valid(
+                    connection,
+                    runtime_dir=self.runtime_dir,
+                )
+            ):
+                raise SchemaMigrationError(
+                    "XHS account snapshot evidence validation failed."
+                )
+            connection.execute(text(
+                "INSERT INTO workbench_schema_migrations(name, applied_at) "
+                "VALUES (:name, CURRENT_TIMESTAMP)"
+            ), {"name": XHS_ACCOUNT_SNAPSHOT_EVIDENCE_MIGRATION})
+        self._require_xhs_account_snapshot_evidence()
 
     def _migrate_xhs_artifact_promotion_journal(
         self,
@@ -1962,6 +2137,457 @@ def _create_xhs_account_note_evidence_triggers(connection: Connection) -> None:
         connection.execute(text(sql))
 
 
+_XHS_ACCOUNT_SNAPSHOT_BINDING_TRIGGERS = {
+    "ck_xhs_profile_snapshot_artifact_job_insert": f"""
+        CREATE TRIGGER ck_xhs_profile_snapshot_artifact_job_insert
+        BEFORE INSERT ON xhs_account_profile_snapshots
+        WHEN NOT EXISTS (
+            SELECT 1 FROM job_artifacts AS artifact
+            JOIN jobs AS job ON job.id=artifact.job_id
+            WHERE {_XHS_TRUSTED_ARTIFACT_WHERE}
+        ) OR NOT EXISTS (
+            SELECT 1 FROM xhs_account_profiles AS profile
+            WHERE profile.user_id=NEW.user_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'XHS profile snapshot binding is invalid');
+        END
+    """,
+    "ck_xhs_snapshot_note_binding_insert": """
+        CREATE TRIGGER ck_xhs_snapshot_note_binding_insert
+        BEFORE INSERT ON xhs_account_snapshot_notes
+        WHEN NOT EXISTS (
+            SELECT 1 FROM xhs_account_profile_snapshots AS snapshot
+            JOIN xhs_account_notes AS note ON note.id=NEW.note_record_id
+            WHERE snapshot.id=NEW.snapshot_id
+            AND note.user_id=snapshot.user_id
+            AND note.collection_job_id=snapshot.collection_job_id
+            AND note.collection_artifact_id=snapshot.collection_artifact_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'XHS snapshot note binding is invalid');
+        END
+    """,
+}
+
+
+_XHS_ACCOUNT_SNAPSHOT_IMMUTABILITY_TRIGGERS = {
+    "ck_xhs_profile_immutable_update": """
+        CREATE TRIGGER ck_xhs_profile_immutable_update
+        BEFORE UPDATE ON xhs_account_profiles
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account profile facts are immutable');
+        END
+    """,
+    "ck_xhs_note_immutable_update": """
+        CREATE TRIGGER ck_xhs_note_immutable_update
+        BEFORE UPDATE ON xhs_account_notes
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account note facts are immutable');
+        END
+    """,
+    "ck_xhs_profile_immutable_delete": """
+        CREATE TRIGGER ck_xhs_profile_immutable_delete
+        BEFORE DELETE ON xhs_account_profiles
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account profile facts are append only');
+        END
+    """,
+    "ck_xhs_note_immutable_delete": """
+        CREATE TRIGGER ck_xhs_note_immutable_delete
+        BEFORE DELETE ON xhs_account_notes
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account note facts are append only');
+        END
+    """,
+    "ck_xhs_profile_snapshot_immutable_update": """
+        CREATE TRIGGER ck_xhs_profile_snapshot_immutable_update
+        BEFORE UPDATE ON xhs_account_profile_snapshots
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account profile snapshots are immutable');
+        END
+    """,
+    "ck_xhs_profile_snapshot_immutable_delete": """
+        CREATE TRIGGER ck_xhs_profile_snapshot_immutable_delete
+        BEFORE DELETE ON xhs_account_profile_snapshots
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account profile snapshots are append only');
+        END
+    """,
+    "ck_xhs_snapshot_note_immutable_update": """
+        CREATE TRIGGER ck_xhs_snapshot_note_immutable_update
+        BEFORE UPDATE ON xhs_account_snapshot_notes
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account snapshot membership is immutable');
+        END
+    """,
+    "ck_xhs_snapshot_note_immutable_delete": """
+        CREATE TRIGGER ck_xhs_snapshot_note_immutable_delete
+        BEFORE DELETE ON xhs_account_snapshot_notes
+        BEGIN
+            SELECT RAISE(ABORT, 'xhs account snapshot membership is append only');
+        END
+    """,
+}
+
+
+def _create_xhs_account_snapshot_triggers(connection: Connection) -> None:
+    definitions = {
+        **_XHS_ACCOUNT_SNAPSHOT_BINDING_TRIGGERS,
+        **_XHS_ACCOUNT_SNAPSHOT_IMMUTABILITY_TRIGGERS,
+    }
+    for name, sql in definitions.items():
+        connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+        connection.execute(text(sql))
+
+
+_XHS_ACCOUNT_SNAPSHOT_TEMPORARY_TABLES = frozenset({
+    "xhs_account_notes_snapshot_v4",
+    "xhs_account_profile_snapshots_v5_rebuild",
+    "xhs_account_snapshot_notes_v5_rebuild",
+})
+
+
+def _require_no_xhs_account_snapshot_leftovers(connection: Connection) -> None:
+    known = {
+        _sqlite_ascii_identifier_key(name)
+        for name in _XHS_ACCOUNT_SNAPSHOT_TEMPORARY_TABLES
+    }
+    actual = {
+        name
+        for name in inspect(connection).get_table_names()
+        if _sqlite_ascii_identifier_key(name) in known
+    }
+    if actual:
+        raise SchemaMigrationError(
+            "Interrupted XHS account snapshot migration requires isolated manual migration."
+        )
+
+
+def _xhs_account_note_versioned_shape_valid(connection: Connection) -> bool:
+    try:
+        inspector = inspect(connection)
+        uniques = {
+            tuple(item.get("column_names") or ())
+            for item in inspector.get_unique_constraints("xhs_account_notes")
+        }
+        foreign_keys = {
+            (
+                tuple(item.get("constrained_columns") or ()),
+                item.get("referred_table"),
+                tuple(item.get("referred_columns") or ()),
+                (item.get("options") or {}).get("ondelete"),
+            )
+            for item in inspector.get_foreign_keys("xhs_account_notes")
+        }
+        return (
+            uniques == {("note_id", "user_id", "collection_job_id")}
+            and (
+                ("user_id",),
+                "xhs_account_profiles",
+                ("user_id",),
+                "RESTRICT",
+            ) in foreign_keys
+            and _xhs_account_note_autoincrement_ddl_valid(connection)
+            and _xhs_account_note_canonical_id_check_valid(connection)
+        )
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+
+
+def _xhs_account_snapshot_schema_valid(connection: Connection) -> bool:
+    inspector = inspect(connection)
+    expected_columns = {
+        "xhs_account_profile_snapshots": {
+            "id": "INTEGER",
+            "user_id": "VARCHAR(500)",
+            "source_url": "TEXT",
+            "nickname": "TEXT",
+            "bio": "TEXT",
+            "public_stats_json": "JSON",
+            "raw_evidence": "JSON",
+            "raw_digest": "VARCHAR(64)",
+            "collection_job_id": "VARCHAR(36)",
+            "collection_artifact_id": "INTEGER",
+            "collected_at": "DATETIME",
+        },
+        "xhs_account_snapshot_notes": {
+            "note_record_id": "INTEGER",
+            "snapshot_id": "INTEGER",
+            "position": "INTEGER",
+        },
+    }
+    expected_checks = {
+        "xhs_account_profile_snapshots": {
+            "ck_xhs_profile_snapshot_canonical_id": _XHS_CANONICAL_NOTE_ID_CHECK,
+            "ck_xhs_profile_snapshot_user_id": "length(user_id)between1and500",
+            "ck_xhs_profile_snapshot_source_url": (
+                "length(source_url)<=2000andsource_urlglob'https://*'"
+            ),
+            "ck_xhs_profile_snapshot_raw_digest": (
+                "json_valid(raw_evidence)=1andjson_type(raw_evidence)='object'and"
+                "raw_evidence_digest(raw_evidence)isnotnulland"
+                "length(raw_digest)=64andraw_digestnotglob'*[^0-9a-f]*'and"
+                "raw_evidence_digest(raw_evidence)=raw_digest"
+            ),
+        },
+        "xhs_account_snapshot_notes": {
+            "ck_xhs_snapshot_note_canonical_id": _XHS_CANONICAL_NOTE_ID_CHECK.replace(
+                "idbetween", "note_record_idbetween"
+            ),
+            "ck_xhs_snapshot_note_position": "positionbetween0and1000",
+        },
+    }
+    expected_fks = {
+        "xhs_account_profile_snapshots": {
+            (("user_id",), "xhs_account_profiles", ("user_id",), "RESTRICT"),
+            (("collection_job_id",), "jobs", ("id",), "RESTRICT"),
+            (("collection_artifact_id",), "job_artifacts", ("id",), "RESTRICT"),
+        },
+        "xhs_account_snapshot_notes": {
+            (("note_record_id",), "xhs_account_notes", ("id",), "RESTRICT"),
+            (("snapshot_id",), "xhs_account_profile_snapshots", ("id",), "RESTRICT"),
+        },
+    }
+    expected_indexes = {
+        "xhs_account_profile_snapshots": {
+            "ix_xhs_profile_snapshots_user_version": (("user_id", "id"), False, ""),
+        },
+        "xhs_account_snapshot_notes": {
+            "ix_xhs_snapshot_notes_snapshot_id": (("snapshot_id",), False, ""),
+        },
+    }
+    expected_uniques = {
+        "xhs_account_profile_snapshots": {
+            ("collection_job_id",),
+            ("collection_artifact_id",),
+        },
+        "xhs_account_snapshot_notes": {("snapshot_id", "position")},
+    }
+    expected_pks = {
+        "xhs_account_profile_snapshots": ("id",),
+        "xhs_account_snapshot_notes": ("note_record_id",),
+    }
+    try:
+        if not _xhs_account_note_versioned_shape_valid(connection):
+            return False
+        if not set(expected_columns).issubset(inspector.get_table_names()):
+            return False
+        for table, expected in expected_columns.items():
+            columns = {item["name"]: item for item in inspector.get_columns(table)}
+            if set(columns) != set(expected):
+                return False
+            nullable = (
+                {"nickname", "bio"}
+                if table == "xhs_account_profile_snapshots"
+                else set()
+            )
+            if any(
+                columns[name].get("nullable") is not (name in nullable)
+                for name in columns
+            ):
+                return False
+            if {
+                name: str(column.get("type") or "").upper()
+                for name, column in columns.items()
+            } != expected:
+                return False
+            checks = {
+                item.get("name"): _compact_sql(item.get("sqltext"))
+                for item in inspector.get_check_constraints(table)
+            }
+            if checks != expected_checks[table]:
+                return False
+            foreign_keys = {
+                (
+                    tuple(item.get("constrained_columns") or ()),
+                    item.get("referred_table"),
+                    tuple(item.get("referred_columns") or ()),
+                    (item.get("options") or {}).get("ondelete"),
+                )
+                for item in inspector.get_foreign_keys(table)
+            }
+            if foreign_keys != expected_fks[table]:
+                return False
+            indexes = {
+                item.get("name"): (
+                    tuple(item.get("column_names") or ()),
+                    bool(item.get("unique")),
+                    _compact_sql(
+                        (item.get("dialect_options") or {}).get("sqlite_where")
+                    ),
+                )
+                for item in inspector.get_indexes(table)
+            }
+            if indexes != expected_indexes[table]:
+                return False
+            uniques = {
+                tuple(item.get("column_names") or ())
+                for item in inspector.get_unique_constraints(table)
+            }
+            if uniques != expected_uniques[table]:
+                return False
+            if tuple(
+                inspector.get_pk_constraint(table).get("constrained_columns") or ()
+            ) != expected_pks[table]:
+                return False
+        definitions = {
+            **_XHS_ACCOUNT_SNAPSHOT_BINDING_TRIGGERS,
+            **_XHS_ACCOUNT_SNAPSHOT_IMMUTABILITY_TRIGGERS,
+        }
+        names = ",".join(f"'{name}'" for name in definitions)
+        actual_triggers = {
+            name: _compact_sql(sql)
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                f"AND name IN ({names})"
+            ))
+        }
+        return actual_triggers == {
+            name: _compact_sql(sql) for name, sql in definitions.items()
+        }
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+
+
+def _xhs_account_snapshot_data_valid(
+    connection: Connection,
+    *,
+    runtime_dir: Path | None,
+) -> bool:
+    try:
+        if not _xhs_account_note_evidence_data_valid(connection):
+            return False
+        invalid_snapshot = connection.scalar(text("""
+            SELECT 1 FROM xhs_account_profile_snapshots AS snapshot
+            LEFT JOIN xhs_account_profiles AS profile
+              ON profile.user_id=snapshot.user_id
+            LEFT JOIN job_artifacts AS artifact
+              ON artifact.id=snapshot.collection_artifact_id
+             AND artifact.job_id=snapshot.collection_job_id
+            LEFT JOIN jobs AS job ON job.id=snapshot.collection_job_id
+            WHERE profile.user_id IS NULL OR artifact.id IS NULL
+               OR job.type!=:job_type
+               OR artifact.kind!=:artifact_kind OR artifact.producer!=:producer
+               OR json_valid(snapshot.raw_evidence)!=1
+               OR json_type(snapshot.raw_evidence)!='object'
+               OR raw_evidence_digest(snapshot.raw_evidence) IS NULL
+               OR raw_evidence_digest(snapshot.raw_evidence) IS NOT snapshot.raw_digest
+               OR datetime(snapshot.collected_at) IS NULL
+            LIMIT 1
+        """), {
+            "job_type": ACCOUNT_COLLECTION_JOB_TYPE,
+            "artifact_kind": ACCOUNT_COLLECTION_ARTIFACT_KIND,
+            "producer": ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
+        })
+        if invalid_snapshot is not None:
+            return False
+        if connection.scalar(text("""
+            SELECT 1 FROM xhs_account_profile_snapshots
+            WHERE typeof(id)!='integer' OR id<1
+               OR id>9223372036854775807
+            LIMIT 1
+        """)) is not None:
+            return False
+        if connection.scalar(text("""
+            SELECT 1 FROM xhs_account_profiles AS profile
+            WHERE NOT EXISTS (
+                SELECT 1 FROM xhs_account_profile_snapshots AS snapshot
+                WHERE snapshot.user_id=profile.user_id
+            ) LIMIT 1
+        """)) is not None:
+            return False
+        if connection.scalar(text("""
+            SELECT 1 FROM xhs_account_notes AS note
+            LEFT JOIN xhs_account_snapshot_notes AS member
+              ON member.note_record_id=note.id
+            LEFT JOIN xhs_account_profile_snapshots AS snapshot
+              ON snapshot.id=member.snapshot_id
+            WHERE member.note_record_id IS NULL OR snapshot.id IS NULL
+               OR snapshot.user_id!=note.user_id
+               OR snapshot.collection_job_id!=note.collection_job_id
+               OR snapshot.collection_artifact_id!=note.collection_artifact_id
+            LIMIT 1
+        """)) is not None:
+            return False
+        if connection.scalar(text("""
+            SELECT 1 FROM xhs_account_snapshot_notes AS member
+            LEFT JOIN xhs_account_notes AS note
+              ON note.id=member.note_record_id
+            LEFT JOIN xhs_account_profile_snapshots AS snapshot
+              ON snapshot.id=member.snapshot_id
+            WHERE note.id IS NULL OR snapshot.id IS NULL
+               OR typeof(member.note_record_id)!='integer'
+               OR member.note_record_id<1
+               OR member.note_record_id>9223372036854775807
+               OR typeof(member.snapshot_id)!='integer'
+               OR member.snapshot_id<1
+               OR member.snapshot_id>9223372036854775807
+               OR typeof(member.position)!='integer'
+               OR member.position<0 OR member.position>1000
+            LIMIT 1
+        """)) is not None:
+            return False
+        if connection.scalar(text("""
+            SELECT 1 FROM xhs_account_profile_snapshots AS snapshot
+            LEFT JOIN xhs_account_snapshot_notes AS member
+              ON member.snapshot_id=snapshot.id
+            GROUP BY snapshot.id
+            HAVING COUNT(member.note_record_id)>0 AND (
+                MIN(member.position)!=0
+                OR MAX(member.position)!=COUNT(member.note_record_id)-1
+                OR COUNT(DISTINCT member.position)!=COUNT(member.note_record_id)
+            ) LIMIT 1
+        """)) is not None:
+            return False
+        if connection.scalar(text("""
+            SELECT 1 FROM xhs_account_profiles AS profile
+            JOIN xhs_account_profile_snapshots AS snapshot
+              ON snapshot.user_id=profile.user_id
+             AND snapshot.collection_job_id=profile.collection_job_id
+             AND snapshot.collection_artifact_id=profile.collection_artifact_id
+            WHERE profile.source_url IS NOT snapshot.source_url
+               OR profile.nickname IS NOT snapshot.nickname
+               OR profile.bio IS NOT snapshot.bio
+               OR json(profile.public_stats_json)!=json(snapshot.public_stats_json)
+               OR json(profile.raw_evidence)!=json(snapshot.raw_evidence)
+               OR profile.raw_digest IS NOT snapshot.raw_digest
+               OR profile.collected_at IS NOT snapshot.collected_at
+            LIMIT 1
+        """)) is not None:
+            return False
+        return _xhs_account_fact_content_data_valid(
+            connection,
+            runtime_dir=runtime_dir,
+            versioned=True,
+        )
+    except SQLAlchemyError:
+        return False
+
+
+def _require_xhs_account_snapshot_precreate_state(connection: Connection) -> None:
+    _require_no_xhs_account_snapshot_leftovers(connection)
+    tables = set(inspect(connection).get_table_names())
+    present = tables & {
+        "xhs_account_profile_snapshots",
+        "xhs_account_snapshot_notes",
+    }
+    if not present:
+        return
+    populated = any(
+        connection.scalar(text(f"SELECT COUNT(*) FROM {table}"))
+        for table in present
+    )
+    if populated and not (
+        len(present) == 2
+        and _xhs_account_snapshot_schema_valid(connection)
+        and _xhs_account_snapshot_data_valid(connection, runtime_dir=None)
+    ):
+        raise SchemaMigrationError(
+            "Ambiguous populated XHS account snapshot migration must fail closed."
+        )
+
+
 _ACCOUNT_NOTE_EVIDENCE_PREFIX = "account-note:"
 _ACCOUNT_NOTE_EVIDENCE_ID = re.compile(r"^account-note:([1-9][0-9]*)$", re.ASCII)
 _SQLITE_MAX_ROW_ID = 9_223_372_036_854_775_807
@@ -2999,7 +3625,14 @@ def _xhs_account_note_evidence_schema_valid(
                 )
                 for item in inspector.get_foreign_keys(table)
             }
-            if foreign_keys != expected_fks[table]:
+            allowed_foreign_keys = [expected_fks[table]]
+            if table == "xhs_account_notes":
+                allowed_foreign_keys.append({
+                    (("user_id",), "xhs_account_profiles", ("user_id",), "RESTRICT"),
+                    (("collection_job_id",), "jobs", ("id",), "RESTRICT"),
+                    (("collection_artifact_id",), "job_artifacts", ("id",), "RESTRICT"),
+                })
+            if foreign_keys not in allowed_foreign_keys:
                 return False
             indexes = {
                 item.get("name"): (
@@ -3023,7 +3656,10 @@ def _xhs_account_note_evidence_schema_valid(
         if {
             tuple(item.get("column_names") or ())
             for item in inspector.get_unique_constraints("xhs_account_notes")
-        } != {("note_id", "user_id")}:
+        } not in (
+            {("note_id", "user_id")},
+            {("note_id", "user_id", "collection_job_id")},
+        ):
             return False
         evidence_trigger_names = ",".join(
             f"'{name}'" for name in _XHS_ACCOUNT_NOTE_EVIDENCE_TRIGGER_SQL
@@ -3103,15 +3739,21 @@ def _xhs_account_fact_content_data_valid(
     connection: Connection,
     *,
     runtime_dir: Path | None,
+    versioned: bool = False,
 ) -> bool:
-    """Compare every current normalized value with readable journal-owned bytes."""
+    """Compare normalized values with their exact readable journal-owned bytes."""
 
     try:
+        profile_table = (
+            "xhs_account_profile_snapshots"
+            if versioned
+            else "xhs_account_profiles"
+        )
         profiles = connection.execute(text(
             "SELECT user_id, source_url, nickname, bio, public_stats_json, "
             "raw_evidence, raw_digest, collection_job_id, "
             "collection_artifact_id, collected_at "
-            "FROM xhs_account_profiles ORDER BY user_id"
+            f"FROM {profile_table} ORDER BY user_id, collection_artifact_id"
         )).mappings().all()
     except SQLAlchemyError:
         return False
@@ -3265,13 +3907,33 @@ def _xhs_account_fact_content_data_valid(
                     "collection_artifact_id": profile["collection_artifact_id"],
                     "collected_at": datetime.fromisoformat(profile["collected_at"]),
                 }
-                notes = connection.execute(text(
-                    "SELECT note_id, user_id, source_url, title, summary, "
-                    "published_at, public_interactions_json, raw_evidence, "
-                    "raw_digest, collection_job_id, collection_artifact_id, "
-                    "collected_at FROM xhs_account_notes "
-                    "WHERE user_id=:user_id ORDER BY id"
-                ), {"user_id": profile["user_id"]}).mappings().all()
+                if versioned:
+                    notes = connection.execute(text(
+                        "SELECT note.note_id, note.user_id, note.source_url, "
+                        "note.title, note.summary, note.published_at, "
+                        "note.public_interactions_json, note.raw_evidence, "
+                        "note.raw_digest, note.collection_job_id, "
+                        "note.collection_artifact_id, note.collected_at "
+                        "FROM xhs_account_notes AS note "
+                        "JOIN xhs_account_snapshot_notes AS member "
+                        "ON member.note_record_id=note.id "
+                        "JOIN xhs_account_profile_snapshots AS snapshot "
+                        "ON snapshot.id=member.snapshot_id "
+                        "WHERE snapshot.collection_job_id=:job_id "
+                        "AND snapshot.collection_artifact_id=:artifact_id "
+                        "ORDER BY member.position"
+                    ), {
+                        "job_id": profile["collection_job_id"],
+                        "artifact_id": profile["collection_artifact_id"],
+                    }).mappings().all()
+                else:
+                    notes = connection.execute(text(
+                        "SELECT note_id, user_id, source_url, title, summary, "
+                        "published_at, public_interactions_json, raw_evidence, "
+                        "raw_digest, collection_job_id, collection_artifact_id, "
+                        "collected_at FROM xhs_account_notes "
+                        "WHERE user_id=:user_id ORDER BY id"
+                    ), {"user_id": profile["user_id"]}).mappings().all()
                 actual_notes = [
                     {
                         "note_id": note["note_id"],

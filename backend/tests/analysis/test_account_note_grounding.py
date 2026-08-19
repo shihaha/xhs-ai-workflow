@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import delete, select, text
+from sqlalchemy import select, text
 
 from backend.app.adapters.contracts import (
     CollectionItem,
@@ -184,7 +184,7 @@ class _Fixture:
             note = session.scalar(
                 select(XhsAccountNoteRecord).where(
                     XhsAccountNoteRecord.user_id == user_id
-                )
+                ).order_by(XhsAccountNoteRecord.id.desc())
             )
             assert note is not None
             return queued.id, note.id
@@ -243,7 +243,21 @@ def _historical_note_fact_tamper(fixture: _Fixture):
     finally:
         with fixture.database.engine.begin() as connection:
             connection.execute(text(
-                db_module._XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS[trigger_name]
+                db_module._XHS_ACCOUNT_SNAPSHOT_IMMUTABILITY_TRIGGERS[trigger_name]
+            ))
+
+
+@contextmanager
+def _historical_snapshot_membership_delete(fixture: _Fixture):
+    trigger_name = "ck_xhs_snapshot_note_immutable_delete"
+    with fixture.database.engine.begin() as connection:
+        connection.execute(text(f"DROP TRIGGER {trigger_name}"))
+    try:
+        yield
+    finally:
+        with fixture.database.engine.begin() as connection:
+            connection.execute(text(
+                db_module._XHS_ACCOUNT_SNAPSHOT_IMMUTABILITY_TRIGGERS[trigger_name]
             ))
 
 
@@ -726,11 +740,13 @@ def test_unknown_and_stale_account_note_ids_fail_before_model(tmp_path: Path) ->
     with pytest.raises(EvidenceNotFound):
         service.create(_account_payload("u1", "account-note:999999"))
     payload = _account_payload("u1", f"account-note:{note_id}")
-    with fixture.database.session() as session:
-        session.execute(
-            delete(XhsAccountNoteRecord).where(XhsAccountNoteRecord.id == note_id)
-        )
-        session.commit()
+    with _historical_snapshot_membership_delete(fixture):
+        with fixture.database.session() as session:
+            session.execute(text(
+                "DELETE FROM xhs_account_snapshot_notes "
+                "WHERE note_record_id=:note_id"
+            ), {"note_id": note_id})
+            session.commit()
     with pytest.raises(EvidenceNotFound):
         service.create(payload)
 
@@ -752,19 +768,20 @@ def test_recollection_never_rebinds_a_historical_account_note_citation(
 
     _, new_note_row_id = fixture.collect("u1")
     new_evidence_id = f"account-note:{new_note_row_id}"
-    stale_model = _ModelSpy()
-    service = fixture.analysis(stale_model)
-
-    with pytest.raises(EvidenceNotFound):
-        service.create(_account_payload("u1", old_evidence_id))
+    historical_model = _ModelSpy()
+    service = fixture.analysis(historical_model)
+    revalidated = service.create(_account_payload("u1", old_evidence_id))
 
     assert new_note_row_id > old_note_row_id
     assert new_evidence_id != old_evidence_id
+    assert revalidated.status == "succeeded"
+    assert revalidated.evidence_ids == [old_evidence_id]
+    assert "old-note" in historical_model.calls[0].user_prompt
+    assert "new-note" not in historical_model.calls[0].user_prompt
     assert [row.evidence_id for row in service.list_evidence(account_user_id="u1")] == [
         new_evidence_id
     ]
     assert service.get(historical.id).evidence_ids == [old_evidence_id]
-    assert stale_model.calls == []
 
 
 def test_concurrent_recollection_cannot_rebind_an_inflight_analysis_citation(
@@ -808,11 +825,95 @@ def test_concurrent_recollection_cannot_rebind_an_inflight_analysis_citation(
     created = result["analysis"]
     assert getattr(created, "status") == "succeeded"
     assert getattr(created, "evidence_ids") == [old_evidence_id]
-    with pytest.raises(EvidenceNotFound):
-        service.create(_account_payload("u1", old_evidence_id))
+    assert "old-note" in model.calls[0].user_prompt
+    assert "new-note" not in model.calls[0].user_prompt
+    resolved_again = service.create(_account_payload("u1", old_evidence_id))
+    assert resolved_again.status == "succeeded"
     assert [row.evidence_id for row in service.list_evidence(account_user_id="u1")] == [
         f"account-note:{new_note_row_id}"
     ]
+
+
+def test_artifact_drift_while_model_is_running_cannot_commit_success(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    job_id, note_row_id = fixture.collect("u1")
+    evidence_id = f"account-note:{note_row_id}"
+    entered_model = Event()
+    release_model = Event()
+
+    class BlockingModel(_ModelSpy):
+        def generate_structured(
+            self, request: StructuredModelRequest, schema: object
+        ) -> ModelResult:
+            entered_model.set()
+            assert release_model.wait(2)
+            return super().generate_structured(request, schema)
+
+    service = fixture.analysis(BlockingModel())
+    result: dict[str, object] = {}
+
+    def create_analysis() -> None:
+        result["analysis"] = service.create(_account_payload("u1", evidence_id))
+
+    thread = Thread(target=create_analysis)
+    thread.start()
+    assert entered_model.wait(1)
+    artifact = _artifact_for_job(fixture, job_id)
+    (fixture.runtime_dir / artifact.path).write_bytes(b"tampered-during-model")
+    release_model.set()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    created = result["analysis"]
+    assert getattr(created, "status") == "needs_human"
+    assert getattr(created, "error_category") == "evidence_changed_after_model"
+    assert getattr(created, "output") is None
+    assert service.list_opportunities() == []
+
+
+def test_note_row_drift_while_model_is_running_cannot_commit_success(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    _, note_row_id = fixture.collect("u1")
+    evidence_id = f"account-note:{note_row_id}"
+    entered_model = Event()
+    release_model = Event()
+
+    class BlockingModel(_ModelSpy):
+        def generate_structured(
+            self, request: StructuredModelRequest, schema: object
+        ) -> ModelResult:
+            entered_model.set()
+            assert release_model.wait(2)
+            return super().generate_structured(request, schema)
+
+    service = fixture.analysis(BlockingModel())
+    result: dict[str, object] = {}
+
+    def create_analysis() -> None:
+        result["analysis"] = service.create(_account_payload("u1", evidence_id))
+
+    thread = Thread(target=create_analysis)
+    thread.start()
+    assert entered_model.wait(1)
+    with _historical_note_fact_tamper(fixture):
+        with fixture.database.engine.begin() as connection:
+            connection.execute(text(
+                "UPDATE xhs_account_notes SET title='tampered-during-model' "
+                "WHERE id=:note_id"
+            ), {"note_id": note_row_id})
+        release_model.set()
+        thread.join(2)
+
+    assert not thread.is_alive()
+    created = result["analysis"]
+    assert getattr(created, "status") == "needs_human"
+    assert getattr(created, "error_category") == "evidence_changed_after_model"
+    assert getattr(created, "output") is None
+    assert service.list_opportunities() == []
 
 
 @pytest.mark.parametrize("poison_id", [0, -1])
@@ -822,13 +923,18 @@ def test_noncanonical_persisted_note_id_is_never_discovered_or_used(
 ) -> None:
     fixture = _Fixture(tmp_path)
     _, note_row_id = fixture.collect("u1")
-    with _historical_note_fact_tamper(fixture):
-        with fixture.database.engine.begin() as connection:
-            connection.execute(text("PRAGMA ignore_check_constraints=ON"))
-            connection.execute(
-                text("UPDATE xhs_account_notes SET id=:poison_id WHERE id=:note_id"),
-                {"poison_id": poison_id, "note_id": note_row_id},
-            )
+    with _historical_snapshot_membership_delete(fixture):
+        with _historical_note_fact_tamper(fixture):
+            with fixture.database.engine.begin() as connection:
+                connection.execute(text("PRAGMA ignore_check_constraints=ON"))
+                connection.execute(text(
+                    "DELETE FROM xhs_account_snapshot_notes "
+                    "WHERE note_record_id=:note_id"
+                ), {"note_id": note_row_id})
+                connection.execute(
+                    text("UPDATE xhs_account_notes SET id=:poison_id WHERE id=:note_id"),
+                    {"poison_id": poison_id, "note_id": note_row_id},
+                )
     model = _ModelSpy()
     service = fixture.analysis(model)
     payload = AnalysisCreate.model_construct(
