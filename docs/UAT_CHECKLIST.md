@@ -9,8 +9,8 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [ ] Xiaohongshu login supplied without storing credentials in Git.
 - [ ] Trusted local `xhs-cli` state is prepared outside the application under an isolated directory inside the configured runtime. Set `XHS_LIVE_STATE_DIR` to that directory; do not paste Cookie, token or password into HTTP, tests, logs or this checklist.
 - [ ] One Android phone connected; ADB/device/app state reports actual availability.
-- [ ] Bailian API key supplied through environment only; configured model call succeeds.
-- [ ] Explicit `BAILIAN_MEDIA_LIVE_TEST=1`, `XHS_BAILIAN_IMAGE_MODEL` and `XHS_BAILIAN_VISION_MODEL` are supplied for the one-off bounded media gate. Never paste the key into chat, HTTP payloads or logs.
+- [x] Bailian API key supplied through environment only; the configured image and vision model calls succeeded in the bounded media gate.
+- [x] Explicit `BAILIAN_MEDIA_LIVE_TEST=1`, `XHS_BAILIAN_IMAGE_MODEL` and `XHS_BAILIAN_VISION_MODEL` were supplied only to the one-off test process. The key was not pasted into chat, HTTP payloads or logs.
 - [ ] Fresh runtime/database selected; all business lists are initially empty.
 
 ## Real end-to-end gate
@@ -45,8 +45,8 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - Qianfan authenticated live collection: **not_run** — no authenticated verified profile/selectors were supplied.
 - Xiaohongshu account/note live collection: **not_run** — `XHS_LIVE_TEST=1`, `XHS_LIVE_STATE_DIR`, target counts and a Python interpreter containing the exact pinned `xhs-cli@3ce7141` sources were not supplied. The adapter reads a non-reparse, single-link prepared cookie file through a held OS handle, passes it only over stdin to the repository read-only wrapper, disables browser-cookie/login and xsec-cache hooks, and runs only fixed read commands inside a private runtime. Credentials never enter argv or the inherited environment.
 - Android real-device collection: **not_run: device unavailable**.
-- Bailian text live contract: **not_run: BAILIAN_API_KEY unavailable**.
-- Bailian image/vision live gate: **real image passed; visual schema passed; usage completion failed; rerun pending** — real wan2.6 remains proven through managed material, and the schema-constrained qwen-vl-max response passed strict `VisualAssessment`. Local completion then rejected official nested token-detail objects in the usage envelope. Vision now retains only the three official numeric counters under the unchanged strict validator; one vision-only rerun must still prove durable visual completion.
+- Bailian text live contract: **not_run** — this bounded validation exercised only image generation and visual assessment, not the text model.
+- Bailian image/vision live gate: **passed (2026-08-19)** — the final isolated opt-in run completed `2 passed in 19.25s` against the configured `wan2.6-t2i` and `qwen-vl-max` models. It proved real remote image generation and download, full local image decoding/validation, managed `output_image` persistence, strict visual-assessment parsing, provider request-ID presence and numeric usage projection. The content remained in human `review`; the advisory result did not auto-approve it. No credential value was printed or persisted in project files.
 - Seven-day real UAT: **not_run**.
 
 Until every item above is evidenced, status is “software implemented / awaiting
@@ -64,4 +64,4 @@ real UAT”, not “same effect as the tutorial proven”.
 - Content Studio submits only current revision, image-plan entry and managed material IDs. It shows durable queued/running/needs-human/failed/succeeded/cancelled facts, provider/model/duration/usage, sanitized failures, retry controls and available managed `output_image` identities.
 - Visual output is labelled “AI visual advice — human review still required”. It never fills a human visual-check field and never invokes approval.
 - The fresh-runtime Playwright fixture no longer writes the old `fixtures/cover.png` placeholder. A controlled image adapter returns real decodable PNG bytes through the production API, reserved worker, database, cleanup reservation and managed file/material path. The browser then analyzes that generated material, rejects the planning draft, creates the final draft from the generated material, performs explicit human checks, approves and exports an available ZIP.
-- This controlled path is software evidence. Real Bailian image generation and the strict visual schema response are proven; durable real visual completion remains pending one guarded vision rerun.
+- This controlled path remains separate software evidence. The guarded live gate independently proved real Bailian image generation and durable strict visual completion on 2026-08-19; it did not test the Bailian text model or replace the remaining platform/device/seven-day UAT gates.
