@@ -376,3 +376,39 @@ def test_non_success_terminal_states_remain_truthful_and_listable(
     assert terminal.analysis_artifact_id is None
     assert [row.id for row in store.list_for_item(ids["item"])] == [terminal.id]
     database.close()
+
+
+def test_failure_transitions_never_persist_caller_error_text_or_location(tmp_path: Path) -> None:
+    hostile_category = "sk-live-secret-C:/runtime/https://evil.invalid"
+    hostile_detail = "Bearer sk-live-secret at C:\\Users\\Admin\\key.txt https://evil.invalid"
+
+    for method_name, expected_status, expected_detail in (
+        ("fail", "failed", "Media run failed."),
+        ("needs_human", "needs_human", "Media run requires operator review."),
+    ):
+        database = Database(tmp_path / f"sanitized-{method_name}.sqlite3")
+        ids = _seed_owner(database)
+        store = ContentMediaRunStore(database)
+        queued = store.create(_request(ids))
+        running = store.claim(
+            queued.id, expected_version=0, lease_token=str(uuid4()),
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=2),
+        )
+
+        terminal = getattr(store, method_name)(
+            running.id, expected_version=running.state_version,
+            lease_token=running.lease_token,
+            error_category=hostile_category, error_detail=hostile_detail,
+        )
+
+        assert terminal.status == expected_status
+        assert terminal.error_category == "internal_failure"
+        assert terminal.error_detail == expected_detail
+        with database.engine.connect() as connection:
+            persisted = " ".join(connection.execute(text(
+                "SELECT error_category,error_detail FROM content_media_runs WHERE id=:id"
+            ), {"id": running.id}).one())
+        assert "sk-live-secret" not in persisted
+        assert "evil.invalid" not in persisted
+        assert "Users" not in persisted
+        database.close()

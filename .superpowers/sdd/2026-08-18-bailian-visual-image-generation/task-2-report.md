@@ -54,3 +54,21 @@ Both commands exited successfully. Live Bailian remains `not_run`; Task 2 is per
 - Provider execution, generated-file/material transaction work and visual trust checks belong to Task 3.
 - Reserved worker lifecycle, HTTP routes and health wiring belong to Task 4.
 - Content Studio and real Bailian validation belong to Task 5.
+
+## Review fix round 1 — caller failure text sanitization
+
+The independent review found that `fail` and `needs_human` accepted caller-provided category/detail strings and persisted them verbatim. A RED test demonstrated that a credential sentinel, URL and Windows path all reached `content_media_runs`.
+
+The persistence boundary now maps only known internal categories to stable safe categories (`unconfigured`, `authentication_failed`, `provider_unavailable`, `provider_rejected`, `invalid_output`, `provider_failure`, `validation_failed`, `trust_changed`, `transaction_unknown`, `state_changed`, `safety_rejected`). Unknown input becomes `internal_failure`. Caller detail is discarded; the database receives only `Media run failed.` or `Media run requires operator review.` according to the terminal state.
+
+Fix verification:
+
+```text
+python -m pytest backend/tests/media backend/tests/test_jobs_hardening.py backend/tests/content/test_content_schema_migration.py -q
+45 passed, 104 warnings in 6.77s
+
+python -m py_compile backend/app/features/media/store.py backend/tests/media/test_media_schema.py
+git diff --check
+```
+
+Both commands exited successfully. No migration, worker, API, frontend, XHS or research change was made.

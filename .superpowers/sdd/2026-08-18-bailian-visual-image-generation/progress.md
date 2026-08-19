@@ -13,7 +13,7 @@
 
 Task 1: implementation complete; independent review pending. TDD RED was the expected missing-contract/module import failure. Focused GREEN: 24 passed. Full backend regression: 1321 passed, 2 guarded live skips; no failures. Live Bailian remains not_run.
 
-Task 2: implementation complete; independent review pending. TDD RED covered the missing media persistence package and then the missing terminal/read-schema behaviors. Focused verification: 42 passed. Full backend regression: 1338 passed, 2 guarded live skips; no failures. Live Bailian remains not_run.
+Task 2: implementation and review fix round 1 complete; focused rereview pending. TDD RED covered the missing media persistence package, terminal/read-schema behaviors and the review-proven raw failure-text persistence. Failure transitions now map only a fixed safe category allowlist and fixed sanitized detail; caller exception/category text is never stored. Latest focused/necessary backend verification: 45 passed. Earlier full backend regression: 1338 passed, 2 guarded live skips; no failures. Live Bailian remains not_run.
 
 Task 3: pending.
 

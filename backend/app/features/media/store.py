@@ -24,6 +24,33 @@ class MediaRunTransactionUnknown(RuntimeError):
     """A commit acknowledgement was lost and the exact result cannot be proven."""
 
 
+_SAFE_ERROR_CATEGORY = {
+    "media_unconfigured": "unconfigured",
+    "media_authentication_failed": "authentication_failed",
+    "media_retry_exhausted": "provider_unavailable",
+    "media_request_failed": "provider_rejected",
+    "media_output_invalid": "invalid_output",
+    "provider_failure": "provider_failure",
+    "validation_failed": "validation_failed",
+    "trust_changed": "trust_changed",
+    "transaction_unknown": "transaction_unknown",
+    "state_changed": "state_changed",
+    "safety_rejected": "safety_rejected",
+}
+
+
+def _safe_failure_facts(category: str, *, needs_human: bool) -> tuple[str, str]:
+    """Map an internal category to bounded facts; never retain caller exception text."""
+
+    safe_category = _SAFE_ERROR_CATEGORY.get(category, "internal_failure")
+    safe_detail = (
+        "Media run requires operator review."
+        if needs_human
+        else "Media run failed."
+    )
+    return safe_category, safe_detail
+
+
 class ContentMediaRunStore:
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -154,13 +181,17 @@ class ContentMediaRunStore:
         self, run_id: str, *, expected_version: int, lease_token: str | None,
         error_category: str, error_detail: str,
     ) -> ContentMediaRunRead:
+        del error_detail
+        safe_category, safe_detail = _safe_failure_facts(
+            error_category, needs_human=False
+        )
         now = datetime.now(timezone.utc)
         return self._cas_terminal_or_claim(
             run_id, expected_version=expected_version, expected_status="running",
             expected_lease_token=lease_token,
             values={"status": "failed", "state_version": expected_version + 1,
                     "lease_token": None, "lease_expires_at": None,
-                    "error_category": error_category, "error_detail": error_detail,
+                    "error_category": safe_category, "error_detail": safe_detail,
                     "updated_at": now, "completed_at": now},
         )
 
@@ -168,6 +199,10 @@ class ContentMediaRunStore:
         self, run_id: str, *, expected_version: int, lease_token: str | None,
         error_category: str, error_detail: str,
     ) -> ContentMediaRunRead:
+        del error_detail
+        safe_category, safe_detail = _safe_failure_facts(
+            error_category, needs_human=True
+        )
         now = datetime.now(timezone.utc)
         return self._cas_terminal_or_claim(
             run_id, expected_version=expected_version, expected_status="running",
@@ -175,7 +210,7 @@ class ContentMediaRunStore:
             values={
                 "status": "needs_human", "state_version": expected_version + 1,
                 "lease_token": None, "lease_expires_at": None,
-                "error_category": error_category, "error_detail": error_detail,
+                "error_category": safe_category, "error_detail": safe_detail,
                 "updated_at": now, "completed_at": now,
             },
         )
