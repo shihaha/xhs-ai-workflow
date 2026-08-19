@@ -228,7 +228,12 @@ class ControlledQianfan:
         return CollectionResult(status="succeeded", evidence_artifacts=[relative.as_posix()], items=[item], expected_count_known=True, expected_count=1, succeeded_count=1, raw_observation_count=1, missing_items=[], overflow_count=0, complete=True)
 
 
-settings = Settings(runtime_dir=RUNTIME, database_path=RUNTIME / "task9.sqlite3", bailian_api_key="controlled-not-live")
+settings = Settings(
+    runtime_dir=RUNTIME,
+    database_path=RUNTIME / "task9.sqlite3",
+    xhs_cli_state_dir=RUNTIME / "xhs-cli-state",
+    bailian_api_key="controlled-not-live",
+)
 assert settings.xhs_cli_state_dir is not None
 xhs_config = settings.xhs_cli_state_dir / ".xhs-cli"
 xhs_config.mkdir(parents=True, exist_ok=True)

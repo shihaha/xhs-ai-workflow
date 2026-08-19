@@ -12,7 +12,9 @@
 - Added an explicit opt-in live media gate. It requires `BAILIAN_MEDIA_LIVE_TEST=1`, a local key and explicit image/vision model variables. Default outcome is exactly `not_run` and creates no successful run or file. It never publishes or logs credentials.
 - Added responsive proof at 320, 768, 1024 and 1440 pixels. The RED check found long package hashes overflowing at 320 pixels; the minimal wrap fix passed all four widths.
 
-No XHS implementation or `research/` file was changed. No live Bailian call was made.
+No production XHS implementation or `research/` file was changed. Task 5's
+initial implementation did not make a live call; the separate guarded gate was
+later run with explicit local authority and passed on 2026-08-19.
 
 ## TDD evidence
 
@@ -41,31 +43,45 @@ npm run test:e2e --prefix frontend -- --repeat-each=5
 5 passed
 ```
 
-The one skip is the explicit guarded Bailian media live test and reports `not_run` without local authority.
+The final repeat-five run on 2026-08-20 initially exposed repository `.env`
+leakage into the E2E fixture's temporary XHS state directory. The fixture now
+explicitly places that state inside its owned temporary runtime; the rerun
+passed 5/5. The guarded media gate without explicit process authority remains
+exactly `not_run` (`1 passed, 1 skipped`) and creates no live success.
 
 ## Final verification
 
 ```text
-python -m pytest backend/tests -q
-1362 passed, 3 skipped, 144 warnings in 255.28s
+scripts/verify.ps1
+backend: 1378 passed, 3 skipped, 144 warnings in 289.06s
+frontend: 8 files / 51 tests passed
+production build: passed
+controlled fresh-runtime E2E: 1 passed
+dependency audit: found 0 vulnerabilities
+tracked-file secret scan: clean
+boundary source scan: clean
 
-python -m pytest backend/tests/test_release_scanner.py backend/tests/test_release_hardening.py -q
-8 passed
-
-python tools/scan_release_boundaries.py --root .
-clean
-
-npm audit --prefix frontend --audit-level=high
-found 0 vulnerabilities
+python -m pytest backend/tests/integration/test_bailian_media_live.py -q
+1 passed, 1 skipped in 0.35s (default, no explicit live authority)
 
 git diff --check
-clean (line-ending notices only)
+clean
 ```
 
-An earlier full-backend attempt had one transient Windows process-cleanup result in the unrelated XHS timeout test (`process_cleanup_failed` instead of `timeout`). Its immediate focused rerun passed, no XHS code was changed, and the complete backend rerun above passed.
+The official full gate was run with the repository `.env` reversibly hidden so
+temporary-runtime tests could not inherit machine-specific paths. The file was
+restored in `finally`; the backup path is absent. No secret value was read,
+printed or modified.
 
 ## Live status
 
-- Bailian image generation: `not_run`.
-- Bailian visual assessment: `not_run`.
-- Authenticated Qianfan, real XHS session, Android device and seven-day UAT remain `not_run`.
+- Bailian image generation: **passed (2026-08-19)** with real `wan2.6-t2i`
+  generation, download, decoding and managed persistence.
+- Bailian visual assessment: **passed (2026-08-19)** with real `qwen-vl-max`
+  strict advisory output, request ID and numeric usage; content remained in
+  human review. The isolated gate completed `2 passed in 19.25s`.
+- Bailian text: attempted separately and failed safely as
+  `model_output_invalid`; it is outside Task 5's media success claim.
+- Authenticated Qianfan and the bounded current-account/three-note XHS gate have
+  passed separately. A non-empty XHS search/ranked-account workflow, Android
+  device and seven-day UAT remain `not_run` and are not implied by Task 5.
