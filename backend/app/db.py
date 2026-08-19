@@ -33,6 +33,7 @@ XHS_ACCOUNT_SNAPSHOT_EVIDENCE_MIGRATION = (
 ANALYSIS_EVIDENCE_SNAPSHOT_MIGRATION = (
     "analysis_evidence_snapshot_v3"
 )
+CONTENT_MEDIA_RUNS_MIGRATION = "content_media_runs_v1"
 _ANALYSIS_EVIDENCE_SNAPSHOT_CHECK = (
     "evidence_snapshot_json IS NULL OR "
     "(json_valid(evidence_snapshot_json) = 1 AND "
@@ -620,6 +621,7 @@ class Database:
             ProductMaterialRecord,
             ProductRecord,
         )
+        from backend.app.features.media.models import ContentMediaRunRecord
         from backend.app.features.radar.models import RankItemRecord, RankSnapshotRecord
         from backend.app.features.xhs.models import (
             XhsAccountNoteRecord,
@@ -640,6 +642,7 @@ class Database:
             ContentRevisionRecord,
             ProductMaterialRecord,
             ProductRecord,
+            ContentMediaRunRecord,
             JobArtifactRecord,
             JobLogRecord,
             JobRecord,
@@ -689,6 +692,9 @@ class Database:
         analysis_evidence_snapshot_marker_present = self._migration_marker_exists(
             ANALYSIS_EVIDENCE_SNAPSHOT_MIGRATION
         )
+        content_media_runs_marker_present = self._migration_marker_exists(
+            CONTENT_MEDIA_RUNS_MIGRATION
+        )
         xhs_account_snapshot_upgrade_started = False
         with self.engine.connect() as connection:
             _require_no_xhs_account_note_identity_leftovers(connection)
@@ -708,6 +714,8 @@ class Database:
             self._require_content_review_audit_schema()
         if analysis_evidence_snapshot_marker_present:
             self._require_analysis_evidence_snapshot_schema()
+        if content_media_runs_marker_present:
+            self._require_content_media_run_schema()
         if quarantine_marker_present:
             self._require_artifact_quarantine_schema(
                 require_identity=quarantine_identity_marker_present,
@@ -789,6 +797,9 @@ class Database:
         self._migrate_analysis_evidence_snapshot(
             marker_present=analysis_evidence_snapshot_marker_present
         )
+        self._migrate_content_media_runs(
+            marker_present=content_media_runs_marker_present
+        )
         self._recover_stranded_content_regenerations()
 
     def _migration_marker_exists(self, name: str) -> bool:
@@ -802,6 +813,34 @@ class Database:
                 ),
                 {"name": name},
             ) is not None
+
+    def _require_content_media_run_schema(self) -> None:
+        with self.engine.connect() as connection:
+            if not _content_media_run_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "content media run schema validation failed."
+                )
+
+    def _migrate_content_media_runs(self, *, marker_present: bool) -> None:
+        """Mark only the exact new schema; marker-present startup is validation-only."""
+
+        if marker_present:
+            self._require_content_media_run_schema()
+            return
+        with self.engine.begin() as connection:
+            if not _content_media_run_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "content media run schema validation failed; partial migration requires recovery."
+                )
+            connection.execute(text(
+                "CREATE TABLE IF NOT EXISTS workbench_schema_migrations ("
+                "name VARCHAR(200) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL)"
+            ))
+            connection.execute(text(
+                "INSERT INTO workbench_schema_migrations(name, applied_at) "
+                "VALUES (:name, CURRENT_TIMESTAMP)"
+            ), {"name": CONTENT_MEDIA_RUNS_MIGRATION})
+        self._require_content_media_run_schema()
 
     def _recover_stranded_content_regenerations(self) -> None:
         """Fail closed exact regeneration reservations left by a stopped process."""
@@ -2527,6 +2566,129 @@ def _content_schema_valid(inspector: object) -> bool:
             if actual != expected:
                 return False
     except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+    return True
+
+
+def _content_media_run_schema_valid(connection: Connection) -> bool:
+    """Validate the small physical contract that later workers may safely resume."""
+
+    try:
+        inspector = inspect(connection)
+        if "content_media_runs" not in inspector.get_table_names():
+            return False
+        columns = {
+            item["name"]: item for item in inspector.get_columns("content_media_runs")
+        }
+        required = {
+            "id", "job_id", "owner_product_id", "content_item_id", "revision_id",
+            "plan_entry_id", "capability", "status", "state_version", "provider",
+            "model", "prompt_version", "input_digest", "allowed_evidence_ids_json",
+            "allowed_material_ids_json", "output_material_id", "analysis_artifact_id",
+            "usage_json", "duration_ms", "attempts_json", "error_category",
+            "error_detail", "lease_token", "lease_expires_at", "created_at",
+            "updated_at", "completed_at",
+        }
+        if set(columns) != required:
+            return False
+        nullable = {
+            name for name, item in columns.items() if item.get("nullable") is True
+        }
+        if nullable != {
+            "plan_entry_id", "output_material_id", "analysis_artifact_id",
+            "duration_ms", "error_category", "error_detail", "lease_token",
+            "lease_expires_at", "completed_at",
+        }:
+            return False
+        checks = {
+            item.get("name") for item in inspector.get_check_constraints("content_media_runs")
+        }
+        if checks != {
+            "ck_content_media_id", "ck_content_media_capability",
+            "ck_content_media_status", "ck_content_media_state_version",
+            "ck_content_media_provider_model", "ck_content_media_input_digest",
+            "ck_content_media_json", "ck_content_media_plan_entry",
+            "ck_content_media_duration", "ck_content_media_lease",
+            "ck_content_media_outcome",
+        }:
+            return False
+        unique = {
+            (item.get("name"), tuple(item.get("column_names") or ()))
+            for item in inspector.get_unique_constraints("content_media_runs")
+        }
+        if unique != {("uq_content_media_job", ("job_id",))}:
+            return False
+        indexes = {
+            item.get("name"): (
+                tuple(item.get("column_names") or ()), bool(item.get("unique")),
+                _compact_sql((item.get("dialect_options") or {}).get("sqlite_where")),
+            )
+            for item in inspector.get_indexes("content_media_runs")
+        }
+        if indexes != {
+            "ix_content_media_item_created": (
+                ("content_item_id", "created_at"), False, "",
+            ),
+            "uq_content_media_open_generation": (
+                ("content_item_id", "revision_id", "plan_entry_id"), True,
+                "capability='generate'andstatusin('queued','running')",
+            ),
+        }:
+            return False
+        fks = {
+            (
+                tuple(item.get("constrained_columns") or ()),
+                item.get("referred_table"),
+                tuple(item.get("referred_columns") or ()),
+                (item.get("options") or {}).get("ondelete"),
+            )
+            for item in inspector.get_foreign_keys("content_media_runs")
+        }
+        expected_fks = {
+            (("job_id",), "jobs", ("id",), "RESTRICT"),
+            (("owner_product_id",), "content_products", ("id",), "RESTRICT"),
+            (("content_item_id",), "content_items", ("id",), "RESTRICT"),
+            (("revision_id", "content_item_id"), "content_revisions", ("id", "content_item_id"), "RESTRICT"),
+            (("output_material_id",), "content_product_materials", ("id",), "RESTRICT"),
+            (("analysis_artifact_id",), "job_artifacts", ("id",), "RESTRICT"),
+        }
+        if fks != expected_fks:
+            return False
+        invalid_binding = connection.scalar(text(
+            "SELECT 1 FROM content_media_runs r "
+            "LEFT JOIN content_items i ON i.id=r.content_item_id "
+            "LEFT JOIN content_revisions v ON v.id=r.revision_id AND v.content_item_id=r.content_item_id "
+            "LEFT JOIN jobs j ON j.id=r.job_id "
+            "LEFT JOIN content_product_materials m ON m.id=r.output_material_id "
+            "LEFT JOIN job_artifacts a ON a.id=r.analysis_artifact_id "
+            "WHERE i.id IS NULL OR i.product_id!=r.owner_product_id OR v.id IS NULL OR j.id IS NULL OR "
+            "j.type!=CASE r.capability WHEN 'generate' THEN 'content_image_generation' ELSE 'content_image_analysis' END OR "
+            "j.state!=r.status OR (m.id IS NOT NULL AND m.product_id!=r.owner_product_id) OR "
+            "(a.id IS NOT NULL AND a.job_id!=r.job_id) LIMIT 1"
+        ))
+        if invalid_binding is not None:
+            return False
+        rows = connection.execute(text(
+            "SELECT allowed_evidence_ids_json,allowed_material_ids_json,usage_json,attempts_json "
+            "FROM content_media_runs"
+        )).all()
+        for raw_evidence, raw_materials, raw_usage, raw_attempts in rows:
+            evidence = json.loads(raw_evidence) if isinstance(raw_evidence, str) else raw_evidence
+            materials = json.loads(raw_materials) if isinstance(raw_materials, str) else raw_materials
+            usage = json.loads(raw_usage) if isinstance(raw_usage, str) else raw_usage
+            attempts = json.loads(raw_attempts) if isinstance(raw_attempts, str) else raw_attempts
+            if (
+                not isinstance(evidence, list) or len(evidence) > 500
+                or not isinstance(materials, list) or len(materials) > 500
+                or any(not isinstance(value, str) or not value.strip() or len(value) > 500 for value in evidence + materials)
+                or len(evidence) != len(set(evidence)) or len(materials) != len(set(materials))
+                or not isinstance(usage, dict) or len(usage) > 50
+                or any(not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int) or value < 0 for key, value in usage.items())
+                or not isinstance(attempts, list) or len(attempts) > 20
+                or any(not isinstance(value, dict) for value in attempts)
+            ):
+                return False
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, SQLAlchemyError):
         return False
     return True
 
