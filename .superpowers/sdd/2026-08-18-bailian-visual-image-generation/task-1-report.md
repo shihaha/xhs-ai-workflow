@@ -50,4 +50,37 @@ git diff --check
 
 Both commands exited successfully.
 
-Live Bailian vision and image generation remain `not_run`; Task 1 used controlled HTTP transports and real in-memory PNG bytes only.
+## Live-discovered wan2.6 compatibility fix
+
+The first opt-in real generation attempt on 2026-08-19 reached Bailian but did not create a successful image run. Bailian returned HTTP 400 `InvalidParameter` with `url error`; its request ID was retained in the local live output. Vision was not reached. The cause was specific and reproduced: the client used the wan2.5-and-earlier `/services/aigc/text2image/image-synthesis` + `input.prompt` contract for the configured `wan2.6-t2i` model.
+
+TDD RED:
+
+```text
+python -m pytest backend/tests/media/test_bailian_media.py::test_image_generation_polls_bounded_task_and_validates_real_png -q
+FAILED: actual POST .../services/aigc/text2image/image-synthesis
+expected POST .../services/aigc/image-generation/generation
+```
+
+The minimal fix changes only the wan2.6 submission route/body and success URL extraction. It now uses `input.messages[0].content[0].text` and reads the one requested image from `output.choices[].message.content[].image`. Polling remains `/tasks/{task_id}`.
+
+Focused GREEN:
+
+```text
+python -m pytest backend/tests/media/test_bailian_media.py::test_image_generation_polls_bounded_task_and_validates_real_png -q
+1 passed in 0.13s
+
+python -m pytest backend/tests/media -q
+57 passed in 12.37s
+```
+
+Necessary backend regression evidence:
+
+```text
+python -m pytest -c <repo>/pyproject.toml <repo>/backend/tests -q
+1361 passed, 3 skipped, 1 failed in 291.60s
+```
+
+The single failure is not in Bailian/media code: a cleanup-worker subprocess deliberately sets its cwd back to the repository, loads the locally prepared live `.env`, and rejects that `.env`'s external `XHS_CLI_STATE_DIR` against the test's temporary runtime. A separate combined run showed the same local live setting contaminating three direct Settings tests. The `.env` file was not printed, modified or disabled; only its variable names were checked to establish the cause. The complete media suite is green.
+
+Real Bailian generation and vision success remain unproven until the opt-in gate is rerun. No credential or provider body was written to this report.

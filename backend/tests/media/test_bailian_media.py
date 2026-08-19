@@ -200,7 +200,17 @@ def _image_transport(image_response: Callable[[], httpx.Response]) -> httpx.Mock
                     "output": {
                         "task_id": "task-1",
                         "task_status": "SUCCEEDED",
-                        "results": [{"url": "https://result.example/generated.png"}],
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": [
+                                        {
+                                            "image": "https://result.example/generated.png"
+                                        }
+                                    ]
+                                }
+                            }
+                        ],
                     },
                     "usage": {"image_count": 1},
                 },
@@ -223,6 +233,10 @@ def test_image_generation_polls_bounded_task_and_validates_real_png() -> None:
 
     def record_submission(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
+            assert request.url == (
+                "https://trusted.example/api/v1/services/aigc/"
+                "image-generation/generation"
+            )
             submitted_bodies.append(json.loads(request.content))
         return base_transport.handle_request(request)
 
@@ -250,7 +264,14 @@ def test_image_generation_polls_bounded_task_and_validates_real_png() -> None:
     assert submitted_bodies == [
         {
             "model": "wan2.6-t2i",
-            "input": {"prompt": "draw a book"},
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": "draw a book"}],
+                    }
+                ]
+            },
             "parameters": {"size": "1280*1280", "n": 1},
         }
     ]

@@ -287,14 +287,21 @@ class BailianImageGenerationAdapter(_BailianMediaClient):
         started = time.monotonic()
         body = {
             "model": self.model,
-            "input": {"prompt": request.prompt},
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": request.prompt}],
+                    }
+                ]
+            },
             "parameters": {"size": "1280*1280", "n": 1},
         }
         with self._authorized_client() as client:
             submitted = self._request(
                 client,
                 "POST",
-                f"{self.base_url}/services/aigc/text2image/image-synthesis",
+                f"{self.base_url}/services/aigc/image-generation/generation",
                 attempts=attempts,
                 json_body=body,
                 extra_headers={"X-DashScope-Async": "enable"},
@@ -354,10 +361,22 @@ class BailianImageGenerationAdapter(_BailianMediaClient):
 
         try:
             output = final_envelope["output"]
-            results = output["results"]
-            if not isinstance(results, list) or len(results) != 1:
+            choices = output["choices"]
+            if not isinstance(choices, list) or not choices:
                 raise ValueError("expected one generated result")
-            result_url = results[0]["url"]
+            image_urls: list[str] = []
+            for choice in choices:
+                content = choice["message"]["content"]
+                if not isinstance(content, list):
+                    raise TypeError("generated content must be a list")
+                image_urls.extend(
+                    item["image"]
+                    for item in content
+                    if isinstance(item, dict) and "image" in item
+                )
+            if len(image_urls) != 1:
+                raise ValueError("expected one generated image")
+            result_url = image_urls[0]
             if not isinstance(result_url, str) or not _safe_https_url(result_url):
                 raise ValueError("invalid generated result URL")
             usage = _validated_usage(final_envelope.get("usage", {}))
