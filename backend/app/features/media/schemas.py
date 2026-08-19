@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.app.db import is_canonical_uuid_text
+from backend.app.adapters.contracts import VisualAssessment
 
 
 class _StrictModel(BaseModel):
@@ -161,3 +162,42 @@ class MediaCompletionFacts(_StrictModel):
         ):
             raise ValueError("usage must contain bounded non-negative counters")
         return value
+
+
+class VisualAssessmentRead(_StrictModel):
+    """Durable advisory output bound to one run and exact managed images."""
+
+    run_id: str = Field(min_length=36, max_length=36)
+    content_item_id: str = Field(min_length=36, max_length=36)
+    revision_id: str = Field(min_length=36, max_length=36)
+    material_ids: list[str] = Field(min_length=1, max_length=20)
+    provider: str = Field(min_length=1, max_length=100)
+    model: str = Field(min_length=1, max_length=300)
+    prompt_version: str = Field(min_length=1, max_length=100)
+    provider_request_id: str | None = Field(default=None, max_length=500)
+    assessment: VisualAssessment
+    usage: dict[str, int] = Field(max_length=50)
+    duration_ms: int = Field(ge=0, le=86_400_000)
+
+    @field_validator("run_id", "content_item_id", "revision_id")
+    @classmethod
+    def canonical_assessment_ids(cls, value: str) -> str:
+        if not is_canonical_uuid_text(value):
+            raise ValueError("assessment identities must be canonical UUIDs")
+        return value
+
+    @field_validator("material_ids")
+    @classmethod
+    def canonical_material_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)) or any(
+            not is_canonical_uuid_text(item) for item in value
+        ):
+            raise ValueError("assessment material identities must be canonical and unique")
+        return value
+
+    @field_validator("usage")
+    @classmethod
+    def bounded_assessment_usage(cls, value: dict[str, int]) -> dict[str, int]:
+        return MediaCompletionFacts(
+            usage=value, duration_ms=0, attempts=[]
+        ).usage
