@@ -9,6 +9,11 @@ import {
   startNoteSearch,
   fetchAccounts,
   startQianfanCollection,
+  fetchContentMediaAssessment,
+  fetchContentMediaRun,
+  fetchContentMediaRuns,
+  startContentImageAnalysis,
+  startContentImageGeneration,
 } from "./client";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -25,6 +30,37 @@ describe("paginated API reads", () => {
     await expect(fetchAccounts()).resolves.toHaveLength(101);
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/radar/accounts?limit=100&offset=0", expect.any(Object));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/radar/accounts?limit=100&offset=100", expect.any(Object));
+  });
+});
+
+describe("content media API", () => {
+  it("submits only trusted media identities and reads durable results", async () => {
+    const run = { id: "run-1", status: "queued" };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => run })
+      .mockResolvedValueOnce({ ok: true, json: async () => run })
+      .mockResolvedValueOnce({ ok: true, json: async () => [run] })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ...run, status: "succeeded" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ run_id: "run-1", assessment: { plan_match: true } }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startContentImageGeneration("item-1", {
+      expected_revision_id: "revision-1",
+      image_plan_entry_id: "plan-entry-1",
+    });
+    await startContentImageAnalysis("item-1", {
+      expected_revision_id: "revision-1",
+      material_ids: ["material-1"],
+    });
+    await fetchContentMediaRuns("item-1");
+    await fetchContentMediaRun("run-1");
+    await fetchContentMediaAssessment("run-1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/content-items/item-1/image-generations", expect.objectContaining({ method: "POST", body: '{"expected_revision_id":"revision-1","image_plan_entry_id":"plan-entry-1"}' }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/content-items/item-1/image-analyses", expect.objectContaining({ method: "POST", body: '{"expected_revision_id":"revision-1","material_ids":["material-1"]}' }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/content-items/item-1/media-runs", expect.any(Object));
+    expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/v1/content-media-runs/run-1", expect.any(Object));
+    expect(fetchMock).toHaveBeenNthCalledWith(5, "/api/v1/content-media-runs/run-1/assessment", expect.any(Object));
   });
 });
 

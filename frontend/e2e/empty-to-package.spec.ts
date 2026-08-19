@@ -67,23 +67,23 @@ test("fresh temporary database reaches an available pending-publication package"
 
   await page.goto("/content");
   const productRecord = page.getByRole("heading", { name: productName }).locator("..").locator("..");
-  await productRecord.getByText("Add managed material").click();
-  const materialForm = productRecord.getByText("Add managed material").locator("..");
+  await productRecord.getByText("Add existing material (manual)").click();
+  const materialForm = productRecord.getByText("Add existing material (manual)").locator("..");
   await materialForm.getByLabel("Logical filename").fill("source.txt");
   await materialForm.getByLabel("Runtime-relative source path").fill("fixtures/source.txt");
   await materialForm.getByLabel("Media type").fill("text/plain");
-  await materialForm.getByRole("button", { name: "Add material" }).click();
-  await expect(page.getByText(/Material accepted/)).toBeVisible();
+  await materialForm.getByRole("button", { name: "Add manual material" }).click();
+  await expect(page.getByText(/Manual material accepted/)).toBeVisible();
   await page.reload();
   const reloadedProductRecord = page.getByRole("heading", { name: productName }).locator("..").locator("..");
-  await reloadedProductRecord.getByText("Add managed material").click();
-  const imageForm = reloadedProductRecord.getByText("Add managed material").locator("..");
-  await imageForm.getByLabel("Logical filename").fill("cover.png");
-  await imageForm.getByLabel("Runtime-relative source path").fill("fixtures/cover.png");
+  await reloadedProductRecord.getByText("Add existing material (manual)").click();
+  const imageForm = reloadedProductRecord.getByText("Add existing material (manual)").locator("..");
+  await imageForm.getByLabel("Logical filename").fill("collected-product.png");
+  await imageForm.getByLabel("Runtime-relative source path").fill("fixtures/shop-account/product-1/images/product.png");
   await imageForm.getByLabel("Media type").fill("image/png");
   await imageForm.getByLabel("Material kind").selectOption("output_image");
-  await imageForm.getByRole("button", { name: "Add material" }).click();
-  await expect(page.getByText(/Material accepted/)).toBeVisible();
+  await imageForm.getByRole("button", { name: "Add manual material" }).click();
+  await expect(page.getByText(/Manual material accepted/)).toBeVisible();
   await page.reload();
 
   const materials = await request.get("http://127.0.0.1:8000/api/v1/products").then(response => response.json()) as Array<{ materials: Array<{ id: string; kind: string }> }>;
@@ -101,23 +101,58 @@ test("fresh temporary database reaches an available pending-publication package"
   await expect(page.getByText(/Content draft request completed/)).toBeVisible();
   await page.reload();
 
+  const planningReview = page.getByRole("heading", { name: contentTitle }).locator("..").locator("..").locator("..");
+  await planningReview.getByRole("button", { name: "Generate image for page 1" }).click();
+  await expect(page.getByText(/Image generation queued/)).toBeVisible();
+  await expect(planningReview.getByText("succeeded").last()).toBeVisible({ timeout: 15_000 });
+  const mediaRuns = await request.get(`http://127.0.0.1:8000/api/v1/content-items/${(await request.get("http://127.0.0.1:8000/api/v1/content-items").then(response => response.json()) as Array<{ id: string; product_id: string }>).find(value => value.product_id === createdProduct.id)!.id}/media-runs`).then(response => response.json()) as Array<{ capability: string; status: string; output_material_id: string | null }>;
+  const generatedImageId = mediaRuns.find(value => value.capability === "generate" && value.status === "succeeded")!.output_material_id!;
+  await page.getByLabel(generatedImageId).check();
+  await planningReview.getByRole("button", { name: "Analyze selected images" }).click();
+  await expect(page.getByText(/Visual analysis queued/)).toBeVisible();
+  await expect(planningReview.getByText("AI visual advice — human review still required")).toBeVisible({ timeout: 15_000 });
+  await expect(planningReview.getByText("受控视觉检查建议人工确认")).toBeVisible();
+  await page.getByLabel(`Review note for ${contentTitle}`).fill("替换为已生成图片后再审核");
+  await page.getByRole("button", { name: `Reject ${contentTitle}` }).click();
+  await expect(page.getByText(/Rejection persisted/)).toBeVisible();
+
+  const productAfterGeneration = page.getByRole("heading", { name: productName }).locator("..").locator("..");
+  await productAfterGeneration.getByText("Create model draft").click();
+  const generatedDraftForm = productAfterGeneration.getByText("Create model draft").locator("..");
+  await generatedDraftForm.getByLabel("Evidence IDs, comma-separated").fill(shopEvidenceId!);
+  await generatedDraftForm.getByLabel("Source material IDs, comma-separated").fill(sourceId);
+  await generatedDraftForm.getByLabel("Ordered image material IDs").fill(generatedImageId);
+  await generatedDraftForm.getByLabel("Research fact").fill("受控证据证明需求存在");
+  await generatedDraftForm.getByRole("button", { name: "Generate content draft" }).click();
+  await expect(page.getByText(/Content draft request completed/)).toBeVisible();
+  await page.reload();
+
   await page.getByLabel(`Review note for ${contentTitle}`).fill("人工核验通过");
-  await page.getByLabel(new RegExp(`Visual check for ${imageId}`)).fill("封面清晰且与正文一致");
+  await page.getByLabel(new RegExp(`Visual check for ${generatedImageId}`)).fill("封面清晰且与正文一致");
   await page.getByRole("button", { name: `Approve ${contentTitle}` }).click();
   await expect(page.getByText(/Approval persisted/)).toBeVisible();
   await page.getByRole("button", { name: `Export ${contentTitle}` }).click();
   await expect(page.getByText(/Package available: content-packages\//)).toBeVisible();
 
-  const items = await request.get("http://127.0.0.1:8000/api/v1/content-items").then(response => response.json()) as Array<{ id: string; product_id: string }>;
-  const currentItem = items.find(item => item.product_id === createdProduct.id)!;
+  const items = await request.get("http://127.0.0.1:8000/api/v1/content-items").then(response => response.json()) as Array<{ id: string; product_id: string; status: string; image_material_ids: string[] }>;
+  const currentItem = items.find(item => item.product_id === createdProduct.id && item.status === "exported")!;
+  expect(currentItem.image_material_ids).toEqual([generatedImageId]);
   const packages = await request.get("http://127.0.0.1:8000/api/v1/content-packages").then(response => response.json()) as Array<{ content_item_id: string; status: string; availability: string }>;
   expect(packages.find(pkg => pkg.content_item_id === currentItem.id)).toEqual(expect.objectContaining({ status: "ready", availability: "available" }));
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: testInfo.outputPath("available-package.png") });
-  await page.setViewportSize({ width: 360, height: 800 });
-  await page.goto("/content");
-  await expect(page.getByRole("heading", { name: "Content studio" })).toBeVisible();
-  await expect(page.getByRole("navigation", { name: "Workbench" })).toBeVisible();
+  for (const width of [320, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/content");
+    await expect(page.getByRole("heading", { name: "Content studio" })).toBeVisible();
+    await expect(page.getByRole("navigation", { name: "Workbench" })).toBeVisible();
+    const overflow = await page.evaluate(() => Array.from(document.querySelectorAll("body *"))
+      .filter(element => element.getBoundingClientRect().right > window.innerWidth + 1)
+      .slice(0, 5)
+      .map(element => `${element.tagName.toLowerCase()}.${element.className}`));
+    expect(overflow).toEqual([]);
+  }
+  await page.setViewportSize({ width: 320, height: 900 });
   await page.screenshot({ path: testInfo.outputPath("mobile-content.png") });
   expect(browserErrors).toEqual([]);
 });

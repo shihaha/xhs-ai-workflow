@@ -134,9 +134,15 @@ async def test_analysis_post_persists_advice_without_approval_mutation(
         detail = await client.get(
             f"/api/v1/content-media-runs/{accepted.json()['id']}"
         )
+        assessment = await client.get(
+            f"/api/v1/content-media-runs/{accepted.json()['id']}/assessment"
+        )
 
     assert detail.json()["status"] == "succeeded"
     assert detail.json()["analysis_artifact_id"] is not None
+    assert assessment.status_code == 200
+    assert assessment.json()["run_id"] == accepted.json()["id"]
+    assert assessment.json()["assessment"]["plan_match"] is True
     assert service.content_service.get_content_item(item.id).status == before == "review"
     worker.close()
 

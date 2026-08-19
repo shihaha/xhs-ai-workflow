@@ -124,6 +124,24 @@ export interface Product { id: string; name: string; target_user: string; opport
 export interface ContentRevision { id: string; number: number; title: string; body: string; claims: Array<{ claim: string; evidence_ids: string[] }>; source_evidence_ids: string[]; image_plan: Array<{ page_number: number; material_id: string; role: "cover" | "page"; headline: string; visual_direction: string }>; model_provider: string; model_name: string; prompt_version: string; usage: Record<string, number>; attempts: Array<Record<string, unknown>>; created_at: string; }
 export interface ContentItem { id: string; product_id: string; opportunity_id: string; template_key: string; status: "research" | "draft" | "review" | "rejected" | "approved" | "exported"; evidence_ids: string[]; material_ids: string[]; image_material_ids: string[]; cover_material_id: string; research_facts: Array<{ fact: string; evidence_ids: string[] }>; current_revision: ContentRevision | null; revisions: ContentRevision[]; reviews: Array<Record<string, unknown>>; export_availability: "available" | "missing" | "corrupt" | "building" | "failed" | null; created_at: string; updated_at: string; }
 export interface ContentPackage { id: string; content_item_id: string; revision_id: string; status: "building" | "ready" | "failed"; availability: "available" | "missing" | "corrupt" | "building" | "failed"; path: string; sha256: string; size_bytes: number; created_at: string; }
+export interface ContentMediaRun {
+  id: string; job_id: string; owner_product_id: string; content_item_id: string; revision_id: string;
+  plan_entry_id: string | null; capability: "generate" | "analyze"; status: JobState; state_version: number;
+  provider: string; model: string; prompt_version: string; input_digest: string;
+  allowed_evidence_ids: string[]; allowed_material_ids: string[]; output_material_id: string | null;
+  analysis_artifact_id: number | null; usage: Record<string, number>; duration_ms: number | null;
+  attempts: Array<{ attempt: number; category: string }>; error_category: string | null; error_detail: string | null;
+  lease_token: string | null; lease_expires_at: string | null; created_at: string; updated_at: string; completed_at: string | null;
+}
+export interface VisualAssessment {
+  summary: string; plan_match: boolean; text_readability: string; defects: string[];
+  safety_issues: string[]; suggestions: string[];
+}
+export interface ContentMediaAssessment {
+  run_id: string; content_item_id: string; revision_id: string; material_ids: string[];
+  provider: string; model: string; prompt_version: string; provider_request_id: string | null;
+  assessment: VisualAssessment; usage: Record<string, number>; duration_ms: number;
+}
 
 async function getAllPages<T>(path: string): Promise<T[]> {
   const pageSize = 100;
@@ -161,3 +179,8 @@ export const createContentItem = (payload: Record<string, unknown>) => postJson<
 export const reviewContentItem = (itemId: string, payload: Record<string, unknown>) => postJson<ContentItem>(`/api/v1/content-items/${encodeURIComponent(itemId)}/reviews`, payload);
 export const regenerateContentItem = (itemId: string, payload: Record<string, unknown>) => postJson<ContentItem>(`/api/v1/content-items/${encodeURIComponent(itemId)}/regenerate`, payload);
 export const exportContentItem = (itemId: string, payload: Record<string, unknown>) => postJson<ContentPackage>(`/api/v1/content-items/${encodeURIComponent(itemId)}/export`, payload);
+export const startContentImageGeneration = (itemId: string, payload: { expected_revision_id: string; image_plan_entry_id: string }) => postJson<ContentMediaRun>(`/api/v1/content-items/${encodeURIComponent(itemId)}/image-generations`, payload);
+export const startContentImageAnalysis = (itemId: string, payload: { expected_revision_id: string; material_ids: string[] }) => postJson<ContentMediaRun>(`/api/v1/content-items/${encodeURIComponent(itemId)}/image-analyses`, payload);
+export const fetchContentMediaRuns = (itemId: string) => getJson<ContentMediaRun[]>(`/api/v1/content-items/${encodeURIComponent(itemId)}/media-runs`);
+export const fetchContentMediaRun = (runId: string) => getJson<ContentMediaRun>(`/api/v1/content-media-runs/${encodeURIComponent(runId)}`);
+export const fetchContentMediaAssessment = (runId: string) => getJson<ContentMediaAssessment>(`/api/v1/content-media-runs/${encodeURIComponent(runId)}/assessment`);

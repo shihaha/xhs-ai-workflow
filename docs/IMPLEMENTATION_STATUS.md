@@ -1,6 +1,6 @@
 # Implementation status
 
-Status date: 2026-08-18
+Status date: 2026-08-19
 
 ## Software scope
 
@@ -22,6 +22,14 @@ state: the prior job stays visible for audit and can be resumed by its exact
 returned ID or superseded by a newly submitted job. Account-note evidence is
 selectable and labelled trusted only when the API returns its trust eligibility
 flag as true; false entries are disabled and require human verification.
+
+The Bailian media extension adds separate trusted vision and image-generation
+configuration, durable reserved media runs, managed generated `output_image`
+files, sealed advisory visual assessments, worker/API lifecycle and Content
+Studio controls. Requests expose only current revision, image-plan entry and
+managed material IDs; operators cannot enter provider endpoints, models, URLs
+or filesystem paths. Visual advice cannot approve content or satisfy a human
+per-image check.
 
 The controlled Playwright flow begins with a fresh temporary SQLite database and
 runs ranking collection through an available ZIP using deterministic test-only
@@ -67,12 +75,14 @@ environment-only.
 | Reserved worker APIs and read-only cleanup API | `backend/tests/test_jobs_api.py`, `backend/tests/content/test_cleanup_api.py` |
 | Account/note collection states, polling release/resume and audit history | `frontend/src/pages/AccountPage.test.tsx`, `frontend/src/pages/RadarPage.test.tsx` |
 | Account-note trust through fresh empty runtime and ZIP | `backend/tests/analysis/test_account_note_grounding.py`, `frontend/e2e/empty-to-package.spec.ts` |
+| Generated PNG through API/worker/DB/file/UI, advisory vision and human-gated ZIP | media backend suites, `frontend/src/pages/ContentStudioPage.test.tsx`, `frontend/e2e/empty-to-package.spec.ts` |
+| Guarded Bailian image/vision live gate | `backend/tests/integration/test_bailian_media_live.py` (explicit opt-in plus local key/models; default exact `not_run`) |
 | Guarded local XHS CLI contract | `backend/tests/xhs/test_live_cli_contract.py` (isolated externally prepared state, real `status` text shape, JSON `whoami` identity, exact read-only commands, explicit opt-in; default `not_run`) |
 | Fresh empty runtime through ZIP | recovery-matrix empty-state test and `frontend/e2e/empty-to-package.spec.ts` |
 
 ## Not verified live
 
 Authenticated Qianfan, an authenticated local `xhs-cli` account/search run, a
-real Android phone, Bailian using a user key, and the seven-day run remain
+real Android phone, Bailian text/image/vision using a user key, and the seven-day run remain
 `not_run`. See `docs/UAT_CHECKLIST.md`. Therefore the honest release label is
 **software implemented / awaiting real UAT**.

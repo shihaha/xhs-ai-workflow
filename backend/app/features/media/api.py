@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.app.db import is_canonical_uuid_text
-from backend.app.features.media.schemas import ContentMediaRunRead
+from backend.app.features.media.schemas import ContentMediaRunRead, VisualAssessmentRead
 from backend.app.features.media.service import (
     ContentMediaService,
     MediaNotFound,
@@ -153,5 +153,18 @@ def list_media_runs(item_id: str, request: Request) -> list[ContentMediaRunRead]
 def get_media_run(run_id: str, request: Request) -> ContentMediaRunRead:
     try:
         return _service(request).get_run(run_id)
+    except (MediaNotFound, MediaStateError, MediaValidationError) as error:
+        raise _translate(error) from error
+
+
+@router.get(
+    "/content-media-runs/{run_id}/assessment",
+    response_model=VisualAssessmentRead,
+)
+def get_media_assessment(run_id: str, request: Request) -> VisualAssessmentRead:
+    """Read sealed advisory output; this route has no approval side effect."""
+
+    try:
+        return _service(request).get_analysis_assessment(run_id)
     except (MediaNotFound, MediaStateError, MediaValidationError) as error:
         raise _translate(error) from error
