@@ -59,3 +59,21 @@ Both commands exited successfully before the report update. Live Bailian media v
 
 - Content Studio controls, browser E2E and guarded live Bailian validation remain Task 5.
 - There is no application authentication/authorization layer in the approved Task 4 scope, so no new artificial 403 mechanism was introduced. Existing local API trust boundaries are unchanged.
+
+## Review fix round 1 — restart recovery ignores stale future leases
+
+The bounded review found that startup recovery selected queued work and only expired running work. A run left by a dead process with a future lease could therefore remain `running` until that timestamp, or indefinitely after clock drift.
+
+A RED test created a running run with a lease one hour in the future and proved it remained stranded. The worker now takes one startup-only snapshot of every pre-existing queued or running media run. Queued work is resumed once; every pre-existing running run is moved fail-closed to `needs_human` without replaying a paid provider call. Runs claimed after startup are not part of that snapshot and keep the normal single-worker lifecycle.
+
+Fix verification:
+
+```text
+python -m pytest backend/tests/media backend/tests/test_jobs_api.py backend/tests/test_jobs_hardening.py backend/tests/test_health.py -q
+96 passed, 104 warnings in 21.81s
+
+python -m pytest backend/tests -q
+1361 passed, 2 skipped, 144 warnings in 267.21s
+```
+
+Live Bailian remains `not_run`; no frontend, XHS or research file was touched.

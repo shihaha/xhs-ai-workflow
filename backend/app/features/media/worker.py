@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from queue import Empty, Queue
 from threading import Event, RLock, Thread
-from time import monotonic
 
 from backend.app.features.media.schemas import ContentMediaRunRead
 from backend.app.features.media.service import ContentMediaService
@@ -59,9 +57,7 @@ class ContentMediaWorker:
                 daemon=True,
             )
             self._thread.start()
-            recoverable = self.service.run_store.list_recoverable(
-                now=datetime.now(UTC)
-            )
+            recoverable = self.service.run_store.list_startup_recoverable()
             for run in recoverable:
                 if run.status == "queued":
                     self._enqueue_locked(run)

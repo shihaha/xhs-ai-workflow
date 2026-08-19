@@ -96,8 +96,10 @@ def test_start_recovers_queued_run_once(tmp_path: Path) -> None:
     assert worker.close() is True
 
 
-def test_start_marks_expired_running_run_for_operator_recovery(tmp_path: Path) -> None:
-    """Blindly replaying an expired provider call could duplicate paid work."""
+def test_start_marks_future_lease_running_run_for_operator_recovery(
+    tmp_path: Path,
+) -> None:
+    """Trusting an old process lease would strand its paid work until far in the future."""
 
     service, item, original = _media_service(tmp_path)
     queued = service.submit_generation(
@@ -109,7 +111,7 @@ def test_start_marks_expired_running_run_for_operator_recovery(tmp_path: Path) -
         queued.id,
         expected_version=queued.state_version,
         lease_token="00000000-0000-4000-8000-000000000001",
-        lease_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
     )
     worker = ContentMediaWorker(service, poll_seconds=0.01)
 

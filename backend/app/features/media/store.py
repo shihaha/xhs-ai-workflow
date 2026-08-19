@@ -384,6 +384,17 @@ class ContentMediaRunStore:
             ).all()
             return [self._read(record) for record in records]
 
+    def list_startup_recoverable(self) -> list[ContentMediaRunRead]:
+        """Return all work that predates a fresh worker process."""
+
+        with self.database.session() as session:
+            records = session.scalars(
+                select(ContentMediaRunRecord)
+                .where(ContentMediaRunRecord.status.in_(("queued", "running")))
+                .order_by(ContentMediaRunRecord.created_at, ContentMediaRunRecord.id)
+            ).all()
+            return [self._read(record) for record in records]
+
     def list_for_item(self, content_item_id: str) -> list[ContentMediaRunRead]:
         with self.database.session() as session:
             records = session.scalars(
