@@ -444,21 +444,41 @@ class QianfanPlaywrightAdapter:
                     **base_evidence,
                 },
             )
-        try:
-            if page.locator(str(selector_profile.login_selector)).count() > 0:
-                reason = "login_required"
-            elif page.locator(str(selector_profile.captcha_selector)).count() > 0:
-                reason = "captcha_required"
-            elif page.locator(str(selector_profile.ready_selector)).count() <= 0:
-                reason = "layout_changed"
-            else:
-                reason = None
+        deadline = self._monotonic() + self._timeout_seconds
+        while True:
+            try:
+                if page.locator(str(selector_profile.login_selector)).count() > 0:
+                    reason = "login_required"
+                elif page.locator(str(selector_profile.captcha_selector)).count() > 0:
+                    reason = "captcha_required"
+                elif page.locator(str(selector_profile.ready_selector)).count() > 0:
+                    break
+                else:
+                    reason = None
+            except Exception as error:
+                capture_errors.append(_capture_error("scope_readiness", error))
+                return QianfanCaptureOutcome(
+                    status="needs_human",
+                    reason="layout_changed",
+                    raw_evidence={
+                        **_raw_page_evidence(page, responses, capture_errors=capture_errors),
+                        **base_evidence,
+                    },
+                )
             if reason is not None:
                 return QianfanCaptureOutcome(
                     status="needs_human",
                     reason=reason,
                     raw_evidence={**_raw_page_evidence(page, responses), **base_evidence},
                 )
+            if self._monotonic() >= deadline:
+                return QianfanCaptureOutcome(
+                    status="needs_human",
+                    reason="layout_changed",
+                    raw_evidence={**_raw_page_evidence(page, responses), **base_evidence},
+                )
+            self._sleep(self._poll_interval)
+        try:
             page.locator(dict(selector_profile.board_selectors)[board]).click()
             page.locator(dict(selector_profile.dimension_selectors)[dimension]).click()
         except Exception as error:
@@ -471,7 +491,6 @@ class QianfanPlaywrightAdapter:
                     **base_evidence,
                 },
             )
-        deadline = self._monotonic() + self._timeout_seconds
         while True:
             try:
                 active = (
@@ -875,21 +894,24 @@ def _record_response(response: Any, sink: list[dict[str, Any]]) -> None:
     request_scope = _record_request_scope(getattr(response, "request", None))
     if request_scope is not None:
         record["request"] = request_scope
-    raw_text: str | None = None
-    try:
-        raw_text = response.text()
-    except Exception:
-        try:
-            raw_bytes = response.body()
-            raw_text = bytes(raw_bytes).decode("utf-8", errors="replace")
-        except Exception:
-            raw_text = None
     try:
         record["body"] = _redact_credential_like_fields(response.json())
     except Exception as error:
         record["capture_error"] = type(error).__name__
-        record["raw_text"] = raw_text if raw_text is not None else repr(response)
+        body_length = _response_body_length(response)
+        if body_length is not None:
+            record["body_length"] = body_length
     sink.append(_redact_credential_like_fields(record))
+
+
+def _response_body_length(response: Any) -> int | None:
+    try:
+        return len(response.text())
+    except Exception:
+        try:
+            return len(bytes(response.body()))
+        except Exception:
+            return None
 
 
 def _record_request_scope(request: Any) -> dict[str, Any] | None:

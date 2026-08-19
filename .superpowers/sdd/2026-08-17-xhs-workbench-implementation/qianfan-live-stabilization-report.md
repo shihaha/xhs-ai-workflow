@@ -33,3 +33,15 @@ no eight-scope collection, and no platform write was performed in this change.
 The controller must run the isolated authenticated eight-scope gate with
 `expected_count_per_scope=10` and record the resulting job IDs, evidence paths,
 and 8/8 persisted scope facts before live success can be claimed.
+
+## Fix round 1 evidence
+
+The authenticated production-UAT collection beginning `75ca2ef5` reached all
+eight scopes as `needs_human/layout_changed`. Its artifacts had the correct
+ranking-page URL, no captured responses, and no `capture_errors`. This exposed
+an early readiness check immediately after `domcontentloaded`, not a verified
+layout break or collection success.
+
+RED: before this fix, `pytest backend/tests/radar/test_qianfan_live_stabilization.py -q` produced **2 failed**: a page whose ready selector appeared during the configured timeout was rejected before any wait, and an invalid JSON response retained credential-like text in `raw_text`.
+
+GREEN: `pytest backend/tests/radar/test_rank_ingestion.py backend/tests/radar/test_qianfan_orchestration.py backend/tests/radar/test_qianfan_live_stabilization.py -q` produced **91 passed in 10.34s**. Scope readiness now polls login/captcha/ready within the existing deadline, clicks only after ready, and returns `layout_changed` only after that bounded timeout. JSON parse failures retain only the error category and body length; no response body text is persisted. No live browser run was performed for this fix.

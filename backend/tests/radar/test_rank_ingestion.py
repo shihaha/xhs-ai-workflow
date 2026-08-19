@@ -336,8 +336,8 @@ def test_controlled_adapter_captures_raw_page_and_response_without_writes() -> N
     assert len(page.removed_listeners) == 1
 
 
-def test_malformed_response_preserves_raw_body_and_parse_error() -> None:
-    """A JSON parse failure must not replace the actual provider response evidence."""
+def test_malformed_response_records_only_parse_category_and_body_length() -> None:
+    """A JSON parse failure remains auditable without persisting opaque response text."""
     page = _FakePage(
         url="https://ark.xiaohongshu.com/app-datacenter/market/note-rank",
         html="<section class='note-rank'><table></table></section>",
@@ -355,8 +355,9 @@ def test_malformed_response_preserves_raw_body_and_parse_error() -> None:
     outcome = QianfanPlaywrightAdapter(page_factory=lambda: page).capture_visible_page()
 
     response = outcome.raw_evidence["responses"][0]
-    assert response["raw_text"] == "<html>bad gateway</html>"
     assert response["capture_error"] == "ValueError"
+    assert response["body_length"] == len("<html>bad gateway</html>")
+    assert "raw_text" not in response
 
 
 def test_capture_waits_for_delayed_ranking_response_and_cleans_listener() -> None:

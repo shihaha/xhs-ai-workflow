@@ -11,6 +11,7 @@ from backend.app.adapters.qianfan_playwright import (
     DEFAULT_QIANFAN_SELECTOR_PROFILE,
     QIANFAN_RANK_URL,
     QianfanPlaywrightAdapter,
+    _record_response,
 )
 from backend.app.db import Database
 from backend.app.services.jobs import JobService
@@ -82,6 +83,114 @@ class _LivePage:
 
     def content(self) -> str:
         return "<main>authenticated current Qianfan layout</main>"
+
+
+class _DelayedReadyLocator(_LiveLocator):
+    def count(self) -> int:
+        if self.selector == DEFAULT_QIANFAN_SELECTOR_PROFILE.ready_selector:
+            return int(self.page.ready)
+        return super().count()
+
+
+class _DelayedReadyPage(_LivePage):
+    def __init__(self, responses: list[_LiveResponse]) -> None:
+        super().__init__(responses)
+        self.ready = False
+
+    def locator(self, selector: str) -> _DelayedReadyLocator:
+        return _DelayedReadyLocator(self, selector)
+
+
+class _MalformedResponse:
+    url = "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list"
+    status = 502
+
+    def __init__(self, raw_text: str) -> None:
+        self._raw_text = raw_text
+
+    def json(self) -> dict[str, Any]:
+        raise ValueError("not json")
+
+    def text(self) -> str:
+        return self._raw_text
+
+
+def test_scope_waits_within_timeout_for_delayed_ready_layout() -> None:
+    """A current page that renders after domcontentloaded must not be called layout-changed early."""
+    page = _DelayedReadyPage(
+        [
+            _LiveResponse(
+                path="/api/edith/business/data/note/rank/v2/list",
+                data={"sortBy": 1, "noteType": 0, "pageNo": 1, "pageSize": 10},
+                body={"code": 0, "data": {"dataList": [{"rank": 1, "noteId": "ready"}]}},
+            )
+        ]
+    )
+    clock = [0.0]
+
+    def sleep_until_ready(_: float) -> None:
+        page.ready = True
+        clock[0] += 0.1
+
+    outcome = QianfanPlaywrightAdapter(
+        page_factory=lambda: page,
+        timeout_seconds=1,
+        poll_interval=0.1,
+        sleep=sleep_until_ready,
+        monotonic=lambda: clock[0],
+    ).capture_scope_page(
+        board="阅读榜",
+        dimension="优秀内容",
+        selector_profile=DEFAULT_QIANFAN_SELECTOR_PROFILE,
+    )
+
+    assert outcome.status == "captured"
+    assert page.clicks == [
+        dict(DEFAULT_QIANFAN_SELECTOR_PROFILE.board_selectors)["阅读榜"],
+        dict(DEFAULT_QIANFAN_SELECTOR_PROFILE.dimension_selectors)["优秀内容"],
+    ]
+
+
+def test_scope_reports_layout_changed_only_after_ready_timeout() -> None:
+    """An absent ready selector remains a bounded layout mismatch and never receives clicks."""
+    page = _DelayedReadyPage([])
+    clock = [0.0]
+
+    def advance(_: float) -> None:
+        clock[0] += 0.1
+
+    outcome = QianfanPlaywrightAdapter(
+        page_factory=lambda: page,
+        timeout_seconds=0.2,
+        poll_interval=0.1,
+        sleep=advance,
+        monotonic=lambda: clock[0],
+    ).capture_scope_page(
+        board="阅读榜",
+        dimension="优秀内容",
+        selector_profile=DEFAULT_QIANFAN_SELECTOR_PROFILE,
+    )
+
+    assert outcome.status == "needs_human"
+    assert outcome.reason == "layout_changed"
+    assert page.clicks == []
+
+
+def test_json_error_fallback_does_not_retain_credential_like_response_text() -> None:
+    """A parse error must be auditable without retaining the unreadable response body."""
+    raw_text = '{"xsec_token":"credential-like-value","nested":{"token":"also-secret"}}'
+    sink: list[dict[str, Any]] = []
+
+    _record_response(_MalformedResponse(raw_text), sink)
+
+    assert sink == [
+        {
+            "url": "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list",
+            "status": 502,
+            "capture_error": "ValueError",
+            "body_length": len(raw_text),
+        }
+    ]
 
 
 def test_live_profile_accepts_only_canonical_content_response_bound_to_active_scope() -> None:
