@@ -82,16 +82,20 @@ environment-only.
 
 ## Not verified live
 
-Authenticated Qianfan, a non-empty live XHS keyword search and ranked-account UI
-workflow, a real Android phone, and the seven-day run remain `not_run`. Qianfan
-software now has the supported `qianfan-note-rank-live-v1` selector/request
-contract: only active UI plus a successful canonical `POST` response
-(`sortBy`, `noteType=0`, `pageNo=1`, `pageSize=10`) may establish one scope;
-the page-size-one helper request cannot be counted. Account-ranking responses
-normalize by safe public account identity, and raw evidence redacts
-credential-like fields. This is not authenticated live success. The
-controller must still record a real 8/8 run with `expected_count_per_scope=10`.
-The bounded authenticated local `xhs-cli` gate passed for the current profile, 3
+Authenticated Qianfan live UAT passed on 2026-08-20 in an isolated runtime:
+collection `b91a86a6-59c9-470f-978c-d875a45ac664` completed the exact 4×2
+scope matrix, with all 8 jobs at 10/10, 8 raw-capture artifacts, 0
+credential-like-key hits, and direct SQLite verification of 8 snapshots with
+10 submitted/10 persisted items per scope. The initial API filtering script
+looked at the wrong `raw_evidence` level; direct database facts are the
+authoritative result. Qianfan software uses the supported
+`qianfan-note-rank-live-v1` request-bound contract, so only active UI plus a
+successful canonical `POST` response (`sortBy`, `noteType=0`, `pageNo=1`,
+`pageSize=10`) establishes a scope. The prior `layout_changed` and
+`scope_unverified` UAT attempts remain preserved debugging evidence.
+
+A non-empty live XHS keyword search and ranked-account UI workflow, a real
+Android phone, and the seven-day run remain `not_run`. The bounded authenticated local `xhs-cli` gate passed for the current profile, 3
 notes and an exact empty search on 2026-08-19. Bailian text was attempted with
 real credentials and HTTP 200 but failed strict `AnalysisOutput` validation as
 `model_output_invalid`; it is not a live success.

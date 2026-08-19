@@ -5,7 +5,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
 ## Prerequisites
 
-- [ ] Authenticated current Qianfan browser profile supplied and health checked.
+- [x] Authenticated current Qianfan browser profile supplied and health checked.
 - [x] Xiaohongshu login supplied without storing credentials in Git.
 - [x] Trusted local `xhs-cli` state is prepared outside the application under an isolated directory inside the configured runtime. Set `XHS_LIVE_STATE_DIR` to that directory; do not paste Cookie, token or password into HTTP, tests, logs or this checklist.
 - [ ] One Android phone connected; ADB/device/app state reports actual availability.
@@ -15,7 +15,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
 ## Real end-to-end gate
 
-- [ ] Run all eight Qianfan scopes with `expected_count_per_scope=10`; require persisted 8/8 scope facts, canonical `pageNo=1,pageSize=10` raw evidence and no fabricated percentage. Do not count page-size-one helper responses.
+- [x] Run all eight Qianfan scopes with `expected_count_per_scope=10`; require persisted 8/8 scope facts, canonical `pageNo=1,pageSize=10` raw evidence and no fabricated percentage. Do not count page-size-one helper responses.
 - [ ] Select a real account and collect its store on the real phone.
 - [ ] From that ranked account's UI, run read-only account collection and verify one public profile plus exact note N/N, source links, reserved job, raw artifact hash and database rows agree.
 - [ ] Run one public-note keyword search and verify expected N, returned N, source links and the hash-bound search artifact agree.
@@ -40,9 +40,9 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [ ] Cleanup quarantine survives restart and respects the 24-hour grace period.
 - [ ] Each day: reconcile page state, DB rows, logs, evidence files and package hashes.
 
-## Current execution status (2026-08-19)
+## Current execution status (2026-08-20)
 
-- Qianfan authenticated live collection: **failed UAT (2026-08-20), 0 snapshots** — first collection `75ca2ef5…` ended 8/8 `needs_human/layout_changed` before the page-ready selector had time to render; page URLs were correct, responses were 0, and artifacts had no `capture_errors`. Second collection `e6f2ffef…` ended 8/8 `scope_unverified`: active selectors were true and each scope observed 2–6 HTTP-200 responses, but persisted request facts contained only method/path because the adapter incorrectly called Playwright Python's `post_data_json` property. Credential hits were 0. Neither attempt is a live pass; rerun the isolated 8/8 gate only after the software fix, still requiring canonical `pageNo=1,pageSize=10` evidence.
+- Qianfan authenticated live collection: **passed (2026-08-20)** — isolated runtime `qianfan-live-uat-20260820-002938`, collection `b91a86a6-59c9-470f-978c-d875a45ac664`. All 8 returned jobs succeeded at 10/10; 8 raw-capture artifacts exist; credential-like key scan found 0 hits. Direct SQLite verification (authoritative) found exactly 8 snapshots for 2026-08-20, the exact four-board by two-dimension matrix, and `submitted_count=10` plus `item_count=10` for every scope. An initial API filtering script inspected the wrong `raw_evidence` level and is not used as the verdict. Earlier `75ca2ef5…` layout and `e6f2ffef…` scope failures remain historical debugging evidence only.
 - Xiaohongshu account/note bounded live gate: **passed (2026-08-19)** — the isolated opt-in run completed `1 passed in 89.83s`. It verified the authenticated current-account profile, exactly 3 public notes, the reserved job/raw artifact/database path, and an exact empty keyword-search result (0/0), using only fixed `status`, `whoami`, `user`, `user-posts` and `search` reads. The real `user-posts` response used nested page slots and was normalized without treating empty slots as notes. Credentials remained outside argv, logs and project files. A non-empty live search and the ranked-account UI-to-analysis workflow remain pending and are not implied by this bounded pass.
 - Android real-device collection: **not_run: device unavailable**.
 - Bailian text live contract: **failed (2026-08-19)** — the configured text model and Key reached Bailian successfully with HTTP 200, but the returned JSON did not satisfy strict `AnalysisOutput` and was rejected as `model_output_invalid` after 7.796 seconds. The production adapter now sends the exact Pydantic JSON Schema and JSON-only/key-preservation instruction; focused contract tests pass, but the real provider output remains non-conformant. No model output, Key or full provider payload was persisted in this record, and no successful analysis fact is claimed.

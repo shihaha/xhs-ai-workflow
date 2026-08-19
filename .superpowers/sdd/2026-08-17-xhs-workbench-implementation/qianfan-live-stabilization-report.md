@@ -62,3 +62,20 @@ GREEN: the adapter now accepts either a property value (the production
 contract) or the existing callable test double, while retaining only the
 allowlisted request facts. The focused Qianfan suite produced **92 passed in
 10.56s**. No live browser run was performed for this fix.
+
+## Final isolated live UAT — passed
+
+On 2026-08-20, the isolated runtime
+`D:\AI_WORKSPACE_RUNTIME\xhs-intelligence-workbench\qianfan-live-uat-20260820-002938`
+completed collection `b91a86a6-59c9-470f-978c-d875a45ac664` successfully.
+All eight returned jobs succeeded at 10/10; eight `qianfan_raw_capture`
+artifacts existed; and the credential-like key scan found 0 hits. Direct
+SQLite verification is authoritative: for source date 2026-08-20 it found
+exactly eight `radar_rank_snapshots`, the exact four-board by two-dimension
+matrix, and `submitted_count=10` plus `item_count=10` for every scope.
+
+An initial API filtering script inspected the wrong `raw_evidence` level, so
+its result is not used to judge the collection. The two earlier failed attempts
+remain historical debugging evidence above; this final isolated run is the
+current Qianfan live-UAT verdict: **passed**. No content, cookies, tokens, or
+raw response bodies are recorded here.
