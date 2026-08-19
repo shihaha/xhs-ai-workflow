@@ -212,7 +212,13 @@ def _image_transport(image_response: Callable[[], httpx.Response]) -> httpx.Mock
                             }
                         ],
                     },
-                    "usage": {"image_count": 1},
+                    "usage": {
+                        "image_count": 1,
+                        "input_tokens": 12,
+                        "output_tokens": 34,
+                        "total_tokens": 46,
+                        "size": "1280*1280",
+                    },
                 },
             )
         if str(request.url) == "https://result.example/generated.png":
@@ -260,7 +266,12 @@ def test_image_generation_polls_bounded_task_and_validates_real_png() -> None:
         3,
     )
     assert images[0].provider_request_id == "final-request-1"
-    assert images[0].usage == {"image_count": 1}
+    assert images[0].usage == {
+        "image_count": 1,
+        "input_tokens": 12,
+        "output_tokens": 34,
+        "total_tokens": 46,
+    }
     assert submitted_bodies == [
         {
             "model": "wan2.6-t2i",

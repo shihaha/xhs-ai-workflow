@@ -83,4 +83,20 @@ python -m pytest -c <repo>/pyproject.toml <repo>/backend/tests -q
 
 The single failure is not in Bailian/media code: a cleanup-worker subprocess deliberately sets its cwd back to the repository, loads the locally prepared live `.env`, and rejects that `.env`'s external `XHS_CLI_STATE_DIR` against the test's temporary runtime. A separate combined run showed the same local live setting contaminating three direct Settings tests. The `.env` file was not printed, modified or disabled; only its variable names were checked to establish the cause. The complete media suite is green.
 
-Real Bailian generation and vision success remain unproven until the opt-in gate is rerun. No credential or provider body was written to this report.
+At that point, real Bailian generation and vision success were still unproven. No credential or provider body was written to this report.
+
+## Live-discovered usage projection fix
+
+The next real run proved the corrected wan2.6 submission and polling contract: Bailian reached `SUCCEEDED` and returned a real image URL. Local processing then stopped before a managed image could succeed because the official response's usage object contains four integer counters plus dimensional metadata `size: "1280*1280"`. Passing that complete object to the deliberately numeric-only shared validator raised `BailianMediaOutputInvalid`.
+
+The MockTransport success fixture was changed to the observed shape and failed for the same reason before production code changed. The image client now selects only `image_count`, `input_tokens`, `output_tokens` and `total_tokens`, then passes those values through the unchanged strict numeric validator. It ignores `size`; it does not loosen validation or accept arbitrary usage value types.
+
+```text
+python -m pytest backend/tests/media/test_bailian_media.py::test_image_generation_polls_bounded_task_and_validates_real_png -q
+1 passed in 0.17s
+
+python -m pytest backend/tests/media -q
+57 passed in 13.63s
+```
+
+The next complete real run must still prove managed image download/persistence and visual analysis. No live pass is claimed yet.

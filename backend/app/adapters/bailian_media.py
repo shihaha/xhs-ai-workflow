@@ -41,6 +41,12 @@ _PENDING_STATUSES = {
     "SUSPENDED",
 }
 _MIME_BY_FORMAT = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
+_IMAGE_NUMERIC_USAGE_FIELDS = (
+    "image_count",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+)
 
 
 class BailianMediaError(ModelAdapterError):
@@ -379,7 +385,17 @@ class BailianImageGenerationAdapter(_BailianMediaClient):
             result_url = image_urls[0]
             if not isinstance(result_url, str) or not _safe_https_url(result_url):
                 raise ValueError("invalid generated result URL")
-            usage = _validated_usage(final_envelope.get("usage", {}))
+            raw_usage = final_envelope.get("usage", {})
+            projected_usage = (
+                {
+                    key: raw_usage[key]
+                    for key in _IMAGE_NUMERIC_USAGE_FIELDS
+                    if key in raw_usage
+                }
+                if isinstance(raw_usage, dict)
+                else raw_usage
+            )
+            usage = _validated_usage(projected_usage)
         except (ValueError, TypeError, KeyError, IndexError) as error:
             raise BailianMediaOutputInvalid(
                 "Bailian returned invalid generated image metadata.", attempts=attempts
