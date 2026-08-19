@@ -78,8 +78,38 @@ class AnalysisNotFound(LookupError):
 
 
 @dataclass(frozen=True)
+class _ContainedFileSnapshot:
+    payload: bytes
+    identity: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _ArtifactBinding:
+    evidence_id: str
+    artifact_id: int
+    artifact_job_id: str
+    relative_path: str
+    sha256: str
+    size_bytes: int
+    file_identity: tuple[int, int, int, int]
+
+    def snapshot_value(self) -> dict[str, Any]:
+        return {
+            "evidence_id": self.evidence_id,
+            "artifact_id": self.artifact_id,
+            "artifact_job_id": self.artifact_job_id,
+            "relative_path": self.relative_path,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+            "file_identity": list(self.file_identity),
+        }
+
+
+@dataclass(frozen=True)
 class _EvidenceResolution:
     facts: list[dict[str, Any]]
+    trust: list[dict[str, Any]]
+    artifact_bindings: tuple[_ArtifactBinding, ...]
     trust_fingerprint: str
     account_scope: tuple[str, ...]
     allowed_ids: tuple[str, ...]
@@ -174,7 +204,7 @@ class AnalysisService:
         record = AnalysisRecord(
             analysis_type=payload.analysis_type,
             account_user_id=payload.account_user_id,
-            account_user_ids_json=list(payload.account_user_ids),
+            account_user_ids_json=sorted(payload.account_user_ids),
             status="succeeded",
             prompt_version=PROMPT_VERSION,
             provider=self.model_adapter.provider,
@@ -234,7 +264,32 @@ class AnalysisService:
                         "Evidence trust changed while the model request was in flight."
                     ),
                 )
+            record.evidence_snapshot_json = _evidence_snapshot_value(
+                after_model,
+                input_digest=digest,
+            )
             session.add(record)
+            # Flush the immutable claim snapshot into the reserved DB
+            # transaction before the final name->identity CAS.  If that CAS
+            # fails the whole success graph is rolled back; after it succeeds,
+            # the claim no longer depends on mutable path bytes.
+            session.flush()
+            if not _artifact_bindings_still_current(
+                self.runtime_dir,
+                after_model.artifact_bindings,
+            ):
+                session.rollback()
+                session.execute(text("BEGIN IMMEDIATE"))
+                return self._persist_failure_in_session(
+                    session,
+                    payload,
+                    digest=digest,
+                    status="needs_human",
+                    error_category="evidence_changed_after_model",
+                    error_detail=(
+                        "Evidence trust changed while the model request was in flight."
+                    ),
+                )
             session.commit()
             return _analysis_read(_load_analysis(session, record.id))
 
@@ -433,6 +488,7 @@ class AnalysisService:
     ) -> _EvidenceResolution:
         facts: list[dict[str, Any]] = []
         trust: list[dict[str, Any]] = []
+        artifact_bindings: list[_ArtifactBinding] = []
         account_scope = payload.account_scope
         for evidence_id in payload.evidence_ids:
             prefix, separator, raw_id = evidence_id.partition(":")
@@ -457,6 +513,13 @@ class AnalysisService:
                     raise EvidenceAccountMismatch(
                         f"Evidence {evidence_id} has no matching account ownership."
                     )
+                (
+                    trusted_shop_result,
+                    artifact_binding,
+                ) = self._trusted_shop_result_and_binding(
+                    artifact,
+                    evidence_id=evidence_id,
+                )
                 facts.append(
                     {
                         "evidence_id": evidence_id,
@@ -465,9 +528,11 @@ class AnalysisService:
                         "job_state": JobState(artifact.job.state).value,
                         "account_user_id": artifact_account,
                         "job_input": job_input,
-                        "trusted_shop_result": self._trusted_shop_result(artifact),
+                        "trusted_shop_result": trusted_shop_result,
                     }
                 )
+                if artifact_binding is not None:
+                    artifact_bindings.append(artifact_binding)
                 trust.append({
                     "evidence_id": evidence_id,
                     "artifact_id": artifact.id,
@@ -524,9 +589,10 @@ class AnalysisService:
                     raise EvidenceNotFound(
                         f"Evidence {evidence_id} is no longer trusted."
                     )
-                public_fact, trust_fact = trusted_note
+                public_fact, trust_fact, artifact_binding = trusted_note
                 facts.append(public_fact)
                 trust.append(trust_fact)
+                artifact_bindings.append(artifact_binding)
             else:
                 raise EvidenceNotFound(f"Unknown evidence id: {evidence_id}")
         fingerprint_value = json.dumps(
@@ -535,6 +601,9 @@ class AnalysisService:
                 "allowed_ids": list(payload.evidence_ids),
                 "facts": facts,
                 "trust": trust,
+                "artifact_bindings": [
+                    binding.snapshot_value() for binding in artifact_bindings
+                ],
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -542,6 +611,8 @@ class AnalysisService:
         )
         return _EvidenceResolution(
             facts=facts,
+            trust=trust,
+            artifact_bindings=tuple(artifact_bindings),
             trust_fingerprint=sha256(fingerprint_value.encode("utf-8")).hexdigest(),
             account_scope=tuple(sorted(account_scope)),
             allowed_ids=tuple(payload.evidence_ids),
@@ -549,7 +620,7 @@ class AnalysisService:
 
     def _trusted_account_note(
         self, session: Any, note: XhsAccountNoteRecord
-    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    ) -> tuple[dict[str, Any], dict[str, Any], _ArtifactBinding] | None:
         if not _canonical_sqlite_identity(note.id):
             return None
         member = session.get(XhsAccountSnapshotNoteRecord, note.id)
@@ -606,13 +677,14 @@ class AnalysisService:
         if artifact.path != expected_path.as_posix():
             return None
         try:
-            raw_payload = _read_contained_regular_file(
+            file_snapshot = _read_contained_regular_file(
                 self.runtime_dir,
                 expected_path,
                 limit=MAX_TRUSTED_ACCOUNT_RESULT_BYTES,
             )
-            if raw_payload is None:
+            if file_snapshot is None:
                 return None
+            raw_payload = file_snapshot.payload
             metadata = artifact.metadata_json
             if not isinstance(metadata, dict):
                 return None
@@ -621,9 +693,7 @@ class AnalysisService:
             file_digest = sha256(raw_payload).hexdigest()
             if metadata.get("sha256") != file_digest:
                 return None
-            physical_identity = _file_identity(
-                (self.runtime_dir / expected_path).stat()
-            )
+            physical_identity = file_snapshot.identity
             if physical_identity != (
                 journal.file_dev,
                 journal.file_ino,
@@ -791,11 +861,35 @@ class AnalysisService:
             "profile_raw_digest": snapshot.raw_digest,
             "note_raw_digests": [row.raw_digest for row in persisted_notes],
         }
-        return public_fact, trust_fact
+        return (
+            public_fact,
+            trust_fact,
+            _ArtifactBinding(
+                evidence_id=public_fact["evidence_id"],
+                artifact_id=artifact.id,
+                artifact_job_id=artifact.job_id,
+                relative_path=artifact.path,
+                sha256=file_digest,
+                size_bytes=len(raw_payload),
+                file_identity=physical_identity,
+            ),
+        )
 
     def _trusted_shop_result(
         self, artifact: JobArtifactRecord
     ) -> dict[str, Any] | None:
+        result, _binding = self._trusted_shop_result_and_binding(
+            artifact,
+            evidence_id=f"artifact:{artifact.id}",
+        )
+        return result
+
+    def _trusted_shop_result_and_binding(
+        self,
+        artifact: JobArtifactRecord,
+        *,
+        evidence_id: str,
+    ) -> tuple[dict[str, Any] | None, _ArtifactBinding | None]:
         job = artifact.job
         if (
             job.type not in ANDROID_SHOP_JOB_TYPES
@@ -803,22 +897,23 @@ class AnalysisService:
             or artifact.producer != "android_shop_worker_v1"
             or JobState(job.state) is not JobState.succeeded
         ):
-            return None
+            return None, None
         expected_path = Path("evidence") / "shops" / job.id / "result.json"
         if artifact.path != expected_path.as_posix():
-            return None
+            return None, None
         try:
-            raw_result = _read_contained_regular_file(
+            file_snapshot = _read_contained_regular_file(
                 self.runtime_dir,
                 expected_path,
                 limit=MAX_TRUSTED_RESULT_BYTES,
             )
-            if raw_result is None:
-                return None
+            if file_snapshot is None:
+                return None, None
+            raw_result = file_snapshot.payload
             file_result = json.loads(raw_result.decode("utf-8", errors="strict"))
             metadata_result = artifact.metadata_json.get("result")
             if not isinstance(file_result, dict) or file_result != metadata_result:
-                return None
+                return None, None
             parsed = ShopCollectionRead.model_validate(file_result)
         except (
             OSError,
@@ -829,7 +924,7 @@ class AnalysisService:
             AttributeError,
             ValidationError,
         ):
-            return None
+            return None, None
         job_account = job.input_data.get("account_user_id")
         expected_count = job.input_data.get("expected_count")
         if (
@@ -844,8 +939,20 @@ class AnalysisService:
             or job.current_stage != "shop_complete"
             or job.error_category is not None
         ):
-            return None
-        return parsed.model_dump(mode="json")
+            return None, None
+        digest = sha256(raw_result).hexdigest()
+        return (
+            parsed.model_dump(mode="json"),
+            _ArtifactBinding(
+                evidence_id=evidence_id,
+                artifact_id=artifact.id,
+                artifact_job_id=artifact.job_id,
+                relative_path=artifact.path,
+                sha256=digest,
+                size_bytes=len(raw_result),
+                file_identity=file_snapshot.identity,
+            ),
+        )
 
 
 def _strict_value(actual: object, expected: object) -> bool:
@@ -1112,7 +1219,7 @@ def _eligible_for_opportunity(
 
 def _read_contained_regular_file(
     root: Path, relative_path: Path, *, limit: int
-) -> bytes | None:
+) -> _ContainedFileSnapshot | None:
     try:
         resolved_root = root.resolve(strict=True)
         candidate = root.joinpath(*relative_path.parts)
@@ -1152,11 +1259,84 @@ def _read_contained_regular_file(
             return None
     except (OSError, ValueError, TypeError):
         return None
-    return payload
+    return _ContainedFileSnapshot(
+        payload=payload,
+        identity=_file_identity(opened_stat),
+    )
 
 
 def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+
+
+def _contained_regular_file_identity(
+    root: Path,
+    relative_path: Path,
+    *,
+    limit: int,
+) -> tuple[int, int, int, int] | None:
+    """CAS the trusted name to an identity without rereading evidence bytes."""
+
+    try:
+        resolved_root = root.resolve(strict=True)
+        candidate = root.joinpath(*relative_path.parts)
+        current = root
+        for part in relative_path.parts:
+            current = current / part
+            if current.is_symlink() or (
+                hasattr(current, "is_junction") and current.is_junction()
+            ):
+                return None
+        first_resolved = candidate.resolve(strict=True)
+        first_resolved.relative_to(resolved_root)
+        first_stat = candidate.stat()
+        if not stat.S_ISREG(first_stat.st_mode) or first_stat.st_size > limit:
+            return None
+        second_resolved = candidate.resolve(strict=True)
+        second_resolved.relative_to(resolved_root)
+        second_stat = candidate.stat()
+        if (
+            second_resolved != first_resolved
+            or _file_identity(second_stat) != _file_identity(first_stat)
+        ):
+            return None
+        return _file_identity(first_stat)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _artifact_bindings_still_current(
+    runtime_dir: Path,
+    bindings: tuple[_ArtifactBinding, ...],
+) -> bool:
+    return all(
+        _contained_regular_file_identity(
+            runtime_dir,
+            Path(binding.relative_path),
+            limit=MAX_TRUSTED_ACCOUNT_RESULT_BYTES,
+        )
+        == binding.file_identity
+        for binding in bindings
+    )
+
+
+def _evidence_snapshot_value(
+    resolution: _EvidenceResolution,
+    *,
+    input_digest: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "trust_fingerprint": resolution.trust_fingerprint,
+        "account_scope": list(resolution.account_scope),
+        "allowed_ids": list(resolution.allowed_ids),
+        "facts": resolution.facts,
+        "trust": resolution.trust,
+        "artifact_bindings": [
+            binding.snapshot_value() for binding in resolution.artifact_bindings
+        ],
+        "input_digest": input_digest,
+    }
 
 
 _SAFE_MODEL_CATEGORIES = {

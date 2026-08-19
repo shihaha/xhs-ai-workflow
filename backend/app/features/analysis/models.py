@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import ForeignKey, JSON, Integer, String, Text
+from sqlalchemy import CheckConstraint, ForeignKey, JSON, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.db import Base
@@ -14,6 +14,14 @@ from backend.app.db import Base
 
 class AnalysisRecord(Base):
     __tablename__ = "analyses"
+    __table_args__ = (
+        CheckConstraint(
+            "evidence_snapshot_json IS NULL OR "
+            "(json_valid(evidence_snapshot_json) = 1 AND "
+            "json_type(evidence_snapshot_json) = 'object')",
+            name="ck_analysis_evidence_snapshot_json",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     analysis_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
@@ -27,6 +35,10 @@ class AnalysisRecord(Base):
     model: Mapped[str] = mapped_column(String(300), nullable=False)
     input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     evidence_ids_json: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    evidence_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
     output_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     usage_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

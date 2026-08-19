@@ -916,6 +916,45 @@ def test_note_row_drift_while_model_is_running_cannot_commit_success(
     assert service.list_opportunities() == []
 
 
+def test_account_artifact_swap_after_final_resolve_cannot_commit_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    job_id, note_row_id = fixture.collect("u1")
+    evidence_id = f"account-note:{note_row_id}"
+    artifact = _artifact_for_job(fixture, job_id)
+    target = fixture.runtime_dir / artifact.path
+    replacement = target.with_name(f"{target.stem}-replacement.json")
+    replacement.write_bytes(b"tampered-after-final-resolve")
+    service = fixture.analysis(_ModelSpy())
+    real_resolve = service._resolve_evidence_in_session
+    resolve_count = 0
+
+    def swap_after_final_resolve(session: Any, payload: AnalysisCreate):
+        nonlocal resolve_count
+        resolved = real_resolve(session, payload)
+        resolve_count += 1
+        if resolve_count == 2:
+            replacement.replace(target)
+        return resolved
+
+    monkeypatch.setattr(
+        service,
+        "_resolve_evidence_in_session",
+        swap_after_final_resolve,
+    )
+
+    created = service.create(_account_payload("u1", evidence_id))
+
+    assert resolve_count == 2
+    assert target.read_bytes() == b"tampered-after-final-resolve"
+    assert created.status == "needs_human"
+    assert created.error_category == "evidence_changed_after_model"
+    assert created.output is None
+    assert service.list_opportunities() == []
+
+
 @pytest.mark.parametrize("poison_id", [0, -1])
 def test_noncanonical_persisted_note_id_is_never_discovered_or_used(
     tmp_path: Path,

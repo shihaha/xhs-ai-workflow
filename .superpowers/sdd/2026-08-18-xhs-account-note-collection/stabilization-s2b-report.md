@@ -158,3 +158,99 @@ identity is claimed. Controlled adapters, migrations and E2E evidence verify
 the software behavior only.
 
 Independent post-commit review remains pending.
+
+# Stabilization S2B fix round 1/5 — sealed analysis evidence handoff
+
+Date: 2026-08-19
+
+## Review finding and RED
+
+Independent review found one remaining filesystem-to-database TOCTOU boundary:
+the second complete evidence resolution read and closed the formal artifact,
+then an external process could replace the path before the successful analysis
+transaction committed. `BEGIN IMMEDIATE` reserves SQLite writes but does not
+reserve a filesystem name.
+
+Two deterministic regressions hook the real second resolution and atomically
+replace the formal artifact after it returns, before the success commit: one
+uses `account-note:<id>`, and one uses a shop artifact. Before the fix, the
+exact selection proved the finding:
+
+```text
+python -m pytest \
+  backend/tests/analysis/test_account_note_grounding.py::test_account_artifact_swap_after_final_resolve_cannot_commit_success \
+  backend/tests/analysis/test_evidence_grounding.py::test_shop_artifact_swap_after_final_resolve_cannot_commit_success -q
+2 failed in 1.17s
+```
+
+Both failures were a real `succeeded` result where `needs_human` was required.
+The identical selection after implementation is `2 passed in 1.07s`.
+
+## Mechanism
+
+- A successful `AnalysisRecord` now owns `evidence_snapshot_json`, a versioned
+  immutable claim snapshot containing the exact public facts sent to the model,
+  trust facts, account scope, allowed evidence IDs, input digest, trust
+  fingerprint and every formal artifact binding (job/artifact/path, SHA-256,
+  byte size and physical identity).
+- The second complete resolution still runs inside `BEGIN IMMEDIATE` and must
+  exactly match the pre-model trust fingerprint, account scope and allowed IDs.
+- The service adds the success graph and flushes the sealed evidence snapshot
+  into that reserved transaction, then performs a final path-to-physical-
+  identity compare-and-swap. This is an identity check, not a third ordinary
+  content read that merely narrows the same window.
+- If any binding no longer names the resolved identity, the entire success
+  graph is rolled back and a fresh writer transaction records only truthful
+  `needs_human`, category `evidence_changed_after_model`, null output and zero
+  opportunities. Provider detail is not exposed.
+- Once the identity compare-and-swap succeeds, the claim and model inputs are
+  already represented by the immutable snapshot inside the pending database
+  commit; a later mutable-path replacement is no longer the authority for that
+  claim.
+- The existing complete-shop-evidence exact N/N opportunity gate is unchanged.
+  Normal concurrent account recollection remains valid because old account-note
+  evidence resolves through its original append-only collection snapshot.
+- A supplemental physical-binding RED showed direct SQL could still alter a
+  sealed row's parent digest or status (`2 failed, 2 passed`). Freezing every
+  column was intentionally not retained: the full repository suite proved that
+  downstream trust loss must still be able to truthfully downgrade status
+  (`4 failed, 1279 passed, 2 skipped`). The final trigger freezes the snapshot
+  and all evidence/claim/output binding columns while allowing status-only
+  downgrade with the original sealed snapshot preserved. A non-success row
+  without a snapshot cannot be promoted to success. The corrected focused
+  boundary selection is `14 passed`.
+
+## Physical migration and fail-closed validation
+
+Migration `analysis_evidence_snapshot_v3` is restart-safe. A marked database is
+validation-only: startup requires the exact JSON column/check, insert/update/
+delete trigger SQL and a complete data scan, and does not repair drift. A
+markerless exact shape may recreate missing triggers before certification.
+Old v2 successful analyses remain addressable with the explicit immutable
+`schema_version: 0, status: legacy_unsealed` sentinel; new successful records
+require the strict v1 shape. The insert trigger binds snapshot scope, allowed
+IDs and input digest to the parent analysis, while UPDATE of the snapshot and
+claim/output binding columns and DELETE of any sealed analysis are physically
+rejected. New non-success records cannot claim a snapshot; a later truthful
+status downgrade retains the already-sealed historical claim across restart.
+
+Coverage includes marked missing-trigger rejection without repair, markerless
+exact-shape recovery, two-restart legacy preservation, invalid/half/tampered
+shape rejection, successful-snapshot UPDATE/DELETE rejection and complete
+snapshot fingerprint/data scans.
+
+## Final controlled verification
+
+- Deterministic review RED: `2 failed in 1.17s`; identical GREEN:
+  `2 passed in 1.07s`.
+- Final analysis + XHS suites: `689 passed, 2 skipped in 122.25s`.
+- Final `scripts/verify.ps1`: exit 0; backend `1284 passed, 2 skipped`;
+  Python compile passed; frontend `47 passed`; production build passed;
+  controlled E2E `1 passed`; npm audit found `0 vulnerabilities`; tracked-
+  secret and release-boundary scans passed.
+- Controlled fresh-runtime E2E repeat gate: `5 passed in 41.3s`.
+- Guarded live contract: `2 passed, 1 skipped`; authenticated execution remains
+  `not_run: XHS_LIVE_TEST=1 was not supplied`.
+
+No Bailian code, frontend source or pre-existing `research/` content is part of
+this fix. Independent post-commit review remains pending.

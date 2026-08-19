@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -86,6 +88,30 @@ class CallbackModel(FakeModel):
         return result
 
 
+def _sealed_rank_analysis_snapshot(evidence_id: str) -> dict[str, object]:
+    facts = [{"evidence_id": evidence_id, "kind": "rank_item"}]
+    trust = [{"evidence_id": evidence_id, "row": facts[0]}]
+    fingerprint_payload = {
+        "account_scope": ["account-a"],
+        "allowed_ids": [evidence_id],
+        "facts": facts,
+        "trust": trust,
+        "artifact_bindings": [],
+    }
+    fingerprint = hashlib.sha256(json.dumps(
+        fingerprint_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return {
+        "schema_version": 1,
+        "trust_fingerprint": fingerprint,
+        **fingerprint_payload,
+        "input_digest": "a" * 64,
+    }
+
+
 def seed_database(database: Database) -> tuple[str, str]:
     now = datetime.now(UTC).replace(tzinfo=None)
     with database.session() as session:
@@ -108,6 +134,7 @@ def seed_database(database: Database) -> tuple[str, str]:
             account_user_ids_json=["account-a"], status="succeeded",
             prompt_version="analysis-v1", provider="controlled_fake", model="fake",
             input_digest="a" * 64, evidence_ids_json=[evidence_id],
+            evidence_snapshot_json=_sealed_rank_analysis_snapshot(evidence_id),
             output_json={
                 "claims": [{"claim": "真实需求", "evidence_ids": [evidence_id]}],
                 "product_clusters": [],

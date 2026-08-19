@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -5,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from backend.app.db import Database
+from backend.app.db import Database, SchemaMigrationError
 from backend.app.main import create_app
 from backend.app.settings import Settings
 
@@ -127,9 +128,30 @@ async def test_f0_database_migrates_idempotently_and_quarantines_old_success(
         app.state.shop_service.close()
         app.state.database.close()
         if pass_number == 0:
+            facts = [{"evidence_id": "rank-item:1", "kind": "rank_item"}]
+            trust = [{"evidence_id": "rank-item:1", "row": facts[0]}]
+            fingerprint_payload = {
+                "account_scope": ["account-a"],
+                "allowed_ids": ["rank-item:1"],
+                "facts": facts,
+                "trust": trust,
+                "artifact_bindings": [],
+            }
+            trust_fingerprint = hashlib.sha256(json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            evidence_snapshot = {
+                "schema_version": 1,
+                "trust_fingerprint": trust_fingerprint,
+                **fingerprint_payload,
+                "input_digest": "e" * 64,
+            }
             connection = sqlite3.connect(database_path)
             connection.execute(
-                "INSERT INTO analyses (id,analysis_type,account_user_id,account_user_ids_json,status,prompt_version,provider,model,input_digest,evidence_ids_json,output_json,usage_json,duration_ms,attempts_json,error_category,error_detail,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO analyses (id,analysis_type,account_user_id,account_user_ids_json,status,prompt_version,provider,model,input_digest,evidence_ids_json,evidence_snapshot_json,output_json,usage_json,duration_ms,attempts_json,error_category,error_detail,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     "post-migration-success",
                     "account_report",
@@ -141,6 +163,7 @@ async def test_f0_database_migrates_idempotently_and_quarantines_old_success(
                     "model",
                     "e" * 64,
                     json.dumps(["rank-item:1"]),
+                    json.dumps(evidence_snapshot, ensure_ascii=False),
                     json.dumps({"claims": [{"claim": "new", "evidence_ids": ["rank-item:1"]}], "product_clusters": [], "opportunities": []}),
                     json.dumps({}),
                     1,
@@ -167,6 +190,85 @@ def test_broken_legacy_analysis_schema_fails_during_startup(tmp_path: Path) -> N
 
     assert app.state.database is None
     assert app.state.database_error == "SQLite database is unavailable."
+
+
+def test_evidence_snapshot_marker_is_validation_only_for_missing_trigger(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "snapshot-marker.sqlite3"
+    database = Database(database_path)
+    database.close()
+    trigger = "ck_analysis_evidence_snapshot_immutable_update"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(f"DROP TRIGGER {trigger}")
+
+    with pytest.raises(
+        SchemaMigrationError,
+        match="evidence snapshot schema validation",
+    ):
+        Database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
+            (trigger,),
+        ).fetchone() is None
+
+
+def test_markerless_exact_evidence_snapshot_shape_recovers_missing_trigger(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "snapshot-retry.sqlite3"
+    database = Database(database_path)
+    database.close()
+    trigger = "ck_analysis_evidence_snapshot_immutable_update"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute(
+            "DELETE FROM workbench_schema_migrations WHERE name=?",
+            ("analysis_evidence_snapshot_v3",),
+        )
+
+    retried = Database(database_path)
+    retried.close()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
+            (trigger,),
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workbench_schema_migrations WHERE name=?",
+            ("analysis_evidence_snapshot_v3",),
+        ).fetchone() == (1,)
+
+
+def test_v2_success_is_preserved_as_explicit_legacy_unsealed_snapshot(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "analysis-v2.sqlite3"
+    _create_f0_schema(database_path)
+    connection = _add_scope_column_and_marker(database_path)
+    connection.close()
+
+    first = Database(database_path)
+    first.close()
+    second = Database(database_path)
+    second.close()
+
+    with sqlite3.connect(database_path) as connection:
+        snapshot_json = connection.execute(
+            "SELECT evidence_snapshot_json FROM analyses WHERE id='old-success'"
+        ).fetchone()[0]
+        marker_count = connection.execute(
+            "SELECT COUNT(*) FROM workbench_schema_migrations WHERE name=?",
+            ("analysis_evidence_snapshot_v3",),
+        ).fetchone()[0]
+    assert json.loads(snapshot_json) == {
+        "schema_version": 0,
+        "status": "legacy_unsealed",
+    }
+    assert marker_count == 1
 
 
 @pytest.mark.parametrize("scope_column", ["missing", "nullable_without_default"])

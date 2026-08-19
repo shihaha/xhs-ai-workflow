@@ -30,6 +30,128 @@ XHS_ACCOUNT_FACT_CONTENT_BINDING_MIGRATION = (
 XHS_ACCOUNT_SNAPSHOT_EVIDENCE_MIGRATION = (
     "xhs_account_snapshot_evidence_v5"
 )
+ANALYSIS_EVIDENCE_SNAPSHOT_MIGRATION = (
+    "analysis_evidence_snapshot_v3"
+)
+_ANALYSIS_EVIDENCE_SNAPSHOT_CHECK = (
+    "evidence_snapshot_json IS NULL OR "
+    "(json_valid(evidence_snapshot_json) = 1 AND "
+    "json_type(evidence_snapshot_json) = 'object')"
+)
+_ANALYSIS_EVIDENCE_SNAPSHOT_TRIGGERS = {
+    "ck_analysis_evidence_snapshot_insert": """
+CREATE TRIGGER ck_analysis_evidence_snapshot_insert
+BEFORE INSERT ON analyses
+WHEN NEW.status='succeeded' AND (
+    NEW.evidence_snapshot_json IS NULL
+    OR json_valid(NEW.evidence_snapshot_json) IS NOT 1
+    OR json_type(NEW.evidence_snapshot_json) IS NOT 'object'
+    OR json_type(NEW.evidence_snapshot_json, '$.schema_version') IS NOT 'integer'
+    OR json_extract(NEW.evidence_snapshot_json, '$.schema_version') IS NOT 1
+    OR json_type(NEW.evidence_snapshot_json, '$.trust_fingerprint') IS NOT 'text'
+    OR json_type(NEW.evidence_snapshot_json, '$.account_scope') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.allowed_ids') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.facts') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.trust') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.artifact_bindings') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.input_digest') IS NOT 'text'
+    OR json_extract(NEW.evidence_snapshot_json, '$.account_scope') IS NOT
+       CASE
+           WHEN NEW.account_user_id IS NOT NULL
+           THEN json_array(NEW.account_user_id)
+           ELSE json(NEW.account_user_ids_json)
+       END
+    OR json_extract(NEW.evidence_snapshot_json, '$.allowed_ids')
+       IS NOT json(NEW.evidence_ids_json)
+    OR json_extract(NEW.evidence_snapshot_json, '$.input_digest')
+       IS NOT NEW.input_digest
+    OR (SELECT COUNT(*) FROM json_each(NEW.evidence_snapshot_json)) IS NOT 8
+    OR EXISTS (
+        SELECT 1 FROM json_each(NEW.evidence_snapshot_json)
+        WHERE key NOT IN (
+            'schema_version', 'trust_fingerprint', 'account_scope',
+            'allowed_ids', 'facts', 'trust', 'artifact_bindings', 'input_digest'
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'successful analysis requires exact evidence snapshot');
+END
+""".strip(),
+    "ck_analysis_evidence_snapshot_immutable_update": """
+CREATE TRIGGER ck_analysis_evidence_snapshot_immutable_update
+BEFORE UPDATE OF
+    analysis_type, account_user_id, account_user_ids_json, prompt_version,
+    provider, model, input_digest, evidence_ids_json, evidence_snapshot_json,
+    output_json, usage_json, duration_ms, attempts_json, error_category,
+    error_detail, created_at
+ON analyses
+WHEN OLD.evidence_snapshot_json IS NOT NULL
+     OR NEW.evidence_snapshot_json IS NOT OLD.evidence_snapshot_json
+BEGIN
+    SELECT RAISE(ABORT, 'sealed analysis and evidence snapshot are immutable');
+END
+""".strip(),
+    "ck_analysis_evidence_snapshot_success_update": """
+CREATE TRIGGER ck_analysis_evidence_snapshot_success_update
+BEFORE UPDATE ON analyses
+WHEN NEW.status='succeeded' AND (
+    NEW.evidence_snapshot_json IS NULL
+    OR json_valid(NEW.evidence_snapshot_json) IS NOT 1
+    OR json_type(NEW.evidence_snapshot_json) IS NOT 'object'
+    OR json_type(NEW.evidence_snapshot_json, '$.schema_version') IS NOT 'integer'
+    OR json_extract(NEW.evidence_snapshot_json, '$.schema_version') IS NOT 1
+    OR json_type(NEW.evidence_snapshot_json, '$.trust_fingerprint') IS NOT 'text'
+    OR json_type(NEW.evidence_snapshot_json, '$.account_scope') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.allowed_ids') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.facts') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.trust') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.artifact_bindings') IS NOT 'array'
+    OR json_type(NEW.evidence_snapshot_json, '$.input_digest') IS NOT 'text'
+    OR json_extract(NEW.evidence_snapshot_json, '$.account_scope') IS NOT
+       CASE
+           WHEN NEW.account_user_id IS NOT NULL
+           THEN json_array(NEW.account_user_id)
+           ELSE json(NEW.account_user_ids_json)
+       END
+    OR json_extract(NEW.evidence_snapshot_json, '$.allowed_ids')
+       IS NOT json(NEW.evidence_ids_json)
+    OR json_extract(NEW.evidence_snapshot_json, '$.input_digest')
+       IS NOT NEW.input_digest
+    OR (SELECT COUNT(*) FROM json_each(NEW.evidence_snapshot_json)) IS NOT 8
+    OR EXISTS (
+        SELECT 1 FROM json_each(NEW.evidence_snapshot_json)
+        WHERE key NOT IN (
+            'schema_version', 'trust_fingerprint', 'account_scope',
+            'allowed_ids', 'facts', 'trust', 'artifact_bindings', 'input_digest'
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'successful analysis requires exact evidence snapshot');
+END
+""".strip(),
+    "ck_analysis_evidence_snapshot_non_success_insert": """
+CREATE TRIGGER ck_analysis_evidence_snapshot_non_success_insert
+BEFORE INSERT ON analyses
+WHEN NEW.status<>'succeeded' AND NEW.evidence_snapshot_json IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'new non-success analysis cannot claim sealed evidence');
+END
+""".strip(),
+    "ck_analysis_evidence_snapshot_immutable_delete": """
+CREATE TRIGGER ck_analysis_evidence_snapshot_immutable_delete
+BEFORE DELETE ON analyses
+WHEN OLD.evidence_snapshot_json IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'analysis evidence snapshot is durable');
+END
+""".strip(),
+}
+_LEGACY_ANALYSIS_EVIDENCE_SNAPSHOT = {
+    "schema_version": 0,
+    "status": "legacy_unsealed",
+}
 _XHS_ACCOUNT_FACT_IMMUTABILITY_TRIGGERS = {
     "ck_xhs_profile_immutable_update": """
         CREATE TRIGGER ck_xhs_profile_immutable_update
@@ -549,6 +671,9 @@ class Database:
         review_audit_marker_present = self._migration_marker_exists(
             "task8_content_review_outcome_v1"
         )
+        analysis_evidence_snapshot_marker_present = self._migration_marker_exists(
+            ANALYSIS_EVIDENCE_SNAPSHOT_MIGRATION
+        )
         xhs_account_snapshot_upgrade_started = False
         with self.engine.connect() as connection:
             _require_no_xhs_account_note_identity_leftovers(connection)
@@ -566,6 +691,8 @@ class Database:
                 )
         if review_audit_marker_present:
             self._require_content_review_audit_schema()
+        if analysis_evidence_snapshot_marker_present:
+            self._require_analysis_evidence_snapshot_schema()
         if quarantine_marker_present:
             self._require_artifact_quarantine_schema(
                 require_identity=quarantine_identity_marker_present,
@@ -643,6 +770,9 @@ class Database:
             )
         self._migrate_xhs_account_snapshot_evidence(
             marker_present=xhs_account_snapshot_marker_present
+        )
+        self._migrate_analysis_evidence_snapshot(
+            marker_present=analysis_evidence_snapshot_marker_present
         )
         self._recover_stranded_content_regenerations()
 
@@ -1675,6 +1805,92 @@ class Database:
         ):
             raise SchemaMigrationError("job_artifacts.producer schema is invalid")
 
+    def _require_analysis_evidence_snapshot_schema(self) -> None:
+        with self.engine.connect() as connection:
+            if not _analysis_evidence_snapshot_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "Analysis evidence snapshot schema validation failed."
+                )
+
+    def _require_analysis_evidence_snapshot(self) -> None:
+        with self.engine.connect() as connection:
+            if (
+                not _analysis_evidence_snapshot_schema_valid(connection)
+                or not _analysis_evidence_snapshot_data_valid(connection)
+            ):
+                raise SchemaMigrationError(
+                    "Analysis evidence snapshot validation failed."
+                )
+
+    def _migrate_analysis_evidence_snapshot(
+        self,
+        *,
+        marker_present: bool,
+    ) -> None:
+        if marker_present:
+            self._require_analysis_evidence_snapshot()
+            return
+        with self.engine.begin() as connection:
+            if connection.scalar(text(
+                "SELECT 1 FROM workbench_schema_migrations WHERE name=:name"
+            ), {"name": ANALYSIS_EVIDENCE_SNAPSHOT_MIGRATION}) is not None:
+                if (
+                    not _analysis_evidence_snapshot_schema_valid(connection)
+                    or not _analysis_evidence_snapshot_data_valid(connection)
+                ):
+                    raise SchemaMigrationError(
+                        "Analysis evidence snapshot validation failed."
+                    )
+                return
+            columns = {
+                item["name"]: item
+                for item in inspect(connection).get_columns("analyses")
+            }
+            added_column = "evidence_snapshot_json" not in columns
+            if added_column:
+                connection.execute(text(
+                    "ALTER TABLE analyses ADD COLUMN evidence_snapshot_json JSON "
+                    "CONSTRAINT ck_analysis_evidence_snapshot_json CHECK ("
+                    f"{_ANALYSIS_EVIDENCE_SNAPSHOT_CHECK})"
+                ))
+                connection.execute(text(
+                    "UPDATE analyses SET evidence_snapshot_json=:snapshot "
+                    "WHERE status='succeeded'"
+                ), {
+                    "snapshot": json.dumps(
+                        _LEGACY_ANALYSIS_EVIDENCE_SNAPSHOT,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                })
+            if not _analysis_evidence_snapshot_column_valid(connection):
+                raise SchemaMigrationError(
+                    "Analysis evidence snapshot column is invalid."
+                )
+            triggers_valid = _analysis_evidence_snapshot_triggers_valid(connection)
+            data_valid = _analysis_evidence_snapshot_data_valid(connection)
+            if not data_valid:
+                raise SchemaMigrationError(
+                    "Analysis evidence snapshot data is invalid."
+                )
+            if not triggers_valid:
+                for name, definition in _ANALYSIS_EVIDENCE_SNAPSHOT_TRIGGERS.items():
+                    connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+                    connection.execute(text(definition))
+            if (
+                not _analysis_evidence_snapshot_schema_valid(connection)
+                or not _analysis_evidence_snapshot_data_valid(connection)
+            ):
+                raise SchemaMigrationError(
+                    "Analysis evidence snapshot validation failed."
+                )
+            connection.execute(text(
+                "INSERT INTO workbench_schema_migrations(name, applied_at) "
+                "VALUES (:name, CURRENT_TIMESTAMP)"
+            ), {"name": ANALYSIS_EVIDENCE_SNAPSHOT_MIGRATION})
+        self._require_analysis_evidence_snapshot()
+
     def _migrate_analysis_scope(self) -> None:
         """Upgrade the pre-scope Task 7 schema and quarantine its success claims."""
         columns = {
@@ -1860,6 +2076,232 @@ def _is_exact_empty_json_array_default(value: object) -> bool:
     while expression.startswith("(") and expression.endswith(")"):
         expression = expression[1:-1].strip()
     return expression == "'[]'"
+
+
+def _analysis_evidence_snapshot_column_valid(connection: Connection) -> bool:
+    try:
+        inspector = inspect(connection)
+        columns = {
+            item["name"]: item for item in inspector.get_columns("analyses")
+        }
+        snapshot = columns.get("evidence_snapshot_json")
+        checks = {
+            item.get("name"): _compact_sql(item.get("sqltext"))
+            for item in inspector.get_check_constraints("analyses")
+        }
+        return (
+            snapshot is not None
+            and snapshot.get("nullable") is True
+            and str(snapshot.get("type") or "").upper() == "JSON"
+            and checks.get("ck_analysis_evidence_snapshot_json")
+            == _compact_sql(_ANALYSIS_EVIDENCE_SNAPSHOT_CHECK)
+        )
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+
+
+def _analysis_evidence_snapshot_triggers_valid(connection: Connection) -> bool:
+    names = ",".join(
+        f"'{name}'" for name in _ANALYSIS_EVIDENCE_SNAPSHOT_TRIGGERS
+    )
+    try:
+        actual = {
+            name: _compact_sql(sql)
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                f"AND name IN ({names})"
+            ))
+        }
+        return actual == {
+            name: _compact_sql(definition)
+            for name, definition in _ANALYSIS_EVIDENCE_SNAPSHOT_TRIGGERS.items()
+        }
+    except SQLAlchemyError:
+        return False
+
+
+def _analysis_evidence_snapshot_schema_valid(connection: Connection) -> bool:
+    return (
+        _analysis_evidence_snapshot_column_valid(connection)
+        and _analysis_evidence_snapshot_triggers_valid(connection)
+    )
+
+
+def _decode_analysis_json(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+
+
+def _analysis_evidence_snapshot_data_valid(connection: Connection) -> bool:
+    try:
+        rows = connection.execute(text(
+            "SELECT status, input_digest, account_user_id, account_user_ids_json, "
+            "evidence_ids_json, evidence_snapshot_json FROM analyses"
+        )).mappings().all()
+    except SQLAlchemyError:
+        return False
+    for row in rows:
+        stored_scope = _decode_analysis_json(row["account_user_ids_json"])
+        scope = (
+            [row["account_user_id"]]
+            if isinstance(row["account_user_id"], str)
+            and row["account_user_id"]
+            else stored_scope
+        )
+        allowed_ids = _decode_analysis_json(row["evidence_ids_json"])
+        snapshot = _decode_analysis_json(row["evidence_snapshot_json"])
+        if (
+            not isinstance(stored_scope, list)
+            or not isinstance(scope, list)
+            or not isinstance(allowed_ids, list)
+            or any(
+                not isinstance(account_id, str)
+                or not account_id
+                or len(account_id) > 500
+                for account_id in scope
+            )
+            or len(scope) != len(set(scope))
+            or any(
+                not isinstance(evidence_id, str)
+                or re.fullmatch(
+                    r"(?:account-note|artifact|rank-item):[1-9][0-9]*",
+                    evidence_id,
+                    re.ASCII,
+                ) is None
+                or int(evidence_id.rpartition(":")[2])
+                > 9_223_372_036_854_775_807
+                for evidence_id in allowed_ids
+            )
+            or len(allowed_ids) != len(set(allowed_ids))
+        ):
+            return False
+        if snapshot is None:
+            if row["status"] == "succeeded":
+                return False
+            continue
+        if snapshot == _LEGACY_ANALYSIS_EVIDENCE_SNAPSHOT:
+            continue
+        if not isinstance(snapshot, dict) or set(snapshot) != {
+            "schema_version",
+            "trust_fingerprint",
+            "account_scope",
+            "allowed_ids",
+            "facts",
+            "trust",
+            "artifact_bindings",
+            "input_digest",
+        }:
+            return False
+        facts = snapshot.get("facts")
+        trust = snapshot.get("trust")
+        bindings = snapshot.get("artifact_bindings")
+        fingerprint = snapshot.get("trust_fingerprint")
+        input_digest = snapshot.get("input_digest")
+        if (
+            type(snapshot.get("schema_version")) is not int
+            or snapshot.get("schema_version") != 1
+            or snapshot.get("account_scope") != scope
+            or snapshot.get("allowed_ids") != allowed_ids
+            or not isinstance(facts, list)
+            or not isinstance(trust, list)
+            or not isinstance(bindings, list)
+            or len(facts) != len(allowed_ids)
+            or len(trust) != len(allowed_ids)
+            or [
+                item.get("evidence_id") if isinstance(item, dict) else None
+                for item in facts
+            ]
+            != allowed_ids
+            or [
+                item.get("evidence_id") if isinstance(item, dict) else None
+                for item in trust
+            ]
+            != allowed_ids
+            or not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint, re.ASCII) is None
+            or not isinstance(input_digest, str)
+            or input_digest != row["input_digest"]
+            or re.fullmatch(r"[0-9a-f]{64}", input_digest, re.ASCII) is None
+        ):
+            return False
+        fingerprint_value = json.dumps(
+            {
+                "account_scope": scope,
+                "allowed_ids": allowed_ids,
+                "facts": facts,
+                "trust": trust,
+                "artifact_bindings": bindings,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if hashlib.sha256(fingerprint_value.encode("utf-8")).hexdigest() != fingerprint:
+            return False
+        binding_ids: list[str] = []
+        for binding in bindings:
+            if not isinstance(binding, dict) or set(binding) != {
+                "evidence_id",
+                "artifact_id",
+                "artifact_job_id",
+                "relative_path",
+                "sha256",
+                "size_bytes",
+                "file_identity",
+            }:
+                return False
+            evidence_id = binding.get("evidence_id")
+            artifact_id = binding.get("artifact_id")
+            artifact_job_id = binding.get("artifact_job_id")
+            relative_path = binding.get("relative_path")
+            digest = binding.get("sha256")
+            size_bytes = binding.get("size_bytes")
+            identity = binding.get("file_identity")
+            if (
+                not isinstance(evidence_id, str)
+                or evidence_id not in allowed_ids
+                or isinstance(artifact_id, bool)
+                or not isinstance(artifact_id, int)
+                or not 1 <= artifact_id <= 9_223_372_036_854_775_807
+                or not isinstance(artifact_job_id, str)
+                or not artifact_job_id
+                or not isinstance(relative_path, str)
+                or not relative_path
+                or "\\" in relative_path
+                or relative_path.startswith("/")
+                or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest, re.ASCII) is None
+                or isinstance(size_bytes, bool)
+                or not isinstance(size_bytes, int)
+                or not 0 <= size_bytes <= 20 * 1024 * 1024
+                or not isinstance(identity, list)
+                or len(identity) != 4
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in identity
+                )
+                or identity[2] != size_bytes
+            ):
+                return False
+            binding_ids.append(evidence_id)
+        if len(binding_ids) != len(set(binding_ids)):
+            return False
+        expected_file_evidence = {
+            item["evidence_id"]
+            for item in facts
+            if isinstance(item, dict)
+            and item.get("kind") in {"account_note", "shop_collection_result"}
+        }
+        if set(binding_ids) != expected_file_evidence:
+            return False
+    return True
 
 
 def _content_review_audit_schema_valid(

@@ -1,10 +1,12 @@
+import hashlib
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.adapters.contracts import ModelResult
 from backend.app.db import Database
@@ -180,6 +182,167 @@ def test_success_persists_only_fully_grounded_output(tmp_path: Path) -> None:
     opportunities = service.list_opportunities()
     assert len(opportunities) == 1
     assert opportunities[0].evidence_ids == [evidence_id]
+    database.close()
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "UPDATE analyses SET evidence_snapshot_json='{}' WHERE id=:analysis_id",
+        "UPDATE analyses SET input_digest='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' WHERE id=:analysis_id",
+        "DELETE FROM analyses WHERE id=:analysis_id",
+    ],
+    ids=["update-snapshot", "update-binding", "delete"],
+)
+def test_success_binds_a_physically_immutable_evidence_snapshot(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    service = AnalysisService(
+        database,
+        StubModel(_output(evidence_id)),
+        runtime_dir=tmp_path,
+    )
+
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+    with database.session() as session:
+        row = session.get(AnalysisRecord, created.id)
+        assert row is not None
+        snapshot = row.evidence_snapshot_json
+        assert snapshot is not None
+        binding = snapshot["artifact_bindings"][0]
+        target = tmp_path / binding["relative_path"]
+        assert snapshot["schema_version"] == 1
+        assert snapshot["allowed_ids"] == [evidence_id]
+        assert snapshot["account_scope"] == ["account-a"]
+        assert binding["evidence_id"] == evidence_id
+        assert binding["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
+    with pytest.raises(IntegrityError):
+        with database.engine.begin() as connection:
+            connection.execute(text(statement), {"analysis_id": created.id})
+    assert service.get(created.id).status == "succeeded"
+    database.close()
+
+
+def test_status_downgrade_preserves_sealed_snapshot_across_restart(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "db.sqlite3"
+    database = Database(database_path)
+    evidence_id = _complete_artifact(database)
+    service = AnalysisService(
+        database,
+        StubModel(_output(evidence_id)),
+        runtime_dir=tmp_path,
+    )
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+    with database.session() as session:
+        row = session.get(AnalysisRecord, created.id)
+        assert row is not None
+        sealed_snapshot = deepcopy(row.evidence_snapshot_json)
+        row.status = "needs_human"
+        session.commit()
+    database.close()
+
+    reopened = Database(database_path)
+    with reopened.session() as session:
+        row = session.get(AnalysisRecord, created.id)
+        assert row is not None
+        assert row.status == "needs_human"
+        assert row.evidence_snapshot_json == sealed_snapshot
+    reopened.close()
+
+
+def test_non_success_analysis_cannot_be_promoted_without_sealed_snapshot(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    service = AnalysisService(database, StubModel({}), runtime_dir=tmp_path)
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+    assert created.status == "failed"
+
+    with pytest.raises(IntegrityError):
+        with database.engine.begin() as connection:
+            connection.execute(
+                text("UPDATE analyses SET status='succeeded' WHERE id=:analysis_id"),
+                {"analysis_id": created.id},
+            )
+    assert service.get(created.id).status == "failed"
+    database.close()
+
+
+def test_shop_artifact_swap_after_final_resolve_cannot_commit_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    with database.session() as session:
+        artifact = session.get(
+            JobArtifactRecord,
+            int(evidence_id.removeprefix("artifact:")),
+        )
+        assert artifact is not None
+        target = tmp_path / artifact.path
+    replacement = target.with_name("replacement-after-final-resolve.json")
+    replacement.write_bytes(b"tampered-after-final-resolve")
+    service = AnalysisService(
+        database,
+        StubModel(_output(evidence_id)),
+        runtime_dir=tmp_path,
+    )
+    real_resolve = service._resolve_evidence_in_session
+    resolve_count = 0
+
+    def swap_after_final_resolve(session: object, payload: AnalysisCreate):
+        nonlocal resolve_count
+        resolved = real_resolve(session, payload)
+        resolve_count += 1
+        if resolve_count == 2:
+            replacement.replace(target)
+        return resolved
+
+    monkeypatch.setattr(
+        service,
+        "_resolve_evidence_in_session",
+        swap_after_final_resolve,
+    )
+
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+
+    assert resolve_count == 2
+    assert target.read_bytes() == b"tampered-after-final-resolve"
+    assert created.status == "needs_human"
+    assert created.error_category == "evidence_changed_after_model"
+    assert created.output is None
+    assert service.list_opportunities() == []
     database.close()
 
 
