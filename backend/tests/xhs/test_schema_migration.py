@@ -719,6 +719,12 @@ def test_identity_migration_rejects_malformed_reference_history_before_writes(
     database.close()
     _downgrade_note_identity_to_v1(path, keep_marker=False)
     with sqlite3.connect(path) as connection:
+        connection.create_function(
+            "analysis_evidence_snapshot_v1_valid",
+            5,
+            lambda *_values: 1,
+            deterministic=True,
+        )
         connection.execute("UPDATE analyses SET evidence_ids_json='not-json'")
 
     with pytest.raises(SchemaMigrationError, match="reference history"):

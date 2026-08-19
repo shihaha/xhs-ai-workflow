@@ -1,12 +1,15 @@
 import hashlib
+import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import pytest
 from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from backend.app.adapters.contracts import ModelResult
 from backend.app.db import Database
@@ -254,8 +257,13 @@ def test_status_downgrade_preserves_sealed_snapshot_across_restart(
         row = session.get(AnalysisRecord, created.id)
         assert row is not None
         sealed_snapshot = deepcopy(row.evidence_snapshot_json)
+        sealed_output = deepcopy(row.output_json)
         row.status = "needs_human"
         session.commit()
+    downgraded = service.get(created.id)
+    assert downgraded.status == "needs_human"
+    assert downgraded.output is None
+    assert service.list_opportunities() == []
     database.close()
 
     reopened = Database(database_path)
@@ -264,15 +272,23 @@ def test_status_downgrade_preserves_sealed_snapshot_across_restart(
         assert row is not None
         assert row.status == "needs_human"
         assert row.evidence_snapshot_json == sealed_snapshot
+        assert row.output_json == sealed_output
+        assert len(row.opportunities) == 1
     reopened.close()
 
 
-def test_non_success_analysis_cannot_be_promoted_without_sealed_snapshot(
+@pytest.mark.parametrize("new_status", ["succeeded", "failed", "invented"])
+def test_sealed_non_success_status_is_terminal(
     tmp_path: Path,
+    new_status: str,
 ) -> None:
     database = Database(tmp_path / "db.sqlite3")
     evidence_id = _complete_artifact(database)
-    service = AnalysisService(database, StubModel({}), runtime_dir=tmp_path)
+    service = AnalysisService(
+        database,
+        StubModel(_output(evidence_id)),
+        runtime_dir=tmp_path,
+    )
     created = service.create(
         AnalysisCreate(
             analysis_type="account_opportunity",
@@ -280,15 +296,400 @@ def test_non_success_analysis_cannot_be_promoted_without_sealed_snapshot(
             evidence_ids=[evidence_id],
         )
     )
-    assert created.status == "failed"
-
+    with database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE analyses SET status='needs_human' WHERE id=:analysis_id"),
+            {"analysis_id": created.id},
+        )
     with pytest.raises(IntegrityError):
         with database.engine.begin() as connection:
             connection.execute(
-                text("UPDATE analyses SET status='succeeded' WHERE id=:analysis_id"),
-                {"analysis_id": created.id},
+                text("UPDATE analyses SET status=:status WHERE id=:analysis_id"),
+                {"analysis_id": created.id, "status": new_status},
             )
-    assert service.get(created.id).status == "failed"
+    assert service.get(created.id).status == "needs_human"
+    database.close()
+
+
+def test_opportunity_cannot_be_added_to_non_success_analysis(tmp_path: Path) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    service = AnalysisService(
+        database,
+        StubModel(_output(evidence_id)),
+        runtime_dir=tmp_path,
+    )
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+    with database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE analyses SET status='failed' WHERE id=:analysis_id"),
+            {"analysis_id": created.id},
+        )
+    with pytest.raises(IntegrityError):
+        with database.session() as session:
+            session.add(OpportunityRecord(
+                analysis_id=created.id,
+                title="must stay historical",
+                status="观察中",
+                summary="not active",
+                evidence_ids_json=[evidence_id],
+                next_action="none",
+                created_at=datetime.now(UTC).replace(tzinfo=None),
+            ))
+            session.commit()
+    database.close()
+
+
+def _recompute_snapshot_fingerprint(snapshot: dict[str, object]) -> None:
+    payload = {
+        "account_scope": snapshot["account_scope"],
+        "allowed_ids": snapshot["allowed_ids"],
+        "facts": snapshot["facts"],
+        "trust": snapshot["trust"],
+        "artifact_bindings": snapshot["artifact_bindings"],
+    }
+    snapshot["trust_fingerprint"] = hashlib.sha256(json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _insert_success_clone(
+    database: Database,
+    source_id: str,
+    snapshot: dict[str, object],
+) -> None:
+    with database.session() as session:
+        source = session.get(AnalysisRecord, source_id)
+        assert source is not None
+        values = {
+            "id": str(uuid4()),
+            "analysis_type": source.analysis_type,
+            "account_user_id": source.account_user_id,
+            "account_user_ids_json": json.dumps(source.account_user_ids_json),
+            "status": "succeeded",
+            "prompt_version": source.prompt_version,
+            "provider": source.provider,
+            "model": source.model,
+            "input_digest": source.input_digest,
+            "evidence_ids_json": json.dumps(source.evidence_ids_json),
+            "evidence_snapshot_json": json.dumps(snapshot, ensure_ascii=False),
+            "output_json": json.dumps(source.output_json, ensure_ascii=False),
+            "usage_json": json.dumps(source.usage_json),
+            "duration_ms": source.duration_ms,
+            "attempts_json": json.dumps(source.attempts_json),
+            "error_category": source.error_category,
+            "error_detail": source.error_detail,
+            "created_at": source.created_at,
+        }
+    with database.engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO analyses ("
+            "id, analysis_type, account_user_id, account_user_ids_json, status, "
+            "prompt_version, provider, model, input_digest, evidence_ids_json, "
+            "evidence_snapshot_json, output_json, usage_json, duration_ms, "
+            "attempts_json, error_category, error_detail, created_at"
+            ") VALUES ("
+            ":id, :analysis_type, :account_user_id, :account_user_ids_json, :status, "
+            ":prompt_version, :provider, :model, :input_digest, :evidence_ids_json, "
+            ":evidence_snapshot_json, :output_json, :usage_json, :duration_ms, "
+            ":attempts_json, :error_category, :error_detail, :created_at)"
+        ), values)
+
+
+def _mutate_snapshot(snapshot: dict[str, object], mutation: str) -> None:
+    if mutation == "fingerprint":
+        snapshot["trust_fingerprint"] = "0" * 64
+        return
+    if mutation == "fact_alignment":
+        snapshot["facts"][0]["evidence_id"] = "artifact:999"  # type: ignore[index]
+    elif mutation == "trust_alignment":
+        snapshot["trust"][0]["evidence_id"] = "artifact:999"  # type: ignore[index]
+    elif mutation == "missing_binding":
+        snapshot["artifact_bindings"] = []
+    elif mutation == "bool_binding":
+        snapshot["artifact_bindings"][0]["artifact_id"] = True  # type: ignore[index]
+    elif mutation == "float_binding":
+        snapshot["artifact_bindings"][0]["size_bytes"] = 1.0  # type: ignore[index]
+    elif mutation == "overflow_binding":
+        snapshot["artifact_bindings"][0]["artifact_id"] = 9_223_372_036_854_775_808  # type: ignore[index]
+    elif mutation == "parent_ids":
+        snapshot["allowed_ids"] = ["artifact:999"]
+    else:
+        raise AssertionError(mutation)
+    _recompute_snapshot_fingerprint(snapshot)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "fingerprint",
+        "fact_alignment",
+        "trust_alignment",
+        "missing_binding",
+        "bool_binding",
+        "float_binding",
+        "overflow_binding",
+        "parent_ids",
+    ],
+)
+def test_runtime_success_insert_uses_complete_snapshot_validator(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    service = AnalysisService(
+        database,
+        StubModel(_output(evidence_id)),
+        runtime_dir=tmp_path,
+    )
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+    with database.session() as session:
+        source = session.get(AnalysisRecord, created.id)
+        assert source is not None and source.evidence_snapshot_json is not None
+        snapshot = deepcopy(source.evidence_snapshot_json)
+    _mutate_snapshot(snapshot, mutation)
+
+    with pytest.raises(IntegrityError):
+        _insert_success_clone(database, created.id, snapshot)
+    database.close()
+
+
+def test_runtime_success_update_uses_complete_snapshot_validator(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    service = AnalysisService(
+        database,
+        StubModel(_output(evidence_id)),
+        runtime_dir=tmp_path,
+    )
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+    trigger_names = (
+        "ck_analysis_evidence_snapshot_immutable_update",
+        "ck_analysis_evidence_snapshot_success_update",
+    )
+    with database.engine.begin() as connection:
+        trigger_sql = {
+            name: connection.scalar(text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=:name"
+            ), {"name": name})
+            for name in trigger_names
+        }
+        assert all(isinstance(sql, str) for sql in trigger_sql.values())
+        snapshot_json = connection.scalar(text(
+            "SELECT evidence_snapshot_json FROM analyses WHERE id=:analysis_id"
+        ), {"analysis_id": created.id})
+        snapshot = json.loads(snapshot_json)
+        snapshot["trust_fingerprint"] = "0" * 64
+        for name in trigger_names:
+            connection.execute(text(f"DROP TRIGGER {name}"))
+        connection.execute(text(
+            "UPDATE analyses SET evidence_snapshot_json=:snapshot WHERE id=:analysis_id"
+        ), {"snapshot": json.dumps(snapshot), "analysis_id": created.id})
+        for sql in trigger_sql.values():
+            connection.execute(text(sql))
+
+    with pytest.raises(IntegrityError):
+        with database.engine.begin() as connection:
+            connection.execute(text(
+                "UPDATE analyses SET status='succeeded' WHERE id=:analysis_id"
+            ), {"analysis_id": created.id})
+    database.close()
+
+
+def test_success_commit_ack_lost_returns_exact_persisted_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    model = StubModel(_output(evidence_id))
+    service = AnalysisService(database, model, runtime_dir=tmp_path)
+    real_commit = Session.commit
+    raised = False
+
+    def commit_then_raise(session: Session) -> None:
+        nonlocal raised
+        real_commit(session)
+        if not raised:
+            raised = True
+            raise SQLAlchemyError("secret acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", commit_then_raise)
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+
+    assert created.status == "succeeded"
+    assert model.calls == 1
+    assert len(service.list()) == 1
+    assert len(service.list_opportunities()) == 1
+    database.close()
+
+
+def test_success_commit_not_landed_is_explicitly_rolled_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    model = StubModel(_output(evidence_id))
+    service = AnalysisService(database, model, runtime_dir=tmp_path)
+    monkeypatch.setattr(
+        Session,
+        "commit",
+        lambda _session: (_ for _ in ()).throw(
+            SQLAlchemyError("secret commit rejected")
+        ),
+    )
+
+    with pytest.raises(Exception) as caught:
+        service.create(
+            AnalysisCreate(
+                analysis_type="account_opportunity",
+                account_user_ids=["account-a"],
+                evidence_ids=[evidence_id],
+            )
+        )
+    assert str(caught.value) == "analysis_success_commit_rolled_back"
+    assert model.calls == 1
+    assert service.list() == []
+    database.close()
+
+
+def test_success_commit_partial_or_mismatched_graph_is_transaction_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    model = StubModel(_output(evidence_id))
+    service = AnalysisService(database, model, runtime_dir=tmp_path)
+    real_commit = Session.commit
+    raised = False
+
+    def commit_mutate_then_raise(session: Session) -> None:
+        nonlocal raised
+        real_commit(session)
+        if not raised:
+            raised = True
+            with database.engine.begin() as connection:
+                connection.execute(text(
+                    "UPDATE opportunities SET title='mismatched' "
+                    "WHERE analysis_id=(SELECT id FROM analyses LIMIT 1)"
+                ))
+            raise SQLAlchemyError("secret ambiguous acknowledgement")
+
+    monkeypatch.setattr(Session, "commit", commit_mutate_then_raise)
+    with pytest.raises(Exception) as caught:
+        service.create(
+            AnalysisCreate(
+                analysis_type="account_opportunity",
+                account_user_ids=["account-a"],
+                evidence_ids=[evidence_id],
+            )
+        )
+    assert str(caught.value) == "analysis_success_transaction_unknown"
+    assert model.calls == 1
+    database.close()
+
+
+def test_success_commit_unreadable_fresh_proof_is_transaction_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    model = StubModel(_output(evidence_id))
+    service = AnalysisService(database, model, runtime_dir=tmp_path)
+    real_session = database.session
+
+    def reject_commit_and_proof(_session: Session) -> None:
+        monkeypatch.setattr(
+            database,
+            "session",
+            lambda: (_ for _ in ()).throw(SQLAlchemyError("secret proof unreadable")),
+        )
+        raise SQLAlchemyError("secret acknowledgement unreadable")
+
+    monkeypatch.setattr(Session, "commit", reject_commit_and_proof)
+    with pytest.raises(Exception) as caught:
+        service.create(
+            AnalysisCreate(
+                analysis_type="account_opportunity",
+                account_user_ids=["account-a"],
+                evidence_ids=[evidence_id],
+            )
+        )
+    assert str(caught.value) == "analysis_success_transaction_unknown"
+    assert model.calls == 1
+    monkeypatch.setattr(database, "session", real_session)
+    database.close()
+
+
+def test_success_commit_proof_retries_one_transient_fresh_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _complete_artifact(database)
+    model = StubModel(_output(evidence_id))
+    service = AnalysisService(database, model, runtime_dir=tmp_path)
+    real_commit = Session.commit
+    real_session = database.session
+    proof_calls = 0
+
+    def flaky_fresh_session():
+        nonlocal proof_calls
+        proof_calls += 1
+        if proof_calls == 1:
+            raise SQLAlchemyError("transient fresh read")
+        return real_session()
+
+    def commit_then_raise(session: Session) -> None:
+        real_commit(session)
+        monkeypatch.setattr(database, "session", flaky_fresh_session)
+        raise SQLAlchemyError("secret acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", commit_then_raise)
+    created = service.create(
+        AnalysisCreate(
+            analysis_type="account_opportunity",
+            account_user_ids=["account-a"],
+            evidence_ids=[evidence_id],
+        )
+    )
+    assert created.status == "succeeded"
+    assert proof_calls == 2
+    assert model.calls == 1
+    monkeypatch.setattr(database, "session", real_session)
     database.close()
 
 

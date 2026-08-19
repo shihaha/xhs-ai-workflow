@@ -39,41 +39,58 @@ _ANALYSIS_EVIDENCE_SNAPSHOT_CHECK = (
     "json_type(evidence_snapshot_json) = 'object')"
 )
 _ANALYSIS_EVIDENCE_SNAPSHOT_TRIGGERS = {
+    "ck_analysis_status_insert": """
+CREATE TRIGGER ck_analysis_status_insert
+BEFORE INSERT ON analyses
+WHEN NEW.status NOT IN ('succeeded', 'failed', 'needs_human')
+     OR (
+         NEW.status='succeeded'
+         AND (
+             NEW.output_json IS NULL
+             OR json_valid(NEW.output_json) IS NOT 1
+             OR json_type(NEW.output_json) IS NOT 'object'
+         )
+     )
+     OR (
+         NEW.status IN ('failed', 'needs_human')
+         AND (
+             (
+                 NEW.output_json IS NOT NULL
+                 AND json_type(NEW.output_json) IS NOT 'null'
+             )
+             OR NEW.evidence_snapshot_json IS NOT NULL
+         )
+     )
+BEGIN
+    SELECT RAISE(ABORT, 'analysis status and output are inconsistent');
+END
+""".strip(),
+    "ck_analysis_status_transition": """
+CREATE TRIGGER ck_analysis_status_transition
+BEFORE UPDATE OF status ON analyses
+WHEN NEW.status NOT IN ('succeeded', 'failed', 'needs_human')
+     OR NOT (
+         NEW.status=OLD.status
+         OR (
+             OLD.status='succeeded'
+             AND NEW.status IN ('failed', 'needs_human')
+         )
+     )
+BEGIN
+    SELECT RAISE(ABORT, 'analysis status transition is invalid');
+END
+""".strip(),
     "ck_analysis_evidence_snapshot_insert": """
 CREATE TRIGGER ck_analysis_evidence_snapshot_insert
 BEFORE INSERT ON analyses
-WHEN NEW.status='succeeded' AND (
-    NEW.evidence_snapshot_json IS NULL
-    OR json_valid(NEW.evidence_snapshot_json) IS NOT 1
-    OR json_type(NEW.evidence_snapshot_json) IS NOT 'object'
-    OR json_type(NEW.evidence_snapshot_json, '$.schema_version') IS NOT 'integer'
-    OR json_extract(NEW.evidence_snapshot_json, '$.schema_version') IS NOT 1
-    OR json_type(NEW.evidence_snapshot_json, '$.trust_fingerprint') IS NOT 'text'
-    OR json_type(NEW.evidence_snapshot_json, '$.account_scope') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.allowed_ids') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.facts') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.trust') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.artifact_bindings') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.input_digest') IS NOT 'text'
-    OR json_extract(NEW.evidence_snapshot_json, '$.account_scope') IS NOT
-       CASE
-           WHEN NEW.account_user_id IS NOT NULL
-           THEN json_array(NEW.account_user_id)
-           ELSE json(NEW.account_user_ids_json)
-       END
-    OR json_extract(NEW.evidence_snapshot_json, '$.allowed_ids')
-       IS NOT json(NEW.evidence_ids_json)
-    OR json_extract(NEW.evidence_snapshot_json, '$.input_digest')
-       IS NOT NEW.input_digest
-    OR (SELECT COUNT(*) FROM json_each(NEW.evidence_snapshot_json)) IS NOT 8
-    OR EXISTS (
-        SELECT 1 FROM json_each(NEW.evidence_snapshot_json)
-        WHERE key NOT IN (
-            'schema_version', 'trust_fingerprint', 'account_scope',
-            'allowed_ids', 'facts', 'trust', 'artifact_bindings', 'input_digest'
-        )
-    )
-)
+WHEN NEW.status='succeeded'
+     AND analysis_evidence_snapshot_v1_valid(
+         NEW.input_digest,
+         NEW.account_user_id,
+         NEW.account_user_ids_json,
+         NEW.evidence_ids_json,
+         NEW.evidence_snapshot_json
+     ) IS NOT 1
 BEGIN
     SELECT RAISE(ABORT, 'successful analysis requires exact evidence snapshot');
 END
@@ -95,38 +112,14 @@ END
     "ck_analysis_evidence_snapshot_success_update": """
 CREATE TRIGGER ck_analysis_evidence_snapshot_success_update
 BEFORE UPDATE ON analyses
-WHEN NEW.status='succeeded' AND (
-    NEW.evidence_snapshot_json IS NULL
-    OR json_valid(NEW.evidence_snapshot_json) IS NOT 1
-    OR json_type(NEW.evidence_snapshot_json) IS NOT 'object'
-    OR json_type(NEW.evidence_snapshot_json, '$.schema_version') IS NOT 'integer'
-    OR json_extract(NEW.evidence_snapshot_json, '$.schema_version') IS NOT 1
-    OR json_type(NEW.evidence_snapshot_json, '$.trust_fingerprint') IS NOT 'text'
-    OR json_type(NEW.evidence_snapshot_json, '$.account_scope') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.allowed_ids') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.facts') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.trust') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.artifact_bindings') IS NOT 'array'
-    OR json_type(NEW.evidence_snapshot_json, '$.input_digest') IS NOT 'text'
-    OR json_extract(NEW.evidence_snapshot_json, '$.account_scope') IS NOT
-       CASE
-           WHEN NEW.account_user_id IS NOT NULL
-           THEN json_array(NEW.account_user_id)
-           ELSE json(NEW.account_user_ids_json)
-       END
-    OR json_extract(NEW.evidence_snapshot_json, '$.allowed_ids')
-       IS NOT json(NEW.evidence_ids_json)
-    OR json_extract(NEW.evidence_snapshot_json, '$.input_digest')
-       IS NOT NEW.input_digest
-    OR (SELECT COUNT(*) FROM json_each(NEW.evidence_snapshot_json)) IS NOT 8
-    OR EXISTS (
-        SELECT 1 FROM json_each(NEW.evidence_snapshot_json)
-        WHERE key NOT IN (
-            'schema_version', 'trust_fingerprint', 'account_scope',
-            'allowed_ids', 'facts', 'trust', 'artifact_bindings', 'input_digest'
-        )
-    )
-)
+WHEN NEW.status='succeeded'
+     AND analysis_evidence_snapshot_v1_valid(
+         NEW.input_digest,
+         NEW.account_user_id,
+         NEW.account_user_ids_json,
+         NEW.evidence_ids_json,
+         NEW.evidence_snapshot_json
+     ) IS NOT 1
 BEGIN
     SELECT RAISE(ABORT, 'successful analysis requires exact evidence snapshot');
 END
@@ -145,6 +138,28 @@ BEFORE DELETE ON analyses
 WHEN OLD.evidence_snapshot_json IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'analysis evidence snapshot is durable');
+END
+""".strip(),
+    "ck_analysis_opportunity_success_insert": """
+CREATE TRIGGER ck_analysis_opportunity_success_insert
+BEFORE INSERT ON opportunities
+WHEN NOT EXISTS (
+    SELECT 1 FROM analyses
+    WHERE id=NEW.analysis_id AND status='succeeded'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'opportunity requires a successful analysis');
+END
+""".strip(),
+    "ck_analysis_opportunity_success_update": """
+CREATE TRIGGER ck_analysis_opportunity_success_update
+BEFORE UPDATE OF analysis_id ON opportunities
+WHEN NOT EXISTS (
+    SELECT 1 FROM analyses
+    WHERE id=NEW.analysis_id AND status='succeeded'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'opportunity requires a successful analysis');
 END
 """.strip(),
 }
@@ -2063,6 +2078,12 @@ def _configure_sqlite(connection: object, _: object) -> None:
     connection.create_function(  # type: ignore[union-attr]
         "raw_evidence_digest", 1, canonical_raw_evidence_digest, deterministic=True
     )
+    connection.create_function(  # type: ignore[union-attr]
+        "analysis_evidence_snapshot_v1_valid",
+        5,
+        _sqlite_analysis_evidence_snapshot_v1_valid,
+        deterministic=True,
+    )
     cursor = connection.cursor()  # type: ignore[union-attr]
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
@@ -2136,24 +2157,22 @@ def _decode_analysis_json(value: object) -> object:
         return None
 
 
-def _analysis_evidence_snapshot_data_valid(connection: Connection) -> bool:
+def _analysis_evidence_snapshot_v1_valid(
+    input_digest_value: object,
+    account_user_id_value: object,
+    account_user_ids_value: object,
+    evidence_ids_value: object,
+    snapshot_value: object,
+) -> bool:
     try:
-        rows = connection.execute(text(
-            "SELECT status, input_digest, account_user_id, account_user_ids_json, "
-            "evidence_ids_json, evidence_snapshot_json FROM analyses"
-        )).mappings().all()
-    except SQLAlchemyError:
-        return False
-    for row in rows:
-        stored_scope = _decode_analysis_json(row["account_user_ids_json"])
+        stored_scope = _decode_analysis_json(account_user_ids_value)
         scope = (
-            [row["account_user_id"]]
-            if isinstance(row["account_user_id"], str)
-            and row["account_user_id"]
+            [account_user_id_value]
+            if isinstance(account_user_id_value, str) and account_user_id_value
             else stored_scope
         )
-        allowed_ids = _decode_analysis_json(row["evidence_ids_json"])
-        snapshot = _decode_analysis_json(row["evidence_snapshot_json"])
+        allowed_ids = _decode_analysis_json(evidence_ids_value)
+        snapshot = _decode_analysis_json(snapshot_value)
         if (
             not isinstance(stored_scope, list)
             or not isinstance(scope, list)
@@ -2177,24 +2196,18 @@ def _analysis_evidence_snapshot_data_valid(connection: Connection) -> bool:
                 for evidence_id in allowed_ids
             )
             or len(allowed_ids) != len(set(allowed_ids))
+            or not isinstance(snapshot, dict)
+            or set(snapshot) != {
+                "schema_version",
+                "trust_fingerprint",
+                "account_scope",
+                "allowed_ids",
+                "facts",
+                "trust",
+                "artifact_bindings",
+                "input_digest",
+            }
         ):
-            return False
-        if snapshot is None:
-            if row["status"] == "succeeded":
-                return False
-            continue
-        if snapshot == _LEGACY_ANALYSIS_EVIDENCE_SNAPSHOT:
-            continue
-        if not isinstance(snapshot, dict) or set(snapshot) != {
-            "schema_version",
-            "trust_fingerprint",
-            "account_scope",
-            "allowed_ids",
-            "facts",
-            "trust",
-            "artifact_bindings",
-            "input_digest",
-        }:
             return False
         facts = snapshot.get("facts")
         trust = snapshot.get("trust")
@@ -2214,17 +2227,15 @@ def _analysis_evidence_snapshot_data_valid(connection: Connection) -> bool:
             or [
                 item.get("evidence_id") if isinstance(item, dict) else None
                 for item in facts
-            ]
-            != allowed_ids
+            ] != allowed_ids
             or [
                 item.get("evidence_id") if isinstance(item, dict) else None
                 for item in trust
-            ]
-            != allowed_ids
+            ] != allowed_ids
             or not isinstance(fingerprint, str)
             or re.fullmatch(r"[0-9a-f]{64}", fingerprint, re.ASCII) is None
             or not isinstance(input_digest, str)
-            or input_digest != row["input_digest"]
+            or input_digest != input_digest_value
             or re.fullmatch(r"[0-9a-f]{64}", input_digest, re.ASCII) is None
         ):
             return False
@@ -2299,7 +2310,56 @@ def _analysis_evidence_snapshot_data_valid(connection: Connection) -> bool:
             if isinstance(item, dict)
             and item.get("kind") in {"account_note", "shop_collection_result"}
         }
-        if set(binding_ids) != expected_file_evidence:
+        return set(binding_ids) == expected_file_evidence
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+        return False
+
+
+def _sqlite_analysis_evidence_snapshot_v1_valid(
+    input_digest_value: object,
+    account_user_id_value: object,
+    account_user_ids_value: object,
+    evidence_ids_value: object,
+    snapshot_value: object,
+) -> int:
+    return int(_analysis_evidence_snapshot_v1_valid(
+        input_digest_value,
+        account_user_id_value,
+        account_user_ids_value,
+        evidence_ids_value,
+        snapshot_value,
+    ))
+
+
+def _analysis_evidence_snapshot_data_valid(connection: Connection) -> bool:
+    try:
+        rows = connection.execute(text(
+            "SELECT status, input_digest, account_user_id, account_user_ids_json, "
+            "evidence_ids_json, evidence_snapshot_json, output_json FROM analyses"
+        )).mappings().all()
+    except SQLAlchemyError:
+        return False
+    for row in rows:
+        status = row["status"]
+        snapshot = _decode_analysis_json(row["evidence_snapshot_json"])
+        output = _decode_analysis_json(row["output_json"])
+        if status not in {"succeeded", "failed", "needs_human"}:
+            return False
+        if snapshot is None:
+            if status == "succeeded" or output is not None:
+                return False
+            continue
+        if snapshot == _LEGACY_ANALYSIS_EVIDENCE_SNAPSHOT:
+            continue
+        if not _analysis_evidence_snapshot_v1_valid(
+            row["input_digest"],
+            row["account_user_id"],
+            row["account_user_ids_json"],
+            row["evidence_ids_json"],
+            row["evidence_snapshot_json"],
+        ):
+            return False
+        if status == "succeeded" and not isinstance(output, dict):
             return False
     return True
 

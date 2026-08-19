@@ -9,8 +9,10 @@ from backend.app.features.analysis.schemas import (
     OpportunityRead,
 )
 from backend.app.features.analysis.service import (
+    AnalysisCommitRolledBack,
     AnalysisNotFound,
     AnalysisService,
+    AnalysisTransactionUnknown,
     EvidenceAccountMismatch,
     EvidenceNotFound,
 )
@@ -35,6 +37,8 @@ def create_analysis(payload: AnalysisCreate, request: Request) -> AnalysisRead:
         return _service(request).create(payload)
     except (EvidenceNotFound, EvidenceAccountMismatch) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except (AnalysisCommitRolledBack, AnalysisTransactionUnknown) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @router.get("/analyses", response_model=list[AnalysisRead])

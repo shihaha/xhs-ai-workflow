@@ -8,12 +8,15 @@ import re
 import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from backend.app.adapters.contracts import (
@@ -77,6 +80,20 @@ class AnalysisNotFound(LookupError):
     pass
 
 
+class AnalysisCommitRolledBack(RuntimeError):
+    pass
+
+
+class AnalysisTransactionUnknown(RuntimeError):
+    pass
+
+
+class _AnalysisCommitOutcome(Enum):
+    committed = "committed"
+    rolled_back = "rolled_back"
+    unknown = "unknown"
+
+
 @dataclass(frozen=True)
 class _ContainedFileSnapshot:
     payload: bytes
@@ -113,6 +130,13 @@ class _EvidenceResolution:
     trust_fingerprint: str
     account_scope: tuple[str, ...]
     allowed_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ExpectedAnalysisGraph:
+    analysis_id: str
+    opportunity_ids: tuple[str, ...]
+    value: str
 
 
 class AnalysisService:
@@ -202,6 +226,7 @@ class AnalysisService:
         now = _utc_now()
         raw_evidence = model_result.raw_evidence
         record = AnalysisRecord(
+            id=str(uuid4()),
             analysis_type=payload.analysis_type,
             account_user_id=payload.account_user_id,
             account_user_ids_json=sorted(payload.account_user_ids),
@@ -222,6 +247,7 @@ class AnalysisService:
         for card in output.opportunities:
             record.opportunities.append(
                 OpportunityRecord(
+                    id=str(uuid4()),
                     title=card.title,
                     status=card.status,
                     summary=card.summary,
@@ -268,6 +294,7 @@ class AnalysisService:
                 after_model,
                 input_digest=digest,
             )
+            expected_graph = _expected_analysis_graph(record)
             session.add(record)
             # Flush the immutable claim snapshot into the reserved DB
             # transaction before the final name->identity CAS.  If that CAS
@@ -290,8 +317,22 @@ class AnalysisService:
                         "Evidence trust changed while the model request was in flight."
                     ),
                 )
-            session.commit()
-            return _analysis_read(_load_analysis(session, record.id))
+            try:
+                session.commit()
+                return _analysis_read(_load_analysis(session, record.id))
+            except SQLAlchemyError as error:
+                session.close()
+                outcome, committed = self._classify_success_commit(expected_graph)
+                if outcome is _AnalysisCommitOutcome.committed:
+                    assert committed is not None
+                    return committed
+                if outcome is _AnalysisCommitOutcome.rolled_back:
+                    raise AnalysisCommitRolledBack(
+                        "analysis_success_commit_rolled_back"
+                    ) from error
+                raise AnalysisTransactionUnknown(
+                    "analysis_success_transaction_unknown"
+                ) from error
 
     def get(self, analysis_id: str) -> AnalysisRead:
         with self.database.session() as session:
@@ -309,9 +350,10 @@ class AnalysisService:
     def list_opportunities(self) -> list[OpportunityRead]:
         with self.database.session() as session:
             records = session.scalars(
-                select(OpportunityRecord).order_by(
-                    OpportunityRecord.created_at.desc(), OpportunityRecord.id
-                )
+                select(OpportunityRecord)
+                .join(AnalysisRecord)
+                .where(AnalysisRecord.status == "succeeded")
+                .order_by(OpportunityRecord.created_at.desc(), OpportunityRecord.id)
             ).all()
             return [_opportunity_read(record) for record in records]
 
@@ -411,6 +453,43 @@ class AnalysisService:
                     )
                 )
         return rows
+
+    def _classify_success_commit(
+        self,
+        expected: _ExpectedAnalysisGraph,
+    ) -> tuple[_AnalysisCommitOutcome, AnalysisRead | None]:
+        for _attempt in range(2):
+            try:
+                return self._probe_success_commit(expected)
+            except SQLAlchemyError:
+                continue
+        return _AnalysisCommitOutcome.unknown, None
+
+    def _probe_success_commit(
+        self,
+        expected: _ExpectedAnalysisGraph,
+    ) -> tuple[_AnalysisCommitOutcome, AnalysisRead | None]:
+        with self.database.session() as session:
+            record = session.scalar(
+                select(AnalysisRecord)
+                .options(selectinload(AnalysisRecord.opportunities))
+                .where(AnalysisRecord.id == expected.analysis_id)
+            )
+            related_opportunities = session.scalars(
+                select(OpportunityRecord).where(or_(
+                    OpportunityRecord.analysis_id == expected.analysis_id,
+                    OpportunityRecord.id.in_(expected.opportunity_ids),
+                ))
+            ).all()
+            if record is None:
+                return (
+                    (_AnalysisCommitOutcome.rolled_back, None)
+                    if not related_opportunities
+                    else (_AnalysisCommitOutcome.unknown, None)
+                )
+            if _analysis_graph_value(record) != expected.value:
+                return _AnalysisCommitOutcome.unknown, None
+            return _AnalysisCommitOutcome.committed, _analysis_read(record)
 
     def _persist_failure(
         self,
@@ -1421,6 +1500,58 @@ def _load_analysis(session: Any, analysis_id: str) -> AnalysisRecord:
     return record
 
 
+def _expected_analysis_graph(record: AnalysisRecord) -> _ExpectedAnalysisGraph:
+    return _ExpectedAnalysisGraph(
+        analysis_id=record.id,
+        opportunity_ids=tuple(sorted(card.id for card in record.opportunities)),
+        value=_analysis_graph_value(record),
+    )
+
+
+def _analysis_graph_value(record: AnalysisRecord) -> str:
+    value = {
+        "analysis": {
+            "id": record.id,
+            "analysis_type": record.analysis_type,
+            "account_user_id": record.account_user_id,
+            "account_user_ids_json": record.account_user_ids_json,
+            "status": record.status,
+            "prompt_version": record.prompt_version,
+            "provider": record.provider,
+            "model": record.model,
+            "input_digest": record.input_digest,
+            "evidence_ids_json": record.evidence_ids_json,
+            "evidence_snapshot_json": record.evidence_snapshot_json,
+            "output_json": record.output_json,
+            "usage_json": record.usage_json,
+            "duration_ms": record.duration_ms,
+            "attempts_json": record.attempts_json,
+            "error_category": record.error_category,
+            "error_detail": record.error_detail,
+            "created_at": record.created_at.isoformat(timespec="microseconds"),
+        },
+        "opportunities": [
+            {
+                "id": card.id,
+                "analysis_id": card.analysis_id or record.id,
+                "title": card.title,
+                "status": card.status,
+                "summary": card.summary,
+                "evidence_ids_json": card.evidence_ids_json,
+                "next_action": card.next_action,
+                "created_at": card.created_at.isoformat(timespec="microseconds"),
+            }
+            for card in sorted(record.opportunities, key=lambda item: item.id)
+        ],
+    }
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _analysis_read(record: AnalysisRecord) -> AnalysisRead:
     return AnalysisRead(
         id=record.id,
@@ -1433,7 +1564,7 @@ def _analysis_read(record: AnalysisRecord) -> AnalysisRead:
         model=record.model,
         input_digest=record.input_digest,
         evidence_ids=list(record.evidence_ids_json),
-        output=record.output_json,
+        output=record.output_json if record.status == "succeeded" else None,
         usage=dict(record.usage_json),
         duration_ms=record.duration_ms,
         attempts=list(record.attempts_json),

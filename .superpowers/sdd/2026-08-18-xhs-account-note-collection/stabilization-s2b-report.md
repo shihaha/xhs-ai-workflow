@@ -254,3 +254,69 @@ snapshot fingerprint/data scans.
 
 No Bailian code, frontend source or pre-existing `research/` content is part of
 this fix. Independent post-commit review remains pending.
+
+# Stabilization S2B fix round 2/5 — status, validator and commit acknowledgement
+
+Date: 2026-08-19
+
+This round is limited to the three Important findings approved from review.
+No new UI, provider behavior or unrelated defense surface was added.
+
+## RED and root causes
+
+The direct regression selection was run before production changes:
+
+```text
+python -m pytest backend/tests/analysis/test_evidence_grounding.py \
+  -k "sealed_non_success or opportunity_cannot or runtime_success or success_commit or status_downgrade_preserves" -q
+18 failed, 1 passed, 30 deselected in 5.19s
+```
+
+- Sealed analyses could move from a non-success status back to success, move
+  between non-success statuses or accept an unknown status. Downgraded analyses
+  still exposed model output and active opportunities.
+- Startup performed the complete v1 evidence-snapshot validation in Python,
+  while runtime INSERT/UPDATE triggers checked only shallow JSON shape and
+  parent fields. Wrong fingerprints, citation alignment, artifact bindings and
+  strict numeric types passed the runtime boundary.
+- A success commit exception escaped without distinguishing an acknowledged
+  commit from a rollback or contradictory/unreadable persisted state.
+
+The identical selection after implementation is `19 passed`.
+
+## Approved fixes
+
+- Analysis status is restricted to `succeeded`, `failed` and `needs_human`.
+  A sealed success may downgrade once to either explicit non-success terminal;
+  a terminal status cannot transition again. Historical sealed output and
+  opportunity rows remain durable, while API projections suppress output and
+  opportunities whenever the parent is non-success. New opportunities require
+  a currently successful parent.
+- The existing complete Python v1 snapshot validator is now the single source
+  for both startup scans and a deterministic SQLite UDF used by successful
+  INSERT and UPDATE triggers. It recomputes the trust fingerprint and validates
+  exact facts/trust/allowed-ID ordering, required artifact bindings, parent
+  scope/digest/IDs and strict integer types including bool/float/overflow
+  rejection. Exact trigger validation remains marker-present fail closed.
+- Analysis and opportunity IDs are generated before the success write. The
+  expected sealed parent plus exact opportunity graph is captured before
+  commit. If commit acknowledgement is lost, two fresh reads classify only:
+  exact graph as `committed`, no parent/children as `rolled_back`, and every
+  partial, mismatched or unreadable state as `unknown`. A committed graph is
+  returned without another model call or duplicate opportunity; rolled-back
+  and unknown outcomes use provider-neutral domain errors, and no speculative
+  failure/success row is written.
+
+## Controlled verification
+
+- Direct RED: `18 failed, 1 passed`; identical GREEN: `19 passed`.
+- Complete analysis suite: `150 passed, 1 skipped`.
+- Final analysis + XHS suites: `706 passed, 2 skipped in 121.22s`.
+- Final `scripts/verify.ps1`: exit 0; backend `1301 passed, 2 skipped`;
+  Python compile passed; frontend `47 passed`; production build passed;
+  controlled E2E `1 passed`; npm audit found `0 vulnerabilities`; tracked-
+  secret and release-boundary scans passed.
+- Controlled fresh-runtime E2E repeat gate: `5 passed in 39.4s`.
+
+No Bailian code, frontend source or pre-existing `research/` content is part of
+this round. Independent post-commit review remains pending.

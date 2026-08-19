@@ -149,32 +149,32 @@ async def test_f0_database_migrates_idempotently_and_quarantines_old_success(
                 **fingerprint_payload,
                 "input_digest": "e" * 64,
             }
-            connection = sqlite3.connect(database_path)
-            connection.execute(
-                "INSERT INTO analyses (id,analysis_type,account_user_id,account_user_ids_json,status,prompt_version,provider,model,input_digest,evidence_ids_json,evidence_snapshot_json,output_json,usage_json,duration_ms,attempts_json,error_category,error_detail,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    "post-migration-success",
-                    "account_report",
-                    "account-a",
-                    json.dumps([]),
-                    "succeeded",
-                    "v2",
-                    "replacement",
-                    "model",
-                    "e" * 64,
-                    json.dumps(["rank-item:1"]),
-                    json.dumps(evidence_snapshot, ensure_ascii=False),
-                    json.dumps({"claims": [{"claim": "new", "evidence_ids": ["rank-item:1"]}], "product_clusters": [], "opportunities": []}),
-                    json.dumps({}),
-                    1,
-                    json.dumps([]),
-                    None,
-                    None,
-                    "2026-08-17 13:00:00.000000",
-                ),
-            )
-            connection.commit()
-            connection.close()
+            fixture_database = Database(database_path)
+            with fixture_database.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "INSERT INTO analyses (id,analysis_type,account_user_id,account_user_ids_json,status,prompt_version,provider,model,input_digest,evidence_ids_json,evidence_snapshot_json,output_json,usage_json,duration_ms,attempts_json,error_category,error_detail,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "post-migration-success",
+                        "account_report",
+                        "account-a",
+                        json.dumps([]),
+                        "succeeded",
+                        "v2",
+                        "replacement",
+                        "model",
+                        "e" * 64,
+                        json.dumps(["rank-item:1"]),
+                        json.dumps(evidence_snapshot, ensure_ascii=False),
+                        json.dumps({"claims": [{"claim": "new", "evidence_ids": ["rank-item:1"]}], "product_clusters": [], "opportunities": []}),
+                        json.dumps({}),
+                        1,
+                        json.dumps([]),
+                        None,
+                        None,
+                        "2026-08-17 13:00:00.000000",
+                    ),
+                )
+            fixture_database.close()
 
 
 def test_broken_legacy_analysis_schema_fails_during_startup(tmp_path: Path) -> None:
