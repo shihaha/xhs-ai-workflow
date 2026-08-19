@@ -179,8 +179,14 @@ def test_server_scope_matrix_and_default_profile_are_fixed_and_truthful() -> Non
         ("成交榜", "优秀内容"),
         ("成交榜", "优秀账号"),
     )
-    assert DEFAULT_QIANFAN_SELECTOR_PROFILE.supported is False
-    assert DEFAULT_QIANFAN_SELECTOR_PROFILE.version
+    assert DEFAULT_QIANFAN_SELECTOR_PROFILE.supported is True
+    assert DEFAULT_QIANFAN_SELECTOR_PROFILE.version == "qianfan-note-rank-live-v1"
+    assert dict(DEFAULT_QIANFAN_SELECTOR_PROFILE.board_request_mapping) == {
+        "阅读榜": 1,
+        "引流榜": 2,
+        "热卖榜": 3,
+        "成交榜": 4,
+    }
     controlled = _controlled_profile()
     with pytest.raises(TypeError):
         controlled.board_selectors["阅读榜"] = "mutated"  # type: ignore[index]
@@ -462,7 +468,11 @@ def test_wrong_source_artifact_cannot_be_relabelled_as_qianfan_snapshot(tmp_path
 @pytest.mark.anyio
 async def test_http_202_starts_only_server_owned_eight_scope_collection(tmp_path: Path) -> None:
     app = create_app(
-        Settings(runtime_dir=tmp_path / "runtime", database_path=tmp_path / "runtime" / "db.sqlite3")
+        Settings(
+            runtime_dir=tmp_path / "runtime",
+            database_path=tmp_path / "runtime" / "db.sqlite3",
+            xhs_cli_state_dir=tmp_path / "runtime" / "xhs-cli-state",
+        )
     )
     original = app.state.qianfan_collection_service
     original.close()
@@ -496,7 +506,13 @@ async def test_http_202_starts_only_server_owned_eight_scope_collection(tmp_path
 @pytest.mark.anyio
 async def test_public_jobs_api_cannot_forge_qianfan_job_or_raw_artifact(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
-    app = create_app(Settings(runtime_dir=runtime, database_path=runtime / "db.sqlite3"))
+    app = create_app(
+        Settings(
+            runtime_dir=runtime,
+            database_path=runtime / "db.sqlite3",
+            xhs_cli_state_dir=runtime / "xhs-cli-state",
+        )
+    )
     generic = app.state.job_service.create(job_type="generic", input_data={})
     evidence = runtime / "evidence" / "forged.json"
     evidence.parent.mkdir(parents=True, exist_ok=True)
@@ -610,8 +626,23 @@ class _ScopeLocator:
         self.page.emit()
 
 
+class _ScopeRequest:
+    method = "POST"
+
+    def __init__(self, *, url: str, board: str) -> None:
+        self.url = url
+        self._data = {
+            "sortBy": {"阅读榜": 1, "引流榜": 2, "热卖榜": 3, "成交榜": 4}[board],
+            "noteType": 0,
+            "pageNo": 1,
+            "pageSize": 10,
+        }
+
+    def post_data_json(self) -> dict[str, Any]:
+        return self._data
+
+
 class _ScopeResponse:
-    url = "https://ark.xiaohongshu.com/api/edith/business/data/note/rank/v2/list"
     status = 200
 
     def __init__(
@@ -620,15 +651,16 @@ class _ScopeResponse:
         self.board = board
         self.dimension = dimension
         self.items = items or []
+        path = (
+            "/api/edith/business/data/note/user/rank/v2/list"
+            if dimension == "优秀账号"
+            else "/api/edith/business/data/note/rank/v2/list"
+        )
+        self.url = f"https://ark.xiaohongshu.com{path}"
+        self.request = _ScopeRequest(url=self.url, board=board)
 
     def json(self) -> dict[str, Any]:
-        return {
-            "data": {
-                "boardName": self.board,
-                "dimensionName": self.dimension,
-                "dataList": self.items,
-            }
-        }
+        return {"data": {"dataList": self.items}}
 
     def text(self) -> str:
         return json.dumps(self.json(), ensure_ascii=False)
@@ -732,14 +764,7 @@ def test_adapter_maps_complete_qianfan_row_only_after_exact_scope_verification()
     assert result.complete is True
     assert result.items[0].data == {
         "rank": 2,
-        "title": "完整标题",
         "author_name": "真实账号",
-        "publish_date": "2026-08-18 10:00:00",
-        "read_range": "10w+",
-        "click_rate_range": "5%-10%",
-        "pay_rate_range": "1%-2%",
-        "gmv_range": "1w-5w",
-        "note_id": "abc_123",
         "user_id": "user-7",
     }
 
@@ -752,7 +777,10 @@ def test_unsupported_selector_profile_never_opens_a_browser() -> None:
         CollectionRequest(capability="rankings", expected_count=20),
         board="成交榜",
         dimension="优秀账号",
-        selector_profile=DEFAULT_QIANFAN_SELECTOR_PROFILE,
+        selector_profile=QianfanSelectorProfile(
+            version="unsupported-controlled-profile",
+            supported=False,
+        ),
     )
 
     assert result.status == "needs_human"

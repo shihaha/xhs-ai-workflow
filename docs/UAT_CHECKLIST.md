@@ -15,7 +15,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
 ## Real end-to-end gate
 
-- [ ] Run all eight Qianfan scopes; require persisted 8/8 scope facts, raw evidence and no fabricated percentage.
+- [ ] Run all eight Qianfan scopes with `expected_count_per_scope=10`; require persisted 8/8 scope facts, canonical `pageNo=1,pageSize=10` raw evidence and no fabricated percentage. Do not count page-size-one helper responses.
 - [ ] Select a real account and collect its store on the real phone.
 - [ ] From that ranked account's UI, run read-only account collection and verify one public profile plus exact note N/N, source links, reserved job, raw artifact hash and database rows agree.
 - [ ] Run one public-note keyword search and verify expected N, returned N, source links and the hash-bound search artifact agree.
@@ -42,7 +42,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
 ## Current execution status (2026-08-19)
 
-- Qianfan authenticated live collection: **not_run** — no authenticated verified profile/selectors were supplied.
+- Qianfan authenticated live collection: **not_run** — `qianfan-note-rank-live-v1` is a software-verified selector/request contract for the observed layout, but the controller has not yet run the authenticated 8/8 isolated gate. Live success, job IDs, and evidence paths must not be inferred from the focused tests.
 - Xiaohongshu account/note bounded live gate: **passed (2026-08-19)** — the isolated opt-in run completed `1 passed in 89.83s`. It verified the authenticated current-account profile, exactly 3 public notes, the reserved job/raw artifact/database path, and an exact empty keyword-search result (0/0), using only fixed `status`, `whoami`, `user`, `user-posts` and `search` reads. The real `user-posts` response used nested page slots and was normalized without treating empty slots as notes. Credentials remained outside argv, logs and project files. A non-empty live search and the ranked-account UI-to-analysis workflow remain pending and are not implied by this bounded pass.
 - Android real-device collection: **not_run: device unavailable**.
 - Bailian text live contract: **failed (2026-08-19)** — the configured text model and Key reached Bailian successfully with HTTP 200, but the returned JSON did not satisfy strict `AnalysisOutput` and was rejected as `model_output_invalid` after 7.796 seconds. The production adapter now sends the exact Pydantic JSON Schema and JSON-only/key-preservation instruction; focused contract tests pass, but the real provider output remains non-conformant. No model output, Key or full provider payload was persisted in this record, and no successful analysis fact is claimed.

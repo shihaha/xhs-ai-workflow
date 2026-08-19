@@ -29,7 +29,11 @@ from backend.app.features.radar.models import BoardName, DimensionName
 
 QIANFAN_RANK_URL = "https://ark.xiaohongshu.com/app-datacenter/market/note-rank"
 _RANK_RESPONSE_PATH = "/api/edith/business/data/note/"
+_CONTENT_RANK_RESPONSE_PATH = "/api/edith/business/data/note/rank/v2/list"
+_ACCOUNT_RANK_RESPONSE_PATH = "/api/edith/business/data/note/user/rank/v2/list"
 _XHS_PUBLIC_ORIGIN = "https://www.xiaohongshu.com"
+_QIANFAN_BOARDS = ("阅读榜", "引流榜", "热卖榜", "成交榜")
+_QIANFAN_DIMENSIONS = ("优秀内容", "优秀账号")
 
 
 class QianfanSelectorProfile(BaseModel):
@@ -46,6 +50,21 @@ class QianfanSelectorProfile(BaseModel):
     dimension_selectors: tuple[tuple[str, str], ...] = ()
     active_board_selectors: tuple[tuple[str, str], ...] = ()
     active_dimension_selectors: tuple[tuple[str, str], ...] = ()
+    response_endpoint_paths: tuple[tuple[str, str], ...] = (
+        ("优秀内容", _CONTENT_RANK_RESPONSE_PATH),
+        ("优秀账号", _ACCOUNT_RANK_RESPONSE_PATH),
+    )
+    board_request_mapping: tuple[tuple[str, int], ...] = (
+        ("阅读榜", 1),
+        ("引流榜", 2),
+        ("热卖榜", 3),
+        ("成交榜", 4),
+    )
+    request_note_type: int = 0
+    canonical_page_no: int = 1
+    canonical_page_size: int = 10
+    # Retained only so controlled historical fixtures can be constructed. Scope
+    # verification for supported profiles is request-bound, never body-bound.
     response_board_path: tuple[str, ...] = ()
     response_dimension_path: tuple[str, ...] = ()
 
@@ -54,6 +73,8 @@ class QianfanSelectorProfile(BaseModel):
         "dimension_selectors",
         "active_board_selectors",
         "active_dimension_selectors",
+        "response_endpoint_paths",
+        "board_request_mapping",
         mode="before",
     )
     @classmethod
@@ -66,8 +87,8 @@ class QianfanSelectorProfile(BaseModel):
     def validate_supported_profile(self) -> "QianfanSelectorProfile":
         if not self.supported:
             return self
-        required_boards = {"阅读榜", "引流榜", "热卖榜", "成交榜"}
-        required_dimensions = {"优秀内容", "优秀账号"}
+        required_boards = set(_QIANFAN_BOARDS)
+        required_dimensions = set(_QIANFAN_DIMENSIONS)
         if (
             not self.ready_selector
             or not self.login_selector
@@ -77,16 +98,46 @@ class QianfanSelectorProfile(BaseModel):
             or {key for key, _ in self.dimension_selectors} != required_dimensions
             or {key for key, _ in self.active_dimension_selectors}
             != required_dimensions
-            or not self.response_board_path
-            or not self.response_dimension_path
+            or {key for key, _ in self.response_endpoint_paths}
+            != required_dimensions
+            or {key for key, _ in self.board_request_mapping} != required_boards
+            or any(not isinstance(path, str) or not path.startswith("/") for _, path in self.response_endpoint_paths)
+            or any(isinstance(sort_by, bool) or not isinstance(sort_by, int) for _, sort_by in self.board_request_mapping)
+            or isinstance(self.request_note_type, bool)
+            or not isinstance(self.request_note_type, int)
+            or isinstance(self.canonical_page_no, bool)
+            or not isinstance(self.canonical_page_no, int)
+            or self.canonical_page_no < 1
+            or isinstance(self.canonical_page_size, bool)
+            or not isinstance(self.canonical_page_size, int)
+            or self.canonical_page_size < 1
         ):
             raise ValueError("Supported Qianfan selector profiles must verify every fixed scope.")
         return self
 
 
 DEFAULT_QIANFAN_SELECTOR_PROFILE = QianfanSelectorProfile(
-    version="qianfan-note-rank-unverified-v1",
-    supported=False,
+    version="qianfan-note-rank-live-v1",
+    supported=True,
+    ready_selector="div.d-tabs-header.d-clickable",
+    login_selector='text="登录"',
+    captcha_selector='text="验证码"',
+    board_selectors=tuple(
+        (board, f'div.d-tabs-header.d-clickable:has-text("{board}")')
+        for board in _QIANFAN_BOARDS
+    ),
+    dimension_selectors=tuple(
+        (dimension, f'button.d-button:has-text("{dimension}")')
+        for dimension in _QIANFAN_DIMENSIONS
+    ),
+    active_board_selectors=tuple(
+        (board, f'div.d-tabs-header.d-clickable.active:has-text("{board}")')
+        for board in _QIANFAN_BOARDS
+    ),
+    active_dimension_selectors=tuple(
+        (dimension, f'button.d-button.active:has-text("{dimension}")')
+        for dimension in _QIANFAN_DIMENSIONS
+    ),
 )
 
 
@@ -817,7 +868,13 @@ def _record_response(response: Any, sink: list[dict[str, Any]]) -> None:
     url = str(response.url)
     if _RANK_RESPONSE_PATH not in url:
         return
-    record: dict[str, Any] = {"url": url, "status": int(response.status)}
+    record: dict[str, Any] = {
+        "url": _without_query_or_fragment(url),
+        "status": int(response.status),
+    }
+    request_scope = _record_request_scope(getattr(response, "request", None))
+    if request_scope is not None:
+        record["request"] = request_scope
     raw_text: str | None = None
     try:
         raw_text = response.text()
@@ -828,11 +885,82 @@ def _record_response(response: Any, sink: list[dict[str, Any]]) -> None:
         except Exception:
             raw_text = None
     try:
-        record["body"] = response.json()
+        record["body"] = _redact_credential_like_fields(response.json())
     except Exception as error:
         record["capture_error"] = type(error).__name__
         record["raw_text"] = raw_text if raw_text is not None else repr(response)
-    sink.append(record)
+    sink.append(_redact_credential_like_fields(record))
+
+
+def _record_request_scope(request: Any) -> dict[str, Any] | None:
+    if request is None:
+        return None
+    method = getattr(request, "method", None)
+    request_url = getattr(request, "url", None)
+    if not isinstance(method, str) or not isinstance(request_url, str):
+        return None
+    scope: dict[str, Any] = {"method": method, "path": _url_path(request_url)}
+    try:
+        raw_post_data = request.post_data_json()
+    except Exception:
+        raw_post_data = None
+    if isinstance(raw_post_data, dict):
+        for key in ("sortBy", "noteType", "pageNo", "pageSize"):
+            value = raw_post_data.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                scope[key] = value
+    return scope
+
+
+def _url_path(url: str) -> str:
+    try:
+        return urlsplit(url).path
+    except (TypeError, ValueError, UnicodeError):
+        return ""
+
+
+def _without_query_or_fragment(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    except (TypeError, ValueError, UnicodeError):
+        return ""
+
+
+def _redact_credential_like_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_credential_like_fields(child)
+            for key, child in value.items()
+            if not _is_credential_like_key(key)
+        }
+    if isinstance(value, list):
+        return [_redact_credential_like_fields(child) for child in value]
+    if isinstance(value, tuple):
+        return [_redact_credential_like_fields(child) for child in value]
+    return value
+
+
+def _is_credential_like_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+    return normalized in {
+        "xsectoken",
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "cookie",
+        "cookies",
+        "authorization",
+        "setcookie",
+        "password",
+        "passwd",
+        "secret",
+        "credential",
+        "credentials",
+        "session",
+        "sessionid",
+    }
 
 
 def _raw_page_evidence(
@@ -854,7 +982,7 @@ def _raw_page_evidence(
     }
     if errors:
         evidence["capture_errors"] = errors
-    return evidence
+    return _redact_credential_like_fields(evidence)
 
 
 def _capture_error(stage: str, error: Exception) -> dict[str, str]:
@@ -880,6 +1008,7 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
         if not isinstance(raw_items, list):
             continue
         valid_response_observed = True
+        account_response = _is_account_ranking_response(response)
         for item_index, raw_item in enumerate(raw_items):
             reference = f"qianfan_response:{response_index + 1}:item:{item_index + 1}"
             item_evidence = {"response_url": response.get("url"), "item": raw_item}
@@ -893,7 +1022,11 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
                 )
                 continue
             try:
-                item_id, note_id, canonical_note_url = _item_identity(raw_item)
+                item = (
+                    _normalized_account_item(raw_item, item_evidence)
+                    if account_response
+                    else _normalized_content_item(raw_item, item_evidence)
+                )
             except _RankItemUnusable as error:
                 rejected_items.append(
                     RejectedCollectionItem(
@@ -903,56 +1036,7 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
                     )
                 )
                 continue
-            source_url = (
-                f"https://www.xiaohongshu.com/explore/{quote(note_id)}"
-                if note_id
-                else canonical_note_url or QIANFAN_RANK_URL
-            )
-            item = CollectionItem(
-                id=item_id,
-                kind="rank_item",
-                source_url=source_url,
-                raw_evidence=item_evidence,
-                data={
-                    "rank": raw_item.get("rank"),
-                    "title": _first_present(raw_item, "noteTitle", "title", "note_title"),
-                    "author_name": _first_present(
-                        raw_item, "userNickname", "authorName", "author_name"
-                    ),
-                    "publish_date": _first_present(
-                        raw_item,
-                        "publishTime",
-                        "publishDate",
-                        "publish_time",
-                        "publish_date",
-                    ),
-                    "read_range": _first_present(
-                        raw_item,
-                        "readNumRange",
-                        "noteReadNumRange",
-                        "readRange",
-                        "read_range",
-                    ),
-                    "click_rate_range": _first_present(
-                        raw_item,
-                        "clickRateRange",
-                        "noteClickRateRange",
-                        "click_rate_range",
-                    ),
-                    "pay_rate_range": _first_present(
-                        raw_item,
-                        "payRateRange",
-                        "notePayRateRange",
-                        "pay_rate_range",
-                    ),
-                    "gmv_range": _first_present(
-                        raw_item, "gmvRange", "noteGmvRange", "gmv_range"
-                    ),
-                    "note_id": note_id or None,
-                    "user_id": raw_item.get("userId") or raw_item.get("user_id"),
-                },
-            )
-            if item_id in chosen:
+            if item.id in chosen:
                 rejected_items.append(
                     RejectedCollectionItem(
                         reference=reference,
@@ -961,11 +1045,88 @@ def _normalized_items(raw_evidence: dict[str, Any]) -> _NormalizedRankings:
                     )
                 )
                 continue
-            chosen[item_id] = item
+            chosen[item.id] = item
     return _NormalizedRankings(
         items=[chosen[item_id] for item_id in sorted(chosen)],
         rejected_items=rejected_items,
         valid_response_observed=valid_response_observed,
+    )
+
+
+def _is_account_ranking_response(response: dict[str, Any]) -> bool:
+    request = response.get("request")
+    return isinstance(request, dict) and request.get("path") == _ACCOUNT_RANK_RESPONSE_PATH
+
+
+def _normalized_content_item(
+    raw_item: dict[str, Any], item_evidence: dict[str, Any]
+) -> CollectionItem:
+    item_id, note_id, canonical_note_url = _item_identity(raw_item)
+    source_url = (
+        f"https://www.xiaohongshu.com/explore/{quote(note_id)}"
+        if note_id
+        else canonical_note_url or QIANFAN_RANK_URL
+    )
+    return CollectionItem(
+        id=item_id,
+        kind="rank_item",
+        source_url=source_url,
+        raw_evidence=_redact_credential_like_fields(item_evidence),
+        data={
+            "rank": raw_item.get("rank"),
+            "title": _first_present(raw_item, "noteTitle", "title", "note_title"),
+            "author_name": _first_present(
+                raw_item, "userNickname", "authorName", "author_name"
+            ),
+            "publish_date": _first_present(
+                raw_item,
+                "publishTime",
+                "publishDate",
+                "publish_time",
+                "publish_date",
+            ),
+            "read_range": _first_present(
+                raw_item,
+                "readNumRange",
+                "noteReadNumRange",
+                "readRange",
+                "read_range",
+            ),
+            "click_rate_range": _first_present(
+                raw_item,
+                "clickRateRange",
+                "noteClickRateRange",
+                "click_rate_range",
+            ),
+            "pay_rate_range": _first_present(
+                raw_item,
+                "payRateRange",
+                "notePayRateRange",
+                "pay_rate_range",
+            ),
+            "gmv_range": _first_present(raw_item, "gmvRange", "noteGmvRange", "gmv_range"),
+            "note_id": note_id or None,
+            "user_id": raw_item.get("userId") or raw_item.get("user_id"),
+        },
+    )
+
+
+def _normalized_account_item(
+    raw_item: dict[str, Any], item_evidence: dict[str, Any]
+) -> CollectionItem:
+    user_id = _safe_identity_token(_first_present(raw_item, "userId", "user_id"))
+    if user_id is None:
+        raise _RankItemUnusable("identity_insufficient")
+    return CollectionItem(
+        id=f"account:{user_id}",
+        kind="rank_item",
+        source_url=f"https://www.xiaohongshu.com/user/profile/{quote(user_id)}",
+        raw_evidence=_redact_credential_like_fields(item_evidence),
+        data={
+            "rank": raw_item.get("rank"),
+            "author_name": _first_present(raw_item, "userNickname", "authorName", "author_name"),
+            "user_id": user_id,
+        },
     )
 
 
@@ -977,12 +1138,21 @@ def _response_matches_scope(
     selector_profile: QianfanSelectorProfile,
 ) -> bool:
     body = response.get("body")
-    if not isinstance(body, dict) or not _successful_response(response, body):
+    request = response.get("request")
+    if (
+        not isinstance(body, dict)
+        or not _successful_response(response, body)
+        or not isinstance(request, dict)
+    ):
         return False
-    return (
-        _nested_value(body, selector_profile.response_board_path) == board
-        and _nested_value(body, selector_profile.response_dimension_path) == dimension
-    )
+    return request == {
+        "method": "POST",
+        "path": dict(selector_profile.response_endpoint_paths)[dimension],
+        "sortBy": dict(selector_profile.board_request_mapping)[board],
+        "noteType": selector_profile.request_note_type,
+        "pageNo": selector_profile.canonical_page_no,
+        "pageSize": selector_profile.canonical_page_size,
+    }
 
 
 def _nested_value(value: Any, path: tuple[str, ...]) -> Any:
