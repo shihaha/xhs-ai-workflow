@@ -83,9 +83,11 @@ environment-only.
 ## Not verified live
 
 Authenticated Qianfan, a non-empty live XHS keyword search and ranked-account UI
-workflow, a real Android phone, Bailian text, and the seven-day run remain
-`not_run`. The bounded authenticated local `xhs-cli` gate passed for the current
-profile, 3 notes and an exact empty search on 2026-08-19.
+workflow, a real Android phone, and the seven-day run remain `not_run`. The
+bounded authenticated local `xhs-cli` gate passed for the current profile, 3
+notes and an exact empty search on 2026-08-19. Bailian text was attempted with
+real credentials and HTTP 200 but failed strict `AnalysisOutput` validation as
+`model_output_invalid`; it is not a live success.
 Bailian image generation and visual assessment passed their bounded real-model
 gate on 2026-08-19. See `docs/UAT_CHECKLIST.md`. Therefore the honest release label is
 **software implemented / awaiting real UAT**.

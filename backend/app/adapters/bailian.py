@@ -83,10 +83,24 @@ class BailianModelAdapter:
             raise BailianNotConfigured("Bailian is not configured.")
         attempts: list[dict[str, Any]] = []
         started = time.monotonic()
+        schema_instruction = (
+            "Return exactly one JSON object using the exact property names and types "
+            "in JSON_SCHEMA. Do not translate or rename keys. Additional properties "
+            "are forbidden. Return JSON only, without Markdown or explanation.\n"
+            "JSON_SCHEMA:\n"
+            + json.dumps(
+                schema.model_json_schema(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\nTASK_INSTRUCTIONS:\n"
+            + request.system_prompt
+        )
         body = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": request.system_prompt},
+                {"role": "system", "content": schema_instruction},
                 {"role": "user", "content": request.user_prompt},
             ],
             "response_format": {"type": "json_object"},

@@ -141,3 +141,18 @@ python -m pytest backend/tests/media -q
 ```
 
 Real image generation remains proven. The vision schema is now proven against the live provider, but durable visual completion still requires one vision-only rerun after this usage fix.
+
+## Text structured-output live attempt — 2026-08-19
+
+The configured text model and API Key reached Bailian successfully with HTTP
+200. A direct contract RED showed the production text adapter sent only generic
+JSON-object mode and task text, without the exact output schema. The adapter now
+includes `AnalysisOutput.model_json_schema()` in a fixed JSON-only instruction,
+forbids renamed/translated/extra keys, and retains unchanged strict Pydantic
+validation. Controlled schema tests passed (8 target tests; 24 focused text
+tests with the unapproved live gate skipped).
+
+One bounded real rerun still returned `model_output_invalid` after 7796 ms. The
+provider body and credentials were not logged, the validator was not relaxed,
+and no real text success is claimed. This is recorded as a live failure, not as
+`not_run` or passed.
