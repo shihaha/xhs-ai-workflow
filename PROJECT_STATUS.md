@@ -5,9 +5,9 @@ repository: shihaha/xhs-ai-workflow
 branch: feature/system-v1
 remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
-last_updated: 2026-08-20 01:48:46 +08:00
+last_updated: 2026-08-20 (Phase A handoff)
 
-> 状态口径：本文以仓库 `98b8534c45fef4856b311fa586145bef268b08d4`、源 Codex 线程的当前活动回合、隔离运行数据库和本机证据目录为依据。自动测试、受控夹具和真实平台 UAT 严格分开。当前发布标签仍是 **software implemented / awaiting real UAT（软件已实现，等待真实验收）**。
+> 状态口径：本文以 `feature/system-v1` 的 Phase A 提交、隔离运行数据库和本机证据目录为依据。自动测试、受控夹具和真实平台 UAT 严格分开。下方“Phase A 完成报告”是当前权威增量，覆盖本文较早的单账号工作流快照。当前结论是 **Phase A software complete / real cross-account UAT blocked（软件完成，真实跨账号验收受阻）**。
 
 # 1. 项目是干什么的
 
@@ -157,7 +157,7 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
 └─ PROJECT_STATUS.md   # 本交接与永久项目身份
 ```
 
-外部运行目录：`D:\AI_WORKSPACE_RUNTIME\xhs-intelligence-workbench`。其中包含 SQLite、evidence、content、logs、浏览器 Profile、CLI 状态和真实 UAT 隔离目录；全部不进入 GitHub。
+外部运行目录由本机受信配置指定（具体路径不写入 GitHub）。其中包含 SQLite、evidence、content、logs、浏览器 Profile、CLI 状态和真实 UAT 隔离目录；全部不进入 GitHub。
 
 # 5. 已经真正完成的功能
 
@@ -414,3 +414,115 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
 - 最近真实数据：`android-live-uat-20260820-09/workbench.sqlite3` 有 1 个 `needs_human` job、17 个 artifacts；其后同批次商品 verifier 已 `complete=true`。真实 runtime 不上传 GitHub。
 
 如果主 Codex 后续产生新提交，应更新本节 HEAD/WIP 和第 6 节，不要把运行中修改误写成稳定完成。
+
+---
+
+## Phase A 完成报告
+
+> 本节是 2026-08-20 的权威 Phase A 交接，覆盖上方较早的单账号流程和
+> Current WIP 快照。结论：**Phase A 软件完成；真实跨账号业务验收未完成；
+> Phase B 未开始。**
+
+1. **最终业务变化**：单账号 `account_report` 只能保存观察信号；
+   `product_cluster/account_opportunity` 必须选择至少两个不同账号。模型只提
+   聚类和引用，账号覆盖、商品/笔记归属和证据等级由服务端验证和计算。
+2. **数据库与迁移**：没有新增业务表；`opportunities` 新增
+   `review_status/evidence_level/supporting_accounts_json/
+   supporting_products_json/supporting_notes_json/reviewed_at/
+   rejection_reason`。版本化迁移
+   `phase_a_cross_account_opportunities_v1` 保留旧 ID，把无法证明为跨账号的
+   历史机会标为 `rejected/legacy_ungraded`。SQLite triggers 固化证据不可变和
+   `pending_review` 的单向审核终态。
+3. **API 变化**：跨账号 `AnalysisCreate.account_user_ids` 至少两个不同账号；
+   `OpportunityRead` 返回审核状态、服务端等级、支撑账号/商品/图片/笔记；新增
+   `POST /api/v1/opportunities/{id}/review`。候选账号在评分指标不足时返回
+   `score_status=insufficient_metrics`、真实出现次数和最佳名次，不伪造分数。
+4. **后端核心变化**：analysis schema/service 验证完整逐账号 shop + note
+   ownership；content service 只接受人工批准且证据合格的机会；radar service
+   对缺失指标做事实排序；db migration 保留历史并 fail closed。
+5. **前端变化**：账号页删除单账号“生成机会”；Opportunities 页面提供完整
+   账号多选、证据完整度、跨账号聚类、支撑账号/商品/图片/笔记展示和人工
+   approve/reject；明确显示 Phase B 尚未开始且不提供产品入口。
+6. **单账号限制**：schema 拒绝少于两个不同账号的跨账号分析；即使模型返回
+   opportunity，`account_report` 也会以严格失败收口，不能写机会行。
+7. **两/三账号等级**：服务端按验证后的不同账号数计算；2 个为
+   `warming_candidate`，3 个及以上为 `validated_candidate`。自动测试覆盖模型
+   伪报状态、重复账号和错绑 evidence。
+8. **审核状态机**：合格候选自动写 `pending_review`；人工 `approve` 写
+   `approved`，`reject + 非空原因` 写 `rejected`。终态不可回退、互转或编辑
+   支撑证据，否决行保留审计。
+9. **产品门禁**：产品创建必须引用 `approved` 且等级为 warming/validated 的
+   机会，并重新核验 analysis output、引用和 shop/account-note trust。未批准、
+   rejected、legacy 或证据漂移均拒绝。Phase A UI 没有创建产品操作。
+10. **真实账号数**：最终只有 **1 个**账号达到完整可信要求。真实千帆隔离导入
+    有 8 个范围、80 条榜单项和 71 个候选账号投影，但候选投影不等于可信账号。
+11. **每账号商品/笔记**：`real-account-A` 有 2 个严格验证商品和 62 篇可信公开
+    笔记；shop 事实为 expected/discovered/succeeded `2/2/2`、missing `0`、
+    `complete=true`。其余五个候选均为 0 个可信商品、0 篇可信笔记。
+12. **真实跨账号候选**：**没有形成**。按批准顺序尝试的五个不同账号全部以
+    持久 `failed/cli_failed` 收口；同会话 existing-account control 也同样失败。
+    系统没有把失败账号或测试夹具冒充真实候选。
+13. **真实候选引用**：因为没有形成真实跨账号候选，所以没有可列的真实机会
+    支撑引用。现有可读基线是 `real-account-A` 的一个 trusted shop `artifact:*`
+    和 62 个 `account-note:*`；具体私人账号 ID、来源链接和 runtime 路径不写入 Git。
+14. **测试结果**：analysis+content focused `458 passed, 1 skipped`；media
+    compatibility `57 passed`；frontend `8 files / 53 passed`；production build
+    passed；受控双账号 Playwright E2E `1 passed`。完整 backend 首轮为
+    `1396 passed, 3 skipped, 1` 个无关并发 5 秒墙钟波动；该精确用例随后连续
+    5/5 通过；最终完整复跑为 `1397 passed, 3 skipped`（3 项均为显式 live
+    gates），无失败。
+15. **真实 UAT**：身份保持的 Stage 2 隔离副本核验 29 个证据文件；生产信任门
+    可读取 1 profile、62 notes、1 complete shop；真实千帆 8/8 通过服务导入。
+    排名前五候选和一个 current-account control 均真实失败并保留任务，未调用
+    AI 分析。详见 `docs/PHASE_A_UAT_REPORT.md`。
+16. **未解决问题和限制**：当前 XHS CLI/session 对候选和已知 control 都返回
+    `cli_failed`，因此没有第二完整账号、真实两账号聚类、pending_review 或人工
+    审核结果。真实 Phase A 尚未通过；Phase B、产品、内容和 ZIP 没有在本阶段
+    启动。七天 UAT 仍未运行。
+
+## Phase A 关键修改文件
+
+- `SYSTEM_SPEC_AND_ACCEPTANCE.md`：把跨账号需求验证、服务端等级和人工审核写入
+  正式验收线。
+- `README.md`：更新当前 Phase A 操作边界。
+- `docs/superpowers/specs/2026-08-20-cross-account-demand-validation-design.md`：
+  记录批准的业务/数据/API/UI/UAT 设计。
+- `backend/app/db.py`：Phase A 机会字段、版本化迁移、历史降级和审核/证据触发器。
+- `backend/app/features/analysis/models.py`：持久化审核、等级和支撑证据字段。
+- `backend/app/features/analysis/schemas.py`：跨账号输入、逐账号模型输出和审核 schema。
+- `backend/app/features/analysis/service.py`：逐账号 trust/ownership、服务端等级、候选
+  投影、审核状态机和 commit-ack 图验证。
+- `backend/app/features/analysis/api.py`：机会审核 API。
+- `backend/app/features/radar/models.py`：缺失评分状态、出现次数和最佳名次。
+- `backend/app/features/radar/service.py`：无指标候选保留和稳定事实排序。
+- `backend/app/features/content/schemas.py`：允许可信 `account-note:*` 引用。
+- `backend/app/features/content/service.py`：approved 跨账号机会和 account-note/shop
+  再核验门禁。
+- `frontend/src/api/client.ts`：Phase A 账号/机会/审核 API 类型与请求。
+- `frontend/src/pages/AccountPage.tsx`：只显示账号报告/观察信号。
+- `frontend/src/pages/OpportunitiesPage.tsx`：多账号完整度、聚类、证据和审核工作台。
+- `frontend/src/pages/RadarPage.tsx`：`insufficient_metrics` 事实展示。
+- `frontend/e2e/fixture_app.py`：受控双账号真实 schema/provenance fixture。
+- `frontend/e2e/empty-to-package.spec.ts`：双账号聚类、warming、人工批准及既有回归链。
+- `docs/PHASE_A_UAT_REPORT.md`：隔离真实 UAT 的事实与阻塞。
+- `docs/UAT_CHECKLIST.md`：Phase A live gate 最新结果。
+- `PROJECT_STATUS.md`：本交接报告。
+
+## Phase A Git 提交
+
+- `44725777df75d647a91c2ccb66b2913b4eb1b929` —
+  `docs: define cross-account validation phase`：同步正式规格、设计和阶段边界。
+- `c6cf45089989447a041c08a8496b9726c3665e9c` —
+  `feat: validate cross-account opportunities`：实现数据库、API、服务、前端和受控
+  双账号 E2E。
+- `feature/system-v1` 的交付 HEAD —
+  `docs: record Phase A real UAT handoff`：记录真实 UAT、最终测试和交接状态。
+  Git commit 不能在自己的文件内容中自引用其最终 SHA；该提交的完整 SHA 以
+  `git log -1`、远端 `refs/heads/feature/system-v1` 和最终交付回报三方核对。
+
+## Phase A 交付状态
+
+- 稳定代码：已完成。
+- 真实跨账号 UAT：未完成，阻塞于第二账号 XHS CLI/session 读取。
+- Phase B：未开始。
+- GitHub：第三笔提交创建后推送并核对本地/远端 SHA；结果由最终交付回报确认。

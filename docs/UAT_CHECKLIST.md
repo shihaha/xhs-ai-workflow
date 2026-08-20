@@ -56,9 +56,11 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
 ## Phase A execution status
 
-- Formal Phase A business specification: **approved / implementation in progress (2026-08-20)**.
-- Existing Stage 2 trusted account baseline: **passed** — one real ranked account, one public profile, 62 persisted public notes, and one new successful shop verification at `2/2/2`, zero missing, `complete=true`; the older `needs_human` shop job remains unchanged.
-- Second independent account and real cross-account cluster: **not_run**.
+- Formal Phase A business specification and implementation: **complete (2026-08-20)** — single-account reports cannot create opportunities; two/three-account levels, immutable evidence ownership, pending review, one-way approval/rejection, and the approved-opportunity product gate are covered by backend/frontend/controlled E2E tests.
+- Identity-preserving isolated Stage 2 baseline: **passed** — one real ranked account, one trusted public profile, 62 persisted public notes, and one trusted shop artifact at `2/2/2`, zero missing, `complete=true`; existing historical `needs_human` tasks remain unchanged.
+- Real Qianfan import into the isolated Phase A database: **passed** — 8 scopes, 80 items and 71 ranked account projections through the trusted radar ingestion service.
+- Second independent account: **failed after the approved top-five bound** — all five selected `成交榜 · 优秀账号` candidates ended as persisted `failed/cli_failed` jobs with zero trusted facts. A same-session control read of the existing account failed identically, so the present blocker is the XHS CLI/session path rather than candidate ordering.
+- Real cross-account cluster and human review: **not_run / not fabricated** — only one trusted real account is available. No real `pending_review`, `warming_candidate`, approval or rejection was claimed. See `docs/PHASE_A_UAT_REPORT.md`.
 
 Until every item above is evidenced, status is “software implemented / awaiting
 real UAT”, not “same effect as the tutorial proven”.

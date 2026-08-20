@@ -117,3 +117,20 @@ real credentials and HTTP 200 but failed strict `AnalysisOutput` validation as
 Bailian image generation and visual assessment passed their bounded real-model
 gate on 2026-08-19. See `docs/UAT_CHECKLIST.md`. Therefore the honest release label is
 **software implemented / awaiting real UAT**.
+
+## Phase A cross-account validation (2026-08-20)
+
+The Phase A software boundary is implemented: single-account reports cannot
+create opportunities; cross-account cards must bind complete per-account shop
+and note evidence; the server computes two-account `warming_candidate` and
+three-plus-account `validated_candidate`; candidates start at `pending_review`;
+approval/rejection is human-only and terminal; product creation requires an
+approved eligible candidate. The Account, Radar and Opportunities pages expose
+that boundary without a Phase B product action.
+
+Controlled backend/frontend/E2E verification passes. Real UAT remains blocked:
+the identity-preserving isolated Stage 2 view proves one profile, 62 notes and a
+complete 2/2/2 shop artifact are trusted, while all five ranked second-account
+candidates and a current-account control ended as persisted `cli_failed` XHS
+jobs. No real cross-account candidate or review was fabricated. See
+`docs/PHASE_A_UAT_REPORT.md` and the Phase A report in `PROJECT_STATUS.md`.
