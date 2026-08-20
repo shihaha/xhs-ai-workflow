@@ -7,6 +7,14 @@ remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
 last_updated: 2026-08-20 (Phase A handoff)
 
+## 2026-08-21 dynamic-card live verification
+
+- The bounded dynamic-card repair now waits for two consecutive stable product/bounds samples after a swipe, relocates the same title/price signature immediately before each click, uses a reliable current clickable-card region when present, and allows one fresh same-target retry when the detail postcondition is absent.
+- Focused verification is `5 passed`. The full Android shop collection file is `40 passed, 1 failed`; the remaining failure is the pre-existing ShopCollectionService scope expectation and does not enter this adapter path.
+- A newly authorized real-phone job `5319ba52…` succeeded at `3/3`, with zero rejected items and 33 bound artifacts: 15 screenshots, 15 UI hierarchies and 3 discovery JSON files. A fresh Database/JobService restart read the same succeeded state, progress, artifacts, discovery order `[1,2,3]` and three distinct source identities.
+- Current-byte SHA-256 matches all 15 screenshots and 3 discovery JSON files. The 15 XML metadata hashes still describe the pre-write hierarchy and match after reversing the known Windows newline expansion; they do not match current file bytes. This remains an explicit evidence-chain limitation.
+- This supersedes the earlier statement below that the third real product was not verified. Historical failed jobs and their evidence remain unchanged. Phase A overall is still not passed: no cross-account analysis, Opportunity, review candidate or Phase B work was run.
+
 > 状态口径：本文以 `feature/system-v1` 的 Phase A 提交、隔离运行数据库和本机证据目录为依据。自动测试、受控夹具和真实平台 UAT 严格分开。下方“Phase A 完成报告”是当前权威增量，覆盖本文较早的单账号工作流快照。当前结论是 **Phase A software implemented / real UAT not passed（软件已实现，真实验收未通过）**。原 `cli_failed` 已定位并恢复 control；当前真实阻塞是第二账号观察到的 18 个商品链接没有持久化，可信样本为 `0/3`。
 
 ## 2026-08-21 Android shop click repair

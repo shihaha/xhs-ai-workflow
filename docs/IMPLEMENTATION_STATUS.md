@@ -2,6 +2,28 @@
 
 Status date: 2026-08-21
 
+## Dynamic-card live verification result
+
+The Android adapter candidate now uses three bounded behaviors required by the
+latest real failure: two consecutive stable product/bounds samples after a
+swipe, fresh same-signature relocation immediately before clicking, and one
+fresh same-target retry when the detail-page postcondition is absent. A reliable
+current clickable-card ancestor supplies the safe point when the hierarchy
+contains one; otherwise the current visible title bounds remain the fallback.
+
+Focused tests pass `5/5`. The complete shop collection file is `40 passed,
+1 failed`; the remaining failure is the known ShopCollectionService scope
+expectation outside this Android path. The latest authorized real-phone job
+then succeeded at `3/3` with no rejection, 15 screenshots, 15 hierarchies and
+three discovery JSON files. Restart read preserved the succeeded state,
+progress, 33 artifacts, discovery order and three distinct identities.
+
+Screenshot and discovery JSON byte hashes match their metadata. XML metadata
+still hashes the original hierarchy rather than the Windows-expanded on-disk
+bytes; that known evidence-chain limitation remains explicit. The older section
+below describes the earlier failed validation and is retained as history. Phase
+A overall remains not passed, and Phase B has not started.
+
 ## Bounded Android shop ordering fix
 
 The retained Phase A failure was caused by a contract mismatch inside the

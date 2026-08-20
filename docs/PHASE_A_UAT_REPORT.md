@@ -2,6 +2,29 @@
 
 Date: 2026-08-20 (Asia/Shanghai)
 
+## 2026-08-21 dynamic-card live result
+
+The latest authorized real-phone validation succeeded at exact `3/3` with no
+rejected product. The adapter waited for two consecutive stable product/bounds
+samples after scrolling, relocated the same title/price signature immediately
+before clicking, and retained one bounded same-target retry behind an explicit
+detail-page postcondition. The durable job `5319ba52…` has 33 bound artifacts:
+15 screenshots, 15 UI hierarchies and three discovery JSON files.
+
+A fresh Database/JobService read returned `succeeded`, progress `3/3`, the same
+33 artifacts, discovery order `[1,2,3]` and three distinct source identities.
+Focused tests are `5 passed`; the complete shop collection file is `40 passed,
+1 failed`, where the remaining failure is the pre-existing service scope
+expectation outside this adapter path.
+
+All screenshot and discovery JSON current-byte hashes match SQLite metadata.
+The XML metadata hashes still represent the pre-write hierarchy and only match
+after reversing the known Windows newline expansion, not the current file
+bytes. This limitation is not hidden. This result supersedes the older
+"third product not verified" statement below without rewriting any historical
+failed job. Phase A as a whole remains not passed; no cross-account analysis,
+Opportunity, candidate review or Phase B action was run.
+
 ## Verdict
 
 Phase A software is implemented, but the real Phase A UAT is **not passed**.

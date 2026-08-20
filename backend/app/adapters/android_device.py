@@ -116,6 +116,8 @@ class ShopProductPosition:
     discount: str
     center_x: int
     center_y: int
+    bounds: tuple[int, int, int, int]
+    title_bounds: tuple[int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -140,6 +142,42 @@ class _ConnectedDevice:
     device: Any | None
 
 
+class _ShopViewportStability:
+    """Recognize a settled viewport from two consecutive product-position samples."""
+
+    def __init__(self) -> None:
+        self._previous: tuple[tuple[object, ...], ...] | None = None
+        self._consecutive = 0
+        self.stable = False
+
+    def observe(self, hierarchy: str) -> bool:
+        try:
+            products = parse_shop_hierarchy(hierarchy)
+        except ValueError:
+            self._previous = None
+            self._consecutive = 0
+            return False
+        if not products:
+            self._previous = None
+            self._consecutive = 0
+            return False
+        current = tuple(
+            (
+                product.title,
+                product.price,
+                product.bounds,
+            )
+            for product in products
+        )
+        if current == self._previous:
+            self._consecutive += 1
+        else:
+            self._previous = current
+            self._consecutive = 1
+        self.stable = self._consecutive >= 2
+        return self.stable
+
+
 class _DeviceDisconnected(RuntimeError):
     pass
 
@@ -151,6 +189,7 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
     except (ET.ParseError, TypeError) as error:
         raise ValueError("invalid_ui_hierarchy") from error
 
+    parents = {child: parent for parent in root.iter() for child in parent}
     nodes: list[dict[str, Any]] = []
     for element in root.iter("node"):
         text = _clean_text(element.attrib.get("text", ""))
@@ -158,7 +197,14 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
             element.attrib.get("content-desc", element.attrib.get("desc", ""))
         )
         bounds = _bounds(element.attrib.get("bounds", ""))
-        nodes.append({"text": text, "description": description, "bounds": bounds})
+        nodes.append(
+            {
+                "text": text,
+                "description": description,
+                "bounds": bounds,
+                "element": element,
+            }
+        )
 
     fixed_shop_tabs = {"综合", "销量", "新品", "价格"}
     fixed_bottom_tabs = {"首页", "分类", "上新"}
@@ -212,13 +258,30 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
         if not title_candidates:
             continue
         title_node = max(title_candidates, key=lambda item: len(item["text"]))
-        x1, y1, x2, y2 = title_node["bounds"]
-        center_y = (y1 + y2) // 2
-        if top_occlusion is not None and center_y <= top_occlusion:
+        title_bounds = title_node["bounds"]
+        x1, y1, x2, y2 = title_bounds
+        clickable_bounds: tuple[int, int, int, int] | None = None
+        ancestor = title_node["element"]
+        while ancestor is not None:
+            candidate_bounds = _bounds(ancestor.attrib.get("bounds", ""))
+            if (
+                ancestor.attrib.get("clickable") == "true"
+                and ancestor.attrib.get("enabled", "true") != "false"
+                and candidate_bounds is not None
+                and any(descendant is node["element"] for descendant in ancestor.iter())
+            ):
+                clickable_bounds = candidate_bounds
+                break
+            ancestor = parents.get(ancestor)
+        click_bounds = clickable_bounds or title_bounds
+        click_x1, click_y1, click_x2, click_y2 = click_bounds
+        center_x = (click_x1 + click_x2) // 2
+        center_y = (click_y1 + click_y2) // 2
+        if top_occlusion is not None and click_y1 <= top_occlusion:
             continue
-        if bottom_occlusion is not None and center_y >= bottom_occlusion:
+        if bottom_occlusion is not None and click_y2 >= bottom_occlusion:
             continue
-        key = (title_node["text"], (x1 + x2) // 2, (y1 + y2) // 2)
+        key = (title_node["text"], center_x, center_y)
         if key in seen:
             continue
         seen.add(key)
@@ -231,6 +294,8 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
                 discount=discount,
                 center_x=key[1],
                 center_y=key[2],
+                bounds=click_bounds,
+                title_bounds=title_bounds,
             )
         )
     products.sort(key=lambda product: (product.center_y, product.center_x))
@@ -247,6 +312,18 @@ def _overlapping_shop_card_prefix(
         if previous_signatures[-size:] == current_signatures[:size]:
             return size
     return 0
+
+
+def _matching_shop_product(
+    hierarchy: str, target: ShopProductPosition
+) -> ShopProductPosition | None:
+    signature = (target.title, target.price)
+    matches = [
+        product
+        for product in parse_shop_hierarchy(hierarchy)
+        if (product.title, product.price) == signature
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _shop_coupon_close_position(xml: str) -> tuple[int, int] | None:
@@ -640,9 +717,6 @@ class AndroidDeviceAdapter:
                         transitions=transitions,
                     )
 
-                screen_fingerprint = sha256(
-                    shop_screen.hierarchy.encode("utf-8")
-                ).hexdigest()
                 overlapping_prefix = _overlapping_shop_card_prefix(
                     previous_products, products
                 )
@@ -651,6 +725,23 @@ class AndroidDeviceAdapter:
                         break
                     if product_index < overlapping_prefix:
                         continue
+                    stable_target = self._wait_for_stable_product(
+                        device, product, job_id
+                    )
+                    if stable_target is None:
+                        return self._result(
+                            request=request,
+                            status="needs_human",
+                            detail="selector_changed",
+                            items=items,
+                            rejected_items=rejected_items,
+                            artifacts=artifact_paths,
+                            transitions=transitions,
+                        )
+                    stable_hierarchy, product = stable_target
+                    screen_fingerprint = sha256(
+                        stable_hierarchy.encode("utf-8")
+                    ).hexdigest()
                     traversal_key = (
                         screen_fingerprint,
                         product.center_x,
@@ -674,6 +765,35 @@ class AndroidDeviceAdapter:
                     )
                     if cancelled is not None:
                         return cancelled
+                    click_attempts: list[dict[str, Any]] = []
+                    click_before = capture(
+                        f"product_{observation_count}_click_1_before"
+                    )
+                    current_product = _matching_shop_product(
+                        click_before.hierarchy, product
+                    )
+                    if current_product is None:
+                        return self._result(
+                            request=request,
+                            status="needs_human",
+                            detail="selector_changed",
+                            items=items,
+                            rejected_items=rejected_items,
+                            artifacts=artifact_paths,
+                            transitions=transitions,
+                        )
+                    product = current_product
+                    first_attempt = {
+                        "attempt": 1,
+                        "target_identity": {
+                            "title": product.title,
+                            "price": product.price,
+                        },
+                        "bounds": list(product.bounds),
+                        "click_coordinates": [product.center_x, product.center_y],
+                        "activity_before": dict(device.app_current()),
+                        "before_screen": click_before.raw(),
+                    }
                     device.click(product.center_x, product.center_y)
                     detail_screen = capture(
                         f"product_{observation_count}_detail",
@@ -682,6 +802,9 @@ class AndroidDeviceAdapter:
                             or self._is_detail_hierarchy(hierarchy)
                         ),
                     )
+                    first_attempt["activity_after"] = dict(device.app_current())
+                    first_attempt["after_screen"] = detail_screen.raw()
+                    click_attempts.append(first_attempt)
                     cancelled = self._cancelled_result(
                         request,
                         job_id,
@@ -712,11 +835,57 @@ class AndroidDeviceAdapter:
                             transitions=transitions,
                         )
                     if not self._is_detail(device, detail_screen.hierarchy):
+                        retry_target = (
+                            self._wait_for_stable_product(device, product, job_id)
+                            if self._is_shop(device, detail_screen.hierarchy)
+                            else None
+                        )
+                        if retry_target is not None:
+                            _, retry_product = retry_target
+                            retry_before = capture(
+                                f"product_{observation_count}_click_2_before"
+                            )
+                            current_retry_product = _matching_shop_product(
+                                retry_before.hierarchy, retry_product
+                            )
+                            if current_retry_product is not None:
+                                product = current_retry_product
+                                second_attempt = {
+                                    "attempt": 2,
+                                    "target_identity": {
+                                        "title": product.title,
+                                        "price": product.price,
+                                    },
+                                    "bounds": list(product.bounds),
+                                    "click_coordinates": [
+                                        product.center_x,
+                                        product.center_y,
+                                    ],
+                                    "activity_before": dict(device.app_current()),
+                                    "before_screen": retry_before.raw(),
+                                }
+                                device.click(product.center_x, product.center_y)
+                                detail_screen = capture(
+                                    f"product_{observation_count}_retry_detail",
+                                    ready=lambda hierarchy: (
+                                        self._blocked_reason(hierarchy) is not None
+                                        or self._is_detail_hierarchy(hierarchy)
+                                    ),
+                                )
+                                second_attempt["activity_after"] = dict(
+                                    device.app_current()
+                                )
+                                second_attempt["after_screen"] = detail_screen.raw()
+                                click_attempts.append(second_attempt)
+                    if not self._is_detail(device, detail_screen.hierarchy):
                         rejected_items.append(
                             _rejected_product(
                                 product,
                                 "selector_changed",
-                                detail_screen.raw(),
+                                {
+                                    **detail_screen.raw(),
+                                    "click_attempts": click_attempts,
+                                },
                                 reference=observation_reference,
                             )
                         )
@@ -1027,12 +1196,16 @@ class AndroidDeviceAdapter:
                     return cancelled
                 previous_hierarchy = shop_screen.hierarchy
                 device.swipe(360, 1300, 360, 500, 0.6)
+                viewport_stability = _ShopViewportStability()
                 shop_screen = capture(
                     f"shop_scroll_{screen_index + 1}",
                     ready=lambda hierarchy: (
                         self._blocked_reason(hierarchy) is not None
-                        or self._is_end(hierarchy)
-                        or hierarchy != previous_hierarchy
+                        or viewport_stability.observe(hierarchy)
+                        or (
+                            self._is_end(hierarchy)
+                            and not parse_shop_hierarchy(hierarchy)
+                        )
                     ),
                 )
                 cancelled = self._cancelled_result(
@@ -1045,6 +1218,19 @@ class AndroidDeviceAdapter:
                 )
                 if cancelled is not None:
                     return cancelled
+                if (
+                    parse_shop_hierarchy(shop_screen.hierarchy)
+                    and not viewport_stability.stable
+                ):
+                    return self._result(
+                        request=request,
+                        status="needs_human",
+                        detail="selector_changed",
+                        items=items,
+                        rejected_items=rejected_items,
+                        artifacts=artifact_paths,
+                        transitions=transitions,
+                    )
 
         except Exception as error:
             if not _is_disconnect_error(error):
@@ -1282,6 +1468,52 @@ class AndroidDeviceAdapter:
         if state not in {JobState.running, JobState.cancelled}:
             raise ValueError("shop collection job must be running or cancelled.")
         return raw_job_id
+
+    def _wait_for_stable_product(
+        self,
+        device: Any,
+        product: ShopProductPosition,
+        job_id: str | None,
+    ) -> tuple[str, ShopProductPosition] | None:
+        """Re-read one unambiguous target until its identity and bounds settle."""
+
+        signature = (product.title, product.price)
+        deadline = self._monotonic() + self.transition_timeout_seconds
+        previous_bounds: tuple[int, int, int, int] | None = None
+        consecutive = 0
+        attempts = 0
+        while attempts < 2 or self._monotonic() < deadline:
+            attempts += 1
+            if self._is_cancelled(job_id):
+                return None
+            hierarchy = device.dump_hierarchy(compressed=False)
+            if self._blocked_reason(hierarchy) is not None:
+                return None
+            try:
+                matches = [
+                    candidate
+                    for candidate in parse_shop_hierarchy(hierarchy)
+                    if (candidate.title, candidate.price) == signature
+                ]
+            except ValueError:
+                matches = []
+            if len(matches) == 1:
+                current = matches[0]
+                if current.bounds == previous_bounds:
+                    consecutive += 1
+                else:
+                    previous_bounds = current.bounds
+                    consecutive = 1
+                if consecutive >= 2:
+                    return hierarchy, current
+            else:
+                previous_bounds = None
+                consecutive = 0
+            if attempts >= 2 and self._monotonic() >= deadline:
+                break
+            remaining = max(deadline - self._monotonic(), 0)
+            self._sleep(min(self.transition_poll_interval, remaining))
+        return None
 
     def _capture_transition(
         self,

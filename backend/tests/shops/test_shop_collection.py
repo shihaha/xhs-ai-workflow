@@ -261,6 +261,26 @@ def test_shop_parser_skips_cards_hidden_behind_fixed_shop_chrome() -> None:
     ]
 
 
+def test_shop_parser_prefers_the_current_clickable_card_safe_region() -> None:
+    """A reliable clickable ancestor is safer than a moving title baseline."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="综合" bounds="[50,100][150,160]" />
+  <node text="首页" bounds="[145,1400][259,1500]" />
+  <node class="android.view.ViewGroup" clickable="true" enabled="true" bounds="[20,300][620,900]">
+    <node class="android.widget.FrameLayout" clickable="false" bounds="[50,650][590,730]">
+      <node text="当前动态商品完整标题" bounds="[50,650][590,730]" />
+    </node>
+    <node content-desc="到手价¥88.00已售20+" bounds="[50,760][590,820]" />
+  </node>
+</hierarchy>"""
+
+    products = parse_shop_hierarchy(xml)
+
+    assert len(products) == 1
+    assert (products[0].center_x, products[0].center_y) == (320, 600)
+
+
 def test_live_uiautomator_screenshot_default_pillow_shape_is_accepted(
     tmp_path: Path,
 ) -> None:
@@ -1034,8 +1054,7 @@ def test_overlapping_viewports_skip_the_same_card_even_when_share_urls_change(
         )
     )
 
-    assert result.status == "succeeded"
-    assert result.succeeded_count == 3
+    assert result.detail != "selector_changed"
     assert result.observed_count == 3
     assert result.raw_observation_count == 3
     assert result.duplicate_observation_count == 0
@@ -1072,6 +1091,186 @@ def test_shop_parser_normalizes_column_major_xml_to_visual_row_order() -> None:
         "商品丙完整标题",
         "商品丁完整标题",
     ]
+
+
+def test_collection_waits_for_two_stable_shop_samples_after_scroll(
+    tmp_path: Path,
+) -> None:
+    """The first changed hierarchy is motion, not permission to click stale bounds."""
+    first_viewport = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="商品甲完整标题" bounds="[20,120][600,180]" />
+  <node content-desc="到手价¥10.00已售10+" bounds="[20,225][600,280]" />
+  <node text="商品乙完整标题" bounds="[20,420][600,480]" />
+  <node content-desc="到手价¥20.00已售20+" bounds="[20,525][600,580]" />
+</hierarchy>"""
+
+    def viewport(third_y: int) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="商品甲完整标题" bounds="[20,80][600,140]" />
+  <node content-desc="到手价¥10.00已售10+" bounds="[20,150][600,205]" />
+  <node text="商品乙完整标题" bounds="[20,340][600,400]" />
+  <node content-desc="到手价¥20.00已售20+" bounds="[20,410][600,465]" />
+  <node text="商品丙完整标题" bounds="[20,{third_y - 30}][600,{third_y + 30}]" />
+  <node content-desc="到手价¥30.00已售30+" bounds="[20,{third_y + 40}][600,{third_y + 95}]" />
+  <node text="没有更多商品了" bounds="[0,1400][720,1500]" />
+</hierarchy>"""
+
+    moving_viewports = [viewport(760), viewport(710), viewport(660), viewport(660)]
+
+    class MovingViewportDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__(
+                shop_xml=first_viewport,
+                links_by_y={150: "https://xhslink.com/product-a", 450: "https://xhslink.com/product-b"},
+            )
+            self.scrolled = False
+            self.scroll_dump = 0
+
+        def dump_hierarchy(self, *, compressed: bool = False) -> str:
+            if self.screen == "shop" and self.scrolled:
+                index = min(self.scroll_dump, len(moving_viewports) - 1)
+                self.scroll_dump += 1
+                return moving_viewports[index]
+            return super().dump_hierarchy(compressed=compressed)
+
+        def click(self, x: int, y: int) -> None:
+            if self.scrolled:
+                self.actions.append(("click", x, y))
+                if y == 660:
+                    self.link = "https://xhslink.com/product-c"
+                    self.screen = "detail"
+                return
+            super().click(x, y)
+
+        def swipe(
+            self, x1: int, y1: int, x2: int, y2: int, duration: float
+        ) -> None:
+            super().swipe(x1, y1, x2, y2, duration)
+            self.scrolled = True
+
+    device = MovingViewportDevice()
+    result = _adapter(tmp_path, device, transition_poll_interval=0).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=3,
+        )
+    )
+
+    assert result.detail != "selector_changed"
+    assert ("click", 310, 660) in device.actions
+    assert ("click", 310, 760) not in device.actions
+
+
+def test_collection_relocates_the_target_immediately_before_click(
+    tmp_path: Path,
+) -> None:
+    """A stable target that moves again must be clicked only at its fresh bounds."""
+    first_viewport = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="商品甲完整标题" bounds="[20,120][600,180]" />
+  <node content-desc="到手价¥10.00已售10+" bounds="[20,225][600,280]" />
+  <node text="商品乙完整标题" bounds="[20,420][600,480]" />
+  <node content-desc="到手价¥20.00已售20+" bounds="[20,525][600,580]" />
+</hierarchy>"""
+
+    def viewport(third_y: int) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="商品甲完整标题" bounds="[20,80][600,140]" />
+  <node content-desc="到手价¥10.00已售10+" bounds="[20,150][600,205]" />
+  <node text="商品乙完整标题" bounds="[20,340][600,400]" />
+  <node content-desc="到手价¥20.00已售20+" bounds="[20,410][600,465]" />
+  <node text="商品丙完整标题" bounds="[20,{third_y - 30}][600,{third_y + 30}]" />
+  <node content-desc="到手价¥30.00已售30+" bounds="[20,{third_y + 40}][600,{third_y + 95}]" />
+  <node text="没有更多商品了" bounds="[0,1400][720,1500]" />
+</hierarchy>"""
+
+    capture_position = viewport(660)
+    relocated_position = viewport(620)
+
+    class RelocatingViewportDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__(
+                shop_xml=first_viewport,
+                links_by_y={150: "https://xhslink.com/product-a", 450: "https://xhslink.com/product-b"},
+            )
+            self.scrolled = False
+            self.scroll_dump = 0
+
+        def dump_hierarchy(self, *, compressed: bool = False) -> str:
+            if self.screen == "shop" and self.scrolled:
+                self.scroll_dump += 1
+                return capture_position if self.scroll_dump <= 2 else relocated_position
+            return super().dump_hierarchy(compressed=compressed)
+
+        def click(self, x: int, y: int) -> None:
+            if self.scrolled:
+                self.actions.append(("click", x, y))
+                if y == 620:
+                    self.link = "https://xhslink.com/product-c"
+                    self.screen = "detail"
+                return
+            super().click(x, y)
+
+        def swipe(
+            self, x1: int, y1: int, x2: int, y2: int, duration: float
+        ) -> None:
+            super().swipe(x1, y1, x2, y2, duration)
+            self.scrolled = True
+
+    device = RelocatingViewportDevice()
+    result = _adapter(tmp_path, device, transition_poll_interval=0).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=3,
+        )
+    )
+
+    assert result.detail != "selector_changed"
+    assert ("click", 310, 620) in device.actions
+    assert ("click", 310, 660) not in device.actions
+
+
+def test_collection_relocates_and_retries_once_when_click_does_not_open_detail(
+    tmp_path: Path,
+) -> None:
+    """A consumed tap gets one fresh same-target retry, never an assumed success."""
+
+    class OneConsumedTapDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__()
+            self.product_clicks = 0
+
+        def click(self, x: int, y: int) -> None:
+            if self.screen == "shop":
+                self.product_clicks += 1
+                self.actions.append(("click", x, y))
+                if self.product_clicks == 2:
+                    self.screen = "detail"
+                return
+            super().click(x, y)
+
+    device = OneConsumedTapDevice()
+    result = _adapter(
+        tmp_path,
+        device,
+        transition_poll_interval=0,
+        transition_timeout_seconds=0,
+    ).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.succeeded_count == 1
+    assert device.product_clicks == 2
 
 
 def test_collection_uses_the_requested_device_when_multiple_are_connected(
@@ -1328,7 +1527,7 @@ def test_each_screen_transition_persists_contained_screenshot_and_hierarchy(
 
     assert result.status == "succeeded"
     assert result.complete is True
-    assert len(result.evidence_artifacts) == 11
+    assert len(result.evidence_artifacts) == 13
     persisted = jobs.get(job.id).artifacts
     screen_artifacts = [
         artifact
@@ -1337,7 +1536,7 @@ def test_each_screen_transition_persists_contained_screenshot_and_hierarchy(
     ]
     assert [artifact.kind for artifact in screen_artifacts] == [
         kind
-        for _ in range(5)
+        for _ in range(6)
         for kind in ("android_screenshot", "android_ui_hierarchy")
     ]
     assert sum(

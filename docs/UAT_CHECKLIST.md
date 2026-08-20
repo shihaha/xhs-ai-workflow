@@ -8,7 +8,8 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Prove the scroll failure from retained screenshot/XML: column-major DOM order caused overlap zero and a repeated first-card click.
 - [x] Add a real-layout RED test, apply the one-line visual-order sort, and observe GREEN plus the pre-existing overlap regression GREEN.
 - [x] Preserve historical job `d21d3e81…` at `needs_human`, `2/3`, `selector_changed`; restart-read the same 22 artifacts and two discoveries.
-- [ ] Verify the third real product after the repair. The only new job `fe7b58b5…` failed at `0/3` before device interaction because the one-off runner used an unsupported adapter keyword; it was not rewritten or retried and no second job was created.
+- [x] Verify the third real product after the dynamic-card repair. Latest authorized job `5319ba52…` succeeded at `3/3`, zero rejected, with three restart-readable discoveries and three distinct source identities.
+- [x] Preserve the earlier runner-error job `fe7b58b5…` unchanged at `failed 0/3`; it remains historical audit evidence and was not rewritten.
 - [ ] Confirm byte-for-byte SHA consistency for every historical Android artifact. Ten screenshots and two discovery JSON files match; ten XML files do not match their metadata SHA after Windows newline expansion.
 - [ ] Phase A remains not passed. No cross-account analysis, Opportunity, `pending_review`, `warming_candidate`, or Phase B action was run.
 
