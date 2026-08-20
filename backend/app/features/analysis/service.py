@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
 
@@ -36,7 +36,11 @@ from backend.app.features.analysis.schemas import (
     OpportunityRead,
 )
 from backend.app.features.radar.models import RankItemRecord
-from backend.app.features.shops.service import ANDROID_SHOP_JOB_TYPES, ShopCollectionRead
+from backend.app.features.shops.service import (
+    ANDROID_SHOP_JOB_TYPES,
+    SHOP_TEST_OVERRIDE_REASON,
+    ShopCollectionRead,
+)
 from backend.app.features.xhs.constants import (
     ACCOUNT_COLLECTION_ARTIFACT_KIND,
     ACCOUNT_COLLECTION_ARTIFACT_PRODUCER,
@@ -64,6 +68,7 @@ from backend.app.models.jobs import JobState
 PROMPT_VERSION = "tutorial-demand-radar-grounded-v1"
 MAX_TRUSTED_RESULT_BYTES = 5 * 1024 * 1024
 MAX_TRUSTED_ACCOUNT_RESULT_BYTES = 20 * 1024 * 1024
+MAX_TRUSTED_SAMPLE_INDEX_BYTES = 1024 * 1024
 MAX_SQLITE_ID = 9_223_372_036_854_775_807
 XHS_RAW_TRUST_ANCHOR_KINDS = frozenset(
     {ACCOUNT_COLLECTION_ARTIFACT_KIND, "xhs_note_search_raw"}
@@ -1068,18 +1073,48 @@ class AnalysisService:
             ValidationError,
         ):
             return None, None
-        job_account = job.input_data.get("account_user_id")
-        expected_count = job.input_data.get("expected_count")
+        job_input = job.input_data
+        job_account = job_input.get("account_user_id")
+        expected_count = job_input.get("expected_count")
+        bounded_mode = file_result.get("collection_mode") == "bounded_sample"
+        bounded_sample = bounded_mode and _exact_bounded_shop_sample(file_result)
+        bounded_files = bounded_sample and _trusted_bounded_sample_indexes(
+            self.runtime_dir,
+            job.id,
+            file_result,
+        )
+        full_shop_mode = parsed.collection_mode in {"legacy_full_shop", "full_shop"}
+        bounded_job = (
+            bounded_files
+            and _strict_value(job_input.get("collection_mode"), "bounded_sample")
+            and _strict_value(job_input.get("expected_count"), 3)
+            and _strict_value(job_input.get("product_sample_limit"), 3)
+            and _strict_value(job_input.get("test_override"), True)
+            and _strict_value(
+                job_input.get("test_override_reason"), SHOP_TEST_OVERRIDE_REASON
+            )
+            and _strict_value(
+                job_input.get("available_count_observed"),
+                file_result.get("available_count_observed"),
+            )
+            and job.progress_total == 3
+            and job.progress_current == 3
+            and job.current_stage == "shop_sample_complete"
+        )
+        full_shop_job = (
+            full_shop_mode
+            and parsed.expected_count == expected_count
+            and job.progress_total == expected_count
+            and job.progress_current == expected_count
+            and job.current_stage == "shop_complete"
+        )
         if (
             parsed.job_id != job.id
             or not isinstance(job_account, str)
             or not job_account.strip()
             or isinstance(expected_count, bool)
             or not isinstance(expected_count, int)
-            or parsed.expected_count != expected_count
-            or job.progress_total != expected_count
-            or job.progress_current != expected_count
-            or job.current_stage != "shop_complete"
+            or not (bounded_job or full_shop_job)
             or job.error_category is not None
         ):
             return None, None
@@ -1269,6 +1304,10 @@ def _eligible_for_opportunity(
         if not isinstance(result, dict):
             return False
         covered_accounts.add(account_user_id)
+        if result.get("collection_mode") == "bounded_sample":
+            if not _exact_bounded_shop_sample(result):
+                return False
+            continue
         if result.get("status") != "succeeded" or result.get("complete") is not True:
             return False
         verification = result.get("verification")
@@ -1358,6 +1397,197 @@ def _eligible_for_opportunity(
         if len(urls) != counts[0] or len(set(urls)) != counts[0]:
             return False
     return covered_accounts == set(required_accounts)
+
+
+def _exact_bounded_shop_sample(result: dict[str, Any]) -> bool:
+    verification = result.get("verification")
+    if not isinstance(verification, dict):
+        return False
+    exact_result_values = {
+        "status": "succeeded",
+        "collection_mode": "bounded_sample",
+        "product_sample_limit": 3,
+        "test_override": True,
+        "test_override_reason": SHOP_TEST_OVERRIDE_REASON,
+        "expected_count": 3,
+        "discovered_count": 3,
+        "collected_count": 3,
+        "raw_observation_count": 3,
+        "duplicate_observation_count": 0,
+        "succeeded_count": 3,
+        "missing_count": 0,
+        "collection_missing_count": 0,
+        "rejected_count": 0,
+        "overflow_count": 0,
+        "sample_complete": True,
+        "shop_complete": False,
+        "complete": False,
+    }
+    exact_verification_values = {
+        "expected_count": 3,
+        "discovered_count": 3,
+        "succeeded_count": 3,
+        "missing_count": 0,
+        "overflow_count": 0,
+        "complete": True,
+    }
+    if any(
+        not _strict_value(result.get(key), expected)
+        for key, expected in exact_result_values.items()
+    ) or any(
+        not _strict_value(verification.get(key), expected)
+        for key, expected in exact_verification_values.items()
+    ):
+        return False
+    available_count = result.get("available_count_observed")
+    binding_paths = (
+        result.get("sample_manifest_path"),
+        result.get("sample_collection_path"),
+    )
+    binding_digests = (
+        result.get("sample_manifest_sha256"),
+        result.get("sample_collection_sha256"),
+    )
+    if (
+        isinstance(available_count, bool)
+        or not isinstance(available_count, int)
+        or available_count < 3
+        or any(not isinstance(path, str) or not path for path in binding_paths)
+        or any(
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest, re.ASCII) is None
+            for digest in binding_digests
+        )
+        or result.get("missing_items") != []
+        or result.get("collection_missing_items") != []
+        or result.get("rejected_items") != []
+        or verification.get("missing_items") != []
+        or verification.get("issues") != []
+    ):
+        return False
+    items = result.get("items")
+    if not isinstance(items, list) or len(items) != 3:
+        return False
+    item_ids = [item.get("id") for item in items if isinstance(item, dict)]
+    urls = [item.get("source_url") for item in items if isinstance(item, dict)]
+    return (
+        len(item_ids) == 3
+        and len(set(item_ids)) == 3
+        and all(isinstance(item_id, str) and item_id for item_id in item_ids)
+        and len(urls) == 3
+        and len(set(urls)) == 3
+        and all(isinstance(url, str) and url for url in urls)
+    )
+
+
+def _trusted_bounded_sample_indexes(
+    runtime_dir: Path,
+    job_id: str,
+    result: dict[str, Any],
+) -> bool:
+    expected_dir = Path("evidence") / "shops" / job_id / "sample-products"
+    expected_manifest = expected_dir / "manifest.json"
+    expected_collection = expected_dir / "collection.json"
+    if (
+        result.get("sample_manifest_path") != expected_manifest.as_posix()
+        or result.get("sample_collection_path") != expected_collection.as_posix()
+    ):
+        return False
+    manifest_snapshot = _read_contained_regular_file(
+        runtime_dir,
+        expected_manifest,
+        limit=MAX_TRUSTED_SAMPLE_INDEX_BYTES,
+    )
+    collection_snapshot = _read_contained_regular_file(
+        runtime_dir,
+        expected_collection,
+        limit=MAX_TRUSTED_SAMPLE_INDEX_BYTES,
+    )
+    if manifest_snapshot is None or collection_snapshot is None:
+        return False
+    if (
+        sha256(manifest_snapshot.payload).hexdigest()
+        != result.get("sample_manifest_sha256")
+        or sha256(collection_snapshot.payload).hexdigest()
+        != result.get("sample_collection_sha256")
+    ):
+        return False
+    try:
+        manifest = json.loads(manifest_snapshot.payload.decode("utf-8", errors="strict"))
+        collection = json.loads(
+            collection_snapshot.payload.decode("utf-8", errors="strict")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return False
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"products"}
+        or not isinstance(collection, dict)
+        or set(collection) != {"unique_product_link_count", "products"}
+        or not _strict_value(collection.get("unique_product_link_count"), 3)
+    ):
+        return False
+    manifest_products = manifest.get("products")
+    collection_products = collection.get("products")
+    items = result.get("items")
+    if (
+        not isinstance(manifest_products, list)
+        or len(manifest_products) != 3
+        or not isinstance(collection_products, list)
+        or len(collection_products) != 3
+        or not isinstance(items, list)
+        or len(items) != 3
+    ):
+        return False
+    result_urls = [item.get("source_url") for item in items if isinstance(item, dict)]
+    manifest_urls: list[object] = []
+    collection_urls: list[object] = []
+    product_dirs: list[str] = []
+    image_paths: list[str] = []
+    for manifest_item, collection_item in zip(
+        manifest_products, collection_products, strict=True
+    ):
+        if (
+            not isinstance(manifest_item, dict)
+            or set(manifest_item) != {"source_url", "image", "sha256"}
+            or not isinstance(collection_item, dict)
+            or set(collection_item) != {"source_url", "product_dir"}
+        ):
+            return False
+        image = manifest_item.get("image")
+        image_sha = manifest_item.get("sha256")
+        product_dir = collection_item.get("product_dir")
+        if (
+            not isinstance(image, str)
+            or "\\" in image
+            or not isinstance(image_sha, str)
+            or not isinstance(product_dir, str)
+            or not product_dir
+            or "/" in product_dir
+            or "\\" in product_dir
+            or product_dir in {".", ".."}
+            or re.fullmatch(r"[0-9a-f]{64}", image_sha, re.ASCII) is None
+        ):
+            return False
+        image_path = PurePosixPath(image)
+        if (
+            image_path.is_absolute()
+            or any(part in {"", ".", ".."} for part in image_path.parts)
+            or len(image_path.parts) < 2
+            or image_path.parts[0] != product_dir
+        ):
+            return False
+        manifest_urls.append(manifest_item.get("source_url"))
+        collection_urls.append(collection_item.get("source_url"))
+        product_dirs.append(product_dir)
+        image_paths.append(image)
+    return (
+        len(result_urls) == 3
+        and manifest_urls == result_urls
+        and collection_urls == result_urls
+        and len(set(product_dirs)) == 3
+        and len(set(image_paths)) == 3
+    )
 
 
 def _validated_opportunity_projection(

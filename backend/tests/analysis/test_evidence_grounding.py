@@ -147,6 +147,225 @@ def _complete_artifact(
         return f"artifact:{artifact.id}"
 
 
+def _bounded_sample_artifact(database: Database) -> str:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    with database.session() as session:
+        job = JobRecord(
+            type="android_shop_collection",
+            input_data={
+                "account_user_id": "account-a",
+                "expected_count": 3,
+                "available_count_observed": 18,
+                "collection_mode": "bounded_sample",
+                "product_sample_limit": 3,
+                "test_override": True,
+                "test_override_reason": "保留服装店完成一次有界E2E验证",
+            },
+            state=JobState.succeeded,
+            progress_current=3,
+            progress_total=3,
+            current_stage="shop_sample_complete",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(job)
+        session.flush()
+        result = _shop_result(job.id)
+        result.update({
+            "expected_count": 3,
+            "discovered_count": 3,
+            "collected_count": 3,
+            "raw_observation_count": 3,
+            "succeeded_count": 3,
+            "collection_mode": "bounded_sample",
+            "product_sample_limit": 3,
+            "available_count_observed": 18,
+            "test_override": True,
+            "test_override_reason": "保留服装店完成一次有界E2E验证",
+            "sample_complete": True,
+            "shop_complete": False,
+            "complete": False,
+        })
+        result["items"] = [
+            {
+                "id": f"p{index}",
+                "kind": "shop_product",
+                "source_url": f"https://www.xiaohongshu.com/goods/p{index}",
+                "raw_evidence": {"detail": "persisted"},
+                "data": {},
+            }
+            for index in range(1, 4)
+        ]
+        result["verification"] = {
+            "expected_count": 3,
+            "discovered_count": 3,
+            "succeeded_count": 3,
+            "missing_count": 0,
+            "missing_items": [],
+            "overflow_count": 0,
+            "issues": [],
+            "complete": True,
+        }
+        sample_dir = (
+            database.database_path.parent
+            / "evidence"
+            / "shops"
+            / job.id
+            / "sample-products"
+        )
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        urls = [item["source_url"] for item in result["items"]]
+        manifest = {
+            "products": [
+                {
+                    "source_url": url,
+                    "image": f"{index:02d}_p{index}/images/detail.png",
+                    "sha256": str(index) * 64,
+                }
+                for index, url in enumerate(urls, start=1)
+            ]
+        }
+        collection = {
+            "unique_product_link_count": 3,
+            "products": [
+                {"source_url": url, "product_dir": f"{index:02d}_p{index}"}
+                for index, url in enumerate(urls, start=1)
+            ],
+        }
+        manifest_path = sample_dir / "manifest.json"
+        collection_path = sample_dir / "collection.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        collection_path.write_text(
+            json.dumps(collection, ensure_ascii=False), encoding="utf-8"
+        )
+        result.update({
+            "sample_manifest_path": manifest_path.relative_to(
+                database.database_path.parent
+            ).as_posix(),
+            "sample_manifest_sha256": hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+            "sample_collection_path": collection_path.relative_to(
+                database.database_path.parent
+            ).as_posix(),
+            "sample_collection_sha256": hashlib.sha256(
+                collection_path.read_bytes()
+            ).hexdigest(),
+        })
+        relative_path = f"evidence/shops/{job.id}/result.json"
+        absolute_path = database.database_path.parent / relative_path
+        absolute_path.parent.mkdir(parents=True, exist_ok=True)
+        absolute_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        artifact = JobArtifactRecord(
+            job_id=job.id,
+            kind="shop_collection_result",
+            producer="android_shop_worker_v1",
+            path=relative_path,
+            metadata_json={"result": result},
+            created_at=now,
+        )
+        session.add(artifact)
+        session.commit()
+        return f"artifact:{artifact.id}"
+
+
+def test_exact_approved_bounded_shop_sample_is_analysis_eligible(tmp_path: Path) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _bounded_sample_artifact(database)
+    model = StubModel(_output(evidence_id))
+    service = AnalysisService(database, model, runtime_dir=tmp_path)
+
+    discovered = service.list_evidence(account_user_id="account-a")
+    created = service.create(AnalysisCreate(
+        analysis_type="account_report",
+        account_user_id="account-a",
+        evidence_ids=[evidence_id],
+    ))
+
+    assert discovered[0].eligible_for_opportunity is True
+    assert created.status == "succeeded"
+    assert model.calls == 1
+    with database.session() as session:
+        row = session.get(AnalysisRecord, created.id)
+        assert row is not None
+        trusted = row.evidence_snapshot_json["facts"][0]["trusted_shop_result"]
+        assert trusted["sample_complete"] is True
+        assert trusted["shop_complete"] is False
+        assert trusted["complete"] is False
+    database.close()
+
+
+def test_bounded_shop_sample_manifest_tamper_is_rejected(tmp_path: Path) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _bounded_sample_artifact(database)
+    with database.session() as session:
+        artifact = session.get(JobArtifactRecord, int(evidence_id.split(":")[1]))
+        assert artifact is not None
+        manifest_path = tmp_path / artifact.metadata_json["result"]["sample_manifest_path"]
+    manifest_path.write_text('{"products": []}', encoding="utf-8")
+    model = StubModel(_output(evidence_id))
+    service = AnalysisService(database, model, runtime_dir=tmp_path)
+
+    discovered = service.list_evidence(account_user_id="account-a")
+    created = service.create(AnalysisCreate(
+        analysis_type="account_report",
+        account_user_id="account-a",
+        evidence_ids=[evidence_id],
+    ))
+
+    assert discovered[0].eligible_for_opportunity is False
+    assert created.status == "needs_human"
+    assert model.calls == 0
+    database.close()
+
+
+@pytest.mark.parametrize(
+    ("target", "key", "value"),
+    [
+        ("job", "test_override", False),
+        ("job", "test_override_reason", "different reason"),
+        ("result", "succeeded_count", 2),
+        ("result", "sample_complete", False),
+        ("result", "shop_complete", True),
+        ("result", "rejected_count", 1),
+        ("verification", "succeeded_count", 2),
+    ],
+)
+def test_malformed_bounded_shop_sample_is_rejected(
+    tmp_path: Path, target: str, key: str, value: object
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    evidence_id = _bounded_sample_artifact(database)
+    with database.session() as session:
+        artifact = session.get(JobArtifactRecord, int(evidence_id.split(":")[1]))
+        assert artifact is not None
+        result = deepcopy(artifact.metadata_json["result"])
+        if target == "job":
+            job_input = dict(artifact.job.input_data)
+            job_input[key] = value
+            artifact.job.input_data = job_input
+        elif target == "verification":
+            result["verification"][key] = value
+        else:
+            result[key] = value
+        artifact.metadata_json = {"result": result}
+        target_path = tmp_path / artifact.path
+        session.commit()
+    target_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    model = StubModel(_output(evidence_id))
+    service = AnalysisService(database, model, runtime_dir=tmp_path)
+
+    created = service.create(AnalysisCreate(
+        analysis_type="account_report",
+        account_user_id="account-a",
+        evidence_ids=[evidence_id],
+    ))
+
+    assert created.status == "needs_human"
+    assert model.calls == 0
+    database.close()
+
+
 def _output(evidence_id: str, *, status: str = "升温") -> dict[str, object]:
     return {
         "claims": [{"claim": "出现可复用方向", "evidence_ids": [evidence_id]}],

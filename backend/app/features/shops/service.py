@@ -162,6 +162,16 @@ class ShopCollectionRead(BaseModel):
         "in_scope", "out_of_scope_physical", "needs_human"
     ] | None = None
     scope_reason: str | None = None
+    sample_manifest_path: str | None = Field(default=None, min_length=1, max_length=1000)
+    sample_manifest_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    sample_collection_path: str | None = Field(
+        default=None, min_length=1, max_length=1000
+    )
+    sample_collection_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
 
     @model_validator(mode="after")
     def preserve_legacy_full_shop_semantics(self) -> "ShopCollectionRead":
@@ -170,6 +180,21 @@ class ShopCollectionRead(BaseModel):
             and self.collection_mode == "legacy_full_shop"
         ):
             self.shop_complete = self.complete
+        bindings = (
+            self.sample_manifest_path,
+            self.sample_manifest_sha256,
+            self.sample_collection_path,
+            self.sample_collection_sha256,
+        )
+        if any(value is not None for value in bindings) and not all(
+            value is not None for value in bindings
+        ):
+            raise ValueError("bounded sample evidence bindings must be all present or all absent")
+        if (
+            all(value is not None for value in bindings)
+            and self.collection_mode != "bounded_sample"
+        ):
+            raise ValueError("sample evidence bindings require bounded_sample mode")
         return self
 
 
@@ -191,6 +216,15 @@ class _PendingShopResult:
     temp_path: str
     final_path: str
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _BoundedSampleEvidenceBinding:
+    verification_dir: Path
+    manifest_path: str
+    manifest_sha256: str
+    collection_path: str
+    collection_sha256: str
 
 
 class ShopCollectionService:
@@ -468,11 +502,19 @@ class ShopCollectionService:
                 read = read.model_copy(update={"complete": False})
         elif result.status == "succeeded" and payload.collection_mode == "bounded_sample":
             try:
-                verification_dir = self._materialize_bounded_sample_evidence(
+                binding = self._materialize_bounded_sample_evidence(
                     job_id, result.items
                 )
+                read = read.model_copy(
+                    update={
+                        "sample_manifest_path": binding.manifest_path,
+                        "sample_manifest_sha256": binding.manifest_sha256,
+                        "sample_collection_path": binding.collection_path,
+                        "sample_collection_sha256": binding.collection_sha256,
+                    }
+                )
                 verification = verify_shop_collection(
-                    verification_dir,
+                    binding.verification_dir,
                     expected_count=payload.expected_count,
                     expected_source_urls=[str(item.source_url) for item in result.items],
                 )
@@ -681,7 +723,7 @@ class ShopCollectionService:
 
     def _materialize_bounded_sample_evidence(
         self, job_id: str, items: list[CollectionItem]
-    ) -> Path:
+    ) -> _BoundedSampleEvidenceBinding:
         """Bind the three selected products to their real, same-job detail screenshots."""
         if len(items) != 3:
             raise ValueError("bounded sample requires exactly three accepted products")
@@ -782,7 +824,19 @@ class ShopCollectionService:
         _write_json_evidence_once(
             sample_dir / "manifest.json", {"products": sha_manifest}
         )
-        return sample_dir
+        manifest_path = sample_dir / "manifest.json"
+        collection_path = sample_dir / "collection.json"
+        return _BoundedSampleEvidenceBinding(
+            verification_dir=sample_dir,
+            manifest_path=manifest_path.relative_to(
+                self.job_service.runtime_dir
+            ).as_posix(),
+            manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            collection_path=collection_path.relative_to(
+                self.job_service.runtime_dir
+            ).as_posix(),
+            collection_sha256=hashlib.sha256(collection_path.read_bytes()).hexdigest(),
+        )
 
     def _persist_result(
         self, job_id: str, result: ShopCollectionRead

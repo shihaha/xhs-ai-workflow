@@ -276,6 +276,29 @@ def test_test_override_processes_three_products_even_when_eighteen_were_discover
         image = sample_manifest.parent / product["image"]
         assert image.is_file()
         assert hashlib.sha256(image.read_bytes()).hexdigest() == product["sha256"]
+    assert result.sample_manifest_path == sample_manifest.relative_to(runtime_dir).as_posix()
+    assert result.sample_manifest_sha256 == hashlib.sha256(
+        sample_manifest.read_bytes()
+    ).hexdigest()
+    sample_collection = sample_manifest.parent / "collection.json"
+    assert result.sample_collection_path == sample_collection.relative_to(
+        runtime_dir
+    ).as_posix()
+    assert result.sample_collection_sha256 == hashlib.sha256(
+        sample_collection.read_bytes()
+    ).hexdigest()
+    artifact = next(
+        artifact
+        for artifact in jobs.get(queued.job_id).artifacts
+        if artifact.kind == "shop_collection_result"
+    )
+    persisted = artifact.metadata["result"]
+    assert persisted["sample_manifest_path"] == result.sample_manifest_path
+    assert persisted["sample_manifest_sha256"] == result.sample_manifest_sha256
+    sample_manifest.write_text("{}\n", encoding="utf-8")
+    assert hashlib.sha256(sample_manifest.read_bytes()).hexdigest() != persisted[
+        "sample_manifest_sha256"
+    ]
 
 
 @pytest.mark.parametrize(
