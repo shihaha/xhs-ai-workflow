@@ -120,6 +120,18 @@ def test_account_uses_profile_plus_n_expected_count_and_atomic_success(tmp_path:
         assert [row.note_id for row in session.scalars(select(XhsAccountNoteRecord))] == ["note-1"]
 
 
+def test_account_submission_allows_two_thousand_notes_without_expanding_search(tmp_path: Path) -> None:
+    service = _service(tmp_path, _Adapter(), submitter=lambda *_args: None)
+
+    queued = service.submit_account("user-1", 2000)
+
+    assert queued.progress_total == 2000
+    with pytest.raises(ValueError, match="2000"):
+        service.submit_account("user-1", 2001)
+    with pytest.raises(ValueError, match="1000"):
+        service.submit_search("收纳", 1001)
+
+
 def test_cancel_after_external_result_leaves_no_account_facts_or_artifact(tmp_path: Path) -> None:
     holder: dict[str, object] = {}
 

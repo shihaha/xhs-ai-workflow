@@ -71,7 +71,7 @@ def test_default_xhs_cli_budget_exceeds_the_initial_read_and_bounded_scroll_wind
         + bounded_scroll_wait_seconds
     )
 
-    assert settings.xhs_cli_timeout_seconds == 90.0
+    assert settings.xhs_cli_timeout_seconds == 120.0
     assert adapter._timeout_seconds == settings.xhs_cli_timeout_seconds
     assert adapter._timeout_seconds >= (
         worst_case_budget_seconds + startup_and_parse_margin_seconds

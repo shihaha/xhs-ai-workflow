@@ -301,8 +301,9 @@ class XhsCollectionService:
         )
 
     def _submit(self, *, job_type: str, input_data: dict[str, Any], expected_count: int) -> Job:
-        if isinstance(expected_count, bool) or not isinstance(expected_count, int) or not 0 <= expected_count <= 1000:
-            raise ValueError("expected count must be an integer from 0 through 1000.")
+        maximum = 2000 if job_type == ACCOUNT_COLLECTION_JOB_TYPE else 1000
+        if isinstance(expected_count, bool) or not isinstance(expected_count, int) or not 0 <= expected_count <= maximum:
+            raise ValueError(f"expected count must be an integer from 0 through {maximum}.")
         with self._admission_condition:
             if not self._accepting:
                 raise CollectionServiceClosed("XHS collection service is closed.")

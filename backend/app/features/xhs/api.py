@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api/v1", tags=["xhs-collections"])
 
 class AccountCollectionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    expected_note_count: StrictInt = Field(ge=0, le=1000)
+    expected_note_count: StrictInt = Field(ge=0, le=2000)
 
 
 class SearchCollectionCreate(BaseModel):

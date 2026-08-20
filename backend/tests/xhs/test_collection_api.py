@@ -29,6 +29,37 @@ async def test_account_collection_returns_202_and_durable_queued_job(tmp_path: P
 
 
 @pytest.mark.anyio
+async def test_account_collection_allows_two_thousand_notes_without_expanding_search_limits(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    app = create_app(Settings(
+        runtime_dir=runtime_dir,
+        database_path=runtime_dir / "db.sqlite3",
+        xhs_cli_state_dir=runtime_dir / "xhs-cli-state",
+        _env_file=None,
+    ))
+    app.state.xhs_collection_service._submitter = lambda *_args: None
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        account = await client.post(
+            "/api/v1/accounts/user-1/collections",
+            json={"expected_note_count": 2000},
+        )
+        account_over_limit = await client.post(
+            "/api/v1/accounts/user-1/collections",
+            json={"expected_note_count": 2001},
+        )
+        search_over_limit = await client.post(
+            "/api/v1/notes/search-collections",
+            json={"keyword": "收纳", "expected_count": 1001},
+        )
+
+    assert account.status_code == 202
+    assert account_over_limit.status_code == 422
+    assert search_over_limit.status_code == 422
+
+
+@pytest.mark.anyio
 async def test_collection_payloads_are_strict_and_database_unavailability_is_503(tmp_path: Path) -> None:
     runtime_dir = tmp_path / "runtime"
     app = create_app(Settings(runtime_dir=runtime_dir, database_path=runtime_dir / "db.sqlite3"))

@@ -286,3 +286,58 @@ continuous-growth case. The existing 90-second default remains budget-safe:
 `20 + 3 + 15 + 40 + 10 = 88` seconds. The two-consecutive-no-growth early
 stop, exception stop, read-only boundary, ID de-duplication, ordering, and
 partial-result behavior remain unchanged.
+
+## Round 7: terminal bounded collection limit
+
+### Root cause
+
+The direct unknown-total control reached 1262 unique notes with no rejected
+rows, consumed the 40 one-second attempts, and was still growing. Returning
+that snapshot as if it had naturally stabilized would make an incomplete
+bounded observation look authoritative. It also exceeded the previous
+account-note API limit of 1000.
+
+### TDD evidence
+
+RED commands:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py -q -k sixtieth
+python -m pytest backend/tests/test_settings.py -q -k default_xhs_cli_budget
+python -m pytest backend/tests/xhs/test_collection_api.py -q -k two_thousand
+python -m pytest backend/tests/xhs/test_cli_adapter.py -q -k bounded_limit_is
+```
+
+Before the production change, the settings assertion found `90.0` instead of
+`120.0`; the API rejected 2000 account notes; and a `bounded_collection_limit`
+child result was reduced to `failed/cli_failed` rather than `needs_human`. The
+new wrapper test initially exposed a missing test import, corrected before the
+production edit; its post-change result is recorded below.
+
+GREEN commands:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py backend/tests/xhs/test_cli_adapter.py -q
+python -m pytest backend/tests/test_settings.py -q -k default_xhs_cli_budget
+python -m pytest backend/tests/xhs/test_collection_api.py -q -k two_thousand
+python -m pytest backend/tests/xhs/test_collection_service.py -q -k two_thousand
+```
+
+Results: wrapper and adapter `159 passed`; focused settings `1 passed`; API
+schema boundary `1 passed`; service boundary `1 passed`; the complete service
+file `27 passed`; and the combined wrapper/adapter/settings/service focused
+suite `192 passed`.
+
+The wrapper now permits at most 60 fixed one-second reads. It retains its
+two-consecutive-no-growth early stop and immediate exception stop, but raises
+the explicit `bounded_collection_limit` category when read 60 itself adds an
+unseen ID. The wrapper allowlists that category and the adapter preserves it as
+`needs_human`, never as `cli_failed` or complete data. Collection remains
+read-only with first-seen ID de-duplication and stable order.
+
+Account collection accepts up to 2000 notes (the adapter accepts 2001 items to
+include the profile), while search remains capped at 1000. The default child
+timeout is 120 seconds; its no-network budget test covers
+`20 + 3 + 15 + 60 + 10 = 108` seconds, within the existing 120-second setting
+maximum. No dotenv, runtime, credentials, Phase B, analysis, or research file
+was changed.

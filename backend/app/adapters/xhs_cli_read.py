@@ -46,6 +46,7 @@ _HUMAN_FAILURES = frozenset({
     "account_visibility_restricted",
     "response_unusable",
     "external_state_untrusted",
+    "bounded_collection_limit",
 })
 _CURRENT_PROFILE_FALLBACK_FAILURES = frozenset({
     "cli_failed",
@@ -227,7 +228,7 @@ class XhsCliReadAdapter:
         return self._bounded_result(request, result)
 
     def fetch_account(self, request: CollectionRequest) -> CollectionResult:
-        _require_bounded_expected_count(request, maximum=1001)
+        _require_bounded_expected_count(request, maximum=2001)
         parameters = self._account_parameters(request)
         profile: dict[str, Any] | None = None
         profile_failure: XhsCliReadError | None = None
@@ -1032,6 +1033,8 @@ def _failure_category(stdout: bytes, stderr: bytes) -> str:
 
 def _failure_category_from_text(value: str) -> str:
     text = value.casefold()
+    if "bounded_collection_limit" in text:
+        return "bounded_collection_limit"
     if any(marker in text for marker in ("captcha", "verify", "需要验证", "验证码", "安全验证")):
         return "captcha_required"
     if any(marker in text for marker in ("rate limit", "too many", "429", "请求频繁", "操作频繁")):

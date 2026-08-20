@@ -435,6 +435,54 @@ def test_fetch_account_returns_one_profile_and_requested_notes(adapter_factory) 
     ]
 
 
+def test_user_posts_bounded_limit_is_a_needs_human_collection_fact(adapter_factory) -> None:
+    """A wrapper cap reached while rows still grow must not be reduced to generic CLI failure."""
+    fake_runner = FakeRunner([
+        _completed(["xhs"], {"user": {"id": "user-1", "nickname": "Alice"}}),
+        subprocess.CompletedProcess(
+            ["xhs"], 73, stdout=b"", stderr=b"bounded_collection_limit\n"
+        ),
+    ])
+    adapter = adapter_factory(fake_runner, executable=Path("xhs"))
+
+    result = adapter.fetch_account(CollectionRequest(
+        capability="fetch_account",
+        parameters={"user_id": "user-1", "job_id": JOB_ID},
+        expected_count=2,
+    ))
+
+    assert (result.status, result.detail, result.complete) == (
+        "needs_human", "bounded_collection_limit", False
+    )
+    assert result.items == []
+
+
+def test_account_expected_count_allows_profile_plus_two_thousand_notes(adapter_factory) -> None:
+    """The adapter's account bound includes the profile plus the API's 2000 notes."""
+    fake_runner = FakeRunner([
+        _completed(["xhs"], {"user": {"id": "user-1", "nickname": "Alice"}}),
+        _completed(
+            ["xhs"],
+            [{"id": f"note-{index}", "userId": "user-1"} for index in range(1, 2001)],
+        ),
+    ])
+    adapter = adapter_factory(fake_runner, executable=Path("xhs"))
+
+    result = adapter.fetch_account(CollectionRequest(
+        capability="fetch_account",
+        parameters={"user_id": "user-1", "job_id": JOB_ID},
+        expected_count=2001,
+    ))
+
+    assert (result.status, result.complete, len(result.items)) == ("succeeded", True, 2001)
+    with pytest.raises(ValueError):
+        adapter.fetch_account(CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "user-1", "job_id": JOB_ID},
+            expected_count=2002,
+        ))
+
+
 def test_fetch_account_uses_verified_whoami_when_current_profile_page_fails(
     adapter_factory,
 ) -> None:

@@ -38,7 +38,7 @@ _COOKIE_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _REQUIRED_COOKIES = frozenset({"a1", "web_session"})
 _USER_POSTS_SCROLL_DELTA = 1200
 _USER_POSTS_SCROLL_WAIT_MS = 1000
-_USER_POSTS_MAX_SCROLL_ATTEMPTS = 40
+_USER_POSTS_MAX_SCROLL_ATTEMPTS = 60
 _USER_POSTS_STABLE_ATTEMPTS = 2
 _USER_POSTS_SNAPSHOT_JS = """
 () => {
@@ -242,7 +242,7 @@ def _largest_observed_user_posts(
     if page is None:
         return list(observed.values())
     stable_attempts = 0
-    for _attempt in range(_USER_POSTS_MAX_SCROLL_ATTEMPTS):
+    for attempt in range(_USER_POSTS_MAX_SCROLL_ATTEMPTS):
         try:
             page.mouse.wheel(0, _USER_POSTS_SCROLL_DELTA)
             page.wait_for_timeout(_USER_POSTS_SCROLL_WAIT_MS)
@@ -251,6 +251,8 @@ def _largest_observed_user_posts(
             break
         if grew:
             stable_attempts = 0
+            if attempt == _USER_POSTS_MAX_SCROLL_ATTEMPTS - 1:
+                raise RuntimeError("bounded_collection_limit")
         else:
             stable_attempts += 1
             if stable_attempts >= _USER_POSTS_STABLE_ATTEMPTS:
@@ -352,6 +354,7 @@ def main() -> int:
             "pinned_module_conflict",
             "prepared_state_invalid",
             "readonly boundary disabled",
+            "bounded_collection_limit",
         }:
             category = "readonly_boundary_failed"
         print(category, file=sys.stderr)

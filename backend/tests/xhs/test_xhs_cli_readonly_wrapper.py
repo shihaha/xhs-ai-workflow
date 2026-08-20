@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import backend.app.adapters.xhs_cli_readonly_wrapper as wrapper
 
 
@@ -149,11 +151,11 @@ def test_user_posts_continues_past_five_growths_until_two_consecutive_stable_rea
     assert page.waits == [1000] * 8
 
 
-def test_user_posts_stops_at_the_hard_forty_scroll_cap_when_every_read_grows() -> None:
-    """A continuously changing page must still have an exact bounded read-only limit."""
+def test_user_posts_reports_a_bounded_limit_when_the_hard_sixty_scroll_cap_still_grows() -> None:
+    """A continuously changing page must not masquerade as a stable collection."""
     first_page = [_note(note_id) for note_id in range(1, 33)]
     snapshots = [[first_page, [], [], [], []]]
-    for last_note_id in range(33, 73):
+    for last_note_id in range(33, 93):
         snapshots.append([
             first_page,
             [_note(note_id) for note_id in range(33, last_note_id + 1)],
@@ -163,11 +165,11 @@ def test_user_posts_stops_at_the_hard_forty_scroll_cap_when_every_read_grows() -
         ])
     page = _FakePage(snapshots)
 
-    rows = _bounded_user_posts_client(page).get_user_posts("user-1")
+    with pytest.raises(RuntimeError, match="bounded_collection_limit"):
+        _bounded_user_posts_client(page).get_user_posts("user-1")
 
-    assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 73)]
-    assert page.scrolls == 40
-    assert page.waits == [1000] * 40
+    assert page.scrolls == 60
+    assert page.waits == [1000] * 60
 
 
 def test_user_posts_reaches_the_allowed_thousand_note_boundary_while_reads_keep_growing() -> None:
@@ -188,8 +190,29 @@ def test_user_posts_reaches_the_allowed_thousand_note_boundary_while_reads_keep_
     rows = _bounded_user_posts_client(page).get_user_posts("user-1")
 
     assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 1001)]
-    assert page.scrolls == 40
-    assert page.waits == [1000] * 40
+    assert page.scrolls == 42
+    assert page.waits == [1000] * 42
+
+
+def test_user_posts_raises_a_bounded_limit_category_when_the_sixtieth_read_still_grows() -> None:
+    """A cap-exhausted live page must not be reported as a stable public collection."""
+    first_page = [_note(1)]
+    snapshots = [[first_page, [], [], [], []]]
+    for last_note_id in range(2, 62):
+        snapshots.append([
+            first_page,
+            [_note(note_id) for note_id in range(2, last_note_id + 1)],
+            [],
+            [],
+            [],
+        ])
+    page = _FakePage(snapshots)
+
+    with pytest.raises(RuntimeError, match="bounded_collection_limit"):
+        _bounded_user_posts_client(page).get_user_posts("user-1")
+
+    assert page.scrolls == 60
+    assert page.waits == [1000] * 60
 
 
 def test_user_posts_deduplicates_repeated_note_ids_without_reordering_first_observations() -> None:
