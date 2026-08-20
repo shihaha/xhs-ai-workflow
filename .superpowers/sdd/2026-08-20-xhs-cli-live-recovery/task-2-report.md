@@ -175,3 +175,42 @@ only two consecutive no-growth reads stop early, so one transient empty window
 is tolerated. Browser interaction/evaluation exceptions still stop immediately.
 It remains read-only, keeps first-observed ID order, and returns only actually
 observed partial rows when exact-count completion is not available.
+
+## Round 4: default child-budget alignment
+
+### Root cause
+
+The final wrapper permits an initial trusted `get_user_posts` read followed by
+up to 20 seconds of fixed read-only scroll waits, while the Settings default
+for the enclosing child process remained 20 seconds. The process could timeout
+before the bounded wrapper had a chance to reach either its stable-read stop or
+its hard cap.
+
+### TDD evidence
+
+RED command:
+
+```powershell
+python -m pytest backend/tests/test_settings.py -q -k default_xhs_cli_budget
+```
+
+Before the round-4 production change: `1 failed, 5 deselected`; the default
+was `20.0`, not the required `60.0` and not greater than the 20-second initial
+read budget plus the wrapper's 20-second fixed scroll window.
+
+GREEN commands:
+
+```powershell
+python -m pytest backend/tests/test_settings.py -q
+python -m pytest backend/tests/test_settings.py backend/tests/xhs/test_xhs_cli_readonly_wrapper.py backend/tests/xhs/test_cli_adapter.py backend/tests/xhs/test_s2a_round1_hardening.py backend/tests/xhs/test_s2a_round2_hardening.py -q
+```
+
+Results: `6 passed in 0.12s`; `196 passed in 9.93s`.
+
+`Settings` now defaults `xhs_cli_timeout_seconds` to 60 seconds, retaining the
+existing 120-second maximum. A no-network Settings-to-adapter integration test
+proves that the default reaches the adapter and exceeds the initial read plus
+maximum fixed-scroll wait budget. Existing non-environment Settings unit tests
+now explicitly disable dotenv loading, so the current external prepared-state
+path cannot make temporary-runtime tests fail before their assertions. The
+repository `.env` was not changed.

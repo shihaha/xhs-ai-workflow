@@ -3,6 +3,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import backend.app.adapters.xhs_cli_readonly_wrapper as wrapper
+from backend.app.adapters.xhs_cli_read import XhsCliReadAdapter
 from backend.app.settings import Settings
 
 
@@ -13,6 +15,7 @@ def test_settings_creates_the_configured_runtime_directory(tmp_path: Path) -> No
     settings = Settings(
         runtime_dir=runtime_dir,
         database_path=runtime_dir / "workbench.sqlite3",
+        _env_file=None,
     )
 
     assert settings.runtime_dir == runtime_dir
@@ -26,6 +29,7 @@ def test_xhs_cli_settings_are_trusted_and_bounded(tmp_path: Path) -> None:
         runtime_dir=tmp_path / "runtime",
         xhs_cli_python_executable="C:/trusted-tools/python.exe",
         xhs_cli_timeout_seconds=12.5,
+        _env_file=None,
     )
 
     assert settings.xhs_cli_python_executable == "C:/trusted-tools/python.exe"
@@ -33,7 +37,36 @@ def test_xhs_cli_settings_are_trusted_and_bounded(tmp_path: Path) -> None:
     assert settings.xhs_cli_state_dir == (tmp_path / "runtime" / "xhs-cli-state").resolve()
     assert settings.xhs_cli_state_dir.is_dir()
     with pytest.raises(ValidationError):
-        Settings(runtime_dir=tmp_path / "invalid", xhs_cli_timeout_seconds=0)
+        Settings(
+            runtime_dir=tmp_path / "invalid",
+            xhs_cli_timeout_seconds=0,
+            _env_file=None,
+        )
+
+
+def test_default_xhs_cli_budget_exceeds_the_initial_read_and_bounded_scroll_window(
+    tmp_path: Path,
+) -> None:
+    """The child process must survive the trusted initial read plus all fixed scroll waits."""
+    runtime_dir = tmp_path / "runtime"
+    settings = Settings(
+        runtime_dir=runtime_dir,
+        xhs_cli_state_dir=runtime_dir / "xhs-cli-state",
+        _env_file=None,
+    )
+    adapter = XhsCliReadAdapter.from_settings(settings)
+    initial_user_posts_read_budget_seconds = 20.0
+    bounded_scroll_wait_seconds = (
+        wrapper._USER_POSTS_MAX_SCROLL_ATTEMPTS
+        * wrapper._USER_POSTS_SCROLL_WAIT_MS
+        / 1000
+    )
+
+    assert settings.xhs_cli_timeout_seconds == 60.0
+    assert adapter._timeout_seconds == settings.xhs_cli_timeout_seconds
+    assert adapter._timeout_seconds > (
+        initial_user_posts_read_budget_seconds + bounded_scroll_wait_seconds
+    )
 
 
 def test_xhs_cli_state_directory_must_be_isolated_inside_runtime(tmp_path: Path) -> None:
@@ -77,6 +110,7 @@ def test_bailian_text_vision_and_image_settings_are_independent_and_bounded(
         bailian_image_base_url="https://image.example/api/v1",
         bailian_vision_timeout_seconds=11,
         bailian_image_timeout_seconds=22,
+        _env_file=None,
     )
 
     assert settings.bailian_text_model == "text-model"
@@ -89,4 +123,8 @@ def test_bailian_text_vision_and_image_settings_are_independent_and_bounded(
     assert settings.bailian_image_timeout_seconds == 22
 
     with pytest.raises(ValidationError):
-        Settings(runtime_dir=tmp_path / "invalid", bailian_image_max_bytes=0)
+        Settings(
+            runtime_dir=tmp_path / "invalid",
+            bailian_image_max_bytes=0,
+            _env_file=None,
+        )
