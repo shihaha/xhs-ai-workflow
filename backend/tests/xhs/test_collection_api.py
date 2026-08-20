@@ -60,6 +60,26 @@ async def test_account_collection_allows_two_thousand_notes_without_expanding_se
 
 
 @pytest.mark.anyio
+async def test_account_collection_defaults_to_the_engineering_latest_ten_sample(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    app = create_app(Settings(
+        runtime_dir=runtime_dir,
+        database_path=runtime_dir / "db.sqlite3",
+        xhs_cli_state_dir=runtime_dir / "xhs-cli-state",
+        _env_file=None,
+    ))
+    app.state.xhs_collection_service._submitter = lambda *_args: None
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        response = await client.post("/api/v1/accounts/user-1/collections", json={})
+        job = await client.get(f"/api/v1/jobs/{response.json()['job_id']}")
+
+    assert response.status_code == 202
+    assert job.json()["input"] == {
+        "user_id": "user-1", "collection_scope": "latest", "sample_limit": 10,
+    }
+
+
+@pytest.mark.anyio
 async def test_collection_payloads_are_strict_and_database_unavailability_is_503(tmp_path: Path) -> None:
     runtime_dir = tmp_path / "runtime"
     app = create_app(Settings(runtime_dir=runtime_dir, database_path=runtime_dir / "db.sqlite3"))

@@ -59,6 +59,66 @@ def _bounded_user_posts_client(page: _FakePage) -> object:
     return client_module.XhsClient()
 
 
+def _latest_ten_user_posts_client(page: _FakePage) -> object:
+    class Client:
+        def __init__(self) -> None:
+            self._page = page
+
+        def get_user_posts(self, _user_id: str) -> list[object]:
+            return page.snapshots[0]
+
+    client_module = SimpleNamespace(XhsClient=Client)
+    wrapper._install_readonly_boundary(
+        SimpleNamespace(), SimpleNamespace(),
+        {"a1": "prepared-a1", "web_session": "prepared-session"},
+        client_module=client_module,
+        command=["user-posts", "user-1", "--latest-10", "--json"],
+    )
+    return client_module.XhsClient()
+
+
+def test_engineering_latest_ten_sample_truncates_an_initial_large_page_without_scrolling() -> None:
+    """The engineering account-sample cap keeps an 1112-row initial page out of later payloads."""
+    initial = [[_note(note_id) for note_id in range(1, 1113)], [], [], [], []]
+    page = _FakePage([initial])
+
+    result = _latest_ten_user_posts_client(page).get_user_posts("user-1")
+
+    assert result == {
+        "collection_scope": "latest",
+        "sample_limit": 10,
+        "notes": [_note(note_id) for note_id in range(1, 11)],
+        "available_count_observed": 1112,
+        "completeness": "bounded_sample",
+    }
+    assert page.scrolls == 0
+    assert page.waits == []
+
+
+def test_engineering_latest_ten_sample_marks_a_short_natural_end_as_exhausted() -> None:
+    """A six-row sample is successful only with fixed natural-end evidence."""
+    initial = [[_note(note_id) for note_id in range(1, 7)], [], [], [], []]
+    page = _FakePage([initial, {"slots": initial, "natural_end": True}])
+
+    result = _latest_ten_user_posts_client(page).get_user_posts("user-1")
+
+    assert result["notes"] == initial[0]
+    assert result["available_count_observed"] == 6
+    assert result["completeness"] == "sample_exhausted"
+    assert page.scrolls == 1
+
+
+def test_engineering_latest_ten_sample_without_a_natural_end_is_not_successful() -> None:
+    """A short stable-looking page is not enough to claim an exhausted sample."""
+    initial = [[_note(note_id) for note_id in range(1, 7)], [], [], [], []]
+    page = _FakePage([initial, initial, initial])
+
+    with pytest.raises(RuntimeError, match="bounded_sample_incomplete"):
+        _latest_ten_user_posts_client(page).get_user_posts("user-1")
+
+    assert page.scrolls == 2
+
+
 def test_user_posts_scrolls_fixed_page_slots_to_the_largest_observed_collection() -> None:
     """Returning after the first populated slot would lose later loaded public notes."""
     first_page = [_note(note_id) for note_id in range(1, 33)]

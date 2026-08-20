@@ -11,7 +11,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from threading import Condition, Event, RLock
 from time import monotonic
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -68,6 +68,7 @@ class XhsCliSearchRequest(BaseModel):
 
     keyword: str = Field(min_length=1, max_length=500)
     job_id: str | None = Field(default=None, min_length=1, max_length=500)
+    sample_limit: Literal[2] | None = None
 
     @field_validator("keyword")
     @classmethod
@@ -82,6 +83,7 @@ class XhsCliAccountRequest(BaseModel):
 
     user_id: str = Field(min_length=1, max_length=500)
     job_id: str | None = Field(default=None, min_length=1, max_length=500)
+    sample_scope: Literal["latest"] | None = None
 
     @field_validator("user_id")
     @classmethod
@@ -224,6 +226,8 @@ class XhsCliReadAdapter:
             payload = self._invoke(["search", parameters.keyword])
         except XhsCliReadError as error:
             return _failed_result(request, error.category)
+        if parameters.sample_limit == 2:
+            payload = payload[:2] if isinstance(payload, list) else payload
         result = _normalize_notes(payload, request=request, source="search")
         return self._bounded_result(request, result)
 
@@ -243,10 +247,19 @@ class XhsCliReadAdapter:
             profile = self._verified_current_profile(parameters.user_id)
             if profile is None:
                 profile_failure = error
+        latest_sample: dict[str, int | str] | None = None
         try:
-            notes = self._invoke(["user-posts", parameters.user_id])
+            notes = self._invoke(
+                ["user-posts", parameters.user_id, "--latest-10"]
+                if parameters.sample_scope == "latest"
+                else ["user-posts", parameters.user_id]
+            )
         except XhsCliReadError as error:
             return _failed_result(request, error.category)
+        if parameters.sample_scope == "latest":
+            notes, latest_sample = _latest_sample_payload(notes)
+            if notes is None or latest_sample is None:
+                return _failed_result(request, "response_unusable")
         if profile is None:
             profile = _profile_from_consistent_post_authors(
                 notes, requested_user_id=parameters.user_id
@@ -264,6 +277,8 @@ class XhsCliReadAdapter:
             requested_user_id=parameters.user_id,
             profile_source=profile_source,
         )
+        if latest_sample is not None:
+            result.raw_evidence["latest_sample"] = latest_sample
         return self._bounded_result(request, result)
 
     def close(self, *, timeout: float = 0.25) -> bool:
@@ -544,6 +559,30 @@ def _normalize_account(
         rejected_items=rejected,
         raw_evidence=shared_raw,
     )
+
+
+def _latest_sample_payload(
+    value: JsonPayload,
+) -> tuple[list[Any] | None, dict[str, int | str] | None]:
+    if not isinstance(value, dict):
+        return None, None
+    notes = value.get("notes")
+    available_count_observed = value.get("available_count_observed")
+    completeness = value.get("completeness")
+    if (
+        value.get("collection_scope") != "latest"
+        or value.get("sample_limit") != 10
+        or not isinstance(notes, list)
+        or not isinstance(available_count_observed, int)
+        or available_count_observed < 0
+        or completeness not in {"bounded_sample", "sample_exhausted"}
+    ):
+        return None, None
+    return notes[:10], {
+        "sample_limit": 10,
+        "available_count_observed": available_count_observed,
+        "completeness": completeness,
+    }
 
 
 def _normalize_notes(

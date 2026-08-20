@@ -63,6 +63,30 @@ def _search_result() -> CollectionResult:
     )
 
 
+def _latest_ten_result(note_count: int, *, completeness: str) -> CollectionResult:
+    profile = _account_result().items[0]
+    notes = [
+        CollectionItem(
+            id=f"note:latest-{index}", kind="note",
+            source_url=f"https://www.xiaohongshu.com/explore/latest-{index}",
+            raw_evidence={"row": {"note_id": f"latest-{index}", "user_id": "user-1"}},
+            data={"note_id": f"latest-{index}", "user_id": "user-1"},
+        )
+        for index in range(note_count)
+    ]
+    items = [profile, *notes]
+    return CollectionResult(
+        status="partial", detail="expected_count_unknown",
+        raw_evidence={"latest_sample": {
+            "sample_limit": 10, "available_count_observed": note_count,
+            "completeness": completeness,
+        }},
+        items=items, expected_count_known=False, succeeded_count=len(items),
+        observed_count=len(items), raw_observation_count=len(items), overflow_count=0,
+        complete=False,
+    )
+
+
 class _Adapter:
     def __init__(self) -> None:
         self.requests: list[CollectionRequest] = []
@@ -130,6 +154,51 @@ def test_account_submission_allows_two_thousand_notes_without_expanding_search(t
         service.submit_account("user-1", 2001)
     with pytest.raises(ValueError, match="1000"):
         service.submit_search("收纳", 1001)
+
+
+def test_engineering_latest_ten_sample_persists_six_exhausted_notes_without_a_full_account_claim(tmp_path: Path) -> None:
+    class SampleAdapter(_Adapter):
+        def fetch_account(self, request: CollectionRequest) -> CollectionResult:
+            self.requests.append(request)
+            return _latest_ten_result(6, completeness="sample_exhausted")
+
+    adapter = SampleAdapter()
+    service = _service(tmp_path, adapter, submitter=lambda *_args: None)
+    queued = service.submit_latest_account_sample("user-1")
+
+    completed = service.execute(queued.id)
+
+    assert [request.expected_count for request in adapter.requests] == [None]
+    assert completed is not None and completed.state is JobState.succeeded
+    assert completed.progress_current == completed.progress_total == 6
+    metadata = completed.artifacts[0].metadata
+    assert {key: metadata[key] for key in (
+        "collection_scope", "sample_limit", "persisted_count",
+        "available_count_observed", "completeness",
+    )} == {
+        "collection_scope": "latest", "sample_limit": 10, "persisted_count": 6,
+        "available_count_observed": 6, "completeness": "sample_exhausted",
+    }
+    assert metadata["complete"] is False
+
+
+def test_engineering_latest_ten_sample_never_promotes_a_bounded_limit(tmp_path: Path) -> None:
+    class HumanAdapter(_Adapter):
+        def fetch_account(self, request: CollectionRequest) -> CollectionResult:
+            self.requests.append(request)
+            return CollectionResult(
+                status="needs_human", detail="bounded_collection_limit",
+                expected_count_known=False, succeeded_count=0, observed_count=0,
+                raw_observation_count=0, overflow_count=0, complete=False,
+            )
+
+    service = _service(tmp_path, HumanAdapter(), submitter=lambda *_args: None)
+    queued = service.submit_latest_account_sample("user-1")
+
+    completed = service.execute(queued.id)
+
+    assert completed is not None and completed.state is JobState.needs_human
+    assert completed.error_category == "bounded_collection_limit"
 
 
 def test_cancel_after_external_result_leaves_no_account_facts_or_artifact(tmp_path: Path) -> None:

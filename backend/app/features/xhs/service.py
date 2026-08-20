@@ -64,6 +64,7 @@ XHS_RESERVED_ARTIFACT_KINDS = (
     SEARCH_COLLECTION_ARTIFACT_KIND,
 )
 _SAFE_SUBJECT = re.compile(r"^[A-Za-z0-9_-]{1,500}$")
+ENGINEERING_ACCOUNT_SAMPLE_LIMIT = 10
 DEFAULT_XHS_ARTIFACT_MAX_BYTES = 5 * 1024 * 1024
 _CLOSE_BUDGET_SECONDS = 0.25
 _JOURNAL_READ_BUDGET_SECONDS = 0.05
@@ -290,6 +291,29 @@ class XhsCollectionService:
             expected_count=expected_note_count,
         )
 
+    def submit_latest_account_sample(
+        self, user_id: str, *, legacy_expected_note_count: int | None = None
+    ) -> Job:
+        if not _SAFE_SUBJECT.fullmatch(user_id):
+            raise ValueError("user_id must be a safe platform identifier.")
+        input_data: dict[str, Any] = {
+            "user_id": user_id,
+            "collection_scope": "latest",
+            "sample_limit": ENGINEERING_ACCOUNT_SAMPLE_LIMIT,
+        }
+        if legacy_expected_note_count is not None:
+            input_data.update(
+                migration_source="expected_note_count",
+                migration_sample_limit=min(
+                    legacy_expected_note_count, ENGINEERING_ACCOUNT_SAMPLE_LIMIT
+                ),
+            )
+        return self._submit(
+            job_type=ACCOUNT_COLLECTION_JOB_TYPE,
+            input_data=input_data,
+            expected_count=ENGINEERING_ACCOUNT_SAMPLE_LIMIT,
+        )
+
     def submit_search(self, keyword: str, expected_count: int) -> Job:
         keyword = keyword.strip()
         if not keyword or len(keyword) > 500 or keyword.startswith("-") or any(ord(c) < 32 for c in keyword):
@@ -352,11 +376,17 @@ class XhsCollectionService:
         job = self.job_service.get(job_id)
         try:
             if job.type == ACCOUNT_COLLECTION_JOB_TYPE:
-                expected_notes = int(job.input["expected_note_count"])
+                latest_sample = job.input.get("collection_scope") == "latest"
+                expected_notes = (
+                    None if latest_sample else int(job.input["expected_note_count"])
+                )
                 request = CollectionRequest(
                     capability="fetch_account",
-                    parameters={"user_id": job.input["user_id"], "job_id": job_id},
-                    expected_count=expected_notes + 1,
+                    parameters={
+                        "user_id": job.input["user_id"], "job_id": job_id,
+                        **({"sample_scope": "latest"} if latest_sample else {}),
+                    },
+                    expected_count=(expected_notes + 1 if expected_notes is not None else None),
                 )
                 result = self.adapter.fetch_account(request)
             elif job.type == SEARCH_COLLECTION_JOB_TYPE:
@@ -370,6 +400,11 @@ class XhsCollectionService:
             else:
                 raise ValueError("Unsupported XHS reserved job type.")
             result = _redacted_result(result)
+            if job.type == ACCOUNT_COLLECTION_JOB_TYPE and latest_sample:
+                sampled = _as_exact_engineering_latest_sample(result)
+                if sampled is not None:
+                    result, note_count = sampled
+                    job = self._set_sample_progress_total(job, note_count)
             if job.type == SEARCH_COLLECTION_JOB_TYPE:
                 _validate_search_owners(result)
         except Exception as error:
@@ -401,6 +436,21 @@ class XhsCollectionService:
             return self._finalize_failure(job.id, category="xhs_collection_finalization_failed", error_type=type(error).__name__)
         finally:
             self._finished(job_id)
+
+    def _set_sample_progress_total(self, job: Job, note_count: int) -> Job:
+        with self.database.session() as session:
+            changed = session.execute(
+                update(JobRecord).where(
+                    JobRecord.id == job.id,
+                    JobRecord.state == JobState.running.value,
+                    JobRecord.progress_total == ENGINEERING_ACCOUNT_SAMPLE_LIMIT,
+                ).values(progress_total=note_count, updated_at=self.clock())
+            )
+            if changed.rowcount != 1:
+                session.rollback()
+                raise InvalidJobTransition("Latest sample total can no longer be bound.")
+            session.commit()
+        return self.job_service.get(job.id)
 
     def get_profile(self, user_id: str) -> AccountProfileRead:
         try:
@@ -825,6 +875,16 @@ class XhsCollectionService:
         }
         if job.type == ACCOUNT_COLLECTION_JOB_TYPE:
             metadata["user_id"] = job.input["user_id"]
+            if job.input.get("collection_scope") == "latest":
+                latest_sample = result.raw_evidence.get("latest_sample", {})
+                metadata.update(
+                    collection_scope="latest",
+                    sample_limit=ENGINEERING_ACCOUNT_SAMPLE_LIMIT,
+                    persisted_count=progress,
+                    available_count_observed=latest_sample.get("available_count_observed"),
+                    completeness=latest_sample.get("completeness"),
+                    complete=False,
+                )
         else:
             metadata["keyword"] = job.input["keyword"]
 
@@ -2088,6 +2148,35 @@ def _is_exact(result: CollectionResult, *, expected_count: int) -> bool:
         and result.duplicate_observation_count == 0 and not result.rejected_items
         and not result.missing_items and result.overflow_count == 0
     )
+
+
+def _as_exact_engineering_latest_sample(
+    result: CollectionResult,
+) -> tuple[CollectionResult, int] | None:
+    """Reclassify only a verified bounded engineering sample, never a full account."""
+    sample = result.raw_evidence.get("latest_sample")
+    if (
+        result.status != "partial" or result.detail != "expected_count_unknown"
+        or result.expected_count_known or result.rejected_items
+        or not isinstance(sample, dict) or sample.get("sample_limit") != ENGINEERING_ACCOUNT_SAMPLE_LIMIT
+        or sample.get("completeness") not in {"bounded_sample", "sample_exhausted"}
+    ):
+        return None
+    profiles = sum(item.kind == "profile" for item in result.items)
+    note_count = sum(item.kind == "note" for item in result.items)
+    if profiles != 1 or profiles + note_count != len(result.items) or note_count > ENGINEERING_ACCOUNT_SAMPLE_LIMIT:
+        return None
+    if sample.get("completeness") == "bounded_sample" and note_count != ENGINEERING_ACCOUNT_SAMPLE_LIMIT:
+        return None
+    if sample.get("completeness") == "sample_exhausted" and note_count >= ENGINEERING_ACCOUNT_SAMPLE_LIMIT:
+        return None
+    payload = result.model_dump(mode="python")
+    item_count = len(result.items)
+    payload.update(status="succeeded", detail=None, expected_count_known=True,
+        expected_count=item_count, succeeded_count=item_count,
+        observed_count=item_count, raw_observation_count=item_count,
+        missing_items=[], overflow_count=0, complete=True)
+    return CollectionResult.model_validate(payload), note_count
 
 
 def _note_success_count(result: CollectionResult, *, account: bool) -> int:

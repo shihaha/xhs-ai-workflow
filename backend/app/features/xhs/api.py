@@ -1,6 +1,6 @@
 """HTTP boundary for durable XHS account and note read collection."""
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -21,7 +21,8 @@ router = APIRouter(prefix="/api/v1", tags=["xhs-collections"])
 
 class AccountCollectionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    expected_note_count: StrictInt = Field(ge=0, le=2000)
+    sample_limit: Literal[10] = 10
+    expected_note_count: StrictInt | None = Field(default=None, ge=0, le=2000)
 
 
 class SearchCollectionCreate(BaseModel):
@@ -57,7 +58,9 @@ def _service(request: Request) -> XhsCollectionService:
 )
 def collect_account(user_id: str, payload: AccountCollectionCreate, request: Request) -> CollectionQueued:
     try:
-        job = _service(request).submit_account(user_id, payload.expected_note_count)
+        job = _service(request).submit_latest_account_sample(
+            user_id, legacy_expected_note_count=payload.expected_note_count
+        )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except CollectionServiceClosed as error:

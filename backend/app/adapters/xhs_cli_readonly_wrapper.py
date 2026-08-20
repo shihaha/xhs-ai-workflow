@@ -40,10 +40,11 @@ _USER_POSTS_SCROLL_DELTA = 1200
 _USER_POSTS_SCROLL_WAIT_MS = 1000
 _USER_POSTS_MAX_SCROLL_ATTEMPTS = 60
 _USER_POSTS_STABLE_ATTEMPTS = 2
+_ENGINEERING_LATEST_SAMPLE_LIMIT = 10
 _USER_POSTS_SNAPSHOT_JS = """
 () => {
     const state = window.__INITIAL_STATE__;
-    if (!state || !state.user || !state.user.notes) return [];
+    if (!state || !state.user || !state.user.notes) return {slots: [], natural_end: false};
     const unwrap = (value, depth = 0) => {
         if (depth > 6 || value === null || value === undefined) return value;
         if (typeof value !== 'object') return value;
@@ -58,13 +59,19 @@ _USER_POSTS_SNAPSHOT_JS = """
         return result;
     };
     const notes = unwrap(state.user.notes);
-    if (Array.isArray(notes)) return notes;
+    let slots = [];
+    if (Array.isArray(notes)) slots = notes;
     if (notes && typeof notes === 'object') {
         for (const key of ['value', '_value', 'data', 'list']) {
-            if (Array.isArray(notes[key])) return notes[key];
+            if (Array.isArray(notes[key])) { slots = notes[key]; break; }
         }
     }
-    return [];
+    const terminalByState = Boolean(notes && typeof notes === 'object' &&
+        (notes.hasMore === false || notes.has_more === false || notes.isEnd === true));
+    const documentElement = document.documentElement;
+    const terminalByViewport = Boolean(documentElement &&
+        window.scrollY + window.innerHeight >= documentElement.scrollHeight - 1);
+    return {slots, natural_end: terminalByState || terminalByViewport};
 }
 """
 
@@ -204,6 +211,8 @@ def _read_cookies() -> dict[str, str]:
 def _user_post_rows(value: object) -> list[dict[str, Any]]:
     """Flatten the pinned CLI's page slots without accepting a caller shape."""
     rows: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        value = value.get("slots")
     if not isinstance(value, list):
         return rows
     for item in value:
@@ -212,6 +221,10 @@ def _user_post_rows(value: object) -> list[dict[str, Any]]:
         elif isinstance(item, list):
             rows.extend(_user_post_rows(item))
     return rows
+
+
+def _natural_end_proven(value: object) -> bool:
+    return isinstance(value, dict) and value.get("natural_end") is True
 
 
 def _user_post_identity(row: dict[str, Any]) -> str | None:
@@ -260,6 +273,62 @@ def _largest_observed_user_posts(
     return list(observed.values())
 
 
+def _engineering_latest_sample_user_posts(
+    client: Any, user_id: str, original_get_user_posts: Any
+) -> dict[str, object]:
+    """Apply the engineering-only latest-ten account sampling rule without full scrolling."""
+    observed: dict[str, dict[str, Any]] = {}
+    available_count_observed = 0
+
+    def add_rows(value: object) -> bool:
+        nonlocal available_count_observed
+        visible: dict[str, dict[str, Any]] = {}
+        for row in _user_post_rows(value):
+            note_id = _user_post_identity(row)
+            if note_id is not None:
+                visible.setdefault(note_id, row)
+        available_count_observed = max(available_count_observed, len(visible))
+        grew = False
+        for note_id, row in visible.items():
+            if note_id not in observed and len(observed) < _ENGINEERING_LATEST_SAMPLE_LIMIT:
+                observed[note_id] = row
+                grew = True
+        return grew
+
+    def sampled(completeness: str) -> dict[str, object]:
+        return {
+            "collection_scope": "latest",
+            "sample_limit": _ENGINEERING_LATEST_SAMPLE_LIMIT,
+            "notes": list(observed.values()),
+            "available_count_observed": available_count_observed,
+            "completeness": completeness,
+        }
+
+    add_rows(original_get_user_posts(client, user_id))
+    if len(observed) == _ENGINEERING_LATEST_SAMPLE_LIMIT:
+        return sampled("bounded_sample")
+    page = getattr(client, "_page", None)
+    if page is None:
+        raise RuntimeError("bounded_sample_incomplete")
+    stable_attempts = 0
+    for _attempt in range(_USER_POSTS_MAX_SCROLL_ATTEMPTS):
+        try:
+            page.mouse.wheel(0, _USER_POSTS_SCROLL_DELTA)
+            page.wait_for_timeout(_USER_POSTS_SCROLL_WAIT_MS)
+            snapshot = page.evaluate(_USER_POSTS_SNAPSHOT_JS)
+        except Exception as error:
+            raise RuntimeError("bounded_sample_incomplete") from error
+        grew = add_rows(snapshot)
+        if len(observed) == _ENGINEERING_LATEST_SAMPLE_LIMIT:
+            return sampled("bounded_sample")
+        if _natural_end_proven(snapshot):
+            return sampled("sample_exhausted")
+        stable_attempts = 0 if grew else stable_attempts + 1
+        if stable_attempts >= _USER_POSTS_STABLE_ATTEMPTS:
+            raise RuntimeError("bounded_sample_incomplete")
+    raise RuntimeError("bounded_sample_incomplete")
+
+
 def _install_readonly_boundary(
     cli_module: ModuleType | Any,
     auth_module: ModuleType | Any,
@@ -267,6 +336,7 @@ def _install_readonly_boundary(
     *,
     client_module: ModuleType | Any | None = None,
     command: list[str] | None = None,
+    latest_sample: bool = False,
 ) -> None:
     """Replace every audited browser/persistence hook before command dispatch."""
     cookie_string = "; ".join(f"{name}={value}" for name, value in sorted(cookies.items()))
@@ -300,6 +370,10 @@ def _install_readonly_boundary(
     if client_module is not None and command is not None and command[0] == "user-posts":
         original_get_user_posts = client_module.XhsClient.get_user_posts
         client_module.XhsClient.get_user_posts = (
+            lambda self, user_id: _engineering_latest_sample_user_posts(
+                self, user_id, original_get_user_posts
+            )
+        ) if latest_sample or "--latest-10" in command else (
             lambda self, user_id: _largest_observed_user_posts(
                 self, user_id, original_get_user_posts
             )
@@ -318,6 +392,9 @@ def _validated_cli_args(argv: list[str]) -> list[str]:
             and not any(ord(char) < 32 or ord(char) == 127 for char in positional)
         ):
             return argv
+    if len(argv) == 4 and argv[0] == "user-posts" and argv[2:] == ["--latest-10", "--json"]:
+        if argv[1] and len(argv[1]) <= 500 and not argv[1].startswith("-") and not any(ord(char) < 32 or ord(char) == 127 for char in argv[1]):
+            return argv
     raise RuntimeError("command_not_allowed")
 
 
@@ -326,6 +403,8 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="strict")
         sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
         command = _validated_cli_args(sys.argv[1:])
+        latest_sample = command[:1] == ["user-posts"] and "--latest-10" in command
+        cli_command = [part for part in command if part != "--latest-10"]
         cookies = _read_cookies()
         modules = _load_verified_package(_locate_pinned_source_root())
         package = modules["xhs_cli"]
@@ -339,9 +418,10 @@ def main() -> int:
             auth_module,
             cookies,
             client_module=client_module,
-            command=command,
+            command=cli_command,
+            latest_sample=latest_sample,
         )
-        cli_module.cli.main(args=command, prog_name="xhs", standalone_mode=True)
+        cli_module.cli.main(args=cli_command, prog_name="xhs", standalone_mode=True)
         return 0
     except SystemExit as error:
         return int(error.code or 0)
@@ -355,6 +435,7 @@ def main() -> int:
             "prepared_state_invalid",
             "readonly boundary disabled",
             "bounded_collection_limit",
+            "bounded_sample_incomplete",
         }:
             category = "readonly_boundary_failed"
         print(category, file=sys.stderr)

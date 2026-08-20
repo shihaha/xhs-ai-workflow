@@ -341,3 +341,45 @@ timeout is 120 seconds; its no-network budget test covers
 `20 + 3 + 15 + 60 + 10 = 108` seconds, within the existing 120-second setting
 maximum. No dotenv, runtime, credentials, Phase B, analysis, or research file
 was changed.
+
+## Round 8: engineering latest-ten account sample
+
+### Scope correction
+
+The fixed latest-ten cap is an engineering sampling rule for candidate account
+homepages; it is not attributed to the tutorial. Separately, the tutorial
+supports a first search round of 5–10 posts per actual keyword; the adapter
+exposes only the conservative per-keyword first-round limit of two here, with
+no cross-keyword or product policy change.
+
+### TDD evidence
+
+RED covered the previous full-page behavior: an initial 1112-row slot was
+returned intact, short stable slots were accepted without an end proof, the
+adapter rejected the controlled sample request, and service/API had no sample
+task. GREEN focused results were: wrapper `3 passed`; account adapter `1
+passed`; service `2 passed`; API `1 passed`; search first-round adapter `1
+passed`; wrapper plus service `42 passed`.
+
+### Contract
+
+`user-posts <id> --latest-10 --json` is a fixed wrapper-only contract. The
+wrapper removes that internal flag before dispatching the pinned CLI. It keeps
+the first ten stable unique IDs in observed order and immediately stops when
+the initial slot already supplies ten; it never scrolls toward a full account.
+An under-ten result succeeds only when the fixed readonly snapshot establishes
+a natural end, and is then labelled `sample_exhausted`; otherwise it emits
+`bounded_sample_incomplete` for human handling. `bounded_collection_limit` and
+captcha remain non-success categories.
+
+The adapter re-applies the ten-row truncation before normalization and raw
+evidence construction, so an overlarge wrapper payload cannot place an
+eleventh row in the artifact or SQLite persistence input. The same task stores
+`collection_scope=latest`, `sample_limit=10`, `persisted_count`, the numeric
+`available_count_observed`, and `completeness` (`bounded_sample` or
+`sample_exhausted`). Artifact metadata deliberately sets `complete=false`: a
+successful bounded sample is never represented as a full-account completion.
+Legacy `expected_note_count` input is accepted only as a recorded migration
+source with its value clamped to ten; it cannot restore a full collection path.
+No historical 62-row record, dotenv, runtime, credential, Phase B, or research
+file was changed.

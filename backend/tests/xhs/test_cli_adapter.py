@@ -457,6 +457,50 @@ def test_user_posts_bounded_limit_is_a_needs_human_collection_fact(adapter_facto
     assert result.items == []
 
 
+def test_engineering_latest_ten_contract_persists_no_eleventh_note_or_raw_payload(adapter_factory) -> None:
+    """Adapter defense keeps an overlarge latest-sample payload out of artifacts and SQLite inputs."""
+    fake_runner = FakeRunner([
+        _completed(["xhs"], {"user": {"id": "user-1", "nickname": "Alice"}}),
+        _completed(["xhs"], {
+            "collection_scope": "latest", "sample_limit": 10,
+            "notes": [{"id": f"note-{index}", "userId": "user-1"} for index in range(1, 12)],
+            "available_count_observed": 1112,
+            "completeness": "bounded_sample",
+        }),
+    ])
+    adapter = adapter_factory(fake_runner, executable=Path("xhs"))
+
+    result = adapter.fetch_account(CollectionRequest(
+        capability="fetch_account",
+        parameters={"user_id": "user-1", "job_id": JOB_ID, "sample_scope": "latest"},
+        expected_count=None,
+    ))
+
+    assert {item.id for item in result.items} == {"profile:user-1", *[f"note:note-{index}" for index in range(1, 11)]}
+    assert "note-11" not in json.dumps(result.raw_evidence)
+    assert result.raw_evidence["latest_sample"]["available_count_observed"] == 1112
+    assert fake_runner.argvs[1] == _wrapper_argv("user-posts", "user-1", "--latest-10", "--json")
+
+
+def test_search_first_round_contract_keeps_only_two_rows_for_one_keyword(adapter_factory) -> None:
+    """Tutorial-derived search first round is per keyword; it does not alter account sampling."""
+    fake_runner = FakeRunner([_completed(["xhs"], [
+        {"id": "search-1", "title": "one"},
+        {"id": "search-2", "title": "two"},
+        {"id": "search-3", "title": "three"},
+    ])])
+    adapter = adapter_factory(fake_runner, executable=Path("xhs"))
+
+    result = adapter.search_notes(CollectionRequest(
+        capability="search_notes",
+        parameters={"keyword": "收纳", "job_id": JOB_ID, "sample_limit": 2},
+        expected_count=None,
+    ))
+
+    assert [item.id for item in result.items] == ["note:search-1", "note:search-2"]
+    assert "search-3" not in json.dumps(result.raw_evidence)
+
+
 def test_account_expected_count_allows_profile_plus_two_thousand_notes(adapter_factory) -> None:
     """The adapter's account bound includes the profile plus the API's 2000 notes."""
     fake_runner = FakeRunner([
