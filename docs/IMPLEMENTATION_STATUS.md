@@ -135,7 +135,8 @@ has one trusted profile and a bounded latest-10 note sample. Real UAT neverthele
 remains blocked because its Android discovery returned 18 deduplicated product
 links only to process memory: the durable job contains 66 screenshots and 66 UI
 hierarchies but no `shop_collection_result` and no reusable persisted
-`source_url`. The truthful shop sample is `0/3`; no real cross-account analysis,
+`source_url`. This physical-goods account is now `out_of_scope_physical` and is
+excluded from real Phase A candidates. The truthful shop sample is `0/3`; no real cross-account analysis,
 candidate or review was fabricated. See `docs/PHASE_A_UAT_REPORT.md` and the
 Phase A report in `PROJECT_STATUS.md`.
 

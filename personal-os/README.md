@@ -1,5 +1,11 @@
 # PersonalOS V1
 
+> **NOT AUTHORITATIVE FOR XHS WORKBENCH**
+>
+> 本目录只保存个人执行系统历史。它不是 `xhs-ai-workflow` 的业务规格，不能改变
+> 小红书工作台的 Phase、验收线或实现路线。发生冲突时，以仓库根目录
+> `SYSTEM_SPEC_AND_ACCEPTANCE.md` 为准。
+
 > 目的：把“每天忙很多但推进很少”改造成“每天都有明确交付”。
 >
 > 版本：V1.0（先运行 14 天，再决定是否开发 UI、数据库或更复杂自动化）

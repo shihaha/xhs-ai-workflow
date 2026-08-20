@@ -550,3 +550,25 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
   第二账号18个商品链接未持久化，可信商品样本 `0/3`。
 - Phase B：未开始。
 - GitHub：第三笔提交创建后推送并核对本地/远端 SHA；结果由最终交付回报确认。
+
+## Phase A Drift Correction
+
+- **保留的真实能力**：千帆 8 榜、XHS CLI/session 恢复、`real-account-A` 的可信
+  profile/历史 62 篇笔记/商品 2/2/2、第二账号的可信 profile/latest-10 笔记、
+  Android 重叠卡片去重、原始截图/UI hierarchy、SQLite/jobs/evidence/hash、跨账号
+  数量与审核门禁。
+- **已收回的支线**：不再为服装测试店增加商业验收特例，不再用工程测试数量替代
+  Phase A 真实闭环；Phase B、PersonalOS、UI 重做及无关加固均不属于当前主线。
+- **test override 隔离**：`bounded_sample/test_override` 只保留测试、debug 和受控
+  预检价值；即使样本文件完整，也不得成为真实 Opportunity evidence。
+- **PersonalOS 降级**：`personal-os/` 保留历史，但已明确标记为
+  `NOT AUTHORITATIVE FOR XHS WORKBENCH`；正式规格以
+  `SYSTEM_SPEC_AND_ACCEPTANCE.md` 为最高优先级。
+- **当前实体服装账号**：保留其 profile、latest-10 笔记、132 份 Android 原始证据
+  和历史 `needs_human` 任务；业务分类为 `out_of_scope_physical`，退出真实 Phase A
+  第二账号候选，不改写历史失败。
+- **discovery persistence**：当前仍是待关闭的直接阻塞。历史观察到的 18 个链接未
+  形成结构化 result、source URL artifact 或 SQLite 商品绑定，可信商品仍为 0；禁止
+  把它们补写成成功或重新扫描该服装店掩盖缺口。
+- **Phase A 当前状态**：真实跨账号分析未运行，candidate/pending_review/人工审核均
+  为 0；Phase A real UAT 仍未通过，Phase B 未开始。

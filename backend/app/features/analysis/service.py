@@ -1305,9 +1305,11 @@ def _eligible_for_opportunity(
             return False
         covered_accounts.add(account_user_id)
         if result.get("collection_mode") == "bounded_sample":
-            if not _exact_bounded_shop_sample(result):
-                return False
-            continue
+            # Controlled/test samples may remain readable for diagnostics and
+            # account reports, but they are never commercial opportunity
+            # evidence.  A future evidence_sample mode requires an explicit
+            # business rule and must not reuse test_override.
+            return False
         if result.get("status") != "succeeded" or result.get("complete") is not True:
             return False
         verification = result.get("verification")

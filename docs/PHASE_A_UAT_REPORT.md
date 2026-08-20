@@ -72,12 +72,16 @@ UAT pass.
 - Android card traversal rejects fixed-toolbar cards and deduplicates adjacent
   viewport overlap without trusting changing share short-links.
 - Default shop work starts with a maximum-three-product scope preflight.
-- The current clothing-store test override can only represent an exact bounded
-  sample and must state `sample_complete=true`, `shop_complete=false`.
+- The current clothing/physical-goods account is `out_of_scope_physical` and
+  has exited the real Phase A candidate set. Its profile, latest-10 notes, raw
+  Android evidence and historical `needs_human` job remain unchanged.
+- `bounded_sample/test_override` is test/debug/preflight-only. It cannot qualify
+  as real Opportunity evidence even when its controlled 3/3 files are exact;
+  it must still state `sample_complete=true`, `shop_complete=false`.
 - Bounded sample result files bind controlled `manifest.json` and
   `collection.json` paths and SHA-256 values. Analysis accepts this exception
   only when every approved 3/3 field, job state, result file, manifest, collection
-  file and source-URL ordering remains exact.
+  file and source-URL ordering remains exact for diagnostic reads only.
 
 These software capabilities do not convert the missing historical links into a
 real 3/3 result.

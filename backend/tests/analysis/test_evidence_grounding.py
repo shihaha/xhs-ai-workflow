@@ -269,7 +269,9 @@ def _bounded_sample_artifact(database: Database) -> str:
         return f"artifact:{artifact.id}"
 
 
-def test_exact_approved_bounded_shop_sample_is_analysis_eligible(tmp_path: Path) -> None:
+def test_test_override_bounded_shop_sample_is_never_opportunity_eligible(
+    tmp_path: Path,
+) -> None:
     database = Database(tmp_path / "db.sqlite3")
     evidence_id = _bounded_sample_artifact(database)
     model = StubModel(_output(evidence_id))
@@ -282,16 +284,14 @@ def test_exact_approved_bounded_shop_sample_is_analysis_eligible(tmp_path: Path)
         evidence_ids=[evidence_id],
     ))
 
-    assert discovered[0].eligible_for_opportunity is True
-    assert created.status == "succeeded"
-    assert model.calls == 1
+    assert discovered[0].eligible_for_opportunity is False
+    assert created.status == "needs_human"
+    assert model.calls == 0
     with database.session() as session:
         row = session.get(AnalysisRecord, created.id)
         assert row is not None
-        trusted = row.evidence_snapshot_json["facts"][0]["trusted_shop_result"]
-        assert trusted["sample_complete"] is True
-        assert trusted["shop_complete"] is False
-        assert trusted["complete"] is False
+        assert row.error_category == "deep_verification_incomplete"
+        assert row.opportunities == []
     database.close()
 
 
