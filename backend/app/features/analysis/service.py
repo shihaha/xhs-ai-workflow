@@ -879,6 +879,12 @@ class AnalysisService:
             return None
         job_user_id = job.input_data.get("user_id")
         expected_note_count = job.input_data.get("expected_note_count")
+        latest_sample = (
+            job.input_data.get("collection_scope") == "latest"
+            and _strict_value(job.input_data.get("sample_limit"), 10)
+        )
+        if latest_sample:
+            expected_note_count = metadata.get("persisted_count")
         if (
             not isinstance(job_user_id, str)
             or not job_user_id
@@ -887,6 +893,7 @@ class AnalysisService:
             or isinstance(expected_note_count, bool)
             or not isinstance(expected_note_count, int)
             or expected_note_count < 0
+            or (latest_sample and expected_note_count > 10)
             or job.progress_total != expected_note_count
             or job.progress_current != expected_note_count
             or job.current_stage != "xhs_collection_complete"
@@ -897,12 +904,10 @@ class AnalysisService:
         ):
             return None
         expected_item_count = expected_note_count + 1
-        if not _exact_account_result(result, expected_item_count=expected_item_count):
-            return None
         metadata_expected = {
             "artifact_id": artifact.id,
             "capability": "fetch_account",
-            "complete": True,
+            "complete": not latest_sample,
             "expected_count": expected_item_count,
             "expected_item_count": expected_item_count,
             "expected_note_count": expected_note_count,
@@ -919,6 +924,42 @@ class AnalysisService:
             "succeeded_note_count": expected_note_count,
             "user_id": job_user_id,
         }
+        if latest_sample:
+            available_count = metadata.get("available_count_observed")
+            completeness = metadata.get("completeness")
+            sample_metadata = {
+                "collection_scope": "latest",
+                "sample_limit": 10,
+                "persisted_count": expected_note_count,
+            }
+            metadata_expected.update(sample_metadata)
+            if (
+                isinstance(available_count, bool)
+                or not isinstance(available_count, int)
+                or available_count < expected_note_count
+                or completeness not in {"bounded_sample", "sample_exhausted"}
+                or (
+                    completeness == "bounded_sample"
+                    and (expected_note_count != 10 or available_count < 10)
+                )
+                or (
+                    completeness == "sample_exhausted"
+                    and (expected_note_count >= 10 or available_count != expected_note_count)
+                )
+                or not _exact_account_sample_result(
+                    result,
+                    expected_item_count=expected_item_count,
+                    available_count=available_count,
+                    completeness=completeness,
+                )
+            ):
+                return None
+            metadata_expected["available_count_observed"] = available_count
+            metadata_expected["completeness"] = completeness
+        elif not _exact_account_result(
+            result, expected_item_count=expected_item_count
+        ):
+            return None
         if any(
             key not in metadata
             or not _strict_value(metadata[key], expected_value)
@@ -1445,6 +1486,35 @@ def _exact_bounded_shop_sample(result: dict[str, Any]) -> bool:
     binding_paths = (
         result.get("sample_manifest_path"),
         result.get("sample_collection_path"),
+    )
+
+
+def _exact_account_sample_result(
+    result: CollectionResult,
+    *,
+    expected_item_count: int,
+    available_count: int,
+    completeness: str,
+) -> bool:
+    sample = result.raw_evidence.get("latest_sample")
+    return (
+        result.status == "succeeded"
+        and result.detail is None
+        and result.complete
+        and result.expected_count_known
+        and result.expected_count == expected_item_count
+        and result.succeeded_count == expected_item_count
+        and result.observed_count == expected_item_count
+        and result.raw_observation_count == expected_item_count
+        and result.duplicate_observation_count == 0
+        and len(result.items) == expected_item_count
+        and not result.rejected_items
+        and not result.missing_items
+        and result.overflow_count == 0
+        and isinstance(sample, dict)
+        and _strict_value(sample.get("sample_limit"), 10)
+        and _strict_value(sample.get("available_count_observed"), available_count)
+        and _strict_value(sample.get("completeness"), completeness)
     )
     binding_digests = (
         result.get("sample_manifest_sha256"),

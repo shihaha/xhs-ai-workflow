@@ -118,6 +118,42 @@ class _RotatingAccountAdapter(_AccountAdapter):
         return next(self.note_ids)
 
 
+class _LatestTenAccountAdapter(_AccountAdapter):
+    def fetch_account(self, request: CollectionRequest) -> CollectionResult:
+        user_id = str(request.parameters["user_id"])
+        profile = super().fetch_account(request).items[0]
+        notes = [
+            CollectionItem(
+                id=f"note:latest-{index}",
+                kind="note",
+                source_url=f"https://www.xiaohongshu.com/explore/latest-{index}",
+                raw_evidence={
+                    "row": {"note_id": f"latest-{index}", "user_id": user_id}
+                },
+                data={"note_id": f"latest-{index}", "user_id": user_id},
+            )
+            for index in range(10)
+        ]
+        return CollectionResult(
+            status="partial",
+            detail="expected_count_unknown",
+            raw_evidence={
+                "latest_sample": {
+                    "sample_limit": 10,
+                    "available_count_observed": 30,
+                    "completeness": "bounded_sample",
+                }
+            },
+            items=[profile, *notes],
+            expected_count_known=False,
+            succeeded_count=11,
+            observed_count=11,
+            raw_observation_count=11,
+            overflow_count=0,
+            complete=False,
+        )
+
+
 class _CompleteCounterAccountAdapter(_AccountAdapter):
     def __init__(self, value: int = 1) -> None:
         self.value = value
@@ -228,6 +264,26 @@ def _artifact_for_job(fixture: _Fixture, job_id: str) -> JobArtifactRecord:
         assert artifact is not None
         session.expunge(artifact)
         return artifact
+
+
+def test_latest_ten_account_sample_is_trusted_without_claiming_full_history(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path, adapter=_LatestTenAccountAdapter())
+    queued = fixture.collection.submit_latest_account_sample("sample-user")
+
+    completed = fixture.collection.execute(queued.id)
+    evidence = fixture.analysis(_ModelSpy()).list_evidence(
+        account_user_id="sample-user"
+    )
+    trusted_notes = [
+        item
+        for item in evidence
+        if item.kind == "account_note" and item.eligible_for_opportunity
+    ]
+
+    assert completed is not None and completed.state is JobState.succeeded
+    assert len(trusted_notes) == 10
 
 
 def _complete_shop_artifact(fixture: _Fixture, account_user_id: str) -> str:
