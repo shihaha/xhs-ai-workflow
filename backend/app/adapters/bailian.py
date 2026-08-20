@@ -202,12 +202,15 @@ def _validated_usage(value: Any) -> dict[str, int]:
     if not isinstance(value, dict):
         raise ValueError("usage must be an object")
     result: dict[str, int] = {}
-    for key, item in value.items():
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        if key not in value:
+            continue
+        item = value[key]
         if isinstance(item, bool) or not isinstance(item, (int, float)):
             raise ValueError("usage values must be finite non-negative integers")
         if isinstance(item, float) and not math.isfinite(item):
             raise ValueError("usage values must be finite non-negative integers")
         if item < 0 or int(item) != item or item > 1_000_000_000:
             raise ValueError("usage values must be finite non-negative integers")
-        result[str(key)] = int(item)
+        result[key] = int(item)
     return result

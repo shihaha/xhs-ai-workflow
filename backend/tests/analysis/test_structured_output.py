@@ -51,6 +51,39 @@ def test_adapter_validates_strict_structured_json() -> None:
     assert "secret" not in json.dumps(result.raw_evidence)
 
 
+def test_adapter_projects_numeric_usage_without_rejecting_provider_details() -> None:
+    output = {
+        "claims": [{"claim": "需求存在", "evidence_ids": ["artifact:1"]}],
+        "product_clusters": [],
+        "opportunities": [],
+    }
+    response = httpx.Response(
+        200,
+        json={
+            "choices": [{"message": {"content": json.dumps(output)}}],
+            "usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 40,
+                "total_tokens": 70,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 5},
+            },
+        },
+    )
+    adapter = BailianModelAdapter(
+        api_key="secret",
+        transport=httpx.MockTransport(lambda _: response),
+    )
+
+    result = adapter.generate_structured(_request(), AnalysisOutput)
+
+    assert result.usage == {
+        "prompt_tokens": 30,
+        "completion_tokens": 40,
+        "total_tokens": 70,
+    }
+
+
 def test_adapter_sends_fixed_exact_json_schema_instruction() -> None:
     """JSON-object mode alone must not let the provider invent replacement keys."""
     output = {
