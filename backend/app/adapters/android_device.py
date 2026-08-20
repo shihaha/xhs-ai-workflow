@@ -609,6 +609,7 @@ class AndroidDeviceAdapter:
             observation_count = 0
             previous_products: list[ShopProductPosition] = []
             natural_end_reached = False
+            scope_early_stop_decision: dict[str, Any] | None = None
             for screen_index in range(self.max_shop_screens):
                 cancelled = self._cancelled_result(
                     request, job_id, items, rejected_items, artifact_paths, transitions
@@ -645,6 +646,8 @@ class AndroidDeviceAdapter:
                     previous_products, products
                 )
                 for product_index, product in enumerate(products):
+                    if expected is not None and len(items) >= expected:
+                        break
                     if product_index < overlapping_prefix:
                         continue
                     traversal_key = (
@@ -908,6 +911,24 @@ class AndroidDeviceAdapter:
                                 },
                             )
                         )
+                        scope_evaluator = request.parameters.get(
+                            "preflight_scope_evaluator"
+                        )
+                        if (
+                            request.parameters.get("collection_mode") == "preflight"
+                            and callable(scope_evaluator)
+                        ):
+                            evaluated = scope_evaluator(list(items))
+                            if evaluated is not None:
+                                if (
+                                    not isinstance(evaluated, dict)
+                                    or evaluated.get("classification")
+                                    not in {"in_scope", "out_of_scope_physical"}
+                                ):
+                                    raise ValueError(
+                                        "preflight scope evaluator returned an invalid decision"
+                                    )
+                                scope_early_stop_decision = dict(evaluated)
 
                     returned_to_shop = False
                     for back_attempt in range(1, 6):
@@ -982,7 +1003,12 @@ class AndroidDeviceAdapter:
                             transitions=transitions,
                         )
 
+                    if scope_early_stop_decision is not None:
+                        break
+
                 previous_products = products
+                if scope_early_stop_decision is not None:
+                    break
                 if self._is_end(shop_screen.hierarchy):
                     natural_end_reached = True
                     break
@@ -1061,6 +1087,23 @@ class AndroidDeviceAdapter:
         )
         identity_observed = raw_observed - duplicate_observations
         non_duplicate_rejections = len(rejected_items) - duplicate_observations
+        if (
+            scope_early_stop_decision is not None
+            and identity_observed > 0
+            and non_duplicate_rejections == 0
+        ):
+            early_result = self._result(
+                request=request.model_copy(update={"expected_count": identity_observed}),
+                status="succeeded",
+                detail=None,
+                items=items,
+                rejected_items=rejected_items,
+                artifacts=artifact_paths,
+                transitions=transitions,
+            )
+            return early_result.model_copy(
+                update={"raw_evidence": {"scope_early_stop": scope_early_stop_decision}}
+            )
         preflight_natural_end = (
             request.parameters.get("collection_mode") == "preflight"
             and natural_end_reached

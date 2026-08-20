@@ -818,6 +818,119 @@ def test_preflight_accepts_explicit_natural_end_below_three_representatives(
     assert str(result.items[0].source_url) == "https://xhslink.com/product-a"
 
 
+def test_preflight_stops_inside_a_viewport_after_three_representatives(
+    tmp_path: Path,
+) -> None:
+    """A six-card viewport must not overflow the three-product preflight boundary."""
+    shop_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="商品甲完整标题" bounds="[20,120][600,180]" />
+  <node content-desc="到手价¥10.00已售10+" bounds="[20,225][600,280]" />
+  <node text="商品乙完整标题" bounds="[20,420][600,480]" />
+  <node content-desc="到手价¥20.00已售20+" bounds="[20,525][600,580]" />
+  <node text="商品丙完整标题" bounds="[20,720][600,780]" />
+  <node content-desc="到手价¥30.00已售30+" bounds="[20,825][600,880]" />
+  <node text="商品丁完整标题" bounds="[20,1020][600,1080]" />
+  <node content-desc="到手价¥40.00已售40+" bounds="[20,1125][600,1180]" />
+  <node text="没有更多商品了" bounds="[0,1400][720,1500]" />
+</hierarchy>"""
+    device = _FakeU2Device(
+        shop_xml=shop_xml,
+        links_by_y={
+            150: "https://xhslink.com/product-a",
+            450: "https://xhslink.com/product-b",
+            750: "https://xhslink.com/product-c",
+            1050: "https://xhslink.com/product-d",
+        },
+    )
+
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={
+                "account_user_id": "account-1",
+                "collection_mode": "preflight",
+            },
+            expected_count=3,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert [str(item.source_url) for item in result.items] == [
+        "https://xhslink.com/product-a",
+        "https://xhslink.com/product-b",
+        "https://xhslink.com/product-c",
+    ]
+    assert ("click", 310, 1050) not in device.actions
+
+
+@pytest.mark.parametrize("decisive_count", [1, 2])
+def test_preflight_stops_after_the_first_decisive_scope_result(
+    tmp_path: Path, decisive_count: int
+) -> None:
+    """A physical decision after item one or two must prevent the next card read."""
+    shop_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="第一件代表商品" bounds="[20,120][600,180]" />
+  <node content-desc="到手价¥10.00已售10+" bounds="[20,225][600,280]" />
+  <node text="第二件代表商品" bounds="[20,420][600,480]" />
+  <node content-desc="到手价¥20.00已售20+" bounds="[20,525][600,580]" />
+  <node text="第三件不得请求" bounds="[20,720][600,780]" />
+  <node content-desc="到手价¥30.00已售30+" bounds="[20,825][600,880]" />
+</hierarchy>"""
+    calls: list[int] = []
+
+    def decide(items: list[CollectionItem]) -> dict[str, object] | None:
+        calls.append(len(items))
+        if len(items) != decisive_count:
+            return None
+        return {
+            "classification": "out_of_scope_physical",
+            "reason": "physical_goods_detected",
+            "representative_product_count": decisive_count,
+            "deep_collection_allowed": False,
+            "decision_source": "rule",
+            "evidence_refs": ["discovery:current"],
+            "evidence": {
+                "shop_profile": "android_preflight_observation",
+                "representative_product_titles": [
+                    item.data["title"] for item in items
+                ],
+                "visible_descriptions": [],
+                "account_profile": None,
+                "evidence_refs": ["discovery:current"],
+            },
+        }
+
+    device = _FakeU2Device(
+        shop_xml=shop_xml,
+        links_by_y={
+            150: "https://xhslink.com/product-a",
+            450: "https://xhslink.com/product-b",
+            750: "https://xhslink.com/product-c",
+        },
+    )
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={
+                "account_user_id": "account-1",
+                "collection_mode": "preflight",
+                "preflight_scope_evaluator": decide,
+            },
+            expected_count=3,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.succeeded_count == decisive_count
+    assert calls == list(range(1, decisive_count + 1))
+    assert result.raw_evidence["scope_early_stop"]["classification"] == (
+        "out_of_scope_physical"
+    )
+    assert not any(action == ("click", 310, 750) for action in device.actions)
+
+
 def test_same_title_cards_with_distinct_urls_are_both_accounted(tmp_path: Path) -> None:
     """Title equality cannot silently discard a different card and canonical URL."""
     device = _FakeU2Device(

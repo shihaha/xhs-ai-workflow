@@ -229,6 +229,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.shop_service = ShopCollectionService(
             job_service=app.state.job_service,
             device_adapter=app.state.android_adapter,
+            scope_model_adapter=app.state.bailian_adapter,
         )
     app.include_router(health_router)
     app.include_router(jobs_router)

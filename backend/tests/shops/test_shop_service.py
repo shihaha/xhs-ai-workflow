@@ -18,6 +18,7 @@ from backend.app.adapters.contracts import (
     CollectionRequest,
     CollectionResult,
     DeviceHealth,
+    ModelResult,
     RejectedCollectionItem,
 )
 from backend.app.db import Database
@@ -328,6 +329,134 @@ def test_scope_gate_classifies_only_three_representative_products(
     assert result.classification == expected
     assert result.representative_product_count == 3
     assert result.deep_collection_allowed is (expected == "in_scope")
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("repor锐珀尔·猫猫枕", "out_of_scope_physical"),
+        ("repor锐珀尔·筋膜枪", "out_of_scope_physical"),
+        ("腰部按摩器", "out_of_scope_physical"),
+        ("新款连衣裙", "out_of_scope_physical"),
+        ("补水护肤品", "out_of_scope_physical"),
+        ("四季猫窝", "out_of_scope_physical"),
+        ("防摔手机壳", "out_of_scope_physical"),
+        ("蓝牙耳机", "out_of_scope_physical"),
+        ("儿童玩具", "out_of_scope_physical"),
+        ("学生文具", "out_of_scope_physical"),
+        ("班主任开学PPT模板", "in_scope"),
+        ("Excel记账模板", "in_scope"),
+        ("PDF学习资料", "in_scope"),
+        ("Canva模板文件", "in_scope"),
+        ("网盘资料包", "in_scope"),
+        ("网站源码", "in_scope"),
+        ("小程序源码", "in_scope"),
+        ("本地软件工具", "in_scope"),
+        ("数字教程 无需物流", "in_scope"),
+        ("交付形态未知的神秘方案", "needs_human"),
+        ("PDF模板 实物发货", "needs_human"),
+        ("商品信息不足", "needs_human"),
+    ],
+)
+def test_scope_gate_uses_bounded_delivery_evidence(
+    title: str, expected: str
+) -> None:
+    from backend.app.features.shops.scope import ShopScopeEvidence, classify_shop_scope
+
+    result = classify_shop_scope(
+        ShopScopeEvidence(
+            shop_profile="android_preflight_observation",
+            representative_product_titles=[title],
+            evidence_refs=["discovery:1"],
+        )
+    )
+
+    assert result.classification == expected
+
+
+def test_scope_gate_uses_the_existing_text_model_only_for_ambiguous_evidence() -> None:
+    from backend.app.features.shops.scope import ShopScopeEvidence, classify_shop_scope
+
+    class ScopeModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_structured(self, request: Any, schema: Any) -> ModelResult:
+            self.calls += 1
+            assert request.evidence_ids == ["discovery:1"]
+            output = schema.model_validate(
+                {
+                    "classification": "physical",
+                    "reason": "The cited item requires parcel delivery.",
+                    "evidence_refs": ["discovery:1"],
+                }
+            )
+            return ModelResult(
+                model="controlled-scope-model",
+                output=output.model_dump(mode="json"),
+                raw_evidence={"provider": "controlled"},
+            )
+
+    model = ScopeModel()
+    result = classify_shop_scope(
+        ShopScopeEvidence(
+            shop_profile="android_preflight_observation",
+            representative_product_titles=["交付形态未知商品"],
+            evidence_refs=["discovery:1"],
+        ),
+        model_adapter=model,
+    )
+
+    assert model.calls == 1
+    assert result.classification == "out_of_scope_physical"
+    assert result.decision_source == "model"
+    assert result.evidence_refs == ["discovery:1"]
+
+
+def test_persisted_account_scope_skips_android_after_restart(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3")
+    jobs = JobService(database, runtime_dir=runtime_dir)
+    source = jobs.create(
+        job_type="android_shop_collection",
+        input_data={"account_user_id": "account-physical"},
+    )
+    evidence_path = Path("evidence/android/source/product.json")
+    (runtime_dir / evidence_path).parent.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / evidence_path).write_text("{}\n", encoding="utf-8")
+    jobs.attach_artifact(
+        source.id,
+        kind="android_shop_product_discovery",
+        path=evidence_path.as_posix(),
+        metadata={"sha256": hashlib.sha256(b"{}\n").hexdigest()},
+    )
+    first = ShopCollectionService(
+        job_service=jobs,
+        device_adapter=_UnusedAdapter(),
+        submitter=lambda *_: pytest.fail("out-of-scope account reached Android"),
+    )
+
+    recorded = first.record_account_scope_decision(
+        account_user_id="account-physical",
+        classification="out_of_scope_physical",
+        decision_source="human",
+        reason="human_confirmed_physical",
+        evidence_refs=[evidence_path.as_posix()],
+    )
+
+    restarted = ShopCollectionService(
+        job_service=JobService(database, runtime_dir=runtime_dir),
+        device_adapter=_UnusedAdapter(),
+        submitter=lambda *_: pytest.fail("out-of-scope account reached Android"),
+    )
+    assert restarted.get_account_scope_decision("account-physical") == recorded
+    with pytest.raises(ValueError, match="out_of_scope_physical"):
+        restarted.enqueue(
+            ShopCollectionCreate(
+                account_user_id="account-physical",
+                account_name="实体账号",
+            )
+        )
 
 
 def test_default_collection_is_real_android_preflight_capped_at_three(

@@ -10,6 +10,7 @@ import stat
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from threading import Event, RLock
 from typing import Any, Literal
@@ -18,6 +19,7 @@ from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
+from sqlalchemy import select
 
 from backend.app.adapters.android_device import DEFAULT_SELECTOR_PROFILE_VERSION
 from backend.app.adapters.contracts import (
@@ -27,6 +29,7 @@ from backend.app.adapters.contracts import (
     RejectedCollectionItem,
 )
 from backend.app.models.jobs import JobState
+from backend.app.models.jobs import JobArtifactRecord, JobRecord
 from backend.app.services.jobs import InvalidJobTransition, JobNotFound, JobService
 from backend.app.services.shop_discovery import (
     ShopProductDiscovery,
@@ -43,6 +46,9 @@ _IMAGE_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg"}
 ANDROID_SHOP_JOB_TYPE = "android_shop_collection"
 ANDROID_SHOP_JOB_TYPES = ("shop_collection", ANDROID_SHOP_JOB_TYPE)
 SHOP_TEST_OVERRIDE_REASON = "保留服装店完成一次有界E2E验证"
+ACCOUNT_SCOPE_JOB_TYPE = "shop_account_scope_decision"
+ACCOUNT_SCOPE_ARTIFACT_KIND = "shop_account_scope_decision"
+ACCOUNT_SCOPE_ARTIFACT_PRODUCER = "shop_scope_service_v1"
 
 
 class ShopVerificationMissing(BaseModel):
@@ -209,6 +215,26 @@ class ShopCollectionQueued(BaseModel):
     status: Literal["queued"] = "queued"
 
 
+class AccountScopeDecision(BaseModel):
+    schema_version: Literal[1] = 1
+    job_id: str = Field(min_length=1, max_length=100)
+    account_user_id: str = Field(min_length=1, max_length=500)
+    classification: Literal[
+        "unknown", "in_scope", "out_of_scope_physical", "needs_human"
+    ]
+    decision_source: Literal["rule", "model", "human"]
+    reason: str = Field(min_length=1, max_length=500)
+    decided_at: str = Field(min_length=1, max_length=100)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def distinct_evidence_refs(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() for item in value) or len(value) != len(set(value)):
+            raise ValueError("account scope evidence refs must be distinct non-empty paths")
+        return value
+
+
 class InvalidVerificationPath(ValueError):
     """Raised when supplied verification evidence is outside runtime storage."""
 
@@ -241,11 +267,13 @@ class ShopCollectionService:
         *,
         job_service: JobService,
         device_adapter: Any,
+        scope_model_adapter: Any | None = None,
         submitter: Callable[..., Any] | None = None,
         max_workers: int = 4,
     ) -> None:
         self.job_service = job_service
         self.device_adapter = device_adapter
+        self.scope_model_adapter = scope_model_adapter
         for job_type in ANDROID_SHOP_JOB_TYPES:
             self.job_service.recover_interrupted_workers(job_type=job_type)
         self._executor = (
@@ -264,6 +292,14 @@ class ShopCollectionService:
 
     def enqueue(self, payload: ShopCollectionCreate) -> ShopCollectionQueued:
         self._resolve_verification_dir(payload.verification_dir)
+        existing_scope = self.get_account_scope_decision(payload.account_user_id)
+        if (
+            existing_scope is not None
+            and existing_scope.classification == "out_of_scope_physical"
+        ):
+            raise ValueError(
+                "account scope is already out_of_scope_physical; in_scope is required"
+            )
         if payload.collection_mode == "full_shop":
             self._require_trusted_in_scope_gate(payload)
         with self._lifecycle_lock:
@@ -312,6 +348,160 @@ class ShopCollectionService:
 
         return read_shop_product_discoveries(self.job_service, job_id)
 
+    def get_account_scope_decision(
+        self, account_user_id: str
+    ) -> AccountScopeDecision | None:
+        """Return the newest strictly bound account-level scope decision."""
+
+        with self.job_service.database.session() as session:
+            rows = session.execute(
+                select(JobArtifactRecord, JobRecord)
+                .join(JobRecord, JobRecord.id == JobArtifactRecord.job_id)
+                .where(JobArtifactRecord.kind == ACCOUNT_SCOPE_ARTIFACT_KIND)
+                .order_by(JobArtifactRecord.id.desc())
+            ).all()
+        for artifact, job in rows:
+            metadata = dict(artifact.metadata_json)
+            payload = metadata.get("result")
+            if (
+                artifact.producer != ACCOUNT_SCOPE_ARTIFACT_PRODUCER
+                or not isinstance(payload, dict)
+                or payload.get("account_user_id") != account_user_id
+                or payload.get("job_id") != job.id
+                or job.state not in {JobState.succeeded, JobState.needs_human}
+            ):
+                continue
+            path = _resolved_regular_file(
+                self.job_service.runtime_dir / artifact.path,
+                roots=(self.job_service.runtime_dir,),
+            )
+            if path is None or path.is_symlink():
+                continue
+            try:
+                loaded = _load_json(path, "account-scope.json")
+            except ValueError:
+                continue
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if loaded != payload or metadata.get("sha256") != digest:
+                continue
+            try:
+                return AccountScopeDecision.model_validate(payload)
+            except ValueError:
+                continue
+        return None
+
+    def record_account_scope_decision(
+        self,
+        *,
+        account_user_id: str,
+        classification: Literal[
+            "unknown", "in_scope", "out_of_scope_physical", "needs_human"
+        ],
+        decision_source: Literal["rule", "model", "human"],
+        reason: str,
+        evidence_refs: list[str],
+    ) -> AccountScopeDecision:
+        """Persist one auditable human/rule/model account decision without editing history."""
+
+        self._require_account_evidence_refs(account_user_id, evidence_refs)
+        job = self.job_service.create(
+            job_type=ACCOUNT_SCOPE_JOB_TYPE,
+            input_data={"account_user_id": account_user_id},
+            current_stage="scope_decision_pending",
+        )
+        self.job_service.claim(job.id)
+        decision = self._persist_account_scope_decision(
+            job.id,
+            account_user_id=account_user_id,
+            classification=classification,
+            decision_source=decision_source,
+            reason=reason,
+            evidence_refs=evidence_refs,
+        )
+        self.job_service.transition(
+            job.id,
+            JobState.succeeded,
+            current_stage=f"account_scope_{classification}",
+        )
+        return decision
+
+    def _require_account_evidence_refs(
+        self, account_user_id: str, evidence_refs: list[str]
+    ) -> None:
+        if not evidence_refs or len(evidence_refs) != len(set(evidence_refs)):
+            raise ValueError("account scope decision requires distinct evidence refs")
+        with self.job_service.database.session() as session:
+            rows = session.execute(
+                select(JobArtifactRecord, JobRecord)
+                .join(JobRecord, JobRecord.id == JobArtifactRecord.job_id)
+                .where(JobArtifactRecord.path.in_(evidence_refs))
+            ).all()
+        matched: set[str] = set()
+        for artifact, job in rows:
+            if job.input_data.get("account_user_id") == account_user_id:
+                matched.add(artifact.path)
+        if matched != set(evidence_refs):
+            raise ValueError("account scope evidence refs do not belong to the account")
+
+    def _persist_account_scope_decision(
+        self,
+        job_id: str,
+        *,
+        account_user_id: str,
+        classification: Literal[
+            "unknown", "in_scope", "out_of_scope_physical", "needs_human"
+        ],
+        decision_source: Literal["rule", "model", "human"],
+        reason: str,
+        evidence_refs: list[str],
+    ) -> AccountScopeDecision:
+        decision = AccountScopeDecision(
+            job_id=job_id,
+            account_user_id=account_user_id,
+            classification=classification,
+            decision_source=decision_source,
+            reason=reason,
+            decided_at=datetime.now(UTC).isoformat(),
+            evidence_refs=evidence_refs,
+        )
+        relative = Path("evidence") / "shops" / job_id / "account-scope.json"
+        absolute = self.job_service.runtime_dir / relative
+        payload = decision.model_dump(mode="json")
+        absolute.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_evidence_once(absolute, payload)
+        digest = hashlib.sha256(absolute.read_bytes()).hexdigest()
+        self.job_service.attach_artifact_once(
+            job_id,
+            kind=ACCOUNT_SCOPE_ARTIFACT_KIND,
+            producer=ACCOUNT_SCOPE_ARTIFACT_PRODUCER,
+            path=relative.as_posix(),
+            metadata={"schema_version": 1, "sha256": digest, "result": payload},
+        )
+        return decision
+
+    def _classify_preflight_items(
+        self, job_id: str, items: list[CollectionItem]
+    ) -> ShopScopeDecision:
+        discoveries = self.list_discoveries(job_id)
+        refs = [item.artifact_path for item in discoveries]
+        descriptions = [
+            " ".join(
+                str(item.data.get(key) or "")
+                for key in ("price", "sold", "rank", "discount")
+            ).strip()
+            for item in items[:3]
+        ]
+        evidence = ShopScopeEvidence(
+            shop_profile="android_preflight_observation",
+            representative_product_titles=[
+                str(item.raw_evidence.get("title") or item.data.get("title") or "未识别商品")
+                for item in items[:3]
+            ],
+            visible_descriptions=[item for item in descriptions if item],
+            evidence_refs=refs,
+        )
+        return classify_shop_scope(evidence, model_adapter=self.scope_model_adapter)
+
     def _persist_scope_gate(
         self,
         job_id: str,
@@ -330,6 +520,9 @@ class ShopCollectionService:
             "reason": decision.reason,
             "representative_product_count": decision.representative_product_count,
             "deep_collection_allowed": decision.deep_collection_allowed,
+            "decision_source": decision.decision_source,
+            "decided_at": datetime.now(UTC).isoformat(),
+            "evidence_refs": decision.evidence_refs,
             "evidence": decision.evidence.model_dump(mode="json"),
             "representative_products": [item.model_dump(mode="json") for item in items],
         }
@@ -340,6 +533,14 @@ class ShopCollectionService:
             kind="shop_scope_gate_result",
             path=relative.as_posix(),
             metadata={"result": payload, "sha256": payload_sha256},
+        )
+        self._persist_account_scope_decision(
+            job_id,
+            account_user_id=account_user_id,
+            classification=decision.classification,
+            decision_source=decision.decision_source,
+            reason=decision.reason,
+            evidence_refs=decision.evidence_refs,
         )
 
     def _require_trusted_in_scope_gate(self, payload: ShopCollectionCreate) -> None:
@@ -420,6 +621,11 @@ class ShopCollectionService:
                         "selector_profile_version": payload.selector_profile_version,
                         "job_id": job_id,
                         "is_cancelled": self._cancellation_callback(job_id),
+                        "preflight_scope_evaluator": (
+                            lambda items: self._preflight_scope_result(job_id, items)
+                            if payload.collection_mode == "preflight"
+                            else None
+                        ),
                     },
                     expected_count=payload.expected_count,
                 )
@@ -459,6 +665,14 @@ class ShopCollectionService:
                 )
             return None
 
+    def _preflight_scope_result(
+        self, job_id: str, items: list[CollectionItem]
+    ) -> dict[str, Any] | None:
+        decision = self._classify_preflight_items(job_id, items)
+        if decision.classification == "needs_human":
+            return None
+        return decision.model_dump(mode="json")
+
     def _complete_execution(
         self,
         job_id: str,
@@ -478,15 +692,15 @@ class ShopCollectionService:
         )
         scope_decision: ShopScopeDecision | None = None
         if payload.collection_mode in {"preflight", "bounded_sample"} and result.items:
-            scope_decision = classify_shop_scope(
-                ShopScopeEvidence(
-                    shop_profile="android_preflight_observation",
-                    representative_product_titles=[
-                        str(item.raw_evidence.get("title") or "未识别商品")
-                        for item in result.items[:3]
-                    ],
+            early_decision = result.raw_evidence.get("scope_early_stop")
+            if payload.collection_mode == "preflight" and isinstance(
+                early_decision, dict
+            ):
+                scope_decision = ShopScopeDecision.model_validate(early_decision)
+            else:
+                scope_decision = self._classify_preflight_items(
+                    job_id, result.items[:3]
                 )
-            )
             self._persist_scope_gate(
                 job_id,
                 scope_decision,
