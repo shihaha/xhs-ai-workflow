@@ -147,3 +147,19 @@ physical stores out of deep collection by default, and strictly separate
 can only become eligible when an exact 3/3 result binds its result artifact,
 `collection.json`, image manifest, SHA values and source-URL ordering. These
 contracts do not upgrade the missing historical links into a real success.
+
+## Windows XHS CDP account reader (2026-08-20)
+
+The Windows Phase A runtime now explicitly selects `XhsCdpReadAdapter` for
+account profile and bounded homepage-note reads. It attaches only to a trusted localhost CDP origin for an
+already-running visible Chrome collection profile. It performs no login and has
+no QR fallback. Success requires the requested and final profile route to match,
+ten-or-natural-end unique note IDs, and every note owner to match the requested
+account. Existing `CollectionRequest`/`CollectionResult`, durable jobs,
+artifact/SHA, SQLite snapshot and account-note trust readers are unchanged.
+
+The production control persisted and restart-read one profile plus latest-10 for
+the known account. One further ranked account also persisted profile/latest-10,
+but its Android scope preflight ended at 2/3 with
+`needs_human/selector_changed`; therefore no new qualified account, analysis,
+opportunity or review state was created.

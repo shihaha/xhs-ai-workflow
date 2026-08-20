@@ -11,6 +11,26 @@ trusted profile plus a bounded 10-note sample, but its 18 observed Android shop
 links were never durably persisted. The current truthful product sample is
 therefore `0/3`, not `3/3`.
 
+### Latest bounded continuation
+
+The Windows account-read route is now a dedicated visible Chrome collection
+profile with manual login and localhost CDP. A production
+`XhsCollectionService` control for `real-account-A` succeeded with one profile,
+latest-10 notes and one trusted artifact; a fresh Database/Service instance read
+the same ten notes with exact owner and job binding. One additional ranked
+candidate then persisted a trusted profile and latest-10 sample. Its Android
+scope preflight stopped truthfully at 2/3 representative products with
+`needs_human/selector_changed` and 26 Android artifacts. No selector retry,
+sample expansion, cross-account analysis or candidate fabrication followed.
+The real Phase A verdict therefore remains **not passed**.
+
+Verification for this continuation: CDP/settings/registry/collection focused
+tests `48 passed`; frontend `60 passed` and production build passed; Python
+compile, dependency audit, secret scan and boundary scan passed. The clean-cwd
+full backend run was `1451 passed, 3 skipped, 5 failed`. The five known failures
+are outside this CDP change: one Bailian image-usage expectation and four legacy
+shop/preflight expectation tests. They were not expanded into this bounded task.
+
 ## Final requested status
 
 1. **`cli_failed` root cause**: the isolated live run copied credential state

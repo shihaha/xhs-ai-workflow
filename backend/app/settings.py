@@ -51,7 +51,7 @@ class Settings(BaseSettings):
         le=20 * 1024 * 1024,
         validation_alias="XHS_CLI_MAX_OUTPUT_BYTES",
     )
-    xhs_read_provider: Literal["cli", "cdp"] = "cdp"
+    xhs_read_provider: Literal["cli", "cdp"] = "cli"
     xhs_cdp_endpoint: str = "http://127.0.0.1:9223"
     xhs_cdp_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     bailian_api_key: str | None = Field(

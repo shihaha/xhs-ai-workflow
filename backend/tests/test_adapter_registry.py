@@ -50,6 +50,7 @@ def test_default_registry_routes_only_account_reads_to_explicit_cdp_provider(
     registry = build_default_registry(
         Settings(
             runtime_dir=tmp_path,
+            xhs_read_provider="cdp",
             xhs_cdp_endpoint="http://127.0.0.1:9223",
             _env_file=None,
         )

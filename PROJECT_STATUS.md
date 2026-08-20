@@ -572,3 +572,26 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
   把它们补写成成功或重新扫描该服装店掩盖缺口。
 - **Phase A 当前状态**：真实跨账号分析未运行，candidate/pending_review/人工审核均
   为 0；Phase A real UAT 仍未通过，Phase B 未开始。
+
+## 2026-08-20 CDP 主读取路径与最新真实门禁
+
+- Windows 账号资料/主页笔记主读取路径已固定为独立可见 Chrome collection
+  profile + 人工正常登录 + localhost CDP；`xhs-cli` 仅保留为显式备用，不会在
+  CDP 失败后自动回退二维码登录。
+- `real-account-A` 的 production control job
+  `245ab0f5-9c4c-4aed-b4ad-b05a7a17ed80` 为 `succeeded`：1 个受信 artifact、
+  profile + latest-10，重启 Database/Service 后仍读回相同 10 篇，owner 与 job
+  绑定全部一致。
+- 本轮新增尝试 1 个既有千帆候选账号。首次 CDP job 保留为
+  `needs_human/cdp_unavailable`；一次有界重试成功持久化可信 profile + latest-10。
+- 该账号随后的 Android 店铺前置门设备可用，但只取得 2/3 件代表商品后出现
+  `selector_changed`。job `a5905707-4055-4733-8022-f64a111f42ed` 已如实保存为
+  `needs_human`，含 26 个 Android artifacts，scope 为 `needs_human`。没有扩大样本、
+  没有重试 selector、没有运行新的跨账号分析。
+- 当前真实合格账号仍为 2 个；既有 A+B 跨账号分析为 0 个共同机会。本轮新增候选
+  1 个、新增跨账号分析 0 次、`pending_review` 仍为 0。Phase A real UAT 未通过，
+  Phase B 未开始。
+- 本轮验证：CDP/settings/registry/collection focused `48 passed`；frontend
+  `60 passed`、production build、compile、audit、secret/boundary scans 通过。干净 cwd
+  全 backend 为 `1451 passed, 3 skipped, 5 failed`；5 个已知失败分别为 1 个百炼
+  image usage 旧期望和 4 个 shop legacy/preflight 旧期望，本轮未跨范围修复。
