@@ -36,6 +36,36 @@ _MAX_SOURCE_BYTES = 2 * 1024 * 1024
 _MAX_STDIN_BYTES = 1024 * 1024
 _COOKIE_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _REQUIRED_COOKIES = frozenset({"a1", "web_session"})
+_USER_POSTS_SCROLL_DELTA = 1200
+_USER_POSTS_SCROLL_WAIT_MS = 1000
+_USER_POSTS_MAX_SCROLL_ATTEMPTS = 3
+_USER_POSTS_SNAPSHOT_JS = """
+() => {
+    const state = window.__INITIAL_STATE__;
+    if (!state || !state.user || !state.user.notes) return [];
+    const unwrap = (value, depth = 0) => {
+        if (depth > 6 || value === null || value === undefined) return value;
+        if (typeof value !== 'object') return value;
+        if ('_value' in value && 'dep' in value) return unwrap(value._value, depth + 1);
+        if ('value' in value && 'dep' in value) return unwrap(value.value, depth + 1);
+        if (Array.isArray(value)) return value.map(item => unwrap(item, depth + 1));
+        const result = {};
+        for (const key of Object.keys(value)) {
+            if (key === 'dep' || key.startsWith('__')) continue;
+            try { result[key] = unwrap(value[key], depth + 1); } catch (_error) {}
+        }
+        return result;
+    };
+    const notes = unwrap(state.user.notes);
+    if (Array.isArray(notes)) return notes;
+    if (notes && typeof notes === 'object') {
+        for (const key of ['value', '_value', 'data', 'list']) {
+            if (Array.isArray(notes[key])) return notes[key];
+        }
+    }
+    return [];
+}
+"""
 
 
 def _locate_pinned_source_root() -> Path:
@@ -170,6 +200,58 @@ def _read_cookies() -> dict[str, str]:
     return clean
 
 
+def _user_post_rows(value: object) -> list[dict[str, Any]]:
+    """Flatten the pinned CLI's page slots without accepting a caller shape."""
+    rows: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return rows
+    for item in value:
+        if isinstance(item, dict):
+            rows.append(item)
+        elif isinstance(item, list):
+            rows.extend(_user_post_rows(item))
+    return rows
+
+
+def _user_post_identity(row: dict[str, Any]) -> str | None:
+    for key in ("id", "noteId", "note_id"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _largest_observed_user_posts(
+    client: Any, user_id: str, original_get_user_posts: Any
+) -> list[dict[str, Any]]:
+    """Make a bounded, fixed read-only follow-up after the pinned initial read."""
+    observed: dict[str, dict[str, Any]] = {}
+
+    def add_rows(value: object) -> bool:
+        grew = False
+        for row in _user_post_rows(value):
+            note_id = _user_post_identity(row)
+            if note_id is not None and note_id not in observed:
+                observed[note_id] = row
+                grew = True
+        return grew
+
+    add_rows(original_get_user_posts(client, user_id))
+    page = getattr(client, "_page", None)
+    if page is None:
+        return list(observed.values())
+    for _attempt in range(_USER_POSTS_MAX_SCROLL_ATTEMPTS):
+        try:
+            page.mouse.wheel(0, _USER_POSTS_SCROLL_DELTA)
+            page.wait_for_timeout(_USER_POSTS_SCROLL_WAIT_MS)
+            grew = add_rows(page.evaluate(_USER_POSTS_SNAPSHOT_JS))
+        except Exception:
+            break
+        if not grew:
+            break
+    return list(observed.values())
+
+
 def _install_readonly_boundary(
     cli_module: ModuleType | Any,
     auth_module: ModuleType | Any,
@@ -207,6 +289,13 @@ def _install_readonly_boundary(
     cli_module._cache_note_tokens = no_cache
     if client_module is not None and command == ["whoami", "--json"]:
         client_module.XhsClient.get_user_info = lambda _self, _user_id: {}
+    if client_module is not None and command is not None and command[0] == "user-posts":
+        original_get_user_posts = client_module.XhsClient.get_user_posts
+        client_module.XhsClient.get_user_posts = (
+            lambda self, user_id: _largest_observed_user_posts(
+                self, user_id, original_get_user_posts
+            )
+        )
 
 
 def _validated_cli_args(argv: list[str]) -> list[str]:
