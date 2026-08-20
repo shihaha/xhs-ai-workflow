@@ -28,6 +28,7 @@ from backend.app.adapters.contracts import (
 )
 from backend.app.models.jobs import JobState
 from backend.app.services.jobs import JobService
+from backend.app.services.shop_discovery import persist_shop_product_discovery
 
 
 DEFAULT_SELECTOR_PROFILE_VERSION = "xhs-android-2026-08-v1"
@@ -797,6 +798,27 @@ class AndroidDeviceAdapter:
                         )
                     else:
                         seen_urls.add(link)
+                        if job_id is not None:
+                            discovery = persist_shop_product_discovery(
+                                self.job_service,
+                                job_id=job_id,
+                                account_user_id=account_user_id,
+                                source_url=link,
+                                title=product.title,
+                                visible_metadata={
+                                    "price": product.price,
+                                    "sold": product.sold,
+                                    "rank": product.rank,
+                                    "discount": product.discount,
+                                },
+                                discovery_order=len(items) + 1,
+                                raw_evidence_references=[
+                                    *shop_screen.artifacts,
+                                    *detail_screen.artifacts,
+                                    *share_screen.artifacts,
+                                ],
+                            )
+                            artifact_paths.append(discovery.artifact_path)
                         items.append(
                             CollectionItem(
                                 id=sha256(link.encode("utf-8")).hexdigest(),

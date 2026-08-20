@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -1115,17 +1117,97 @@ def test_each_screen_transition_persists_contained_screenshot_and_hierarchy(
 
     assert result.status == "succeeded"
     assert result.complete is True
-    assert len(result.evidence_artifacts) == 10
+    assert len(result.evidence_artifacts) == 11
     persisted = jobs.get(job.id).artifacts
-    assert [artifact.kind for artifact in persisted] == [
+    screen_artifacts = [
+        artifact
+        for artifact in persisted
+        if artifact.kind in {"android_screenshot", "android_ui_hierarchy"}
+    ]
+    assert [artifact.kind for artifact in screen_artifacts] == [
         kind
         for _ in range(5)
         for kind in ("android_screenshot", "android_ui_hierarchy")
     ]
+    assert sum(
+        artifact.kind == "android_shop_product_discovery" for artifact in persisted
+    ) == 1
     for artifact in persisted:
         absolute = (runtime_dir / artifact.path).resolve()
         absolute.relative_to(runtime_dir.resolve())
         assert absolute.is_file()
+
+
+def test_unique_product_discovery_survives_job_stop_and_service_restart(
+    tmp_path: Path,
+) -> None:
+    """A returned product identity must outlive the in-memory CollectionResult."""
+
+    runtime_dir = tmp_path / "runtime"
+    database_path = runtime_dir / "workbench.sqlite3"
+    first_database = Database(database_path)
+    first_jobs = JobService(first_database, runtime_dir=runtime_dir)
+    job = first_jobs.create(
+        job_type="android_shop_collection",
+        input_data={"account_user_id": "account-1"},
+        progress_total=1,
+    )
+    first_jobs.claim(job.id)
+
+    result = _adapter(
+        tmp_path,
+        _FakeU2Device(),
+        jobs=first_jobs,
+    ).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1", "job_id": job.id},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    discovery_artifacts = [
+        artifact
+        for artifact in first_jobs.get(job.id).artifacts
+        if artifact.kind == "android_shop_product_discovery"
+    ]
+    assert len(discovery_artifacts) == 1
+    first_jobs.transition(
+        job.id,
+        JobState.needs_human,
+        current_stage="test_stop_after_discovery",
+        error_category="test_stop_after_discovery",
+    )
+    first_database.close()
+
+    restarted_database = Database(database_path)
+    restarted_jobs = JobService(restarted_database, runtime_dir=runtime_dir)
+    restarted_service = ShopCollectionService(
+        job_service=restarted_jobs,
+        device_adapter=object(),
+        submitter=lambda *_: None,
+    )
+    discoveries = restarted_service.list_discoveries(job.id)
+
+    assert len(discoveries) == 1
+    discovery = discoveries[0]
+    assert discovery.discovery_job_id == job.id
+    assert discovery.account_user_id == "account-1"
+    assert discovery.discovery_order == 1
+    assert discovery.source_url == "https://xhslink.com/product-a"
+    assert discovery.title == "高质量课程资料合集"
+    assert discovery.raw_evidence_references
+    artifact_path = runtime_dir / discovery.artifact_path
+    assert artifact_path.is_file()
+    assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == discovery.result_sha256
+    assert json.loads(artifact_path.read_text(encoding="utf-8"))["source_url"] == discovery.source_url
+    assert any(
+        artifact.kind == "android_shop_product_discovery"
+        for artifact in restarted_jobs.get(job.id).artifacts
+    )
+    restarted_service.close()
+    restarted_database.close()
 
 
 class _StaticDeviceAdapter:

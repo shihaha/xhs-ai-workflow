@@ -360,6 +360,59 @@ class JobService:
                 metadata=artifact.metadata_json,
             )
 
+    def attach_artifact_once(
+        self,
+        job_id: str,
+        *,
+        kind: str,
+        producer: str,
+        path: str,
+        metadata: dict[str, Any],
+    ) -> JobArtifact:
+        """Bind one immutable worker artifact path, idempotently after restart."""
+
+        relative_path = self._validated_artifact_path(path)
+        with self.database.session() as session:
+            record = self._record(session, job_id)
+            existing = session.scalar(
+                select(JobArtifactRecord).where(
+                    JobArtifactRecord.job_id == job_id,
+                    JobArtifactRecord.kind == kind,
+                    JobArtifactRecord.path == relative_path.as_posix(),
+                )
+            )
+            if existing is not None:
+                if (
+                    existing.producer != producer
+                    or dict(existing.metadata_json) != metadata
+                ):
+                    raise InvalidArtifactPath(
+                        "Artifact path is already bound to different evidence."
+                    )
+                return JobArtifact(
+                    kind=existing.kind,
+                    producer=existing.producer,
+                    path=existing.path,
+                    metadata=dict(existing.metadata_json),
+                )
+            artifact = JobArtifactRecord(
+                job_id=record.id,
+                kind=kind,
+                producer=producer,
+                path=relative_path.as_posix(),
+                metadata_json=metadata,
+                created_at=_utc_now(),
+            )
+            session.add(artifact)
+            record.updated_at = _utc_now()
+            session.commit()
+            return JobArtifact(
+                kind=artifact.kind,
+                producer=artifact.producer,
+                path=artifact.path,
+                metadata=dict(artifact.metadata_json),
+            )
+
     def recover_expired_running(
         self, *, worker_job_types: tuple[str, ...] = ()
     ) -> int:

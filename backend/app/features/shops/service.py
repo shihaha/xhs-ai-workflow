@@ -26,6 +26,10 @@ from backend.app.adapters.contracts import (
 )
 from backend.app.models.jobs import JobState
 from backend.app.services.jobs import InvalidJobTransition, JobNotFound, JobService
+from backend.app.services.shop_discovery import (
+    ShopProductDiscovery,
+    read_shop_product_discoveries,
+)
 from backend.app.features.shops.scope import (
     ShopScopeDecision,
     ShopScopeEvidence,
@@ -300,6 +304,11 @@ class ShopCollectionService:
                     lambda _future, job_id=job.id: self._mark_job_finished(job_id)
                 )
         return ShopCollectionQueued(job_id=job.id)
+
+    def list_discoveries(self, job_id: str) -> list[ShopProductDiscovery]:
+        """Read strict per-product discovery facts after failure or restart."""
+
+        return read_shop_product_discoveries(self.job_service, job_id)
 
     def _persist_scope_gate(
         self,
