@@ -51,6 +51,7 @@ _CURRENT_PROFILE_FALLBACK_FAILURES = frozenset({
     "cli_failed",
     "malformed_output",
     "response_unusable",
+    "timeout",
 })
 _ENVELOPE_MESSAGE_FIELDS = frozenset({"message", "msg", "detail", "reason"})
 _ENVELOPE_STATUS_FIELDS = frozenset({"status", "code"})

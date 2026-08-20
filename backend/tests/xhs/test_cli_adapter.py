@@ -565,6 +565,72 @@ def test_fetch_account_uses_consistent_public_post_author_when_profile_page_is_u
     ]
 
 
+def test_fetch_account_uses_consistent_post_authors_after_profile_timeout(
+    adapter_factory,
+) -> None:
+    """A timeout must not discard complete public posts from the requested author."""
+    posts = [[
+        {
+            "id": f"note-{index}",
+            "noteCard": {
+                "displayTitle": f"Observed post {index}",
+                "desc": f"Public observation {index}",
+                "user": {
+                    "userId": "ranked-user",
+                    "nickname": "Ranked Author",
+                },
+                "interactInfo": {
+                    "likedCount": index,
+                    "collectedCount": index + 1,
+                    "commentCount": index + 2,
+                },
+            },
+        }
+        for index in range(1, 63)
+    ]]
+    responses = iter([
+        cli_module.XhsCliReadError("timeout"),
+        cli_module.XhsCliReadError("response_unusable"),
+        _completed(["xhs"], posts),
+    ])
+    calls: list[list[str]] = []
+
+    def timeout_then_posts(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(list(argv))
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    adapter = adapter_factory(timeout_then_posts)
+
+    result = adapter.fetch_account(
+        CollectionRequest(
+            capability="fetch_account",
+            parameters={"user_id": "ranked-user", "job_id": JOB_ID},
+            expected_count=63,
+        )
+    )
+
+    assert (result.status, result.complete) == ("succeeded", True)
+    assert len(result.items) == 63
+    assert result.items[0].data == {
+        "nickname": "Ranked Author",
+        "user_id": "ranked-user",
+    }
+    assert result.items[0].raw_evidence["profile_source"] == "user-posts-author"
+    assert {item.id for item in result.items[1:]} == {
+        f"note:note-{index}" for index in range(1, 63)
+    }
+    assert calls == [
+        _wrapper_argv("user", "ranked-user", "--json"),
+        _wrapper_argv("whoami", "--json"),
+        _wrapper_argv("user-posts", "ranked-user", "--json"),
+    ]
+
+
 @pytest.mark.parametrize(
     "posts",
     [
