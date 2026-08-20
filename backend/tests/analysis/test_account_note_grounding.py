@@ -1,5 +1,6 @@
 import json
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -19,15 +20,16 @@ from backend.app.adapters.contracts import (
 import backend.app.db as db_module
 import backend.app.features.analysis.service as analysis_module
 from backend.app.db import Database, canonical_raw_evidence_digest
-from backend.app.features.analysis.schemas import AnalysisCreate
+from backend.app.features.analysis.schemas import AnalysisCreate, OpportunityReviewCreate
 from backend.app.features.analysis.service import (
     AnalysisService,
     EvidenceAccountMismatch,
     EvidenceNotFound,
+    OpportunityStateError,
 )
 from backend.app.features.xhs.models import XhsAccountNoteRecord
 from backend.app.features.xhs.service import XhsCollectionService
-from backend.app.models.jobs import JobArtifactRecord, JobState
+from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 from backend.app.services.jobs import JobService
 
 
@@ -226,6 +228,116 @@ def _artifact_for_job(fixture: _Fixture, job_id: str) -> JobArtifactRecord:
         assert artifact is not None
         session.expunge(artifact)
         return artifact
+
+
+def _complete_shop_artifact(fixture: _Fixture, account_user_id: str) -> str:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    with fixture.database.session() as session:
+        job = JobRecord(
+            type="android_shop_collection",
+            input_data={"account_user_id": account_user_id, "expected_count": 1},
+            state=JobState.succeeded,
+            progress_current=1,
+            progress_total=1,
+            current_stage="shop_complete",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(job)
+        session.flush()
+        source_url = f"https://www.xiaohongshu.com/goods/product-{account_user_id}"
+        result = {
+            "job_id": job.id,
+            "status": "succeeded",
+            "detail": None,
+            "selector_profile_version": "xhs-shop-v1",
+            "expected_count": 1,
+            "discovered_count": 1,
+            "collected_count": 1,
+            "raw_observation_count": 1,
+            "duplicate_observation_count": 0,
+            "succeeded_count": 1,
+            "missing_count": 0,
+            "missing_items": [],
+            "collection_missing_count": 0,
+            "collection_missing_items": [],
+            "rejected_count": 0,
+            "rejected_items": [],
+            "overflow_count": 0,
+            "evidence_artifacts": [
+                f"evidence/shops/{job.id}/product_1_image_1.jpg",
+                f"evidence/shops/{job.id}/product_1_manifest.json",
+            ],
+            "items": [{
+                "id": f"product-{account_user_id}",
+                "kind": "shop_product",
+                "source_url": source_url,
+                "raw_evidence": {"title": f"Product {account_user_id}"},
+                "data": {"title": f"Product {account_user_id}"},
+            }],
+            "verification": {
+                "expected_count": 1,
+                "discovered_count": 1,
+                "succeeded_count": 1,
+                "missing_count": 0,
+                "missing_items": [],
+                "overflow_count": 0,
+                "issues": [],
+                "complete": True,
+            },
+            "complete": True,
+        }
+        relative_path = f"evidence/shops/{job.id}/result.json"
+        target = fixture.runtime_dir / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        artifact = JobArtifactRecord(
+            job_id=job.id,
+            kind="shop_collection_result",
+            producer="android_shop_worker_v1",
+            path=relative_path,
+            metadata_json={"result": result},
+            created_at=now,
+        )
+        session.add(artifact)
+        session.commit()
+        return f"artifact:{artifact.id}"
+
+
+def _cross_account_output(
+    accounts: list[tuple[str, str, str]],
+) -> dict[str, Any]:
+    evidence_ids = [
+        evidence_id
+        for _account_id, shop_id, note_id in accounts
+        for evidence_id in (shop_id, note_id)
+    ]
+    return {
+        "claims": [{
+            "claim": "Multiple independent accounts expose the same demand.",
+            "evidence_ids": evidence_ids,
+        }],
+        "product_clusters": [{
+            "name": "Shared demand cluster",
+            "summary": "The products and public notes share one demand.",
+            "evidence_ids": evidence_ids,
+        }],
+        "opportunities": [{
+            "title": "Cross-account demand",
+            "status": "观察中",
+            "summary": "Independent evidence supports human review.",
+            "evidence_ids": evidence_ids,
+            "next_action": "Human review only",
+            "supporting_accounts": [
+                {
+                    "account_user_id": account_id,
+                    "shop_evidence_ids": [shop_id],
+                    "note_evidence_ids": [note_id],
+                }
+                for account_id, shop_id, note_id in accounts
+            ],
+        }],
+    }
 
 
 @contextmanager
@@ -731,13 +843,17 @@ def test_note_only_never_replaces_complete_shop_gate_for_opportunity(
 ) -> None:
     fixture = _Fixture(tmp_path)
     _, note_id = fixture.collect("u1")
+    _, second_note_id = fixture.collect("u2")
     model = _ModelSpy()
 
     created = fixture.analysis(model).create(
         AnalysisCreate(
             analysis_type="account_opportunity",
-            account_user_ids=["u1"],
-            evidence_ids=[f"account-note:{note_id}"],
+            account_user_ids=["u1", "u2"],
+            evidence_ids=[
+                f"account-note:{note_id}",
+                f"account-note:{second_note_id}",
+            ],
         )
     )
 
@@ -774,7 +890,7 @@ def test_recollection_never_rebinds_a_historical_account_note_citation(
     fixture = _Fixture(
         tmp_path,
         adapter=_RotatingAccountAdapter(["old-note", "new-note"]),
-    )
+            )
     _, old_note_row_id = fixture.collect("u1")
     old_evidence_id = f"account-note:{old_note_row_id}"
     historical = fixture.analysis(_ModelSpy()).create(
@@ -1017,3 +1133,87 @@ def test_duplicate_account_note_ids_are_rejected_before_service_or_model() -> No
             account_user_id="u1",
             evidence_ids=["account-note:1", "account-note:1"],
         )
+
+
+@pytest.mark.parametrize(
+    ("account_ids", "expected_level"),
+    [
+        (["u1", "u2"], "warming_candidate"),
+        (["u1", "u2", "u3"], "validated_candidate"),
+    ],
+)
+def test_cross_account_opportunity_level_and_review_are_server_derived(
+    tmp_path: Path,
+    account_ids: list[str],
+    expected_level: str,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    accounts: list[tuple[str, str, str]] = []
+    for account_id in account_ids:
+        _job_id, note_row_id = fixture.collect(account_id)
+        shop_id = _complete_shop_artifact(fixture, account_id)
+        accounts.append((account_id, shop_id, f"account-note:{note_row_id}"))
+    model = _ModelSpy(_cross_account_output(accounts))
+    service = fixture.analysis(model)
+    evidence_ids = [
+        evidence_id
+        for _account_id, shop_id, note_id in accounts
+        for evidence_id in (shop_id, note_id)
+    ]
+
+    created = service.create(AnalysisCreate(
+        analysis_type="account_opportunity",
+        account_user_ids=account_ids,
+        evidence_ids=evidence_ids,
+    ))
+
+    assert created.status == "succeeded"
+    [opportunity] = service.list_opportunities()
+    assert opportunity.review_status == "pending_review"
+    assert opportunity.evidence_level == expected_level
+    assert opportunity.supporting_account_count == len(account_ids)
+    assert {item.account_user_id for item in opportunity.supporting_accounts} == set(account_ids)
+    assert len(opportunity.supporting_products) == len(account_ids)
+    assert all(item.image_evidence_count == 1 for item in opportunity.supporting_products)
+    assert len(opportunity.supporting_notes) == len(account_ids)
+    approved = service.review_opportunity(
+        opportunity.id,
+        OpportunityReviewCreate(decision="approve"),
+    )
+    assert approved.review_status == "approved"
+    with pytest.raises(OpportunityStateError):
+        service.review_opportunity(
+            opportunity.id,
+            OpportunityReviewCreate(decision="reject", reason="late change"),
+        )
+
+
+def test_cross_account_support_must_match_each_evidence_owner(tmp_path: Path) -> None:
+    fixture = _Fixture(tmp_path)
+    accounts: list[tuple[str, str, str]] = []
+    for account_id in ("u1", "u2"):
+        _job_id, note_row_id = fixture.collect(account_id)
+        accounts.append((
+            account_id,
+            _complete_shop_artifact(fixture, account_id),
+            f"account-note:{note_row_id}",
+        ))
+    output = _cross_account_output(accounts)
+    output["opportunities"][0]["supporting_accounts"][0]["note_evidence_ids"] = [
+        accounts[1][2]
+    ]
+    service = fixture.analysis(_ModelSpy(output))
+
+    created = service.create(AnalysisCreate(
+        analysis_type="product_cluster",
+        account_user_ids=["u1", "u2"],
+        evidence_ids=[
+            evidence_id
+            for _account_id, shop_id, note_id in accounts
+            for evidence_id in (shop_id, note_id)
+        ],
+    ))
+
+    assert created.status == "failed"
+    assert created.error_category == "evidence_grounding_failed"
+    assert service.list_opportunities() == []

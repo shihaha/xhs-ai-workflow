@@ -34,6 +34,52 @@ ANALYSIS_EVIDENCE_SNAPSHOT_MIGRATION = (
     "analysis_evidence_snapshot_v3"
 )
 CONTENT_MEDIA_RUNS_MIGRATION = "content_media_runs_v1"
+PHASE_A_CROSS_ACCOUNT_OPPORTUNITIES_MIGRATION = (
+    "phase_a_cross_account_opportunities_v1"
+)
+_PHASE_A_OPPORTUNITY_TRIGGERS = {
+    "ck_phase_a_opportunity_insert": """
+CREATE TRIGGER ck_phase_a_opportunity_insert
+BEFORE INSERT ON opportunities
+WHEN NEW.review_status NOT IN ('pending_review','approved','rejected')
+     OR NEW.evidence_level NOT IN ('warming_candidate','validated_candidate','legacy_ungraded')
+     OR json_valid(NEW.supporting_accounts_json) IS NOT 1
+     OR json_type(NEW.supporting_accounts_json) IS NOT 'array'
+     OR json_valid(NEW.supporting_products_json) IS NOT 1
+     OR json_type(NEW.supporting_products_json) IS NOT 'array'
+     OR json_valid(NEW.supporting_notes_json) IS NOT 1
+     OR json_type(NEW.supporting_notes_json) IS NOT 'array'
+     OR NOT (
+         (NEW.review_status='pending_review' AND NEW.reviewed_at IS NULL AND NEW.rejection_reason IS NULL)
+         OR (NEW.review_status='approved' AND NEW.reviewed_at IS NOT NULL AND NEW.rejection_reason IS NULL)
+         OR (NEW.review_status='rejected' AND NEW.reviewed_at IS NOT NULL AND length(trim(NEW.rejection_reason)) > 0)
+     )
+BEGIN
+    SELECT RAISE(ABORT, 'opportunity phase A facts are invalid');
+END
+""".strip(),
+    "ck_phase_a_opportunity_evidence_immutable": """
+CREATE TRIGGER ck_phase_a_opportunity_evidence_immutable
+BEFORE UPDATE OF analysis_id,status,evidence_ids_json,evidence_level,
+    supporting_accounts_json,supporting_products_json,supporting_notes_json
+ON opportunities
+BEGIN
+    SELECT RAISE(ABORT, 'opportunity evidence facts are immutable');
+END
+""".strip(),
+    "ck_phase_a_opportunity_review_transition": """
+CREATE TRIGGER ck_phase_a_opportunity_review_transition
+BEFORE UPDATE OF review_status,reviewed_at,rejection_reason ON opportunities
+WHEN OLD.review_status<>'pending_review'
+     OR NEW.review_status NOT IN ('approved','rejected')
+     OR NEW.reviewed_at IS NULL
+     OR (NEW.review_status='approved' AND NEW.rejection_reason IS NOT NULL)
+     OR (NEW.review_status='rejected' AND (NEW.rejection_reason IS NULL OR length(trim(NEW.rejection_reason))=0))
+BEGIN
+    SELECT RAISE(ABORT, 'opportunity review transition is invalid');
+END
+""".strip(),
+}
 _ANALYSIS_EVIDENCE_SNAPSHOT_CHECK = (
     "evidence_snapshot_json IS NULL OR "
     "(json_valid(evidence_snapshot_json) = 1 AND "
@@ -695,6 +741,9 @@ class Database:
         content_media_runs_marker_present = self._migration_marker_exists(
             CONTENT_MEDIA_RUNS_MIGRATION
         )
+        phase_a_opportunities_marker_present = self._migration_marker_exists(
+            PHASE_A_CROSS_ACCOUNT_OPPORTUNITIES_MIGRATION
+        )
         xhs_account_snapshot_upgrade_started = False
         with self.engine.connect() as connection:
             _require_no_xhs_account_note_identity_leftovers(connection)
@@ -716,6 +765,8 @@ class Database:
             self._require_analysis_evidence_snapshot_schema()
         if content_media_runs_marker_present:
             self._require_content_media_run_schema()
+        if phase_a_opportunities_marker_present:
+            self._require_phase_a_opportunity_schema()
         if quarantine_marker_present:
             self._require_artifact_quarantine_schema(
                 require_identity=quarantine_identity_marker_present,
@@ -797,6 +848,9 @@ class Database:
         self._migrate_analysis_evidence_snapshot(
             marker_present=analysis_evidence_snapshot_marker_present
         )
+        self._migrate_phase_a_opportunities(
+            marker_present=phase_a_opportunities_marker_present
+        )
         self._migrate_content_media_runs(
             marker_present=content_media_runs_marker_present
         )
@@ -820,6 +874,55 @@ class Database:
                 raise SchemaMigrationError(
                     "content media run schema validation failed."
                 )
+
+    def _require_phase_a_opportunity_schema(self) -> None:
+        with self.engine.connect() as connection:
+            if not _phase_a_opportunity_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "Phase A opportunity schema validation failed."
+                )
+
+    def _migrate_phase_a_opportunities(self, *, marker_present: bool) -> None:
+        if marker_present:
+            self._require_phase_a_opportunity_schema()
+            return
+        with self.engine.begin() as connection:
+            columns = {
+                item["name"]: item
+                for item in inspect(connection).get_columns("opportunities")
+            }
+            additions = {
+                "review_status": "VARCHAR(32) NOT NULL DEFAULT 'pending_review'",
+                "evidence_level": "VARCHAR(32) NOT NULL DEFAULT 'legacy_ungraded'",
+                "supporting_accounts_json": "JSON NOT NULL DEFAULT '[]'",
+                "supporting_products_json": "JSON NOT NULL DEFAULT '[]'",
+                "supporting_notes_json": "JSON NOT NULL DEFAULT '[]'",
+                "reviewed_at": "DATETIME",
+                "rejection_reason": "TEXT",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    connection.execute(
+                        text(f"ALTER TABLE opportunities ADD COLUMN {name} {definition}")
+                    )
+            connection.execute(text(
+                "UPDATE opportunities SET review_status='rejected', "
+                "evidence_level='legacy_ungraded', reviewed_at=created_at, "
+                "rejection_reason='Legacy opportunity lacks Phase A cross-account proof' "
+                "WHERE evidence_level='legacy_ungraded'"
+            ))
+            for name, definition in _PHASE_A_OPPORTUNITY_TRIGGERS.items():
+                connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+                connection.execute(text(definition))
+            if not _phase_a_opportunity_schema_valid(connection):
+                raise SchemaMigrationError(
+                    "Phase A opportunity schema validation failed."
+                )
+            connection.execute(text(
+                "INSERT INTO workbench_schema_migrations(name, applied_at) "
+                "VALUES (:name, CURRENT_TIMESTAMP)"
+            ), {"name": PHASE_A_CROSS_ACCOUNT_OPPORTUNITIES_MIGRATION})
+        self._require_phase_a_opportunity_schema()
 
     def _migrate_content_media_runs(self, *, marker_present: bool) -> None:
         """Mark only the exact new schema; marker-present startup is validation-only."""
@@ -2185,6 +2288,87 @@ def _analysis_evidence_snapshot_schema_valid(connection: Connection) -> bool:
         _analysis_evidence_snapshot_column_valid(connection)
         and _analysis_evidence_snapshot_triggers_valid(connection)
     )
+
+
+def _phase_a_opportunity_schema_valid(connection: Connection) -> bool:
+    """Validate the migrated Phase A opportunity contract and retained rows."""
+
+    try:
+        inspector = inspect(connection)
+        if "opportunities" not in inspector.get_table_names():
+            return False
+        columns = {
+            item["name"]: item for item in inspector.get_columns("opportunities")
+        }
+        required = {
+            "id", "analysis_id", "title", "status", "summary",
+            "evidence_ids_json", "review_status", "evidence_level",
+            "supporting_accounts_json", "supporting_products_json",
+            "supporting_notes_json", "reviewed_at", "rejection_reason",
+            "next_action", "created_at",
+        }
+        if set(columns) != required:
+            return False
+        names = ",".join(f"'{name}'" for name in _PHASE_A_OPPORTUNITY_TRIGGERS)
+        actual_triggers = {
+            name: _compact_sql(sql)
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                f"AND name IN ({names})"
+            ))
+        }
+        if actual_triggers != {
+            name: _compact_sql(definition)
+            for name, definition in _PHASE_A_OPPORTUNITY_TRIGGERS.items()
+        }:
+            return False
+        rows = connection.execute(text(
+            "SELECT review_status,evidence_level,supporting_accounts_json,"
+            "supporting_products_json,supporting_notes_json,reviewed_at,"
+            "rejection_reason FROM opportunities"
+        )).mappings()
+        for row in rows:
+            accounts = _decode_analysis_json(row["supporting_accounts_json"])
+            products = _decode_analysis_json(row["supporting_products_json"])
+            notes = _decode_analysis_json(row["supporting_notes_json"])
+            review_status = row["review_status"]
+            evidence_level = row["evidence_level"]
+            if (
+                review_status not in {"pending_review", "approved", "rejected"}
+                or evidence_level not in {
+                    "warming_candidate", "validated_candidate", "legacy_ungraded"
+                }
+                or not isinstance(accounts, list)
+                or not isinstance(products, list)
+                or not isinstance(notes, list)
+                or (
+                    evidence_level != "legacy_ungraded"
+                    and (
+                        len(accounts) < 2
+                        or any(not isinstance(item, dict) for item in accounts)
+                    )
+                )
+                or (
+                    review_status == "pending_review"
+                    and (row["reviewed_at"] is not None or row["rejection_reason"] is not None)
+                )
+                or (
+                    review_status == "approved"
+                    and (row["reviewed_at"] is None or row["rejection_reason"] is not None)
+                )
+                or (
+                    review_status == "rejected"
+                    and (
+                        row["reviewed_at"] is None
+                        or not isinstance(row["rejection_reason"], str)
+                        or not row["rejection_reason"].strip()
+                    )
+                )
+            ):
+                return False
+    except (KeyError, TypeError, AttributeError, SQLAlchemyError):
+        return False
+    return True
 
 
 def _decode_analysis_json(value: object) -> object:

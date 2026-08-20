@@ -1404,6 +1404,13 @@ class ContentService:
     def _validate_opportunity(self, opportunity: OpportunityRecord | None, *, session: Any) -> None:
         if opportunity is None:
             raise ContentValidationError("Product requires a persisted successful opportunity.")
+        if opportunity.review_status != "approved" or opportunity.evidence_level not in {
+            "warming_candidate",
+            "validated_candidate",
+        }:
+            raise ContentStateError(
+                "Product creation requires a human-approved cross-account opportunity."
+            )
         analysis = opportunity.analysis
         if analysis.status != "succeeded" or analysis.output_json is None:
             raise ContentValidationError("Product opportunity analysis is no longer successful.")
@@ -1427,7 +1434,15 @@ class ContentService:
             raise ContentValidationError("Opportunity row is not bound to its validated analysis output.")
         for evidence_id in opportunity.evidence_ids_json:
             prefix, _, raw_id = evidence_id.partition(":")
-            record = session.get(JobArtifactRecord if prefix == "artifact" else RankItemRecord, int(raw_id))
+            if prefix == "artifact":
+                record = session.get(JobArtifactRecord, int(raw_id))
+            elif prefix == "rank-item":
+                record = session.get(RankItemRecord, int(raw_id))
+            elif prefix == "account-note":
+                from backend.app.features.xhs.models import XhsAccountNoteRecord
+                record = session.get(XhsAccountNoteRecord, int(raw_id))
+            else:
+                record = None
             if record is None:
                 raise ContentValidationError("Product opportunity evidence is missing.")
             if prefix == "artifact":
@@ -1435,6 +1450,11 @@ class ContentService:
                 checker = AnalysisService(self.database, self.model_adapter, runtime_dir=self.runtime_dir)
                 if checker._trusted_shop_result(record) is None:
                     raise ContentValidationError("Product opportunity artifact is no longer trusted.")
+            elif prefix == "account-note":
+                from backend.app.features.analysis.service import AnalysisService
+                checker = AnalysisService(self.database, self.model_adapter, runtime_dir=self.runtime_dir)
+                if checker._trusted_account_note(session, record) is None:
+                    raise ContentValidationError("Product opportunity note is no longer trusted.")
 
     def _validate_item_trust(
         self, item: ContentItemRecord, *, session: Any,

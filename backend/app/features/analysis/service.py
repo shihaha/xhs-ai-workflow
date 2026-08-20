@@ -15,7 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
@@ -32,6 +32,7 @@ from backend.app.features.analysis.schemas import (
     AnalysisEvidenceRead,
     AnalysisOutput,
     AnalysisRead,
+    OpportunityReviewCreate,
     OpportunityRead,
 )
 from backend.app.features.radar.models import RankItemRecord
@@ -78,6 +79,14 @@ class EvidenceAccountMismatch(ValueError):
 
 
 class AnalysisNotFound(LookupError):
+    pass
+
+
+class OpportunityNotFound(LookupError):
+    pass
+
+
+class OpportunityStateError(ValueError):
     pass
 
 
@@ -210,11 +219,22 @@ class AnalysisService:
                 error_detail="Model adapter timed out.",
             )
 
+        opportunity_projections: list[dict[str, Any]] = []
         try:
             output = AnalysisOutput.model_validate(model_result.output)
             _validate_grounding(output, allowed=set(payload.evidence_ids))
+            if payload.analysis_type == "account_report" and output.opportunities:
+                raise ValueError("Single-account reports cannot create opportunities.")
             if output.opportunities and not eligible:
                 raise ValueError("Opportunity output requires complete deep verification.")
+            opportunity_projections = [
+                _validated_opportunity_projection(
+                    card,
+                    evidence=evidence,
+                    required_accounts=payload.account_scope,
+                )
+                for card in output.opportunities
+            ]
         except (ValidationError, ValueError) as error:
             return self._persist_failure(
                 payload,
@@ -245,14 +265,21 @@ class AnalysisService:
             ),
             created_at=now,
         )
-        for card in output.opportunities:
+        for card, projection in zip(
+            output.opportunities, opportunity_projections, strict=True
+        ):
             record.opportunities.append(
                 OpportunityRecord(
                     id=str(uuid4()),
                     title=card.title,
-                    status=card.status,
+                    status=projection["status"],
                     summary=card.summary,
                     evidence_ids_json=list(card.evidence_ids),
+                    review_status="pending_review",
+                    evidence_level=projection["evidence_level"],
+                    supporting_accounts_json=projection["supporting_accounts"],
+                    supporting_products_json=projection["supporting_products"],
+                    supporting_notes_json=projection["supporting_notes"],
                     next_action=card.next_action,
                     created_at=now,
                 )
@@ -357,6 +384,42 @@ class AnalysisService:
                 .order_by(OpportunityRecord.created_at.desc(), OpportunityRecord.id)
             ).all()
             return [_opportunity_read(record) for record in records]
+
+    def review_opportunity(
+        self, opportunity_id: str, payload: OpportunityReviewCreate
+    ) -> OpportunityRead:
+        now = _utc_now()
+        review_status = "approved" if payload.decision == "approve" else "rejected"
+        rejection_reason = payload.reason if payload.decision == "reject" else None
+        with self.database.session() as session:
+            result = session.execute(
+                update(OpportunityRecord)
+                .where(
+                    OpportunityRecord.id == opportunity_id,
+                    OpportunityRecord.review_status == "pending_review",
+                )
+                .values(
+                    review_status=review_status,
+                    reviewed_at=now,
+                    rejection_reason=rejection_reason,
+                )
+            )
+            if result.rowcount != 1:
+                existing = session.get(OpportunityRecord, opportunity_id)
+                if existing is None:
+                    raise OpportunityNotFound(
+                        f"Opportunity {opportunity_id} does not exist."
+                    )
+                raise OpportunityStateError(
+                    "Opportunity review is final and cannot be changed."
+                )
+            session.commit()
+            record = session.get(OpportunityRecord, opportunity_id)
+            if record is None:
+                raise OpportunityNotFound(
+                    f"Opportunity {opportunity_id} does not exist."
+                )
+            return _opportunity_read(record)
 
     def list_evidence(
         self, *, account_user_id: str | None = None
@@ -1297,6 +1360,110 @@ def _eligible_for_opportunity(
     return covered_accounts == set(required_accounts)
 
 
+def _validated_opportunity_projection(
+    card: Any,
+    *,
+    evidence: list[dict[str, Any]],
+    required_accounts: frozenset[str],
+) -> dict[str, Any]:
+    if len(required_accounts) < 2:
+        raise ValueError("Cross-account opportunities require at least two accounts.")
+    facts_by_id = {
+        fact.get("evidence_id"): fact
+        for fact in evidence
+        if isinstance(fact.get("evidence_id"), str)
+    }
+    supporting_accounts = [item.model_dump(mode="json") for item in card.supporting_accounts]
+    if {item["account_user_id"] for item in supporting_accounts} != set(required_accounts):
+        raise ValueError("Opportunity support must cover the complete account scope.")
+    cited = set(card.evidence_ids)
+    supporting_products: list[dict[str, Any]] = []
+    supporting_notes: list[dict[str, Any]] = []
+    for support in supporting_accounts:
+        account_user_id = support["account_user_id"]
+        support_ids = set(support["shop_evidence_ids"]) | set(
+            support["note_evidence_ids"]
+        )
+        if not support_ids.issubset(cited):
+            raise ValueError("Opportunity support must be included in card citations.")
+        for evidence_id in support["shop_evidence_ids"]:
+            fact = facts_by_id.get(evidence_id)
+            if (
+                not isinstance(fact, dict)
+                or fact.get("account_user_id") != account_user_id
+                or fact.get("kind") != "shop_collection_result"
+                or not isinstance(fact.get("trusted_shop_result"), dict)
+            ):
+                raise ValueError("Shop evidence does not belong to its supporting account.")
+            result = fact["trusted_shop_result"]
+            artifacts = result.get("evidence_artifacts")
+            artifacts = artifacts if isinstance(artifacts, list) else []
+            items = result.get("items")
+            if not isinstance(items, list) or not items:
+                raise ValueError("Supporting shop evidence has no verified products.")
+            for index, item in enumerate(items, start=1):
+                if not isinstance(item, dict):
+                    raise ValueError("Supporting shop product is malformed.")
+                data = item.get("data") if isinstance(item.get("data"), dict) else {}
+                raw = (
+                    item.get("raw_evidence")
+                    if isinstance(item.get("raw_evidence"), dict)
+                    else {}
+                )
+                title = data.get("title") or raw.get("title")
+                image_count = sum(
+                    isinstance(path, str)
+                    and f"product_{index}_" in path
+                    and path.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+                    for path in artifacts
+                )
+                if image_count < 1:
+                    raise ValueError(
+                        "Supporting shop product has no trusted image manifest entry."
+                    )
+                supporting_products.append(
+                    {
+                        "account_user_id": account_user_id,
+                        "evidence_id": evidence_id,
+                        "product_id": str(item.get("id") or ""),
+                        "title": title if isinstance(title, str) else None,
+                        "source_url": str(item.get("source_url") or ""),
+                        "image_evidence_count": image_count,
+                    }
+                )
+        for evidence_id in support["note_evidence_ids"]:
+            fact = facts_by_id.get(evidence_id)
+            note = fact.get("facts", {}).get("note") if isinstance(fact, dict) else None
+            if (
+                not isinstance(fact, dict)
+                or fact.get("account_user_id") != account_user_id
+                or fact.get("kind") != "account_note"
+                or not isinstance(note, dict)
+            ):
+                raise ValueError("Note evidence does not belong to its supporting account.")
+            supporting_notes.append(
+                {
+                    "account_user_id": account_user_id,
+                    "evidence_id": evidence_id,
+                    "note_id": str(note.get("note_id") or ""),
+                    "title": note.get("title") if isinstance(note.get("title"), str) else None,
+                    "source_url": str(note.get("source_url") or ""),
+                }
+            )
+    level = (
+        "validated_candidate"
+        if len(required_accounts) >= 3
+        else "warming_candidate"
+    )
+    return {
+        "status": "已验证" if level == "validated_candidate" else "升温",
+        "evidence_level": level,
+        "supporting_accounts": supporting_accounts,
+        "supporting_products": supporting_products,
+        "supporting_notes": supporting_notes,
+    }
+
+
 def _read_contained_regular_file(
     root: Path, relative_path: Path, *, limit: int
 ) -> _ContainedFileSnapshot | None:
@@ -1544,6 +1711,17 @@ def _analysis_graph_value(record: AnalysisRecord) -> str:
                 "status": card.status,
                 "summary": card.summary,
                 "evidence_ids_json": card.evidence_ids_json,
+                "review_status": card.review_status,
+                "evidence_level": card.evidence_level,
+                "supporting_accounts_json": card.supporting_accounts_json,
+                "supporting_products_json": card.supporting_products_json,
+                "supporting_notes_json": card.supporting_notes_json,
+                "reviewed_at": (
+                    card.reviewed_at.isoformat(timespec="microseconds")
+                    if card.reviewed_at is not None
+                    else None
+                ),
+                "rejection_reason": card.rejection_reason,
                 "next_action": card.next_action,
                 "created_at": card.created_at.isoformat(timespec="microseconds"),
             }
@@ -1588,6 +1766,14 @@ def _opportunity_read(record: OpportunityRecord) -> OpportunityRead:
         status=record.status,
         summary=record.summary,
         evidence_ids=list(record.evidence_ids_json),
+        review_status=record.review_status,
+        evidence_level=record.evidence_level,
+        supporting_account_count=len(record.supporting_accounts_json),
+        supporting_accounts=list(record.supporting_accounts_json),
+        supporting_products=list(record.supporting_products_json),
+        supporting_notes=list(record.supporting_notes_json),
+        reviewed_at=record.reviewed_at,
+        rejection_reason=record.rejection_reason,
         next_action=record.next_action,
         created_at=record.created_at,
     )

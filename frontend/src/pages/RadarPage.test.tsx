@@ -37,13 +37,19 @@ describe("RadarPage", () => {
   it("renders persisted ranking and scored-account facts with an account route", async () => {
     render(<RadarPage loadRadar={vi.fn().mockResolvedValue({
       snapshots: [{ id: 4, source_date: "2026-08-17", collected_at: "2026-08-17T08:00:00", board: "热卖榜", dimension: "优秀账号", source_url: "https://qianfan.example/rank", raw_evidence: { response: "saved" }, submitted_count: 2, deduplicated_count: 1, items: [] }],
-      accounts: [{ user_id: "author-1", account_name: "真实账号", score: 4.25, evidence: 2.5, credibility: 1.25, accessibility: 1.36, fans: 400, gmv: "1万-10万", pay: "5%-10%", read: "1万-10万", nday: 3, nboard: 2 }],
+      accounts: [{ user_id: "author-1", account_name: "真实账号", score: 4.25, score_status: "scored", ranking_evidence_count: 3, best_rank: 1, evidence: 2.5, credibility: 1.25, accessibility: 1.36, fans: 400, gmv: "1万-10万", pay: "5%-10%", read: "1万-10万", nday: 3, nboard: 2 }],
     })} />);
 
     expect(await screen.findByRole("heading", { name: "Demand radar" })).toBeVisible();
     expect(screen.getByText("热卖榜 · 优秀账号")).toBeVisible();
     expect(screen.getByRole("link", { name: "真实账号" })).toHaveAttribute("href", "/accounts/author-1");
     expect(screen.getByText("4.25")).toBeVisible();
+  });
+
+  it("shows missing score inputs without inventing a numeric score", async () => {
+    render(<RadarPage loadRadar={vi.fn().mockResolvedValue({ snapshots: [], accounts: [{ user_id: "author-2", account_name: "缺指标账号", score: null, score_status: "insufficient_metrics", ranking_evidence_count: 4, best_rank: 2, evidence: 0, credibility: 0, accessibility: 0, fans: 0, gmv: "—", pay: "—", read: "—", nday: 2, nboard: 2 }] })} />);
+    expect(await screen.findByText("insufficient_metrics")).toBeVisible();
+    expect(screen.getByText(/4 appearances · best rank 2/)).toBeVisible();
   });
 
   it("shows an actionable API error instead of stale data", async () => {

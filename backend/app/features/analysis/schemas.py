@@ -10,6 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 EvidenceId = str
 OpportunityStatus = Literal["观察中", "升温", "已验证", "降温", "放弃"]
+OpportunityReviewStatus = Literal["pending_review", "approved", "rejected"]
+OpportunityEvidenceLevel = Literal[
+    "warming_candidate", "validated_candidate", "legacy_ungraded"
+]
 _MAX_SQLITE_ID = 9_223_372_036_854_775_807
 
 
@@ -47,14 +51,42 @@ class ProductCluster(_StrictModel):
     _validate_evidence_ids = field_validator("evidence_ids")(_canonical_evidence_ids)
 
 
+class OpportunityAccountSupport(_StrictModel):
+    account_user_id: str = Field(min_length=1, max_length=500)
+    shop_evidence_ids: list[EvidenceId] = Field(min_length=1, max_length=100)
+    note_evidence_ids: list[EvidenceId] = Field(min_length=1, max_length=500)
+
+    _validate_shop_ids = field_validator("shop_evidence_ids")(_canonical_evidence_ids)
+    _validate_note_ids = field_validator("note_evidence_ids")(_canonical_evidence_ids)
+
+    @field_validator("account_user_id")
+    @classmethod
+    def normalize_account_user_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("account_user_id must not be blank")
+        return normalized
+
+
 class OpportunityCard(_StrictModel):
     title: str = Field(min_length=1, max_length=500)
     status: OpportunityStatus
     summary: str = Field(min_length=1, max_length=4000)
     evidence_ids: list[EvidenceId] = Field(min_length=1)
     next_action: str = Field(min_length=1, max_length=4000)
+    supporting_accounts: list[OpportunityAccountSupport] = Field(min_length=2)
 
     _validate_evidence_ids = field_validator("evidence_ids")(_canonical_evidence_ids)
+
+    @field_validator("supporting_accounts")
+    @classmethod
+    def unique_supporting_accounts(
+        cls, value: list[OpportunityAccountSupport]
+    ) -> list[OpportunityAccountSupport]:
+        accounts = [item.account_user_id for item in value]
+        if len(accounts) != len(set(accounts)):
+            raise ValueError("supporting_accounts must be unique")
+        return value
 
 
 class AnalysisOutput(_StrictModel):
@@ -99,9 +131,9 @@ class AnalysisCreate(_StrictModel):
         if self.analysis_type == "account_report":
             if self.account_user_id is None or self.account_user_ids:
                 raise ValueError("account_report requires exactly one account_user_id")
-        elif self.account_user_id is not None or not self.account_user_ids:
+        elif self.account_user_id is not None or len(self.account_user_ids) < 2:
             raise ValueError(
-                "cross-account analyses require an explicit account_user_ids collection"
+                "cross-account analyses require at least two distinct accounts"
             )
         return self
 
@@ -132,6 +164,38 @@ class AnalysisRead(_StrictModel):
     created_at: datetime
 
 
+class SupportingProductRead(_StrictModel):
+    account_user_id: str
+    evidence_id: EvidenceId
+    product_id: str
+    title: str | None
+    source_url: str
+    image_evidence_count: int = Field(ge=0)
+
+
+class SupportingNoteRead(_StrictModel):
+    account_user_id: str
+    evidence_id: EvidenceId
+    note_id: str
+    title: str | None
+    source_url: str
+
+
+class OpportunityReviewCreate(_StrictModel):
+    decision: Literal["approve", "reject"]
+    reason: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def require_rejection_reason(self) -> "OpportunityReviewCreate":
+        if self.decision == "reject":
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("reject requires a non-empty reason")
+            self.reason = self.reason.strip()
+        elif self.reason is not None:
+            raise ValueError("approve does not accept a rejection reason")
+        return self
+
+
 class OpportunityRead(_StrictModel):
     id: str
     analysis_id: str
@@ -139,6 +203,14 @@ class OpportunityRead(_StrictModel):
     status: OpportunityStatus
     summary: str
     evidence_ids: list[str]
+    review_status: OpportunityReviewStatus
+    evidence_level: OpportunityEvidenceLevel
+    supporting_account_count: int = Field(ge=0)
+    supporting_accounts: list[OpportunityAccountSupport]
+    supporting_products: list[SupportingProductRead]
+    supporting_notes: list[SupportingNoteRead]
+    reviewed_at: datetime | None
+    rejection_reason: str | None
     next_action: str
     created_at: datetime
 

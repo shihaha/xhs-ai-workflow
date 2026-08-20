@@ -153,19 +153,11 @@ def _output(evidence_id: str, *, status: str = "升温") -> dict[str, object]:
         "product_clusters": [
             {"name": "资料产品", "summary": "同类交付", "evidence_ids": [evidence_id]}
         ],
-        "opportunities": [
-            {
-                "title": "资料方向",
-                "status": status,
-                "summary": "证据支持继续观察",
-                "evidence_ids": [evidence_id],
-                "next_action": "人工检查商品图后决定是否测试",
-            }
-        ],
+        "opportunities": [],
     }
 
 
-def test_success_persists_only_fully_grounded_output(tmp_path: Path) -> None:
+def test_success_persists_only_fully_grounded_account_report(tmp_path: Path) -> None:
     database = Database(tmp_path / "db.sqlite3")
     evidence_id = _complete_artifact(database)
     service = AnalysisService(
@@ -174,17 +166,15 @@ def test_success_persists_only_fully_grounded_output(tmp_path: Path) -> None:
 
     result = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
 
     assert result.status == "succeeded"
     assert result.output is not None
-    opportunities = service.list_opportunities()
-    assert len(opportunities) == 1
-    assert opportunities[0].evidence_ids == [evidence_id]
+    assert service.list_opportunities() == []
     database.close()
 
 
@@ -211,8 +201,8 @@ def test_success_binds_a_physically_immutable_evidence_snapshot(
 
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -248,8 +238,8 @@ def test_status_downgrade_preserves_sealed_snapshot_across_restart(
     )
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -273,7 +263,7 @@ def test_status_downgrade_preserves_sealed_snapshot_across_restart(
         assert row.status == "needs_human"
         assert row.evidence_snapshot_json == sealed_snapshot
         assert row.output_json == sealed_output
-        assert len(row.opportunities) == 1
+        assert row.opportunities == []
     reopened.close()
 
 
@@ -291,8 +281,8 @@ def test_sealed_non_success_status_is_terminal(
     )
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -321,8 +311,8 @@ def test_opportunity_cannot_be_added_to_non_success_analysis(tmp_path: Path) -> 
     )
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -454,8 +444,8 @@ def test_runtime_success_insert_uses_complete_snapshot_validator(
     )
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -482,8 +472,8 @@ def test_runtime_success_update_uses_complete_snapshot_validator(
     )
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -541,8 +531,8 @@ def test_success_commit_ack_lost_returns_exact_persisted_graph(
     monkeypatch.setattr(Session, "commit", commit_then_raise)
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -550,7 +540,7 @@ def test_success_commit_ack_lost_returns_exact_persisted_graph(
     assert created.status == "succeeded"
     assert model.calls == 1
     assert len(service.list()) == 1
-    assert len(service.list_opportunities()) == 1
+    assert service.list_opportunities() == []
     database.close()
 
 
@@ -573,8 +563,8 @@ def test_success_commit_not_landed_is_explicitly_rolled_back(
     with pytest.raises(Exception) as caught:
         service.create(
             AnalysisCreate(
-                analysis_type="account_opportunity",
-                account_user_ids=["account-a"],
+                analysis_type="account_report",
+                account_user_id="account-a",
                 evidence_ids=[evidence_id],
             )
         )
@@ -602,8 +592,15 @@ def test_success_commit_partial_or_mismatched_graph_is_transaction_unknown(
             raised = True
             with database.engine.begin() as connection:
                 connection.execute(text(
-                    "UPDATE opportunities SET title='mismatched' "
-                    "WHERE analysis_id=(SELECT id FROM analyses LIMIT 1)"
+                        "INSERT INTO opportunities "
+                        "(id,analysis_id,title,status,summary,evidence_ids_json,"
+                        "review_status,evidence_level,supporting_accounts_json,"
+                        "supporting_products_json,supporting_notes_json,reviewed_at,"
+                        "rejection_reason,next_action,created_at) "
+                        "SELECT 'unexpected-opportunity',id,'mismatched','升温','bad',"
+                        "evidence_ids_json,'pending_review','warming_candidate',"
+                        "'[{\"account_user_id\":\"account-a\"},{\"account_user_id\":\"account-b\"}]',"
+                        "'[]','[]',NULL,NULL,'none',created_at FROM analyses LIMIT 1"
                 ))
             raise SQLAlchemyError("secret ambiguous acknowledgement")
 
@@ -611,8 +608,8 @@ def test_success_commit_partial_or_mismatched_graph_is_transaction_unknown(
     with pytest.raises(Exception) as caught:
         service.create(
             AnalysisCreate(
-                analysis_type="account_opportunity",
-                account_user_ids=["account-a"],
+                analysis_type="account_report",
+                account_user_id="account-a",
                 evidence_ids=[evidence_id],
             )
         )
@@ -643,8 +640,8 @@ def test_success_commit_unreadable_fresh_proof_is_transaction_unknown(
     with pytest.raises(Exception) as caught:
         service.create(
             AnalysisCreate(
-                analysis_type="account_opportunity",
-                account_user_ids=["account-a"],
+                analysis_type="account_report",
+                account_user_id="account-a",
                 evidence_ids=[evidence_id],
             )
         )
@@ -681,8 +678,8 @@ def test_success_commit_proof_retries_one_transient_fresh_read(
     monkeypatch.setattr(Session, "commit", commit_then_raise)
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -732,8 +729,8 @@ def test_shop_artifact_swap_after_final_resolve_cannot_commit_success(
 
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -756,8 +753,8 @@ def test_unknown_or_foreign_citation_rejects_whole_output(tmp_path: Path, bad_id
 
     result = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -780,8 +777,8 @@ def test_incomplete_deep_verification_never_calls_model_or_persists_opportunity(
 
     result = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -817,8 +814,8 @@ def test_zero_product_completion_is_not_opportunity_evidence(tmp_path: Path) -> 
 
     created = AnalysisService(database, model, runtime_dir=tmp_path).create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -855,8 +852,8 @@ def test_contradictory_complete_file_cannot_hide_collection_missing_items(
 
     created = AnalysisService(database, model, runtime_dir=tmp_path).create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -875,8 +872,8 @@ def test_citationless_claim_rejects_entire_result(tmp_path: Path) -> None:
 
     result = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -908,11 +905,11 @@ async def test_evidence_endpoint_exposes_ids_required_to_create_analysis(
         app.state.analysis_service.model_adapter = model
         substituted = await client.post(
             "/api/v1/analyses",
-            json={
-                "analysis_type": "account_opportunity",
-                "account_user_ids": ["account-a"],
-                "evidence_ids": [evidence_id],
-            },
+                json={
+                    "analysis_type": "account_report",
+                    "account_user_id": "account-a",
+                    "evidence_ids": [evidence_id],
+                },
         )
 
     assert response.status_code == 200
@@ -982,8 +979,8 @@ def test_every_evidence_must_have_nonempty_matching_account_scope(tmp_path: Path
     with pytest.raises(ValueError, match="account"):
         service.create(
             AnalysisCreate(
-                analysis_type="account_opportunity",
-                account_user_ids=["account-a"],
+                analysis_type="account_report",
+                account_user_id="account-a",
                 evidence_ids=[unowned],
             )
         )
@@ -1071,8 +1068,8 @@ def test_historical_shop_result_must_satisfy_full_collection_invariants(
 
     created = AnalysisService(database, model, runtime_dir=tmp_path).create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -1107,8 +1104,8 @@ def test_untrusted_result_file_is_bounded_and_never_crashes_discovery_or_create(
     discovered = service.list_evidence(account_user_id="account-a")
     created = service.create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -1131,8 +1128,8 @@ def test_external_artifact_provenance_is_never_trusted(tmp_path: Path) -> None:
 
     created = AnalysisService(database, model, runtime_dir=tmp_path).create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )
@@ -1165,8 +1162,8 @@ def test_duplicate_rejected_references_break_collection_conservation(
 
     created = AnalysisService(database, model, runtime_dir=tmp_path).create(
         AnalysisCreate(
-            analysis_type="account_opportunity",
-            account_user_ids=["account-a"],
+            analysis_type="account_report",
+            account_user_id="account-a",
             evidence_ids=[evidence_id],
         )
     )

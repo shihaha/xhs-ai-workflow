@@ -95,7 +95,8 @@ export interface RankSnapshot {
 export interface QianfanScopeQueued { job_id: string; board: string; dimension: string; status: "queued"; }
 export interface QianfanCollectionQueued { collection_id: string; scopes: QianfanScopeQueued[]; }
 export interface Account {
-  user_id: string; account_name: string; score: number; evidence: number; credibility: number;
+  user_id: string; account_name: string; score: number | null; score_status: "scored" | "insufficient_metrics";
+  ranking_evidence_count: number; best_rank: number; evidence: number; credibility: number;
   accessibility: number; fans: number; gmv: string; pay: string; read: string; nday: number; nboard: number;
 }
 export interface DeviceHealth { status: "available" | "unavailable" | "needs_human"; device_id: string | null; detail: string; raw_evidence: Record<string, unknown>; }
@@ -118,7 +119,17 @@ export interface NoteSearchResults {
   artifact_id: number; collected_at: string; items: SearchNote[];
 }
 export interface Analysis { id: string; analysis_type: string; account_user_id: string | null; account_user_ids: string[]; status: "succeeded" | "failed" | "needs_human"; evidence_ids: string[]; output?: Record<string, unknown> | null; error_category?: string | null; error_detail?: string | null; provider?: string; model?: string; prompt_version?: string; created_at?: string; }
-export interface Opportunity { id: string; analysis_id: string; title: string; status: string; summary: string; evidence_ids: string[]; next_action: string; created_at: string; }
+export interface OpportunityAccountSupport { account_user_id: string; shop_evidence_ids: string[]; note_evidence_ids: string[]; }
+export interface SupportingProduct { account_user_id: string; evidence_id: string; product_id: string; title: string | null; source_url: string; image_evidence_count: number; }
+export interface SupportingNote { account_user_id: string; evidence_id: string; note_id: string; title: string | null; source_url: string; }
+export interface Opportunity {
+  id: string; analysis_id: string; title: string; status: string; summary: string; evidence_ids: string[];
+  review_status: "pending_review" | "approved" | "rejected";
+  evidence_level: "warming_candidate" | "validated_candidate" | "legacy_ungraded";
+  supporting_account_count: number; supporting_accounts: OpportunityAccountSupport[];
+  supporting_products: SupportingProduct[]; supporting_notes: SupportingNote[];
+  reviewed_at: string | null; rejection_reason: string | null; next_action: string; created_at: string;
+}
 export interface Material { id: string; product_id: string; logical_name: string; version: number; path: string; sha256: string; size_bytes: number; media_type: string; kind: "source" | "output_image"; availability: "available" | "missing" | "corrupt"; created_at: string; }
 export interface Product { id: string; name: string; target_user: string; opportunity_id: string; materials: Material[]; created_at?: string; }
 export interface ContentRevision { id: string; number: number; title: string; body: string; claims: Array<{ claim: string; evidence_ids: string[] }>; source_evidence_ids: string[]; image_plan: Array<{ page_number: number; material_id: string; role: "cover" | "page"; headline: string; visual_direction: string }>; model_provider: string; model_name: string; prompt_version: string; usage: Record<string, number>; attempts: Array<Record<string, unknown>>; created_at: string; }
@@ -168,6 +179,7 @@ export const fetchNoteSearchResults = (jobId: string) => getJson<NoteSearchResul
 export const fetchAnalysisEvidence = (accountId?: string) => getJson<AnalysisEvidence[]>(`/api/v1/analysis-evidence${accountId ? `?account_user_id=${encodeURIComponent(accountId)}` : ""}`);
 export const fetchAnalyses = () => getJson<Analysis[]>("/api/v1/analyses");
 export const fetchOpportunities = () => getJson<Opportunity[]>("/api/v1/opportunities");
+export const reviewOpportunity = (opportunityId: string, payload: { decision: "approve" | "reject"; reason?: string }) => postJson<Opportunity>(`/api/v1/opportunities/${encodeURIComponent(opportunityId)}/review`, payload);
 export const fetchProducts = () => getJson<Product[]>("/api/v1/products");
 export const fetchContentItems = () => getJson<ContentItem[]>("/api/v1/content-items");
 export const fetchContentPackages = () => getJson<ContentPackage[]>("/api/v1/content-packages");

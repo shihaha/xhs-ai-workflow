@@ -20,6 +20,7 @@ from backend.app.features.content.schemas import (
 from backend.app.features.content.service import (
     ContentModelUnavailable,
     ContentService,
+    ContentStateError,
     ContentValidationError,
 )
 from backend.app.features.radar.models import RankItemRecord, RankSnapshotRecord
@@ -141,6 +142,18 @@ def seed_database(database: Database) -> tuple[str, str]:
                 "opportunities": [{
                     "title": "资料产品机会", "status": "升温", "summary": "真实证据支持",
                     "evidence_ids": [evidence_id], "next_action": "制作一篇待审核内容",
+                    "supporting_accounts": [
+                        {
+                            "account_user_id": "account-a",
+                            "shop_evidence_ids": [evidence_id],
+                            "note_evidence_ids": [evidence_id],
+                        },
+                        {
+                            "account_user_id": "account-b",
+                            "shop_evidence_ids": [evidence_id],
+                            "note_evidence_ids": [evidence_id],
+                        },
+                    ],
                 }],
             },
             usage_json={}, attempts_json=[], created_at=now,
@@ -148,6 +161,13 @@ def seed_database(database: Database) -> tuple[str, str]:
         opportunity = OpportunityRecord(
             analysis=analysis, title="资料产品机会", status="升温",
             summary="真实证据支持", evidence_ids_json=[evidence_id],
+            review_status="approved", evidence_level="warming_candidate",
+            supporting_accounts_json=[
+                {"account_user_id": "account-a"},
+                {"account_user_id": "account-b"},
+            ],
+            supporting_products_json=[], supporting_notes_json=[],
+            reviewed_at=now,
             next_action="制作一篇待审核内容", created_at=now,
         )
         session.add(analysis)
@@ -168,6 +188,38 @@ def create_product(service: ContentService, opportunity_id: str) -> str:
     ).id
 
 
+@pytest.mark.parametrize("review_status", ["pending_review", "rejected"])
+def test_product_creation_requires_human_approved_cross_account_opportunity(
+    tmp_path: Path,
+    review_status: str,
+) -> None:
+    service, approved_id, _evidence_id = seeded_service(tmp_path)
+    with service.database.session() as session:
+        approved = session.get(OpportunityRecord, approved_id)
+        blocked = OpportunityRecord(
+            analysis_id=approved.analysis_id,
+            title=f"blocked-{review_status}",
+            status="升温",
+            summary="must remain behind Phase A review",
+            evidence_ids_json=list(approved.evidence_ids_json),
+            review_status=review_status,
+            evidence_level="warming_candidate",
+            supporting_accounts_json=list(approved.supporting_accounts_json),
+            supporting_products_json=[],
+            supporting_notes_json=[],
+            reviewed_at=approved.reviewed_at if review_status == "rejected" else None,
+            rejection_reason="not selected" if review_status == "rejected" else None,
+            next_action="human review",
+            created_at=approved.created_at,
+        )
+        session.add(blocked)
+        session.commit()
+        blocked_id = blocked.id
+
+    with pytest.raises(ContentStateError, match="human-approved"):
+        create_product(service, blocked_id)
+
+
 def rebind_product_to_another_valid_opportunity(
     service: ContentService, product_id: str, opportunity_id: str,
 ) -> str:
@@ -179,6 +231,12 @@ def rebind_product_to_another_valid_opportunity(
             status=original.status,
             summary=original.summary,
             evidence_ids_json=list(original.evidence_ids_json),
+            review_status=original.review_status,
+            evidence_level=original.evidence_level,
+            supporting_accounts_json=list(original.supporting_accounts_json),
+            supporting_products_json=list(original.supporting_products_json),
+            supporting_notes_json=list(original.supporting_notes_json),
+            reviewed_at=original.reviewed_at,
             next_action=original.next_action,
             created_at=original.created_at,
         )

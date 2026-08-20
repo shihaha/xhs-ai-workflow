@@ -243,6 +243,95 @@ def test_markerless_exact_evidence_snapshot_shape_recovers_missing_trigger(
         ).fetchone() == (1,)
 
 
+def test_phase_a_marker_is_validation_only_for_missing_review_trigger(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "phase-a-marker.sqlite3"
+    database = Database(database_path)
+    database.close()
+    trigger = "ck_phase_a_opportunity_review_transition"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(f"DROP TRIGGER {trigger}")
+
+    with pytest.raises(
+        SchemaMigrationError,
+        match="Phase A opportunity schema validation",
+    ):
+        Database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
+            (trigger,),
+        ).fetchone() is None
+
+
+def test_phase_a_migration_rejects_ungraded_legacy_opportunity(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "phase-a-legacy.sqlite3"
+    database = Database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        analysis_guard_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='ck_analysis_opportunity_success_insert'"
+        ).fetchone()[0]
+        for trigger in (
+            "ck_phase_a_opportunity_insert",
+            "ck_phase_a_opportunity_evidence_immutable",
+            "ck_phase_a_opportunity_review_transition",
+            "ck_analysis_opportunity_success_insert",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger}")
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql(
+            "DELETE FROM workbench_schema_migrations WHERE name=?",
+            ("phase_a_cross_account_opportunities_v1",),
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO analyses "
+            "(id,analysis_type,account_user_id,account_user_ids_json,status,"
+            "prompt_version,provider,model,input_digest,evidence_ids_json,"
+            "evidence_snapshot_json,output_json,usage_json,duration_ms,attempts_json,"
+            "error_category,error_detail,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "legacy-analysis", "account_report", "account-a", "[]", "failed",
+                "legacy", "legacy", "legacy", "a" * 64, '["artifact:1"]',
+                None, None, "{}", None, "[]", "legacy_failure", "legacy",
+                "2026-08-20 00:00:00",
+            ),
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO opportunities "
+            "(id,analysis_id,title,status,summary,evidence_ids_json,review_status,"
+            "evidence_level,supporting_accounts_json,supporting_products_json,"
+            "supporting_notes_json,reviewed_at,rejection_reason,next_action,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "legacy-opportunity", "legacy-analysis", "legacy", "候选", "legacy",
+                '["artifact:1"]', "pending_review", "legacy_ungraded", "[]", "[]",
+                "[]", None, None, "none", "2026-08-20 00:00:00",
+            ),
+        )
+        connection.exec_driver_sql(analysis_guard_sql)
+    database.close()
+
+    migrated = Database(database_path)
+    migrated.close()
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT review_status,evidence_level,rejection_reason "
+            "FROM opportunities WHERE id='legacy-opportunity'"
+        ).fetchone()
+        assert row == (
+            "rejected",
+            "legacy_ungraded",
+            "Legacy opportunity lacks Phase A cross-account proof",
+        )
+
+
 def test_v2_success_is_preserved_as_explicit_legacy_unsealed_snapshot(
     tmp_path: Path,
 ) -> None:

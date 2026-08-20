@@ -142,7 +142,11 @@ def test_permanently_blocked_worker_does_not_prevent_process_exit_after_lifespan
         runtime = Path(os.environ["CLEANUP_EXIT_RUNTIME"])
         atexit.register(marker.write_text, "closed", encoding="utf-8")
         app = create_app(
-            Settings(runtime_dir=runtime, database_path=runtime / "workbench.sqlite3")
+            Settings(
+                runtime_dir=runtime,
+                database_path=runtime / "workbench.sqlite3",
+                xhs_cli_state_dir=runtime / "xhs-cli-state",
+            )
         )
         entered = Event()
         never_release = Event()

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { AccountPage } from "./AccountPage";
 
-const account = { user_id: "author-1", account_name: "真实账号", score: 4.25, evidence: 2.5, credibility: 1.25, accessibility: 1.36, fans: 400, gmv: "1万-10万", pay: "5%-10%", read: "1万-10万", nday: 3, nboard: 2 };
+const account = { user_id: "author-1", account_name: "真实账号", score: 4.25, score_status: "scored" as const, ranking_evidence_count: 3, best_rank: 1, evidence: 2.5, credibility: 1.25, accessibility: 1.36, fans: 400, gmv: "1万-10万", pay: "5%-10%", read: "1万-10万", nday: 3, nboard: 2 };
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -71,8 +71,8 @@ describe("AccountPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Generate account report" }));
     await waitFor(() => expect(createAnalysis).toHaveBeenCalledWith({ analysis_type: "account_report", account_user_id: "author-1", account_user_ids: [], evidence_ids: ["rank-item:7"] }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Generate opportunity analysis" }));
-    await waitFor(() => expect(createAnalysis).toHaveBeenCalledWith({ analysis_type: "account_opportunity", account_user_ids: ["author-1"], evidence_ids: ["rank-item:7"] }));
+    expect(screen.queryByRole("button", { name: "Generate opportunity analysis" })).not.toBeInTheDocument();
+    expect(screen.getByText(/single account can produce observations only/i)).toBeVisible();
   });
 
   it("blocks duplicate account mutations while one request is pending", async () => {

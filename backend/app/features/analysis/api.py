@@ -6,6 +6,7 @@ from backend.app.features.analysis.schemas import (
     AnalysisCreate,
     AnalysisEvidenceRead,
     AnalysisRead,
+    OpportunityReviewCreate,
     OpportunityRead,
 )
 from backend.app.features.analysis.service import (
@@ -15,6 +16,8 @@ from backend.app.features.analysis.service import (
     AnalysisTransactionUnknown,
     EvidenceAccountMismatch,
     EvidenceNotFound,
+    OpportunityNotFound,
+    OpportunityStateError,
 )
 
 
@@ -64,3 +67,17 @@ def get_analysis(analysis_id: str, request: Request) -> AnalysisRead:
 @router.get("/opportunities", response_model=list[OpportunityRead])
 def list_opportunities(request: Request) -> list[OpportunityRead]:
     return _service(request).list_opportunities()
+
+
+@router.post("/opportunities/{opportunity_id}/review", response_model=OpportunityRead)
+def review_opportunity(
+    opportunity_id: str,
+    payload: OpportunityReviewCreate,
+    request: Request,
+) -> OpportunityRead:
+    try:
+        return _service(request).review_opportunity(opportunity_id, payload)
+    except OpportunityNotFound as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except OpportunityStateError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error

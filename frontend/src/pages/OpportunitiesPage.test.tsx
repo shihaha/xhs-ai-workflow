@@ -3,47 +3,76 @@ import { describe, expect, it, vi } from "vitest";
 
 import { OpportunitiesPage } from "./OpportunitiesPage";
 
+const account = (id: string) => ({ user_id: id, account_name: `Account ${id}`, score: null, score_status: "insufficient_metrics" as const, ranking_evidence_count: 1, best_rank: 1, evidence: 0, credibility: 0, accessibility: 0, fans: 0, gmv: "—", pay: "—", read: "—", nday: 1, nboard: 1 });
+const evidence = (id: string) => [
+  { evidence_id: `artifact:${id === "a" ? 1 : 2}`, kind: "shop_collection_result", account_user_id: id, eligible_for_opportunity: true },
+  { evidence_id: `account-note:${id === "a" ? 10 : 20}`, kind: "account_note", account_user_id: id, eligible_for_opportunity: true },
+];
+const opportunity = {
+  id: "opp-1", analysis_id: "analysis-1", title: "Shared demand", status: "升温", summary: "Two accounts support this", evidence_ids: ["artifact:1", "account-note:10", "artifact:2", "account-note:20"],
+  review_status: "pending_review" as const, evidence_level: "warming_candidate" as const, supporting_account_count: 2,
+  supporting_accounts: [
+    { account_user_id: "a", shop_evidence_ids: ["artifact:1"], note_evidence_ids: ["account-note:10"] },
+    { account_user_id: "b", shop_evidence_ids: ["artifact:2"], note_evidence_ids: ["account-note:20"] },
+  ],
+  supporting_products: [{ account_user_id: "a", evidence_id: "artifact:1", product_id: "p1", title: "Product A", source_url: "https://example.com/p1", image_evidence_count: 2 }],
+  supporting_notes: [{ account_user_id: "b", evidence_id: "account-note:20", note_id: "n2", title: "Note B", source_url: "https://example.com/n2" }],
+  reviewed_at: null, rejection_reason: null, next_action: "human review", created_at: "2026-08-20T08:00:00",
+};
+
 describe("OpportunitiesPage", () => {
-  it("shows a truthful empty state and model guidance", async () => {
-    render(<OpportunitiesPage loadOpportunities={vi.fn().mockResolvedValue({ opportunities: [], products: [] })} />);
-    expect(await screen.findByText("No evidence-backed opportunities yet")).toBeVisible();
+  it("shows the Phase A boundary and a truthful empty state", async () => {
+    render(<OpportunitiesPage loadOpportunities={vi.fn().mockResolvedValue({ opportunities: [], accounts: [], evidence: [] })} />);
+    expect(await screen.findByText("No cross-account candidates yet")).toBeVisible();
+    expect(screen.getByText(/Phase B has not started/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Create product/ })).not.toBeInTheDocument();
   });
 
-  it("creates a product bound to the selected persisted opportunity", async () => {
-    const createProduct = vi.fn().mockResolvedValue({ id: "product-1", materials: [] });
-    const loadOpportunities = vi.fn().mockResolvedValue({
-      opportunities: [{ id: "opp-1", analysis_id: "analysis-1", title: "露营收纳", status: "升温", summary: "多条证据支持", evidence_ids: ["rank-item:7"], next_action: "验证产品", created_at: "2026-08-17T08:00:00" }],
-      products: [],
-    });
-    render(<OpportunitiesPage loadOpportunities={loadOpportunities} createProduct={createProduct} />);
+  it("submits two complete accounts with their trusted shop and note evidence", async () => {
+    const createAnalysis = vi.fn().mockResolvedValue({ status: "succeeded" });
+    const load = vi.fn().mockResolvedValue({ opportunities: [], accounts: [account("a"), account("b")], evidence: [...evidence("a"), ...evidence("b")] });
+    render(<OpportunitiesPage loadOpportunities={load} createAnalysis={createAnalysis} />);
+    await screen.findByText("Account a · shop 1 · notes 1 · complete");
+    fireEvent.click(screen.getByLabelText("Select Account a"));
+    fireEvent.click(screen.getByLabelText("Select Account b"));
+    fireEvent.click(screen.getByRole("button", { name: "Run cross-account clustering" }));
+    await waitFor(() => expect(createAnalysis).toHaveBeenCalledWith({
+      analysis_type: "account_opportunity",
+      account_user_ids: ["a", "b"],
+      evidence_ids: ["artifact:1", "account-note:10", "artifact:2", "account-note:20"],
+    }));
+    expect(await screen.findByText(/Cross-account analysis completed/)).toBeVisible();
+  });
 
-    await screen.findByText("露营收纳");
-    fireEvent.change(screen.getByLabelText("Product name for 露营收纳"), { target: { value: "露营收纳清单" } });
-    fireEvent.change(screen.getByLabelText("Target user for 露营收纳"), { target: { value: "首次自驾露营的人" } });
-    fireEvent.click(screen.getByRole("button", { name: "Create product for 露营收纳" }));
-    await waitFor(() => expect(createProduct).toHaveBeenCalledWith({ opportunity_id: "opp-1", name: "露营收纳清单", target_user: "首次自驾露营的人" }));
-    expect(await screen.findByText("Created product product-1")).toBeVisible();
-    await waitFor(() => expect(loadOpportunities).toHaveBeenCalledTimes(2));
+  it("renders evidence ownership and performs one-way human review", async () => {
+    const review = vi.fn().mockResolvedValue({ ...opportunity, review_status: "approved" });
+    const load = vi.fn().mockResolvedValue({ opportunities: [opportunity], accounts: [account("a"), account("b")], evidence: [...evidence("a"), ...evidence("b")] });
+    render(<OpportunitiesPage loadOpportunities={load} reviewOpportunity={review} />);
+    expect(await screen.findByText("warming_candidate · 2 supporting accounts")).toBeVisible();
+    expect(screen.getByText(/artifact:1/)).toBeVisible();
+    expect(screen.getByText("Product A")).toBeVisible();
+    expect(screen.getByText("Note B")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Approve Shared demand" }));
+    await waitFor(() => expect(review).toHaveBeenCalledWith("opp-1", { decision: "approve" }));
+  });
+
+  it("requires a rejection reason and blocks duplicate review requests", async () => {
+    let resolve!: (value: typeof opportunity) => void;
+    const review = vi.fn(() => new Promise<typeof opportunity>(done => { resolve = done; }));
+    render(<OpportunitiesPage loadOpportunities={vi.fn().mockResolvedValue({ opportunities: [opportunity], accounts: [], evidence: [] })} reviewOpportunity={review} />);
+    await screen.findByText("Shared demand");
+    const reject = screen.getByRole("button", { name: "Reject Shared demand" });
+    expect(reject).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Rejection reason for Shared demand"), { target: { value: "No common demand" } });
+    fireEvent.click(reject); fireEvent.click(reject);
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(review).toHaveBeenCalledWith("opp-1", { decision: "reject", reason: "No common demand" });
+    resolve(opportunity);
+    await waitFor(() => expect(reject).toBeEnabled());
   });
 
   it("keeps API failure visible and retryable", async () => {
     render(<OpportunitiesPage loadOpportunities={vi.fn().mockRejectedValue(new Error("offline"))} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not load opportunities");
-  });
-
-  it("blocks duplicate product creation while the first request is pending", async () => {
-    let resolve!: (value: { id: string }) => void;
-    const createProduct = vi.fn(() => new Promise<{ id: string }>(done => { resolve = done; }));
-    const data = { opportunities: [{ id: "opp-1", analysis_id: "analysis-1", title: "露营收纳", status: "升温", summary: "证据", evidence_ids: ["rank:1"], next_action: "验证", created_at: "2026-08-17" }], products: [] };
-    render(<OpportunitiesPage loadOpportunities={vi.fn().mockResolvedValue(data)} createProduct={createProduct} />);
-    await screen.findByText("露营收纳");
-    fireEvent.change(screen.getByLabelText("Product name for 露营收纳"), { target: { value: "产品" } });
-    fireEvent.change(screen.getByLabelText("Target user for 露营收纳"), { target: { value: "用户" } });
-    const button = screen.getByRole("button", { name: "Create product for 露营收纳" });
-    fireEvent.click(button); fireEvent.click(button);
-    expect(createProduct).toHaveBeenCalledTimes(1);
-    expect(button).toBeDisabled();
-    resolve({ id: "product-1" });
-    await waitFor(() => expect(button).toBeEnabled());
   });
 });

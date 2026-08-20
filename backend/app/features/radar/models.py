@@ -145,5 +145,9 @@ class AccountScore(BaseModel):
 
 
 class AccountRead(AccountScore):
+    score: float | None
     user_id: str
     account_name: str
+    score_status: Literal["scored", "insufficient_metrics"]
+    ranking_evidence_count: int = Field(ge=1)
+    best_rank: int = Field(ge=1)

@@ -8,7 +8,7 @@ from backend.app.adapters.bailian import (
     ModelOutputInvalid,
 )
 from backend.app.adapters.contracts import StructuredModelRequest
-from backend.app.features.analysis.schemas import AnalysisOutput
+from backend.app.features.analysis.schemas import AnalysisCreate, AnalysisOutput
 
 
 def _response(content: str) -> httpx.Response:
@@ -130,3 +130,67 @@ def test_output_citation_groups_are_unique_and_canonical(payload: dict[str, obje
 
     with pytest.raises(ValidationError):
         AnalysisOutput.model_validate(payload)
+
+
+@pytest.mark.parametrize("analysis_type", ["product_cluster", "account_opportunity"])
+def test_cross_account_analysis_requires_two_distinct_accounts(
+    analysis_type: str,
+) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="at least two distinct accounts"):
+        AnalysisCreate(
+            analysis_type=analysis_type,
+            account_user_ids=["account-a"],
+            evidence_ids=["artifact:1", "account-note:1"],
+        )
+
+
+def test_opportunity_output_declares_evidence_support_per_account() -> None:
+    output = AnalysisOutput.model_validate(
+        {
+            "claims": [
+                {
+                    "claim": "Two independent accounts show the same demand.",
+                    "evidence_ids": [
+                        "artifact:1",
+                        "account-note:1",
+                        "artifact:2",
+                        "account-note:2",
+                    ],
+                }
+            ],
+            "product_clusters": [],
+            "opportunities": [
+                {
+                    "title": "Shared demand",
+                    "status": "升温",
+                    "summary": "The same demand appears in two accounts.",
+                    "evidence_ids": [
+                        "artifact:1",
+                        "account-note:1",
+                        "artifact:2",
+                        "account-note:2",
+                    ],
+                    "next_action": "Human review",
+                    "supporting_accounts": [
+                        {
+                            "account_user_id": "account-a",
+                            "shop_evidence_ids": ["artifact:1"],
+                            "note_evidence_ids": ["account-note:1"],
+                        },
+                        {
+                            "account_user_id": "account-b",
+                            "shop_evidence_ids": ["artifact:2"],
+                            "note_evidence_ids": ["account-note:2"],
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert [
+        support.account_user_id
+        for support in output.opportunities[0].supporting_accounts
+    ] == ["account-a", "account-b"]

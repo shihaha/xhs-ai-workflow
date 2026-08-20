@@ -12,7 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from backend.app.db import canonical_artifact_path_key, is_canonical_uuid_text
 
 
-_EVIDENCE = re.compile(r"^(?:artifact|rank-item):([1-9][0-9]*)$", re.ASCII)
+_EVIDENCE = re.compile(
+    r"^(?:account-note|artifact|rank-item):([1-9][0-9]*)$", re.ASCII
+)
 _MAX_SQLITE_ID = 9_223_372_036_854_775_807
 
 

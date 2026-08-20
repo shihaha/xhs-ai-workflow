@@ -127,6 +127,9 @@ async def test_rank_snapshot_accounts_and_candidate_apis_use_persisted_evidence(
             "read": "10万以上",
             "nday": 2,
             "nboard": 2,
+            "score_status": "scored",
+            "ranking_evidence_count": 2,
+            "best_rank": 1,
         }
     ]
     assert "category" not in candidates.json()[0]
@@ -203,8 +206,55 @@ async def test_dated_candidates_do_not_use_future_score_name_or_fans(
             "read": "1000-3000",
             "nday": 1,
             "nboard": 1,
+            "score_status": "scored",
+            "ranking_evidence_count": 1,
+            "best_rank": 1,
         }
     ]
+
+
+@pytest.mark.anyio
+async def test_candidates_keep_missing_metrics_as_truthful_stable_facts(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    app = create_app(
+        Settings(runtime_dir=runtime_dir, database_path=runtime_dir / "workbench.sqlite3")
+    )
+    snapshots = [
+        _payload(
+            source_date="2026-08-17",
+            collected_at=f"2026-08-17T09:0{index}:00+08:00",
+            board=board,
+            user_id="missing-account",
+            account_name="缺指标账号",
+            fans=0,
+            gmv=None,
+            pay=None,
+            read=None,
+        )
+        for index, board in enumerate(("成交榜", "热卖榜"))
+    ]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        for payload in snapshots:
+            assert (
+                await client.post("/api/v1/radar/rank-snapshots", json=payload)
+            ).status_code == 201
+        response = await client.get(
+            "/api/v1/radar/candidates",
+            params={"source_date": "2026-08-17", "limit": 5},
+        )
+
+    assert response.status_code == 200
+    [candidate] = response.json()
+    assert candidate["user_id"] == "missing-account"
+    assert candidate["score"] is None
+    assert candidate["score_status"] == "insufficient_metrics"
+    assert candidate["ranking_evidence_count"] == 2
+    assert candidate["best_rank"] == 1
 
 
 @pytest.mark.anyio

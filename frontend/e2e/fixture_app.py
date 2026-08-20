@@ -55,6 +55,11 @@ IMAGE.write_bytes(_PNG)
     "link": SOURCE_URL,
     "image_manifest": [{"file": "images/product.png", "sha256": hashlib.sha256(_PNG).hexdigest()}],
 }), encoding="utf-8")
+(SHOP / "product_1_image_1.png").write_bytes(_PNG)
+(SHOP / "product_1_manifest.json").write_text(
+    json.dumps({"source_url": SOURCE_URL, "sha256": hashlib.sha256(_PNG).hexdigest()}),
+    encoding="utf-8",
+)
 
 
 class ControlledModel:
@@ -66,12 +71,21 @@ class ControlledModel:
         if schema.__name__ == "AnalysisOutput":
             context = json.loads(request.user_prompt)
             account_ids = context.get("account_user_ids") or [context.get("account_user_id")]
-            account_suffix = f"{account_ids[0]}-{request.evidence_ids[0]}"
+            allowed = context["allowed_evidence"]
+            supporting_accounts = []
+            for account_id in account_ids:
+                account_facts = [item for item in allowed if item.get("account_user_id") == account_id]
+                supporting_accounts.append({
+                    "account_user_id": account_id,
+                    "shop_evidence_ids": [item["evidence_id"] for item in account_facts if item["kind"] == "shop_collection_result"],
+                    "note_evidence_ids": [item["evidence_id"] for item in account_facts if item["kind"] == "account_note"],
+                })
+            account_suffix = "-".join(account_ids)
             shop_evidence_ids = [item for item in request.evidence_ids if item.startswith("artifact:")]
             output = {
                 "claims": [{"claim": "受控证据证明需求存在", "evidence_ids": request.evidence_ids}],
                 "product_clusters": [{"name": "露营收纳", "summary": "受控聚类", "evidence_ids": request.evidence_ids}],
-                "opportunities": [{"title": f"受控露营收纳机会-{account_suffix}", "status": "升温", "summary": "深度核验商品证据支持", "evidence_ids": shop_evidence_ids, "next_action": "创建受控产品任务"}],
+                "opportunities": [{"title": f"受控露营收纳机会-{account_suffix}", "status": "升温", "summary": "跨账号深度核验证据支持", "evidence_ids": request.evidence_ids, "next_action": "等待人工审核", "supporting_accounts": supporting_accounts}],
             }
         else:
             context = json.loads(request.user_prompt)
@@ -94,7 +108,7 @@ class ControlledDevice:
         expected = request.expected_count
         assert expected == 1
         item = CollectionItem(id="product-1", kind="shop_product", source_url=SOURCE_URL, raw_evidence={"fixture": "task9-device"}, data={"title": "受控商品"})
-        return CollectionResult(status="succeeded", evidence_artifacts=["fixtures/shop-account"], items=[item], expected_count_known=True, expected_count=1, succeeded_count=1, raw_observation_count=1, missing_items=[], overflow_count=0, complete=True)
+        return CollectionResult(status="succeeded", evidence_artifacts=["fixtures/shop-account/product_1_image_1.png", "fixtures/shop-account/product_1_manifest.json"], items=[item], expected_count_known=True, expected_count=1, succeeded_count=1, raw_observation_count=1, missing_items=[], overflow_count=0, complete=True)
 
 
 class ControlledImageGeneration:
@@ -211,7 +225,8 @@ class ControlledQianfan:
     def collect_scope(self, request, *, board, dimension, selector_profile):
         job_id = request.parameters["job_id"]
         collection_id = str(self.job_service.get(job_id).input["collection_id"])
-        account_id = f"controlled-account-{collection_id}"
+        account_slot = "a" if board in {"阅读榜", "引流榜"} else "b"
+        account_id = f"controlled-account-{account_slot}-{collection_id}"
         payload = json.dumps({"scope": {"board": board, "dimension": dimension}, "fixture": "task9"}, ensure_ascii=False).encode("utf-8")
         relative = Path("evidence") / "qianfan" / f"{job_id}.json"
         absolute = RUNTIME / relative
@@ -222,7 +237,7 @@ class ControlledQianfan:
             "selector_profile_version": selector_profile.version, "board": board, "dimension": dimension,
         })
         item = CollectionItem(id=f"{board}-{dimension}", kind="ranking_item", source_url=f"https://www.xiaohongshu.com/explore/{job_id}", raw_evidence={"fixture": "task9-qianfan"}, data={
-            "rank": 1, "author_name": f"受控千帆账号-{collection_id}", "user_id": account_id, "note_id": job_id,
+            "rank": 1, "author_name": f"受控千帆账号-{account_slot}-{collection_id}", "user_id": account_id, "note_id": job_id,
             "read_range": "10万以上", "pay_rate_range": "70%-90%", "gmv_range": "1万-5万",
         })
         return CollectionResult(status="succeeded", evidence_artifacts=[relative.as_posix()], items=[item], expected_count_known=True, expected_count=1, succeeded_count=1, raw_observation_count=1, missing_items=[], overflow_count=0, complete=True)

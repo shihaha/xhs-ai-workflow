@@ -54,6 +54,22 @@ class AnalysisRecord(Base):
 
 class OpportunityRecord(Base):
     __tablename__ = "opportunities"
+    __table_args__ = (
+        CheckConstraint(
+            "review_status IN ('pending_review','approved','rejected')",
+            name="ck_opportunity_review_status",
+        ),
+        CheckConstraint(
+            "evidence_level IN ('warming_candidate','validated_candidate','legacy_ungraded')",
+            name="ck_opportunity_evidence_level",
+        ),
+        CheckConstraint(
+            "(review_status='pending_review' AND reviewed_at IS NULL AND rejection_reason IS NULL) "
+            "OR (review_status='approved' AND reviewed_at IS NOT NULL AND rejection_reason IS NULL) "
+            "OR (review_status='rejected' AND reviewed_at IS NOT NULL AND rejection_reason IS NOT NULL)",
+            name="ck_opportunity_review_facts",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     analysis_id: Mapped[str] = mapped_column(
@@ -63,6 +79,23 @@ class OpportunityRecord(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     evidence_ids_json: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    review_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending_review", server_default="pending_review"
+    )
+    evidence_level: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="legacy_ungraded", server_default="legacy_ungraded"
+    )
+    supporting_accounts_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
+    supporting_products_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
+    supporting_notes_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     next_action: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
 

@@ -181,18 +181,41 @@ class RadarService:
                     }
                 )
             ]
-            if not score_rows:
-                continue
             fans = _latest_fans(evidence_rows)
-            score = score_account(score_rows, fans)
+            best_rank = min(item.rank_no for _snapshot, item in evidence_rows)
+            if score_rows:
+                score = score_account(score_rows, fans).model_dump()
+                score_status = "scored"
+            else:
+                score = {
+                    "score": None,
+                    "evidence": 0.0,
+                    "credibility": 0.0,
+                    "accessibility": 0.0,
+                    "fans": fans,
+                    "gmv": "—",
+                    "pay": "—",
+                    "read": "—",
+                    "nday": len({snapshot.source_date for snapshot, _item in evidence_rows}),
+                    "nboard": len({snapshot.board for snapshot, _item in evidence_rows}),
+                }
+                score_status = "insufficient_metrics"
             rows.append(
                 AccountRead(
                     user_id=user_id,
                     account_name=newest_item.author_name or user_id,
-                    **score.model_dump(),
+                    **score,
+                    score_status=score_status,
+                    ranking_evidence_count=len(evidence_rows),
+                    best_rank=best_rank,
                 )
             )
-        rows.sort(key=lambda account: (-account.score, account.user_id))
+        rows.sort(key=lambda account: (
+            account.score is None,
+            -(account.score or 0.0) if account.score is not None else -account.ranking_evidence_count,
+            account.best_rank,
+            account.user_id,
+        ))
         return rows
 
 
