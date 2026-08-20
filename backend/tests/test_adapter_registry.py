@@ -31,11 +31,29 @@ def test_registry_rejects_a_capability_without_a_registered_adapter() -> None:
         AdapterRegistry().resolve("collect_shop")
 
 
-def test_default_registry_routes_xhs_reads_to_the_strict_cli_adapter(tmp_path) -> None:
-    registry = build_default_registry(Settings(runtime_dir=tmp_path))
+def test_registry_routes_xhs_reads_to_the_strict_cli_adapter_when_explicit(tmp_path) -> None:
+    registry = build_default_registry(
+        Settings(runtime_dir=tmp_path, xhs_read_provider="cli", _env_file=None)
+    )
 
     search = registry.resolve("search_notes")
     account = registry.resolve("fetch_account")
 
     assert search is account
     assert search.__class__.__name__ == "XhsCliReadAdapter"
+
+
+def test_default_registry_routes_only_account_reads_to_explicit_cdp_provider(
+    tmp_path,
+) -> None:
+    """Ignoring the explicit provider would silently return to the failed QR-dependent path."""
+    registry = build_default_registry(
+        Settings(
+            runtime_dir=tmp_path,
+            xhs_cdp_endpoint="http://127.0.0.1:9223",
+            _env_file=None,
+        )
+    )
+
+    assert registry.resolve("fetch_account").__class__.__name__ == "XhsCdpReadAdapter"
+    assert registry.resolve("search_notes").__class__.__name__ == "XhsCliReadAdapter"

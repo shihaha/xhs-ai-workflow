@@ -62,6 +62,7 @@ class AdapterRegistry:
 
 def build_default_registry(settings: Any) -> AdapterRegistry:
     """Register production adapters from trusted application settings only."""
+    from backend.app.adapters.xhs_cdp_read import XhsCdpReadAdapter
     from backend.app.adapters.xhs_cli_read import XhsCliReadAdapter
 
     registry = AdapterRegistry()
@@ -72,4 +73,12 @@ def build_default_registry(settings: Any) -> AdapterRegistry:
         capabilities=adapter.capabilities,
         priority=100,
     )
+    if settings.xhs_read_provider == "cdp":
+        cdp_adapter = XhsCdpReadAdapter.from_settings(settings)
+        registry.register(
+            name="xhs-cdp-read",
+            adapter=cdp_adapter,
+            capabilities=cdp_adapter.capabilities,
+            priority=200,
+        )
     return registry

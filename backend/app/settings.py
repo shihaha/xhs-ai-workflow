@@ -3,8 +3,10 @@
 import os
 import sys
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -49,6 +51,9 @@ class Settings(BaseSettings):
         le=20 * 1024 * 1024,
         validation_alias="XHS_CLI_MAX_OUTPUT_BYTES",
     )
+    xhs_read_provider: Literal["cli", "cdp"] = "cdp"
+    xhs_cdp_endpoint: str = "http://127.0.0.1:9223"
+    xhs_cdp_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     bailian_api_key: str | None = Field(
         default=None,
         validation_alias="BAILIAN_API_KEY",
@@ -81,6 +86,27 @@ class Settings(BaseSettings):
     )
     artifact_cleanup_batch_size: int = Field(default=10, ge=1, le=100)
     artifact_cleanup_grace_hours: int = Field(default=24, ge=1, le=168)
+
+    @field_validator("xhs_cdp_endpoint")
+    @classmethod
+    def require_local_cdp_endpoint(cls, value: str) -> str:
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise ValueError("xhs_cdp_endpoint must be a local HTTP origin") from error
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("xhs_cdp_endpoint must be a local HTTP origin")
+        return value.rstrip("/")
 
     @model_validator(mode="after")
     def prepare_runtime_dir(self) -> "Settings":

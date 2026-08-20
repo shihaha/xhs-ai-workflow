@@ -106,6 +106,27 @@ def test_xhs_cli_settings_use_explicit_nonduplicated_environment_names(
     assert settings.xhs_cli_max_output_bytes == 4096
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    (
+        "http://192.0.2.10:9223",
+        "https://127.0.0.1:9223",
+        "http://user:pass@127.0.0.1:9223",
+        "http://127.0.0.1:9223/json/version",
+    ),
+)
+def test_xhs_cdp_endpoint_is_an_explicit_local_browser_boundary(
+    tmp_path: Path, endpoint: str
+) -> None:
+    """A remote or ambiguous endpoint could expose the trusted browser session."""
+    with pytest.raises(ValidationError, match="xhs_cdp_endpoint"):
+        Settings(
+            runtime_dir=tmp_path / "runtime",
+            xhs_cdp_endpoint=endpoint,
+            _env_file=None,
+        )
+
+
 def test_bailian_text_vision_and_image_settings_are_independent_and_bounded(
     tmp_path: Path,
 ) -> None:
