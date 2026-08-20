@@ -233,6 +233,7 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
                 center_y=key[2],
             )
         )
+    products.sort(key=lambda product: (product.center_y, product.center_x))
     return products
 
 

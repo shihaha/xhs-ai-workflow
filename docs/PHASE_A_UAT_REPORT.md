@@ -11,6 +11,38 @@ trusted profile plus a bounded 10-note sample, but its 18 observed Android shop
 links were never durably persisted. The current truthful product sample is
 therefore `0/3`, not `3/3`.
 
+### 2026-08-21 bounded Android selector repair
+
+The retained shop XML proves that the two-column product grid is emitted in
+column-major DOM order. The old parser preserved that order, while overlap
+comparison assumed visual row order. After a scroll, the prior `A,B` viewport
+was parsed as `A,C,B,D`, overlap became zero, and the third observation clicked
+the repeated `A` title coordinate. The captured post-click screen remained the
+shop list. The minimal repair sorts parsed cards by vertical center and then
+horizontal center; the retained XML now yields overlap two and selects the
+next distinct visible card coordinate.
+
+A real-layout regression was observed RED before the production change and
+GREEN after it. The existing overlapping-viewport regression also remains
+GREEN. Focused shop collection verification was `36 passed, 1 failed`; the
+unfiltered shop suite was `109 passed, 4 failed`. The four failures
+are existing scope/legacy service expectations and do not enter the Android
+parser/click path.
+
+The historical `d21d3e81…` job remains unchanged at `needs_human`, `2/3`,
+`selector_changed`, with 22 artifact rows and two restart-readable discoveries.
+The one permitted new validation job `fe7b58b5…` failed at `0/3` before any
+device click because the one-off runner passed the job ID through an unsupported
+keyword argument. It has zero artifacts and was not rewritten or retried; no
+second job was created. Therefore the real third product is **not verified**.
+
+Current-byte hashes match SQLite metadata for the historical ten screenshots
+and two discovery JSON files. The ten XML metadata hashes describe the original
+hierarchy text but do not match the on-disk bytes after Windows newline
+expansion. This pre-existing evidence-chain gap was not changed in the bounded
+click repair. Phase A remains not passed; no cross-account analysis,
+Opportunity, candidate-review state, or Phase B work was run.
+
 ### Latest bounded continuation
 
 The Windows account-read route is now a dedicated visible Chrome collection

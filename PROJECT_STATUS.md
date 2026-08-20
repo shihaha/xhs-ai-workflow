@@ -9,6 +9,15 @@ last_updated: 2026-08-20 (Phase A handoff)
 
 > 状态口径：本文以 `feature/system-v1` 的 Phase A 提交、隔离运行数据库和本机证据目录为依据。自动测试、受控夹具和真实平台 UAT 严格分开。下方“Phase A 完成报告”是当前权威增量，覆盖本文较早的单账号工作流快照。当前结论是 **Phase A software implemented / real UAT not passed（软件已实现，真实验收未通过）**。原 `cli_failed` 已定位并恢复 control；当前真实阻塞是第二账号观察到的 18 个商品链接没有持久化，可信样本为 `0/3`。
 
+## 2026-08-21 Android shop click repair
+
+- 根因已由保留的滚动前后 XML 与截图证明：商品网格的 UI XML 按列返回，旧 parser 因而输出 `左上、左下、右上`，但 viewport overlap 逻辑要求视觉行顺序。滚动后的重复商品没有被识别，第三次观察实际再次点击了第一件商品的标题区域并留在店铺列表。
+- 生产修复仅在 `parse_shop_hierarchy` 返回前按 `(center_y, center_x)` 排序。真实布局回归测试先 RED，再 GREEN；原 overlapping-viewport 测试继续通过。完整 shop collection 文件为 `36 passed, 1 failed`，不排除任何测试的完整 shop suite 为 `109 passed, 4 failed`；四个失败均为既有 scope/legacy service 期望，不经过本次 Android 排序分支。
+- 历史 discovery job `d21d3e81…` 保持 `needs_human`、`2/3`、`selector_changed`，22 条 artifact 和 2 条 discovery 均未改写。重启复读仍得到相同状态与 discovery 顺序。
+- 允许的唯一新验证 job `fe7b58b5…` 在任何手机点击前因一次性执行脚本把 job ID 误作为 `collect_shop` 关键字参数而失败，持久状态为 `failed`、`0/3`、`android_collection_exception`、0 artifact。没有创建第二个 job，所以第三件真实商品尚未验证成功。
+- 历史 10 个 PNG 与 2 个 discovery JSON 的当前文件字节 SHA 与 SQLite metadata 一致。10 个 XML 的 metadata SHA 可对应到写入前原始 hierarchy，但 Windows 文本换行扩展后不等于当前文件字节 SHA；该既有证据缺口未在本故障范围内修复。
+- Phase A 仍为 **real UAT not passed**；没有运行跨账号分析，没有创建 Opportunity、`pending_review` 或 `warming_candidate`，Phase B 未开始。
+
 # 1. 项目是干什么的
 
 这是一个在 Windows 本机运行的“小红书需求雷达 + 内容生产工作台”。它把原教程中的业务流程改写为可追踪、可恢复、状态来自真实数据库和文件的系统：

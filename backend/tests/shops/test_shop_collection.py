@@ -1050,6 +1050,30 @@ def test_overlapping_viewports_skip_the_same_card_even_when_share_urls_change(
     assert result.complete is True
 
 
+def test_shop_parser_normalizes_column_major_xml_to_visual_row_order() -> None:
+    """Column-major UI XML must not turn an overlapping card into the next click."""
+    column_major_viewport = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="商品甲完整标题" bounds="[20,780][574,838]" />
+  <node content-desc="到手价¥10.00已售10+" bounds="[20,850][574,910]" />
+  <node text="商品丙完整标题" bounds="[20,1598][574,1656]" />
+  <node content-desc="到手价¥30.00已售30+" bounds="[20,1668][574,1728]" />
+  <node text="商品乙完整标题" bounds="[594,845][1154,903]" />
+  <node content-desc="到手价¥20.00已售20+" bounds="[594,915][1154,975]" />
+  <node text="商品丁完整标题" bounds="[594,2472][1154,2530]" />
+  <node content-desc="到手价¥40.00已售40+" bounds="[594,2540][1154,2600]" />
+</hierarchy>"""
+
+    products = parse_shop_hierarchy(column_major_viewport)
+
+    assert [product.title for product in products] == [
+        "商品甲完整标题",
+        "商品乙完整标题",
+        "商品丙完整标题",
+        "商品丁完整标题",
+    ]
+
+
 def test_collection_uses_the_requested_device_when_multiple_are_connected(
     tmp_path: Path,
 ) -> None:

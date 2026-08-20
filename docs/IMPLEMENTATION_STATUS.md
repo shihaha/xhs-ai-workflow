@@ -1,6 +1,24 @@
 # Implementation status
 
-Status date: 2026-08-20
+Status date: 2026-08-21
+
+## Bounded Android shop ordering fix
+
+The retained Phase A failure was caused by a contract mismatch inside the
+Android adapter: two-column shop XML arrives in column-major DOM order, while
+viewport overlap and click traversal require visual row order. The parser now
+performs one final `(center_y, center_x)` sort. A real-coordinate column-major
+fixture failed before this change and passes after it; the earlier overlapping
+viewport behavior remains covered.
+
+This is not a live-complete claim. The historical job remains `needs_human`
+with two discoveries. The only new validation job failed before device
+interaction because its one-off invocation supplied an unsupported keyword,
+so no third real discovery exists. Restart reads preserve both job states and
+the two historical discoveries. Screenshot and discovery JSON hashes match;
+historical XML current-byte hashes do not match their pre-write hierarchy
+metadata after Windows newline expansion. Phase A UAT therefore remains not
+passed, and no Phase B capability was started.
 
 ## Active business phase
 
