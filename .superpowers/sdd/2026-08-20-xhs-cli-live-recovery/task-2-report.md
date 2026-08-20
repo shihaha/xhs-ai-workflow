@@ -102,3 +102,38 @@ The bounded supplement now completes all three fixed one-second read-only
 scroll attempts unless browser interaction/evaluation raises. No-growth still
 returns only the actually observed partial collection; it no longer stops the
 second and third timing-safe checks.
+
+## Round 2: final lazy-slot timing recovery
+
+### Root cause
+
+A real exact retry improved from 62 to 92 notes but remained
+`needs_human` against the prior 122-note observation. This showed the fixed
+three-attempt cap could still end before the final lazy-loaded slot appeared.
+
+### TDD evidence
+
+RED command:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py -q -k all_five_fixed_scrolls
+```
+
+Before the round-2 production change: `1 failed, 5 deselected`. The controlled
+five-slot FakePage had two initial no-growth reads, then grew from 32 to 62,
+92, and finally 122 rows on the third through fifth scrolls. The three-scroll
+cap returned only 62 rows.
+
+GREEN commands:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py -q
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py backend/tests/xhs/test_cli_adapter.py backend/tests/xhs/test_s2a_round1_hardening.py backend/tests/xhs/test_s2a_round2_hardening.py -q
+```
+
+Results: `6 passed in 0.04s`; `188 passed in 10.19s`.
+
+The fixed bounded cap is now five one-second attempts (maximum additional
+wait: five seconds). There is no adaptive behavior, no unbounded retry, and
+no change to exception stopping, read-only browser use, ID de-duplication, or
+partial-result accounting.
