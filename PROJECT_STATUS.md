@@ -7,7 +7,7 @@ remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
 last_updated: 2026-08-20 (Phase A handoff)
 
-> 状态口径：本文以 `feature/system-v1` 的 Phase A 提交、隔离运行数据库和本机证据目录为依据。自动测试、受控夹具和真实平台 UAT 严格分开。下方“Phase A 完成报告”是当前权威增量，覆盖本文较早的单账号工作流快照。当前结论是 **Phase A software complete / real cross-account UAT blocked（软件完成，真实跨账号验收受阻）**。
+> 状态口径：本文以 `feature/system-v1` 的 Phase A 提交、隔离运行数据库和本机证据目录为依据。自动测试、受控夹具和真实平台 UAT 严格分开。下方“Phase A 完成报告”是当前权威增量，覆盖本文较早的单账号工作流快照。当前结论是 **Phase A software implemented / real UAT not passed（软件已实现，真实验收未通过）**。原 `cli_failed` 已定位并恢复 control；当前真实阻塞是第二账号观察到的 18 个商品链接没有持久化，可信样本为 `0/3`。
 
 # 1. 项目是干什么的
 
@@ -454,14 +454,18 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
 9. **产品门禁**：产品创建必须引用 `approved` 且等级为 warming/validated 的
    机会，并重新核验 analysis output、引用和 shop/account-note trust。未批准、
    rejected、legacy 或证据漂移均拒绝。Phase A UI 没有创建产品操作。
-10. **真实账号数**：最终只有 **1 个**账号达到完整可信要求。真实千帆隔离导入
-    有 8 个范围、80 条榜单项和 71 个候选账号投影，但候选投影不等于可信账号。
+10. **真实账号数**：有 **2 个**账号具备可信 profile/note 事实，但只有
+    `real-account-A` 同时具备可信 shop 事实，因此仍不足以运行真实跨账号聚类。
+    真实千帆隔离导入有 8 个范围、80 条榜单项和 71 个候选账号投影；候选投影
+    不等于可信账号。
 11. **每账号商品/笔记**：`real-account-A` 有 2 个严格验证商品和 62 篇可信公开
     笔记；shop 事实为 expected/discovered/succeeded `2/2/2`、missing `0`、
-    `complete=true`。其余五个候选均为 0 个可信商品、0 篇可信笔记。
-12. **真实跨账号候选**：**没有形成**。按批准顺序尝试的五个不同账号全部以
-    持久 `failed/cli_failed` 收口；同会话 existing-account control 也同样失败。
-    系统没有把失败账号或测试夹具冒充真实候选。
+    `complete=true`。第二账号有 10 篇可信 latest-note 样本、0 个可信商品。其
+    Android 任务观察到 18 个去重链接，但这些链接没有写入 SQLite/result artifact。
+12. **真实跨账号候选**：**没有形成**。原 `cli_failed` 已定位为隔离
+    CLI/private-runtime 状态不完整，control 已恢复，第二账号 profile/note 也已
+    成功；当前阻塞改为第二账号 shop evidence 缺失。系统没有把进程内18个链接、
+    失败任务或测试夹具冒充真实候选。
 13. **真实候选引用**：因为没有形成真实跨账号候选，所以没有可列的真实机会
     支撑引用。现有可读基线是 `real-account-A` 的一个 trusted shop `artifact:*`
     和 62 个 `account-note:*`；具体私人账号 ID、来源链接和 runtime 路径不写入 Git。
@@ -471,14 +475,15 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
     `1396 passed, 3 skipped, 1` 个无关并发 5 秒墙钟波动；该精确用例随后连续
     5/5 通过；最终完整复跑为 `1397 passed, 3 skipped`（3 项均为显式 live
     gates），无失败。
-15. **真实 UAT**：身份保持的 Stage 2 隔离副本核验 29 个证据文件；生产信任门
-    可读取 1 profile、62 notes、1 complete shop；真实千帆 8/8 通过服务导入。
-    排名前五候选和一个 current-account control 均真实失败并保留任务，未调用
-    AI 分析。详见 `docs/PHASE_A_UAT_REPORT.md`。
-16. **未解决问题和限制**：当前 XHS CLI/session 对候选和已知 control 都返回
-    `cli_failed`，因此没有第二完整账号、真实两账号聚类、pending_review 或人工
-    审核结果。真实 Phase A 尚未通过；Phase B、产品、内容和 ZIP 没有在本阶段
-    启动。七天 UAT 仍未运行。
+15. **真实 UAT**：身份保持的 Stage 2 隔离副本继续证明 `real-account-A` 的
+    1 profile、62 notes 和 complete 2/2/2 shop；真实千帆 8/8 通过。control
+    恢复后，第二账号成功持久化 1 profile + 10 notes。其 shop discovery job 持久
+    保存 66 screenshots + 66 UI hierarchies，但保存 0 个 result artifact 和 0 个
+    reusable source URL；AI 分析未调用。详见 `docs/PHASE_A_UAT_REPORT.md`。
+16. **未解决问题和限制**：第二账号的18个商品链接只存在于当时进程内，未形成
+    `shop_collection_result`、`collection.json`、图片 manifest 或 SQLite 商品事实。
+    当前样本是 `0/3`，不是 `3/3`。真实 Phase A 尚未通过；没有真实两账号聚类、
+    pending_review 或人工审核结果；Phase B 未启动，七天 UAT 未运行。
 
 ## Phase A 关键修改文件
 
@@ -498,6 +503,12 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
 - `backend/app/features/content/schemas.py`：允许可信 `account-note:*` 引用。
 - `backend/app/features/content/service.py`：approved 跨账号机会和 account-note/shop
   再核验门禁。
+- `backend/app/adapters/xhs_cli_readonly_wrapper.py`：真实 CLI shape、只读滚动和有界
+  latest account-note 读取。
+- `backend/app/adapters/android_device.py`：固定栏排除和相邻 viewport 稳定去重。
+- `backend/app/features/shops/scope.py`：最多三件代表商品的店铺类型前置门。
+- `backend/app/features/shops/service.py`：bounded sample、sample/shop 完整性分离和
+  manifest/collection SHA 绑定。
 - `frontend/src/api/client.ts`：Phase A 账号/机会/审核 API 类型与请求。
 - `frontend/src/pages/AccountPage.tsx`：只显示账号报告/观察信号。
 - `frontend/src/pages/OpportunitiesPage.tsx`：多账号完整度、聚类、证据和审核工作台。
@@ -515,6 +526,18 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
 - `c6cf45089989447a041c08a8496b9726c3665e9c` —
   `feat: validate cross-account opportunities`：实现数据库、API、服务、前端和受控
   双账号 E2E。
+- `980bc6636467e24aa1a70bd50b5adf9d25cdb497` —
+  `fix: bound latest xhs account samples`：账号主页默认保存 latest-10
+  工程样本，不冒充全量。
+- `d53c97a18fa03584234b33ffc1347b42b5eae3bf` —
+  `fix: deduplicate overlapping shop viewports`：修复 Android 重叠卡片
+  与动态短链重复计数。
+- `d8f25b2006d6ddb557d1cd21b288cfe7300cbd0f` —
+  `feat: gate shop collection with bounded samples`：店铺类型前置门、
+  当前测试店3件样本语义和前端展示。
+- `4f164505dcb455bdd4cdc68c4693fc5a37a78e59` —
+  `fix: bind bounded shop sample evidence`：绑定 sample manifest、
+  collection SHA，并为分析增加严格3/3信任门。
 - `feature/system-v1` 的交付 HEAD —
   `docs: record Phase A real UAT handoff`：记录真实 UAT、最终测试和交接状态。
   Git commit 不能在自己的文件内容中自引用其最终 SHA；该提交的完整 SHA 以
@@ -522,7 +545,8 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
 
 ## Phase A 交付状态
 
-- 稳定代码：已完成。
-- 真实跨账号 UAT：未完成，阻塞于第二账号 XHS CLI/session 读取。
+- 稳定软件改动：已提交；不等同于真实 UAT 完成。
+- 真实跨账号 UAT：未完成；control 与第二账号 profile/note 已恢复，当前阻塞于
+  第二账号18个商品链接未持久化，可信商品样本 `0/3`。
 - Phase B：未开始。
 - GitHub：第三笔提交创建后推送并核对本地/远端 SHA；结果由最终交付回报确认。

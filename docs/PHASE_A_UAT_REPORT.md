@@ -4,90 +4,99 @@ Date: 2026-08-20 (Asia/Shanghai)
 
 ## Verdict
 
-Phase A software and controlled verification are complete, but the real Phase A
-business gate is **not complete**. One existing real account remains fully
-trusted; no second account could be collected during the bounded top-five
-candidate attempt, so no real cross-account candidate was created or reviewed.
+Phase A software is implemented, but the real Phase A UAT is **not passed**.
+Phase B has not started. The current blocker is no longer the original generic
+`cli_failed`: the XHS control path was restored and a second account reached a
+trusted profile plus a bounded 10-note sample, but its 18 observed Android shop
+links were never durably persisted. The current truthful product sample is
+therefore `0/3`, not `3/3`.
 
-## Isolation and evidence reconciliation
+## Final requested status
 
-- The Stage 2 SQLite database was opened through an online backup into a new
-  isolated UAT database. The source database was not modified.
-- The authoritative XHS/shop artifacts were reconciled by relative path,
-  SHA-256 and physical file identity. The identity-preserving isolated view
-  linked 29 required evidence files and passed the existing trust readers.
-- The previously completed real Qianfan run was imported through
-  `RadarService.ingest_snapshot`: 8 scopes, 80 ranking items and 71 distinct
-  ranked-account projections were present.
-- No `.env`, Cookie, token, browser profile, phone screenshot/XML, private
-  account identifier or runtime path is recorded in this report or Git.
+1. **`cli_failed` root cause**: the isolated live run copied credential state
+   without the complete trusted CLI/private-runtime state required by the
+   pinned read-only wrapper. The failure occurred before trustworthy profile
+   completion and affected both candidates and the known control account.
+2. **What was fixed**: the isolated prepared-state path, pinned read-only CLI
+   wrapper, bounded process budget, real `user`/`user-posts` response handling,
+   latest-account-note sampling, Android overlapping-card deduplication, shop
+   scope preflight and bounded three-product evidence contracts were fixed.
+   Trust/evidence checks were not relaxed and historical failures were retained.
+3. **`real-account-A` control**: restored successfully. Production trust readers
+   can read one profile and 62 persisted public notes. Its trusted shop result
+   remains expected/discovered/succeeded `2/2/2`, missing `0`, `complete=true`.
+4. **Second real account**: partially successful. One distinct candidate reached
+   one trusted profile plus 10 persisted latest-note sample facts. It did not
+   reach a trusted shop result.
+5. **Second-account counts**: notes `10`; trusted products `0`. Android observed
+   18 deduplicated product links in process memory, but the discovery helper did
+   not persist the returned product items.
+6. **Real cross-account analysis**: not run. The service correctly refused to
+   proceed without trusted shop evidence for both accounts.
+7. **Real candidate**: none produced; no common demand was fabricated.
+8. **Candidate state**: no real `evidence_level` or `review_status` exists because
+   no candidate row was created.
+9. **Human review**: not run; there was nothing eligible to approve or reject.
+10. **Git handoff**: the final local and remote SHA are recorded in the delivery
+    response after the documentation commit and push.
 
-## Existing trusted Stage 2 account
+## Durable evidence reconciliation
 
-Safe reference: `real-account-A`.
+The historical Android discovery job that observed 18 unique links remains
+`needs_human / expected_count_unknown`. Its durable evidence contains exactly
+132 files and database artifact rows:
 
-- Public profile: trusted and readable through the production provenance gate.
-- Public notes: 62 persisted `account-note:*` facts, all readable through the
-  production analysis evidence discovery path.
-- Shop result: one trusted `artifact:*` result bound to the account.
-- Product verification: expected/discovered/succeeded `2/2/2`, missing `0`,
-  `complete=true`, with the previously persisted image-manifest evidence.
-- The older real `needs_human` shop task remains historical evidence and was
-  not changed or deleted.
+- 66 `android_screenshot` artifacts;
+- 66 `android_ui_hierarchy` artifacts;
+- 0 `shop_collection_result` artifacts;
+- 0 artifact metadata rows containing reusable `source_url` fields;
+- 0 job-input or job-log rows containing reusable product links.
 
-## Second-account attempt
+All 132 declared evidence files exist. However, there is no candidate
+`collection.json`, product-link result file, image manifest or normalized SQLite
+product result. The only shop `result.json` elsewhere in the isolated runtime
+belongs to the already completed two-product account and cannot be reused.
 
-The server selected five distinct candidates after excluding `real-account-A`.
-The order was: `成交榜 · 优秀账号`, best rank ascending, appearance count
-descending, then stable account ID. Best ranks were 1, 2, 4, 5 and 6.
+The earlier statement that the 18 links were “preserved” was inaccurate. The
+screenshots and UI hierarchies were preserved; the links themselves remained
+only in the process-local `CollectionResult`. The helper printed counts and
+transitioned the job to `needs_human` without attaching that result. The system
+will not rescan the phone or substitute different products merely to make the
+UAT pass.
 
-Each candidate was submitted through the existing reserved XHS account
-collection path. All five jobs persisted a bounded failure artifact and ended
-as `failed/cli_failed` with zero trusted note facts:
+## Software delivered after the original handoff
 
-- `8b723263-c38e-40ac-90e2-f7e018cfe509`
-- `12e6f3e4-177c-48eb-8d28-e5ee00977d2c`
-- `88e065ab-9696-40a2-950c-d8e0e492b6d6`
-- `9485558f-4229-487c-9f59-2640a1780176`
-- `412545f9-edd5-4a22-b5c0-c622767b0fd4`
+- Account homepage collection is an engineering-bounded latest-10 sample; it
+  is not described as full-account completeness or as a tutorial requirement.
+- Keyword search remains a separate tutorial-aligned bounded workflow.
+- Android card traversal rejects fixed-toolbar cards and deduplicates adjacent
+  viewport overlap without trusting changing share short-links.
+- Default shop work starts with a maximum-three-product scope preflight.
+- The current clothing-store test override can only represent an exact bounded
+  sample and must state `sample_complete=true`, `shop_complete=false`.
+- Bounded sample result files bind controlled `manifest.json` and
+  `collection.json` paths and SHA-256 values. Analysis accepts this exception
+  only when every approved 3/3 field, job state, result file, manifest, collection
+  file and source-URL ordering remains exact.
 
-A bounded control read of `real-account-A` in the same current CLI session also
-ended `failed/cli_failed` (`88b67695-814b-4e70-a217-b157d44717b5`). This
-separates the current XHS CLI/session failure from candidate ordering. The
-temporary copied credential state was removed after every bounded run.
+These software capabilities do not convert the missing historical links into a
+real 3/3 result.
 
-Because no second account reached exact profile + notes, Android collection was
-not started for those candidates. This avoids producing unowned shop evidence
-or manufacturing a cross-account result.
+## Verification already completed
 
-## Cross-account result
+- Shop scope/bounded focused backend: 8 passed.
+- Shop service isolated regression: 32 passed.
+- Bounded shop analysis focused: 9 passed.
+- Account-page/API frontend focused: 23 passed.
+- Frontend full unit suite: 60 passed.
+- Frontend production build: passed.
 
-- Trusted real accounts available to clustering: 1.
-- Real cross-account analysis calls: 0.
-- Real `pending_review` opportunities: 0.
-- Human review decisions: 0.
-- Real cross-account candidate: **not produced**.
+These are software verification results, not proof of real Phase A completion.
+No additional full-repository run was required for this truthful blocked-state
+handoff.
 
-The automated/controlled suite separately proves that two exact accounts yield
-`warming_candidate`, three yield `validated_candidate`, review is a one-way
-terminal transition, and product creation requires an approved eligible
-candidate. Those tests are software evidence and are not reported as real UAT.
+## Stop condition
 
-## Verification evidence
-
-- Analysis + content focused backend: `458 passed, 1 skipped`.
-- Media compatibility focused backend: `57 passed`.
-- Frontend unit tests: `8 files, 53 passed`.
-- Frontend production build: passed (35 modules).
-- Controlled two-account Playwright path: `1 passed`; it performed two exact
-  account/shop collections, created a `warming_candidate`, recorded human
-  approval, then exercised the existing downstream regression path.
-- Final complete backend result is recorded in `PROJECT_STATUS.md` after the
-  final clean run.
-
-## Remaining blocker
-
-The only blocker to the real Phase A completion gate is obtaining a second
-independent account with exact trusted XHS profile/notes and Android shop N/N
-evidence. The current XHS CLI session returns `cli_failed` even for the existing
-control account. Phase B remains out of scope and has not started.
+Current real status is `sample 0/3`, `shop_complete=false`. Phase A remains
+blocked at durable second-account shop evidence. No cross-account analysis,
+candidate, review, product workflow or Phase B activity was started.

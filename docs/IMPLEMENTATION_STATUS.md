@@ -128,9 +128,21 @@ approval/rejection is human-only and terminal; product creation requires an
 approved eligible candidate. The Account, Radar and Opportunities pages expose
 that boundary without a Phase B product action.
 
-Controlled backend/frontend/E2E verification passes. Real UAT remains blocked:
-the identity-preserving isolated Stage 2 view proves one profile, 62 notes and a
-complete 2/2/2 shop artifact are trusted, while all five ranked second-account
-candidates and a current-account control ended as persisted `cli_failed` XHS
-jobs. No real cross-account candidate or review was fabricated. See
-`docs/PHASE_A_UAT_REPORT.md` and the Phase A report in `PROJECT_STATUS.md`.
+Controlled backend/frontend/E2E verification passes. The original live
+`cli_failed` blocker was diagnosed as an incomplete isolated CLI/private-runtime
+state and the known control account was restored. A distinct second account now
+has one trusted profile and a bounded latest-10 note sample. Real UAT nevertheless
+remains blocked because its Android discovery returned 18 deduplicated product
+links only to process memory: the durable job contains 66 screenshots and 66 UI
+hierarchies but no `shop_collection_result` and no reusable persisted
+`source_url`. The truthful shop sample is `0/3`; no real cross-account analysis,
+candidate or review was fabricated. See `docs/PHASE_A_UAT_REPORT.md` and the
+Phase A report in `PROJECT_STATUS.md`.
+
+Subsequent software changes make account notes a bounded latest-10 engineering
+sample, introduce a default maximum-three-product shop scope preflight, keep
+physical stores out of deep collection by default, and strictly separate
+`sample_complete` from `shop_complete`. The approved clothing-store E2E override
+can only become eligible when an exact 3/3 result binds its result artifact,
+`collection.json`, image manifest, SHA values and source-URL ordering. These
+contracts do not upgrade the missing historical links into a real success.
