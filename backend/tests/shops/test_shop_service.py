@@ -116,6 +116,68 @@ class _OverflowAdapter(_UnusedAdapter):
         )
 
 
+class _CaptureExpectedAdapter(_UnusedAdapter):
+    def __init__(
+        self,
+        jobs: JobService | None = None,
+        *,
+        titles: list[str] | None = None,
+    ) -> None:
+        self.requests: list[CollectionRequest] = []
+        self.jobs = jobs
+        self.titles = titles or ["连衣裙", "衬衫", "半身裙"]
+
+    def collect_shop(self, request: CollectionRequest) -> CollectionResult:
+        self.requests.append(request)
+        expected = request.expected_count or 0
+        job_id = str(request.parameters["job_id"])
+        raw_evidence: list[dict[str, Any]] = []
+        for index in range(expected):
+            transition = f"product_{index + 1}_detail"
+            screenshot = f"real-detail-screen-{index}".encode()
+            digest = hashlib.sha256(screenshot).hexdigest()
+            relative = f"evidence/android/{job_id}/{transition}.png"
+            if self.jobs is not None:
+                absolute = self.jobs.runtime_dir / relative
+                absolute.parent.mkdir(parents=True, exist_ok=True)
+                absolute.write_bytes(screenshot)
+                self.jobs.attach_artifact(
+                    job_id,
+                    kind="android_screenshot",
+                    path=relative,
+                    metadata={"transition": transition, "sha256": digest},
+                )
+            raw_evidence.append(
+                {
+                    "title": self.titles[index % len(self.titles)],
+                    "detail_screen": {
+                        "transition": transition,
+                        "screenshot_sha256": digest,
+                        "artifacts": [relative],
+                    },
+                }
+            )
+        return CollectionResult(
+            status="succeeded",
+            items=[
+                CollectionItem(
+                    id=f"product-{index}",
+                    kind="shop_product",
+                    source_url=f"https://xhslink.com/product-{index}",
+                    raw_evidence=raw_evidence[index],
+                )
+                for index in range(expected)
+            ],
+            expected_count_known=True,
+            expected_count=expected,
+            succeeded_count=expected,
+            observed_count=expected,
+            missing_items=[],
+            overflow_count=0,
+            complete=True,
+        )
+
+
 def _write_verified_product_evidence(account_dir: Path, source_url: str) -> None:
     product_dir = account_dir / "01_product-a"
     images_dir = product_dir / "images"
@@ -157,6 +219,271 @@ def _capturing_submitter(
         scheduled.append((action, args))
 
     return submit
+
+
+def test_test_override_processes_three_products_even_when_eighteen_were_discovered(
+    tmp_path: Path,
+) -> None:
+    """Using the discovery count as expected_count would deep-read all 18 products."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(
+        Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir
+    )
+    adapter = _CaptureExpectedAdapter(jobs)
+    scheduled: list[tuple[Callable[..., Any], tuple[Any, ...]]] = []
+    service = ShopCollectionService(
+        job_service=jobs,
+        device_adapter=adapter,
+        submitter=_capturing_submitter(scheduled),
+    )
+    queued = service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1",
+            account_name="账号甲",
+            expected_count=18,
+            available_count_observed=18,
+            collection_mode="bounded_sample",
+            product_sample_limit=3,
+            test_override=True,
+            test_override_reason="保留服装店完成一次有界E2E验证",
+        )
+    )
+
+    action, args = scheduled.pop()
+    result = action(*args)
+
+    assert adapter.requests[0].expected_count == 3
+    assert result is not None
+    assert result.status == "succeeded"
+    assert result.expected_count == 3
+    assert result.sample_complete is True
+    assert result.shop_complete is False
+    assert result.complete is False
+    assert result.collection_mode == "bounded_sample"
+    assert result.available_count_observed == 18
+    assert result.scope_classification == "out_of_scope_physical"
+    assert result.scope_reason == "physical_goods_detected"
+    job = jobs.get(queued.job_id)
+    assert job.progress_current == 3
+    assert job.progress_total == 3
+    sample_manifest = (
+        runtime_dir / "evidence" / "shops" / queued.job_id / "sample-products" / "manifest.json"
+    )
+    assert sample_manifest.is_file()
+    manifest = json.loads(sample_manifest.read_text(encoding="utf-8"))
+    assert len(manifest["products"]) == 3
+    for product in manifest["products"]:
+        image = sample_manifest.parent / product["image"]
+        assert image.is_file()
+        assert hashlib.sha256(image.read_bytes()).hexdigest() == product["sha256"]
+
+
+@pytest.mark.parametrize(
+    ("profile", "titles", "expected"),
+    [
+        ("原创服装店", ["连衣裙", "衬衫", "半身裙"], "out_of_scope_physical"),
+        ("数字资料与模板", ["运营教程", "测试清单", "网站模板"], "in_scope"),
+        ("个人工作室", ["方案一", "方案二", "方案三"], "needs_human"),
+    ],
+)
+def test_scope_gate_classifies_only_three_representative_products(
+    tmp_path: Path,
+    profile: str,
+    titles: list[str],
+    expected: str,
+) -> None:
+    """Failing to stop at three would turn the cheap preflight gate into deep collection."""
+    from backend.app.features.shops.scope import ShopScopeEvidence, classify_shop_scope
+
+    evidence = ShopScopeEvidence(
+        shop_profile=profile,
+        representative_product_titles=titles + ["第四件不得查看"],
+    )
+
+    result = classify_shop_scope(evidence)
+
+    assert result.classification == expected
+    assert result.representative_product_count == 3
+    assert result.deep_collection_allowed is (expected == "in_scope")
+
+
+def test_default_collection_is_real_android_preflight_capped_at_three(
+    tmp_path: Path,
+) -> None:
+    """Defaulting to a legacy full read would bypass the required cheap scope gate."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(
+        Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir
+    )
+    adapter = _CaptureExpectedAdapter(jobs)
+    scheduled: list[tuple[Callable[..., Any], tuple[Any, ...]]] = []
+    service = ShopCollectionService(
+        job_service=jobs,
+        device_adapter=adapter,
+        submitter=_capturing_submitter(scheduled),
+    )
+    queued = service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1",
+            account_name="账号甲",
+        )
+    )
+
+    action, args = scheduled.pop()
+    result = action(*args)
+
+    assert adapter.requests[0].expected_count == 3
+    assert result is not None
+    assert result.collection_mode == "preflight"
+    assert result.scope_classification == "out_of_scope_physical"
+    gate_artifact = next(
+        artifact
+        for artifact in jobs.get(queued.job_id).artifacts
+        if artifact.kind == "shop_scope_gate_result"
+    )
+    assert gate_artifact.metadata["result"]["classification"] == "out_of_scope_physical"
+
+
+def test_scope_gate_api_does_not_accept_client_supplied_evidence() -> None:
+    """A public profile/title payload could forge an in-scope decision without Android."""
+    from backend.app.features.shops.api import router
+
+    assert "/api/v1/shop-scope-gates" not in {route.path for route in router.routes}
+
+
+def test_bounded_sample_fails_closed_when_detail_screenshot_is_missing(
+    tmp_path: Path,
+) -> None:
+    """Treating a link as product evidence would allow a sample without real detail images."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(
+        Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir
+    )
+    adapter = _CaptureExpectedAdapter()
+    scheduled: list[tuple[Callable[..., Any], tuple[Any, ...]]] = []
+    service = ShopCollectionService(
+        job_service=jobs,
+        device_adapter=adapter,
+        submitter=_capturing_submitter(scheduled),
+    )
+    service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1",
+            account_name="账号甲",
+            expected_count=18,
+            collection_mode="bounded_sample",
+            product_sample_limit=3,
+            test_override=True,
+            test_override_reason="保留服装店完成一次有界E2E验证",
+        )
+    )
+
+    action, args = scheduled.pop()
+    result = action(*args)
+
+    assert result is not None
+    assert result.status == "needs_human"
+    assert result.detail == "bounded_sample_evidence_invalid"
+    assert result.sample_complete is False
+    assert result.shop_complete is False
+    assert result.complete is False
+
+
+def test_full_shop_requires_a_trusted_in_scope_gate_job(tmp_path: Path) -> None:
+    """Accepting a missing or out-of-scope gate id would bypass the physical-shop stop."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(
+        Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir
+    )
+    scheduled: list[tuple[Callable[..., Any], tuple[Any, ...]]] = []
+    service = ShopCollectionService(
+        job_service=jobs,
+        device_adapter=_CaptureExpectedAdapter(jobs),
+        submitter=_capturing_submitter(scheduled),
+    )
+    out_gate = service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1", account_name="服装店", expected_count=18
+        )
+    )
+    action, args = scheduled.pop()
+    action(*args)
+
+    for gate_id in (out_gate.job_id, None):
+        with pytest.raises(ValueError, match="in_scope"):
+            service.enqueue(
+                ShopCollectionCreate(
+                    account_user_id="account-1",
+                    account_name="账号甲",
+                    expected_count=18,
+                    collection_mode="full_shop",
+                    scope_gate_job_id=gate_id,
+                )
+            )
+    assert not service._futures
+
+
+def test_full_shop_accepts_only_matching_trusted_in_scope_gate(tmp_path: Path) -> None:
+    """Dropping the account binding would let one account reuse another account's gate."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(
+        Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir
+    )
+    scheduled: list[tuple[Callable[..., Any], tuple[Any, ...]]] = []
+    service = ShopCollectionService(
+        job_service=jobs,
+        device_adapter=_CaptureExpectedAdapter(
+            jobs, titles=["运营教程", "测试清单", "网站模板"]
+        ),
+        submitter=_capturing_submitter(scheduled),
+    )
+    gate = service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1",
+            account_name="数字资料店",
+            expected_count=18,
+        )
+    )
+    action, args = scheduled.pop()
+    action(*args)
+
+    service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1",
+            account_name="账号甲",
+            expected_count=18,
+            collection_mode="full_shop",
+            scope_gate_job_id=gate.job_id,
+        )
+    )
+
+    assert len(scheduled) == 1
+    with pytest.raises(ValueError, match="account"):
+        service.enqueue(
+            ShopCollectionCreate(
+                account_user_id="account-2",
+                account_name="账号乙",
+                expected_count=18,
+                collection_mode="full_shop",
+                scope_gate_job_id=gate.job_id,
+            )
+        )
+    gate_artifact = next(
+        artifact
+        for artifact in jobs.get(gate.job_id).artifacts
+        if artifact.kind == "shop_scope_gate_result"
+    )
+    (runtime_dir / gate_artifact.path).write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="trusted in_scope"):
+        service.enqueue(
+            ShopCollectionCreate(
+                account_user_id="account-1",
+                account_name="账号甲",
+                expected_count=18,
+                collection_mode="full_shop",
+                scope_gate_job_id=gate.job_id,
+            )
+        )
 
 
 @pytest.fixture
@@ -236,6 +563,7 @@ def test_url_only_collection_reports_collected_links_but_zero_verified_products(
             account_user_id="account-1",
             account_name="账号甲",
             expected_count=1,
+            collection_mode="legacy_full_shop",
         )
     )
     action, args = scheduled.pop()
@@ -329,6 +657,7 @@ async def test_shop_collection_post_returns_queued_job_before_device_work_finish
                     "account_user_id": "account-1",
                     "account_name": "账号甲",
                     "expected_count": 1,
+                    "collection_mode": "legacy_full_shop",
                 },
             )
             elapsed = time.monotonic() - started_at
@@ -378,6 +707,7 @@ def test_verified_runtime_evidence_is_required_before_job_success(
             account_user_id="account-1",
             account_name="账号甲",
             expected_count=1,
+            collection_mode="legacy_full_shop",
             verification_dir="shop-evidence/account-a",
         )
     )
@@ -428,6 +758,7 @@ def test_verification_must_match_the_urls_observed_by_the_device(
             account_user_id="account-1",
             account_name="账号甲",
             expected_count=1,
+            collection_mode="legacy_full_shop",
             verification_dir="shop-evidence/account-a",
         )
     )
@@ -469,6 +800,7 @@ def test_public_and_persisted_result_keep_all_accepted_and_rejected_observations
             account_user_id="account-1",
             account_name="账号甲",
             expected_count=1,
+            collection_mode="legacy_full_shop",
         )
     )
     action, args = scheduled.pop()
@@ -551,6 +883,7 @@ def test_service_checks_cancellation_before_persisting_a_final_success(
             account_user_id="account-1",
             account_name="账号甲",
             expected_count=1,
+            collection_mode="legacy_full_shop",
         )
     )
     action, args = scheduled.pop()
@@ -615,6 +948,7 @@ def test_cancellation_wins_atomically_against_shop_result_finalization(
             account_user_id="account-1",
             account_name="账号甲",
             expected_count=1,
+            collection_mode="legacy_full_shop",
             verification_dir="shop-evidence/account-a",
         )
     )
@@ -747,6 +1081,7 @@ def test_unexpected_background_failure_does_not_leave_job_running(
             account_user_id="account-1",
             account_name="账号甲",
             expected_count=1,
+            collection_mode="legacy_full_shop",
         )
     )
     action, args = scheduled.pop()

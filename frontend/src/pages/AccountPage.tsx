@@ -21,6 +21,7 @@ import {
   type CollectionQueued,
   type DeviceHealth,
   type Job,
+  type ShopPreflightCreate,
 } from "../api/client";
 
 type AccountData = {
@@ -39,7 +40,7 @@ type TrackedCollection = { job_id: string; status: Job["state"]; polls: number; 
 export interface AccountPageProps {
   accountId: string;
   loadAccount?: () => Promise<AccountData>;
-  queueShop?: (payload: Record<string, unknown>) => Promise<{ job_id: string; status: "queued" }>;
+  queueShop?: (payload: ShopPreflightCreate) => Promise<{ job_id: string; status: "queued" }>;
   createAnalysis?: (payload: AnalysisPayload) => Promise<unknown>;
   startAccountCollection?: (userId: string, payload: { sample_limit: 10 }) => Promise<CollectionQueued>;
   loadCollectionJob?: (jobId: string) => Promise<Job>;
@@ -104,8 +105,6 @@ export function AccountPage({
 }: AccountPageProps) {
   const loader = useMemo(() => loadAccount ?? (() => loadFor(accountId)), [accountId, loadAccount]);
   const [state, setState] = useState<{ kind: "loading" } | { kind: "error" } | { kind: "ready"; data: AccountData }>({ kind: "loading" });
-  const [expected, setExpected] = useState("0");
-  const [verificationDir, setVerificationDir] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -229,10 +228,10 @@ export function AccountPage({
     </section>
 
     <div className="workflow-grid">
-      <section className="operator-panel"><div className="panel-heading"><h2>True-device shop verification</h2></div><form className="action-form" onSubmit={event => { event.preventDefault(); void act(async () => { const result = await queueShop({ account_user_id: account.user_id, account_name: account.account_name, expected_count: Number(expected), ...(device?.device_id ? { device_id: device.device_id } : {}), ...(verificationDir.trim() ? { verification_dir: verificationDir.trim() } : {}) }); try { await reloadFacts(); } catch { setActionError("Action completed, but persisted facts could not be reloaded."); } return `Queued job ${result.job_id}`; }); }}><label>Expected shop products<input aria-label="Expected shop products" min="0" required type="number" value={expected} onChange={event => setExpected(event.target.value)} /></label><label>Verification evidence directory<input aria-label="Verification evidence directory" placeholder="evidence/shops/account-id" value={verificationDir} onChange={event => setVerificationDir(event.target.value)} /></label><p className="field-help">Use a runtime-relative directory containing collection.json and exact N/N product evidence. Leave empty to queue collection and receive a factual verification-pending state.</p><button disabled={pending} type="submit">Queue device collection</button></form></section>
+      <section className="operator-panel"><div className="panel-heading"><h2>Shop type preflight</h2><p>Read-only · at most 3 representative products</p></div><form className="action-form" onSubmit={event => { event.preventDefault(); void act(async () => { const result = await queueShop({ account_user_id: account.user_id, account_name: account.account_name, collection_mode: "preflight", ...(device?.device_id ? { device_id: device.device_id } : {}) }); try { await reloadFacts(); } catch { setActionError("Action completed, but persisted facts could not be reloaded."); } return `Queued job ${result.job_id}`; }); }}><p className="field-help">Checks the shop profile and no more than three representative products before any deep collection. Physical shops stop; ambiguous shops require human classification.</p><p className="field-help">An in-scope result only makes a separately started full-shop N/N collection eligible. This page never starts deep collection automatically.</p><button disabled={pending} type="submit">Check shop type</button></form></section>
       <section className="operator-panel"><div className="panel-heading"><h2>Evidence-bound account report</h2></div>{evidence.length === 0 ? <p className="panel-empty">No eligible evidence returned.</p> : <form className="action-form" onSubmit={event => { event.preventDefault(); void act(async () => { await createAnalysis({ analysis_type: "account_report", account_user_id: account.user_id, account_user_ids: [], evidence_ids: selectedEvidenceIds }); try { await reloadFacts(); } catch { setActionError("Action completed, but persisted facts could not be reloaded."); } return "Account report completed. It is an observation signal only; cross-account candidates are created on Opportunities."; }); }}><fieldset><legend>Persisted evidence</legend>{evidence.map(item => { const selectable = item.kind !== "account_note" || item.eligible_for_opportunity; return <label className="check-label" key={item.evidence_id}><input aria-label={item.evidence_id} checked={selectable && selected.includes(item.evidence_id)} disabled={!selectable} type="checkbox" onChange={event => setSelected(current => event.target.checked ? [...current, item.evidence_id] : current.filter(id => id !== item.evidence_id))} />{item.evidence_id} · {item.kind}{item.kind === "account_note" && item.eligible_for_opportunity ? " · trusted selectable input" : item.kind === "account_note" ? " · stale or untrusted · human verification required" : item.eligible_for_opportunity ? " · deep-verified" : ""}</label>; })}</fieldset><p className="field-help">A single account can produce observations only. Select at least two complete accounts on Opportunities for demand validation.</p><div className="button-row"><button disabled={pending || selectedEvidenceIds.length === 0} type="submit">Generate account report</button></div></form>}</section>
     </div>
-    <section className="operator-panel"><div className="panel-heading"><h2>Collection jobs</h2><p>{deviceJobs.length} returned</p></div>{deviceJobs.length === 0 ? <p className="panel-empty">No device collection has been recorded for this account.</p> : <ol className="collection-list">{deviceJobs.map(job => { const missing = shopMissingItems(job); return <li key={job.id}><header><strong>{job.state === "needs_human" ? "Human attention required" : job.state}</strong><span>{job.progress_current} / {job.progress_total ?? "unknown"} verified or collected</span></header><p>Stage: {job.current_stage ?? "not reported"}{job.error_category ? ` · Error: ${job.error_category}` : ""}</p>{missing.length ? <><h3>Reported missing items</h3><ul>{missing.map((item, index) => <li key={`${item.reference}-${index}`}>{item.reference} · {item.reason}</li>)}</ul></> : null}<a href={`/jobs#job-${encodeURIComponent(job.id)}-evidence`}>Inspect {job.artifacts.length} evidence {job.artifacts.length === 1 ? "item" : "items"}</a>{job.state === "needs_human" || job.state === "failed" ? <p className="field-help">Resolve the device, login, or evidence issue, then queue a new collection above. The prior job remains unchanged for audit.</p> : null}</li>; })}</ol>}</section>
+    <section className="operator-panel"><div className="panel-heading"><h2>Collection jobs</h2><p>{deviceJobs.length} returned</p></div>{deviceJobs.length === 0 ? <p className="panel-empty">No device collection has been recorded for this account.</p> : <ol className="collection-list">{deviceJobs.map(job => { const missing = shopMissingItems(job); const scope = shopScopeResult(job); const completion = shopCompletionResult(job); return <li key={job.id}><header><strong>{job.state === "needs_human" ? "Human attention required" : job.state}</strong><span>{job.progress_current} / {job.progress_total ?? "unknown"} verified or collected</span></header><p>Stage: {job.current_stage ?? "not reported"}{job.error_category ? ` · Error: ${job.error_category}` : ""}</p>{scope ? <div><h3>Shop scope gate</h3><p>Shop type: {scope.classification}</p><p>Representative products checked: {scope.representative_product_count} / 3 maximum</p><p>{shopScopeGuidance(scope)}</p></div> : null}{completion ? <div><h3>Collection completeness</h3>{completion.collection_mode === "bounded_sample" ? <p>Sample complete: {completion.sample_complete ? `${completion.succeeded_count} / ${completion.expected_count} products` : "no"}</p> : null}<p>Full shop complete: {completion.shop_complete ? "yes" : "no"}</p></div> : null}{missing.length ? <><h3>Reported missing items</h3><ul>{missing.map((item, index) => <li key={`${item.reference}-${index}`}>{item.reference} · {item.reason}</li>)}</ul></> : null}<a href={`/jobs#job-${encodeURIComponent(job.id)}-evidence`}>Inspect {job.artifacts.length} evidence {job.artifacts.length === 1 ? "item" : "items"}</a>{job.state === "needs_human" || job.state === "failed" ? <p className="field-help">Resolve the device, login, or evidence issue, then queue a new collection above. The prior job remains unchanged for audit.</p> : null}</li>; })}</ol>}</section>
     <section className="operator-panel"><div className="panel-heading"><h2>Analysis history</h2></div>{analyses.length === 0 ? <p className="panel-empty">No account analysis persisted.</p> : <ol className="analysis-list">{analyses.map(item => { const claims = analysisClaims(item.output); return <li key={item.id}><header><strong>{item.analysis_type}</strong><span className={`state state--${item.status}`}>{item.status}{item.error_category ? ` · ${item.error_category}` : ""}</span></header><p className="evidence-line">Evidence: {item.evidence_ids.join(", ") || "none reported"}</p>{claims.length ? <ul>{claims.map((claim, index) => <li key={`${item.id}-claim-${index}`}>{claim}</li>)}</ul> : null}{item.error_detail ? <p>{item.error_detail}</p> : null}{item.status !== "succeeded" ? <p className="field-help">Resolve the reported evidence or provider issue, then submit a new evidence-bound analysis above.</p> : null}</li>; })}</ol>}</section>
   </main>;
 }
@@ -248,4 +247,58 @@ function shopMissingItems(job: Job): Array<{ reference: string; reason: string }
     if (!result || typeof result !== "object" || !Array.isArray((result as { missing_items?: unknown }).missing_items)) return [];
     return (result as { missing_items: unknown[] }).missing_items.flatMap(value => value && typeof value === "object" && typeof (value as { reference?: unknown }).reference === "string" && typeof (value as { reason?: unknown }).reason === "string" ? [{ reference: (value as { reference: string }).reference, reason: (value as { reason: string }).reason }] : []);
   });
+}
+
+type ShopScopeResult = {
+  classification: "in_scope" | "out_of_scope_physical" | "needs_human";
+  representative_product_count: number;
+  deep_collection_allowed: boolean;
+};
+
+type ShopCompletionResult = {
+  collection_mode: string;
+  expected_count: number;
+  succeeded_count: number;
+  sample_complete: boolean;
+  shop_complete: boolean;
+};
+
+function artifactResult(job: Job, kind: string): Record<string, unknown> | null {
+  const result = job.artifacts.find(item => item.kind === kind)?.metadata.result;
+  return result && typeof result === "object" && !Array.isArray(result) ? result as Record<string, unknown> : null;
+}
+
+function shopScopeResult(job: Job): ShopScopeResult | null {
+  const result = artifactResult(job, "shop_scope_gate_result");
+  if (!result) return null;
+  const classification = result.classification;
+  if (classification !== "in_scope" && classification !== "out_of_scope_physical" && classification !== "needs_human") return null;
+  if (typeof result.representative_product_count !== "number" || typeof result.deep_collection_allowed !== "boolean") return null;
+  return {
+    classification,
+    representative_product_count: result.representative_product_count,
+    deep_collection_allowed: result.deep_collection_allowed,
+  };
+}
+
+function shopCompletionResult(job: Job): ShopCompletionResult | null {
+  const result = artifactResult(job, "shop_collection_result");
+  if (!result || typeof result.collection_mode !== "string" || typeof result.expected_count !== "number" || typeof result.succeeded_count !== "number" || typeof result.sample_complete !== "boolean" || typeof result.shop_complete !== "boolean") return null;
+  return {
+    collection_mode: result.collection_mode,
+    expected_count: result.expected_count,
+    succeeded_count: result.succeeded_count,
+    sample_complete: result.sample_complete,
+    shop_complete: result.shop_complete,
+  };
+}
+
+function shopScopeGuidance(result: ShopScopeResult): string {
+  if (result.classification === "in_scope" && result.deep_collection_allowed) {
+    return "Eligible for a separately started full-shop N/N collection.";
+  }
+  if (result.classification === "out_of_scope_physical") {
+    return "Stopped after the scope check; no deep collection is allowed.";
+  }
+  return "Needs human classification; no deep collection is started automatically.";
 }

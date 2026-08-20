@@ -102,6 +102,12 @@ export interface Account {
 export interface DeviceHealth { status: "available" | "unavailable" | "needs_human"; device_id: string | null; detail: string; raw_evidence: Record<string, unknown>; }
 export interface AnalysisEvidence { evidence_id: string; kind: string; account_user_id: string | null; eligible_for_opportunity: boolean; }
 export interface CollectionQueued { job_id: string; status: "queued"; }
+export interface ShopPreflightCreate {
+  account_user_id: string;
+  account_name: string;
+  collection_mode: "preflight";
+  device_id?: string;
+}
 export interface AccountProfile {
   user_id: string; source_url: string; nickname: string | null; bio: string | null;
   public_stats: Record<string, number>; collection_job_id: string; collection_artifact_id: number; collected_at: string;
@@ -183,7 +189,7 @@ export const reviewOpportunity = (opportunityId: string, payload: { decision: "a
 export const fetchProducts = () => getJson<Product[]>("/api/v1/products");
 export const fetchContentItems = () => getJson<ContentItem[]>("/api/v1/content-items");
 export const fetchContentPackages = () => getJson<ContentPackage[]>("/api/v1/content-packages");
-export const queueShopCollection = (payload: Record<string, unknown>) => postJson<{ job_id: string; status: "queued" }>("/api/v1/shop-collections", payload);
+export const queueShopCollection = (payload: ShopPreflightCreate) => postJson<{ job_id: string; status: "queued" }>("/api/v1/shop-collections", payload);
 export const createAnalysis = (payload: Record<string, unknown>) => postJson<Analysis>("/api/v1/analyses", payload);
 export const createProduct = (payload: Record<string, unknown>) => postJson<Product>("/api/v1/products", payload);
 export const addProductMaterial = (productId: string, payload: Record<string, unknown>) => postJson<Material>(`/api/v1/products/${encodeURIComponent(productId)}/materials`, payload);

@@ -49,7 +49,7 @@ describe("AccountPage", () => {
     expect(screen.getByText(/Resolve the reported evidence or provider issue/)).toBeVisible();
   });
 
-  it("queues a real device job and requests an evidence-bound analysis", async () => {
+  it("queues a three-product shop scope preflight and requests an evidence-bound analysis", async () => {
     const queueShop = vi.fn().mockResolvedValue({ job_id: "job-new", status: "queued" });
     const createAnalysis = vi.fn().mockResolvedValue({ id: "analysis-1", status: "succeeded" });
     const loadAccount = vi.fn().mockResolvedValue({
@@ -60,10 +60,15 @@ describe("AccountPage", () => {
     render(<AccountPage accountId="author-1" loadAccount={loadAccount} queueShop={queueShop} createAnalysis={createAnalysis} />);
 
     await screen.findByRole("heading", { name: "真实账号" });
-    fireEvent.change(screen.getByLabelText("Expected shop products"), { target: { value: "6" } });
-    fireEvent.change(screen.getByLabelText("Verification evidence directory"), { target: { value: "evidence/e2e-shop" } });
-    fireEvent.click(screen.getByRole("button", { name: "Queue device collection" }));
-    await waitFor(() => expect(queueShop).toHaveBeenCalledWith(expect.objectContaining({ account_user_id: "author-1", expected_count: 6, device_id: "serial-1", verification_dir: "evidence/e2e-shop" })));
+    expect(screen.queryByLabelText("Expected shop products")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Verification evidence directory")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Check shop type" }));
+    await waitFor(() => expect(queueShop).toHaveBeenCalledWith({
+      account_user_id: "author-1",
+      account_name: "真实账号",
+      collection_mode: "preflight",
+      device_id: "serial-1",
+    }));
     expect(await screen.findByText("Queued job job-new")).toBeVisible();
     await waitFor(() => expect(loadAccount).toHaveBeenCalledTimes(2));
 
@@ -80,7 +85,7 @@ describe("AccountPage", () => {
     const queueShop = vi.fn(() => new Promise<{ job_id: string; status: "queued" }>(done => { resolve = done; }));
     render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({ account, evidence: [], analyses: [], jobs: [], devices: [] })} queueShop={queueShop} />);
     await screen.findByRole("heading", { name: "真实账号" });
-    const button = screen.getByRole("button", { name: "Queue device collection" });
+    const button = screen.getByRole("button", { name: "Check shop type" });
     fireEvent.click(button); fireEvent.click(button);
     expect(queueShop).toHaveBeenCalledTimes(1);
     expect(button).toBeDisabled();
@@ -143,6 +148,75 @@ describe("AccountPage", () => {
     expect(screen.getByText(/does not replace exact shop N\/N verification/i)).toBeVisible();
     expect(screen.getByText(/older persisted notes remain historical evidence/i)).toBeVisible();
     expect(screen.queryByText(/notes make this opportunity eligible/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["in_scope", true, "Eligible for a separately started full-shop N/N collection."],
+    ["out_of_scope_physical", false, "Stopped after the scope check; no deep collection is allowed."],
+    ["needs_human", false, "Needs human classification; no deep collection is started automatically."],
+  ] as const)("shows %s scope classification and its deep-collection gate", async (classification, allowed, guidance) => {
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({
+      account, evidence: [], analyses: [], devices: [],
+      jobs: [{
+        id: `gate-${classification}`,
+        type: "android_shop_collection",
+        input: { account_user_id: "author-1", collection_mode: "preflight" },
+        state: "succeeded",
+        progress_current: 3,
+        progress_total: 3,
+        current_stage: "shop_scope_classified",
+        error_category: null,
+        retry_count: 0,
+        created_at: "2026-08-20T00:00:00Z",
+        updated_at: "2026-08-20T00:01:00Z",
+        started_at: "2026-08-20T00:00:00Z",
+        completed_at: "2026-08-20T00:01:00Z",
+        lease_expires_at: null,
+        logs: [],
+        artifacts: [{
+          kind: "shop_scope_gate_result",
+          path: `evidence/shops/gate-${classification}/scope.json`,
+          metadata: { result: { classification, reason: "controlled_reason", representative_product_count: 3, deep_collection_allowed: allowed } },
+        }],
+      }],
+    })} />);
+
+    expect(await screen.findByText(`Shop type: ${classification}`)).toBeVisible();
+    expect(screen.getByText("Representative products checked: 3 / 3 maximum")).toBeVisible();
+    expect(screen.getByText(guidance)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /full-shop/i })).not.toBeInTheDocument();
+  });
+
+  it("labels a bounded 3/3 product sample without claiming full-shop completeness", async () => {
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({
+      account, evidence: [], analyses: [], devices: [],
+      jobs: [{
+        id: "shop-sample-1",
+        type: "android_shop_collection",
+        input: { account_user_id: "author-1", collection_mode: "bounded_sample", product_sample_limit: 3, test_override: true },
+        state: "succeeded",
+        progress_current: 3,
+        progress_total: 3,
+        current_stage: "shop_sample_complete",
+        error_category: null,
+        retry_count: 0,
+        created_at: "2026-08-20T00:00:00Z",
+        updated_at: "2026-08-20T00:01:00Z",
+        started_at: "2026-08-20T00:00:00Z",
+        completed_at: "2026-08-20T00:01:00Z",
+        lease_expires_at: null,
+        logs: [],
+        artifacts: [{
+          kind: "shop_collection_result",
+          path: "evidence/shops/shop-sample-1/result.json",
+          metadata: { result: { collection_mode: "bounded_sample", product_sample_limit: 3, sample_complete: true, shop_complete: false, succeeded_count: 3, expected_count: 3 } },
+        }],
+      }],
+    })} />);
+
+    expect(await screen.findByText("Sample complete: 3 / 3 products")).toBeVisible();
+    expect(screen.getByText("Full shop complete: no")).toBeVisible();
+    expect(screen.queryByText("Full shop complete: yes")).not.toBeInTheDocument();
   });
 
   it("labels fewer than ten persisted account notes as an exhausted sample instead of full-account completeness", async () => {

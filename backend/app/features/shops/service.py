@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import stat
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -14,7 +15,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, StrictInt, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 from backend.app.adapters.android_device import DEFAULT_SELECTOR_PROFILE_VERSION
 from backend.app.adapters.contracts import (
@@ -24,12 +25,18 @@ from backend.app.adapters.contracts import (
     RejectedCollectionItem,
 )
 from backend.app.models.jobs import JobState
-from backend.app.services.jobs import InvalidJobTransition, JobService
+from backend.app.services.jobs import InvalidJobTransition, JobNotFound, JobService
+from backend.app.features.shops.scope import (
+    ShopScopeDecision,
+    ShopScopeEvidence,
+    classify_shop_scope,
+)
 
 
 _IMAGE_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg"}
 ANDROID_SHOP_JOB_TYPE = "android_shop_collection"
 ANDROID_SHOP_JOB_TYPES = ("shop_collection", ANDROID_SHOP_JOB_TYPE)
+SHOP_TEST_OVERRIDE_REASON = "保留服装店完成一次有界E2E验证"
 
 
 class ShopVerificationMissing(BaseModel):
@@ -54,7 +61,15 @@ class ShopCollectionCreate(BaseModel):
         min_length=1, max_length=500, pattern=r"^[A-Za-z0-9_-]+$"
     )
     account_name: str = Field(min_length=1, max_length=500)
-    expected_count: StrictInt = Field(ge=0)
+    expected_count: StrictInt = Field(default=3, ge=0)
+    available_count_observed: StrictInt | None = Field(default=None, ge=0)
+    collection_mode: Literal[
+        "preflight", "legacy_full_shop", "bounded_sample", "full_shop"
+    ] = "preflight"
+    product_sample_limit: StrictInt | None = Field(default=None, ge=1, le=3)
+    test_override: bool = False
+    test_override_reason: str | None = Field(default=None, min_length=1, max_length=200)
+    scope_gate_job_id: str | None = Field(default=None, min_length=1, max_length=100)
     device_id: str | None = Field(default=None, min_length=1, max_length=500)
     verification_dir: str | None = Field(default=None, min_length=1, max_length=1000)
     selector_profile_version: str = Field(
@@ -72,6 +87,38 @@ class ShopCollectionCreate(BaseModel):
         if not normalized:
             raise ValueError("value must contain non-whitespace text")
         return normalized
+
+    @field_validator("test_override_reason", "scope_gate_job_id")
+    @classmethod
+    def trim_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must contain non-whitespace text")
+        return normalized
+
+    @model_validator(mode="after")
+    def enforce_collection_mode(self) -> "ShopCollectionCreate":
+        if self.collection_mode == "preflight":
+            if self.available_count_observed is None:
+                self.available_count_observed = self.expected_count
+            self.expected_count = 3
+        elif self.collection_mode == "bounded_sample":
+            if not self.test_override:
+                raise ValueError("bounded_sample requires test_override=true")
+            if self.test_override_reason != SHOP_TEST_OVERRIDE_REASON:
+                raise ValueError("bounded_sample requires the approved test override reason")
+            if self.product_sample_limit != 3:
+                raise ValueError("bounded_sample requires product_sample_limit=3")
+            if self.available_count_observed is None:
+                self.available_count_observed = self.expected_count
+            self.expected_count = 3
+        elif self.test_override or self.test_override_reason is not None:
+            raise ValueError("test_override is only valid for bounded_sample")
+        if self.collection_mode == "full_shop" and not self.scope_gate_job_id:
+            raise ValueError("full_shop requires a trusted in_scope gate job")
+        return self
 
 
 class ShopCollectionMissing(BaseModel):
@@ -102,6 +149,28 @@ class ShopCollectionRead(BaseModel):
     items: list[CollectionItem]
     verification: ShopVerificationResult | None = None
     complete: bool
+    collection_mode: Literal[
+        "preflight", "legacy_full_shop", "bounded_sample", "full_shop"
+    ] = "legacy_full_shop"
+    product_sample_limit: int | None = None
+    available_count_observed: int | None = None
+    test_override: bool = False
+    test_override_reason: str | None = None
+    sample_complete: bool = False
+    shop_complete: bool = False
+    scope_classification: Literal[
+        "in_scope", "out_of_scope_physical", "needs_human"
+    ] | None = None
+    scope_reason: str | None = None
+
+    @model_validator(mode="after")
+    def preserve_legacy_full_shop_semantics(self) -> "ShopCollectionRead":
+        if (
+            "shop_complete" not in self.model_fields_set
+            and self.collection_mode == "legacy_full_shop"
+        ):
+            self.shop_complete = self.complete
+        return self
 
 
 class ShopCollectionQueued(BaseModel):
@@ -155,6 +224,8 @@ class ShopCollectionService:
 
     def enqueue(self, payload: ShopCollectionCreate) -> ShopCollectionQueued:
         self._resolve_verification_dir(payload.verification_dir)
+        if payload.collection_mode == "full_shop":
+            self._require_trusted_in_scope_gate(payload)
         with self._lifecycle_lock:
             if not self._accepting_work:
                 raise ShopCollectionServiceClosed(
@@ -195,6 +266,87 @@ class ShopCollectionService:
                     lambda _future, job_id=job.id: self._mark_job_finished(job_id)
                 )
         return ShopCollectionQueued(job_id=job.id)
+
+    def _persist_scope_gate(
+        self,
+        job_id: str,
+        decision: ShopScopeDecision,
+        *,
+        account_user_id: str,
+        items: list[CollectionItem],
+    ) -> None:
+        relative = Path("evidence") / "shops" / job_id / "scope-gate.json"
+        artifact_path = self.job_service.runtime_dir / relative
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "job_id": job_id,
+            "account_user_id": account_user_id,
+            "classification": decision.classification,
+            "reason": decision.reason,
+            "representative_product_count": decision.representative_product_count,
+            "deep_collection_allowed": decision.deep_collection_allowed,
+            "evidence": decision.evidence.model_dump(mode="json"),
+            "representative_products": [item.model_dump(mode="json") for item in items],
+        }
+        _write_json_evidence_once(artifact_path, payload)
+        payload_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        self.job_service.attach_artifact(
+            job_id,
+            kind="shop_scope_gate_result",
+            path=relative.as_posix(),
+            metadata={"result": payload, "sha256": payload_sha256},
+        )
+
+    def _require_trusted_in_scope_gate(self, payload: ShopCollectionCreate) -> None:
+        assert payload.scope_gate_job_id is not None
+        try:
+            gate = self.job_service.get(payload.scope_gate_job_id)
+        except JobNotFound as error:
+            raise ValueError("full_shop requires a trusted in_scope gate job") from error
+        artifact = next(
+            (
+                item
+                for item in gate.artifacts
+                if item.kind == "shop_scope_gate_result"
+            ),
+            None,
+        )
+        result = artifact.metadata.get("result") if artifact is not None else None
+        artifact_path = (
+            _resolved_regular_file(
+                self.job_service.runtime_dir / artifact.path,
+                roots=(self.job_service.runtime_dir,),
+            )
+            if artifact is not None
+            else None
+        )
+        artifact_payload: dict[str, Any] | None = None
+        if artifact_path is not None and not artifact_path.is_symlink():
+            try:
+                loaded = _load_json(artifact_path, "scope-gate.json")
+            except ValueError:
+                loaded = None
+            if isinstance(loaded, dict):
+                artifact_payload = loaded
+        trusted_artifact = (
+            artifact_path is not None
+            and artifact_payload == result
+            and artifact is not None
+            and artifact.metadata.get("sha256")
+            == hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        )
+        if (
+            gate.type != ANDROID_SHOP_JOB_TYPE
+            or gate.state is not JobState.succeeded
+            or gate.input.get("account_user_id") != payload.account_user_id
+            or gate.input.get("collection_mode") != "preflight"
+            or not trusted_artifact
+        ):
+            if gate.input.get("account_user_id") != payload.account_user_id:
+                raise ValueError("scope gate account does not match collection account")
+            raise ValueError("full_shop requires a trusted in_scope gate job")
+        if not isinstance(result, dict) or result.get("classification") != "in_scope":
+            raise ValueError("full_shop requires a trusted in_scope gate job")
 
     def execute(
         self, job_id: str, payload: ShopCollectionCreate
@@ -272,9 +424,100 @@ class ShopCollectionService:
             selector_profile_version=payload.selector_profile_version,
             expected_count=payload.expected_count,
             result=result,
+            collection_mode=payload.collection_mode,
+            product_sample_limit=payload.product_sample_limit,
+            available_count_observed=payload.available_count_observed,
+            test_override=payload.test_override,
+            test_override_reason=payload.test_override_reason,
         )
+        scope_decision: ShopScopeDecision | None = None
+        if payload.collection_mode in {"preflight", "bounded_sample"} and result.items:
+            scope_decision = classify_shop_scope(
+                ShopScopeEvidence(
+                    shop_profile="android_preflight_observation",
+                    representative_product_titles=[
+                        str(item.raw_evidence.get("title") or "未识别商品")
+                        for item in result.items[:3]
+                    ],
+                )
+            )
+            self._persist_scope_gate(
+                job_id,
+                scope_decision,
+                account_user_id=payload.account_user_id,
+                items=result.items[:3],
+            )
+            read = read.model_copy(
+                update={
+                    "scope_classification": scope_decision.classification,
+                    "scope_reason": scope_decision.reason,
+                }
+            )
         if self.job_service.get(job_id).state is JobState.cancelled:
             read = _cancelled_shop_read(read)
+        elif result.status == "succeeded" and payload.collection_mode == "preflight":
+            if scope_decision is None or scope_decision.classification == "needs_human":
+                read = read.model_copy(
+                    update={
+                        "status": "needs_human",
+                        "detail": "shop_scope_needs_human",
+                        "complete": False,
+                    }
+                )
+            else:
+                read = read.model_copy(update={"complete": False})
+        elif result.status == "succeeded" and payload.collection_mode == "bounded_sample":
+            try:
+                verification_dir = self._materialize_bounded_sample_evidence(
+                    job_id, result.items
+                )
+                verification = verify_shop_collection(
+                    verification_dir,
+                    expected_count=payload.expected_count,
+                    expected_source_urls=[str(item.source_url) for item in result.items],
+                )
+            except (InvalidVerificationPath, ValueError) as error:
+                self.job_service.append_log(
+                    job_id,
+                    level="warning",
+                    message=(
+                        "Bounded sample evidence failed closed: "
+                        f"{type(error).__name__}: {error}"
+                    ),
+                )
+                read = read.model_copy(
+                    update={
+                        "status": "needs_human",
+                        "detail": "bounded_sample_evidence_invalid",
+                        "complete": False,
+                    }
+                )
+            else:
+                verified_missing = [
+                    ShopCollectionMissing(
+                        reference=item.reference,
+                        reason=item.reason,
+                        raw_evidence={"product_dir": item.product_dir},
+                    )
+                    for item in verification.missing_items
+                ]
+                read = read.model_copy(
+                    update={
+                        "verification": verification,
+                        "succeeded_count": verification.succeeded_count,
+                        "missing_count": len(verified_missing),
+                        "missing_items": verified_missing,
+                        "complete": verification.complete,
+                    }
+                )
+                if not verification.complete:
+                    read = read.model_copy(
+                        update={
+                            "status": "needs_human",
+                            "detail": "bounded_sample_evidence_invalid",
+                            "complete": False,
+                        }
+                    )
         elif result.status == "succeeded" and payload.verification_dir is None:
             read = _verification_required(read)
         elif result.status == "succeeded":
@@ -348,6 +591,22 @@ class ShopCollectionService:
                             "complete": False,
                         }
                     )
+        if payload.collection_mode == "bounded_sample":
+            read = read.model_copy(
+                update={
+                    "sample_complete": bool(
+                        read.status == "succeeded"
+                        and read.succeeded_count == payload.expected_count
+                        and read.missing_count == 0
+                    ),
+                    "shop_complete": False,
+                    "complete": False,
+                }
+            )
+        elif payload.collection_mode != "preflight":
+            read = read.model_copy(
+                update={"shop_complete": read.complete, "sample_complete": False}
+            )
         if self.job_service.get(job_id).state is JobState.cancelled:
             read = _cancelled_shop_read(read)
         pending = self._persist_result(job_id, read)
@@ -420,6 +679,111 @@ class ShopCollectionService:
             raise InvalidVerificationPath("Verification directory is not a directory.")
         return resolved
 
+    def _materialize_bounded_sample_evidence(
+        self, job_id: str, items: list[CollectionItem]
+    ) -> Path:
+        """Bind the three selected products to their real, same-job detail screenshots."""
+        if len(items) != 3:
+            raise ValueError("bounded sample requires exactly three accepted products")
+        job = self.job_service.get(job_id)
+        screenshot_artifacts = {
+            artifact.path: artifact
+            for artifact in job.artifacts
+            if artifact.kind == "android_screenshot"
+        }
+        sample_dir = (
+            self.job_service.runtime_dir
+            / "evidence"
+            / "shops"
+            / job_id
+            / "sample-products"
+        ).resolve()
+        sample_dir.relative_to(self.job_service.runtime_dir)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        products: list[dict[str, Any]] = []
+        sha_manifest: list[dict[str, str]] = []
+        for index, item in enumerate(items, start=1):
+            detail_screen = item.raw_evidence.get("detail_screen")
+            if not isinstance(detail_screen, dict):
+                raise ValueError("detail_screen evidence is missing")
+            transition = detail_screen.get("transition")
+            declared_sha = detail_screen.get("screenshot_sha256")
+            paths = detail_screen.get("artifacts")
+            if (
+                not isinstance(transition, str)
+                or not transition
+                or not isinstance(declared_sha, str)
+                or len(declared_sha) != 64
+                or not isinstance(paths, list)
+            ):
+                raise ValueError("detail_screen evidence is malformed")
+            matches = [
+                path
+                for path in paths
+                if isinstance(path, str) and path in screenshot_artifacts
+            ]
+            if len(matches) != 1:
+                raise ValueError("detail screenshot is not bound to this job")
+            artifact = screenshot_artifacts[matches[0]]
+            if (
+                artifact.metadata.get("transition") != transition
+                or artifact.metadata.get("sha256") != declared_sha
+            ):
+                raise ValueError("detail screenshot metadata does not match")
+            source = _resolved_regular_file(
+                self.job_service.runtime_dir / artifact.path,
+                roots=(self.job_service.runtime_dir,),
+            )
+            if source is None or source.is_symlink():
+                raise ValueError("detail screenshot is not a contained regular file")
+            actual_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            if actual_sha != declared_sha:
+                raise ValueError("detail screenshot hash does not match")
+            product_dir = sample_dir / f"{index:02d}_{item.id[:24]}"
+            image_dir = product_dir / "images"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            destination = image_dir / "detail.png"
+            if destination.exists() or destination.is_symlink():
+                existing = _resolved_regular_file(
+                    destination, roots=(self.job_service.runtime_dir, sample_dir)
+                )
+                if existing is None or existing.is_symlink():
+                    raise ValueError("existing bounded screenshot path is invalid")
+                if hashlib.sha256(existing.read_bytes()).hexdigest() != actual_sha:
+                    raise ValueError("existing bounded screenshot must not be overwritten")
+            else:
+                shutil.copyfile(source, destination)
+            copied_sha = hashlib.sha256(destination.read_bytes()).hexdigest()
+            if copied_sha != actual_sha:
+                raise ValueError("copied detail screenshot hash does not match")
+            source_url = str(item.source_url)
+            detail = {
+                "link": source_url,
+                "title": item.raw_evidence.get("title"),
+                "image_manifest": [
+                    {"file": "images/detail.png", "sha256": copied_sha}
+                ],
+            }
+            _write_json_evidence_once(product_dir / "detail.json", detail)
+            products.append(
+                {"source_url": source_url, "product_dir": product_dir.name}
+            )
+            sha_manifest.append(
+                {
+                    "source_url": source_url,
+                    "image": f"{product_dir.name}/images/detail.png",
+                    "sha256": copied_sha,
+                }
+            )
+        _write_json_evidence_once(
+            sample_dir / "collection.json",
+            {"unique_product_link_count": 3, "products": products},
+        )
+        _write_json_evidence_once(
+            sample_dir / "manifest.json", {"products": sha_manifest}
+        )
+        return sample_dir
+
     def _persist_result(
         self, job_id: str, result: ShopCollectionRead
     ) -> _PendingShopResult:
@@ -452,7 +816,15 @@ class ShopCollectionService:
     ) -> Any | None:
         if result.status == "succeeded":
             state = JobState.succeeded
-            current_stage = "shop_complete"
+            current_stage = (
+                "shop_sample_complete"
+                if result.collection_mode == "bounded_sample"
+                else (
+                    f"scope_gate_{result.scope_classification}"
+                    if result.collection_mode == "preflight"
+                    else "shop_complete"
+                )
+            )
             error_category = None
         elif result.status == "failed":
             state = JobState.failed
@@ -465,7 +837,11 @@ class ShopCollectionService:
         return self.job_service.finalize_running_with_artifact(
             job_id,
             state=state,
-            progress_current=result.succeeded_count,
+            progress_current=(
+                result.collected_count
+                if result.collection_mode == "preflight"
+                else result.succeeded_count
+            ),
             progress_total=result.expected_count,
             current_stage=current_stage,
             error_category=error_category,
@@ -630,6 +1006,13 @@ def _shop_collection_read(
     selector_profile_version: str,
     expected_count: int,
     result: CollectionResult,
+    collection_mode: Literal[
+        "preflight", "legacy_full_shop", "bounded_sample", "full_shop"
+    ],
+    product_sample_limit: int | None,
+    available_count_observed: int | None,
+    test_override: bool,
+    test_override_reason: str | None,
 ) -> ShopCollectionRead:
     collection_missing_items = [
         ShopCollectionMissing(
@@ -676,6 +1059,11 @@ def _shop_collection_read(
         evidence_artifacts=result.evidence_artifacts,
         items=result.items,
         complete=False,
+        collection_mode=collection_mode,
+        product_sample_limit=product_sample_limit,
+        available_count_observed=available_count_observed,
+        test_override=test_override,
+        test_override_reason=test_override_reason,
     )
 
 
@@ -810,6 +1198,21 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object: {path}")
     return value
+
+
+def _write_json_evidence_once(path: Path, payload: dict[str, Any]) -> None:
+    """Create derived evidence once; retries may reuse identical bytes only."""
+    if path.exists() or path.is_symlink():
+        existing = _resolved_regular_file(path, roots=(path.parent,))
+        if existing is None or existing.is_symlink():
+            raise ValueError("existing evidence path is invalid")
+        if _load_json(existing, path.name) != payload:
+            raise ValueError("existing evidence must not be overwritten")
+        return
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _safe_product_dir(value: str) -> bool:

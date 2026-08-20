@@ -14,6 +14,7 @@ import {
   fetchContentMediaRuns,
   startContentImageAnalysis,
   startContentImageGeneration,
+  queueShopCollection,
 } from "./client";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -106,5 +107,27 @@ describe("XHS account and note collection API", () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/notes/search-collections", expect.objectContaining({ method: "POST", body: '{"keyword":"露营收纳","expected_count":1}' }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/note-search-results?job_id=job-search", expect.any(Object));
+  });
+});
+
+describe("shop scope preflight API", () => {
+  it("starts the three-product scope check without inventing a full-shop count", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ job_id: "shop-gate-1", status: "queued" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await queueShopCollection({
+      account_user_id: "author-1",
+      account_name: "真实账号",
+      collection_mode: "preflight",
+      device_id: "serial-1",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/shop-collections", expect.objectContaining({
+      method: "POST",
+      body: '{"account_user_id":"author-1","account_name":"真实账号","collection_mode":"preflight","device_id":"serial-1"}',
+    }));
   });
 });
