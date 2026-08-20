@@ -38,7 +38,8 @@ _COOKIE_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _REQUIRED_COOKIES = frozenset({"a1", "web_session"})
 _USER_POSTS_SCROLL_DELTA = 1200
 _USER_POSTS_SCROLL_WAIT_MS = 1000
-_USER_POSTS_MAX_SCROLL_ATTEMPTS = 5
+_USER_POSTS_MAX_SCROLL_ATTEMPTS = 20
+_USER_POSTS_STABLE_ATTEMPTS = 2
 _USER_POSTS_SNAPSHOT_JS = """
 () => {
     const state = window.__INITIAL_STATE__;
@@ -240,13 +241,20 @@ def _largest_observed_user_posts(
     page = getattr(client, "_page", None)
     if page is None:
         return list(observed.values())
+    stable_attempts = 0
     for _attempt in range(_USER_POSTS_MAX_SCROLL_ATTEMPTS):
         try:
             page.mouse.wheel(0, _USER_POSTS_SCROLL_DELTA)
             page.wait_for_timeout(_USER_POSTS_SCROLL_WAIT_MS)
-            add_rows(page.evaluate(_USER_POSTS_SNAPSHOT_JS))
+            grew = add_rows(page.evaluate(_USER_POSTS_SNAPSHOT_JS))
         except Exception:
             break
+        if grew:
+            stable_attempts = 0
+        else:
+            stable_attempts += 1
+            if stable_attempts >= _USER_POSTS_STABLE_ATTEMPTS:
+                break
     return list(observed.values())
 
 

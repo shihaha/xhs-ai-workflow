@@ -137,3 +137,41 @@ The fixed bounded cap is now five one-second attempts (maximum additional
 wait: five seconds). There is no adaptive behavior, no unbounded retry, and
 no change to exception stopping, read-only browser use, ID de-duplication, or
 partial-result accounting.
+
+## Round 3: bounded stable-read completion
+
+### Root cause
+
+Five real candidates showed that even the five-scroll cap could keep growing
+(the largest reached 182 observed notes); another candidate timed out. A fixed
+cap alone could not distinguish a genuinely complete observation from a still
+loading final slot.
+
+### TDD evidence
+
+RED command:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py -q -k 'past_five_growths or hard_twenty'
+```
+
+Before the round-3 production change: `2 failed, 6 deselected`. The first
+FakePage continued growing beyond five scrolls to 182 rows before two stable
+reads; the old cap returned 172. The second grew on every read and proved the
+old cap could not exercise the requested exact 20-attempt ceiling.
+
+GREEN commands:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py -q
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py backend/tests/xhs/test_cli_adapter.py backend/tests/xhs/test_s2a_round1_hardening.py backend/tests/xhs/test_s2a_round2_hardening.py -q
+```
+
+Results: `8 passed in 0.04s`; `190 passed in 9.96s`.
+
+The final mechanism has a hard maximum of 20 fixed one-second attempts
+(maximum additional wait: 20 seconds). A growth resets the stability counter;
+only two consecutive no-growth reads stop early, so one transient empty window
+is tolerated. Browser interaction/evaluation exceptions still stop immediately.
+It remains read-only, keeps first-observed ID order, and returns only actually
+observed partial rows when exact-count completion is not available.

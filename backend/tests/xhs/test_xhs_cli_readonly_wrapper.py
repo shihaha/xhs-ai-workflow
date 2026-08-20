@@ -72,8 +72,8 @@ def test_user_posts_scrolls_fixed_page_slots_to_the_largest_observed_collection(
     rows = _bounded_user_posts_client(page).get_user_posts("user-1")
 
     assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 63)]
-    assert page.scrolls == 5
-    assert page.waits == [1000, 1000, 1000, 1000, 1000]
+    assert page.scrolls == 3
+    assert page.waits == [1000, 1000, 1000]
 
 
 def test_user_posts_keeps_the_real_partial_collection_when_scroll_adds_nothing() -> None:
@@ -84,8 +84,8 @@ def test_user_posts_keeps_the_real_partial_collection_when_scroll_adds_nothing()
     rows = _bounded_user_posts_client(page).get_user_posts("user-1")
 
     assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 33)]
-    assert page.scrolls == 5
-    assert page.waits == [1000, 1000, 1000, 1000, 1000]
+    assert page.scrolls == 2
+    assert page.waits == [1000, 1000]
 
 
 def test_user_posts_keeps_scrolling_when_the_first_follow_up_has_not_loaded_new_slots() -> None:
@@ -108,27 +108,66 @@ def test_user_posts_keeps_scrolling_when_the_first_follow_up_has_not_loaded_new_
     rows = _bounded_user_posts_client(page).get_user_posts("user-1")
 
     assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 63)]
-    assert page.scrolls == 5
-    assert page.waits == [1000, 1000, 1000, 1000, 1000]
+    assert page.scrolls == 4
+    assert page.waits == [1000, 1000, 1000, 1000]
 
 
-def test_user_posts_uses_all_five_fixed_scrolls_when_two_initial_waits_have_no_growth() -> None:
-    """Stopping before the fixed fifth read can still lose the final lazy-loaded slot."""
+def test_user_posts_stops_after_two_consecutive_no_growth() -> None:
+    """Two stable reads are sufficient evidence to return the real partial observation."""
     first_page = [_note(note_id) for note_id in range(1, 33)]
     page = _FakePage([
         [first_page, [], [], [], []],
         [first_page, [], [], [], []],
         [first_page, [], [], [], []],
-        [first_page, [_note(note_id) for note_id in range(33, 63)], [], [], []],
-        [first_page, [_note(note_id) for note_id in range(33, 93)], [], [], []],
-        [first_page, [_note(note_id) for note_id in range(33, 123)], [], [], []],
     ])
 
     rows = _bounded_user_posts_client(page).get_user_posts("user-1")
 
-    assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 123)]
-    assert page.scrolls == 5
-    assert page.waits == [1000, 1000, 1000, 1000, 1000]
+    assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 33)]
+    assert page.scrolls == 2
+    assert page.waits == [1000, 1000]
+
+
+def test_user_posts_continues_past_five_growths_until_two_consecutive_stable_reads() -> None:
+    """A five-scroll cap loses real slots that keep loading before two stable reads."""
+    first_page = [_note(note_id) for note_id in range(1, 33)]
+    snapshots = [[first_page, [], [], [], []]]
+    for last_note_id in (62, 92, 122, 152, 172, 182, 182, 182):
+        snapshots.append([
+            first_page,
+            [_note(note_id) for note_id in range(33, last_note_id + 1)],
+            [],
+            [],
+            [],
+        ])
+    page = _FakePage(snapshots)
+
+    rows = _bounded_user_posts_client(page).get_user_posts("user-1")
+
+    assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 183)]
+    assert page.scrolls == 8
+    assert page.waits == [1000] * 8
+
+
+def test_user_posts_stops_at_the_hard_twenty_scroll_cap_when_every_read_grows() -> None:
+    """A continuously changing page must still have an exact bounded read-only limit."""
+    first_page = [_note(note_id) for note_id in range(1, 33)]
+    snapshots = [[first_page, [], [], [], []]]
+    for last_note_id in range(33, 53):
+        snapshots.append([
+            first_page,
+            [_note(note_id) for note_id in range(33, last_note_id + 1)],
+            [],
+            [],
+            [],
+        ])
+    page = _FakePage(snapshots)
+
+    rows = _bounded_user_posts_client(page).get_user_posts("user-1")
+
+    assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 53)]
+    assert page.scrolls == 20
+    assert page.waits == [1000] * 20
 
 
 def test_user_posts_deduplicates_repeated_note_ids_without_reordering_first_observations() -> None:
