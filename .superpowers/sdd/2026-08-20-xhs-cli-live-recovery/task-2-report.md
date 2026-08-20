@@ -248,3 +248,41 @@ The default timeout is now 90 seconds. The no-network Settings-to-adapter
 budget test explicitly accounts for `20 + 3 + 15 + 20` seconds and requires a
 fixed at-least-10-second startup/parse margin while retaining the existing
 120-second maximum. No wrapper, environment, or other module changed.
+
+## Round 6: API-limit-compatible scroll cap
+
+### Root cause
+
+In a fresh real control session, two unknown-total read-only observations grew
+from 542 to 662 notes. The second observation still grew through the existing
+20-scroll cap, so that cap did not align with the adapter's permitted
+1000-note collection boundary.
+
+### TDD evidence
+
+RED command:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py -q -k allowed_thousand
+```
+
+Before the round-6 production change: `1 failed, 8 deselected`. A controlled
+initial 542-note slot continued growing over 40 fixed reads to the allowed
+1000-note boundary; the 20-scroll cap stopped at about 771 rows.
+
+GREEN commands:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py -q
+python -m pytest backend/tests/test_settings.py backend/tests/xhs/test_xhs_cli_readonly_wrapper.py backend/tests/xhs/test_cli_adapter.py backend/tests/xhs/test_s2a_round1_hardening.py backend/tests/xhs/test_s2a_round2_hardening.py -q
+```
+
+Results: `9 passed in 0.03s`; `197 passed in 10.23s`.
+
+The hard cap is now 40 fixed one-second scroll attempts. This is explicitly
+finite and does not assume a particular number of notes per page: it permits a
+542-note initial slot to reach the allowed 1000-note boundary in the controlled
+continuous-growth case. The existing 90-second default remains budget-safe:
+`20 + 3 + 15 + 40 + 10 = 88` seconds. The two-consecutive-no-growth early
+stop, exception stop, read-only boundary, ID de-duplication, ordering, and
+partial-result behavior remain unchanged.

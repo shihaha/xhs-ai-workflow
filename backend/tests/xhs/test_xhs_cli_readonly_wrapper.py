@@ -149,11 +149,11 @@ def test_user_posts_continues_past_five_growths_until_two_consecutive_stable_rea
     assert page.waits == [1000] * 8
 
 
-def test_user_posts_stops_at_the_hard_twenty_scroll_cap_when_every_read_grows() -> None:
+def test_user_posts_stops_at_the_hard_forty_scroll_cap_when_every_read_grows() -> None:
     """A continuously changing page must still have an exact bounded read-only limit."""
     first_page = [_note(note_id) for note_id in range(1, 33)]
     snapshots = [[first_page, [], [], [], []]]
-    for last_note_id in range(33, 53):
+    for last_note_id in range(33, 73):
         snapshots.append([
             first_page,
             [_note(note_id) for note_id in range(33, last_note_id + 1)],
@@ -165,9 +165,31 @@ def test_user_posts_stops_at_the_hard_twenty_scroll_cap_when_every_read_grows() 
 
     rows = _bounded_user_posts_client(page).get_user_posts("user-1")
 
-    assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 53)]
-    assert page.scrolls == 20
-    assert page.waits == [1000] * 20
+    assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 73)]
+    assert page.scrolls == 40
+    assert page.waits == [1000] * 40
+
+
+def test_user_posts_reaches_the_allowed_thousand_note_boundary_while_reads_keep_growing() -> None:
+    """A cap based on an assumed page size can stop below the API's 1000-note limit."""
+    first_page = [_note(note_id) for note_id in range(1, 543)]
+    snapshots = [[first_page, [], [], [], []]]
+    for attempt in range(1, 41):
+        last_note_id = 542 + (458 * attempt // 40)
+        snapshots.append([
+            first_page,
+            [_note(note_id) for note_id in range(543, last_note_id + 1)],
+            [],
+            [],
+            [],
+        ])
+    page = _FakePage(snapshots)
+
+    rows = _bounded_user_posts_client(page).get_user_posts("user-1")
+
+    assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 1001)]
+    assert page.scrolls == 40
+    assert page.waits == [1000] * 40
 
 
 def test_user_posts_deduplicates_repeated_note_ids_without_reordering_first_observations() -> None:
