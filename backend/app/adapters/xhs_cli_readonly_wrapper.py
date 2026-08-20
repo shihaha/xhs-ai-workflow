@@ -244,10 +244,8 @@ def _largest_observed_user_posts(
         try:
             page.mouse.wheel(0, _USER_POSTS_SCROLL_DELTA)
             page.wait_for_timeout(_USER_POSTS_SCROLL_WAIT_MS)
-            grew = add_rows(page.evaluate(_USER_POSTS_SNAPSHOT_JS))
+            add_rows(page.evaluate(_USER_POSTS_SNAPSHOT_JS))
         except Exception:
-            break
-        if not grew:
             break
     return list(observed.values())
 

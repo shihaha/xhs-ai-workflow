@@ -65,3 +65,40 @@ the allowlist or pinned package verification, change ownership checks, or
 claim completion for a partial result. When scrolling adds nothing, it returns
 the real partial set so the existing upper-layer exact-count logic remains
 responsible for `needs_human`.
+
+## Round 1: delayed page-slot timing recovery
+
+### Root cause
+
+A real control reproduction observed 122 notes during an unknown-total probe,
+then only 62/122 during the immediately following exact persistence read. The
+first fixed scroll can leave `user.notes` unchanged while a later fixed scroll
+loads the next slot. Treating that first no-growth read as terminal preserved a
+timing-dependent partial result.
+
+### TDD evidence
+
+RED command:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py -q -k first_follow_up
+```
+
+Before the round-1 production change: `1 failed, 4 deselected`. The controlled
+five-slot FakePage remained at 32 rows after the first fixed scroll, grew to
+62 rows after the second, and the previous early-stop behavior returned only
+the first 32 rows.
+
+GREEN commands:
+
+```powershell
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py -q
+python -m pytest backend/tests/xhs/test_xhs_cli_readonly_wrapper.py backend/tests/xhs/test_cli_adapter.py backend/tests/xhs/test_s2a_round1_hardening.py backend/tests/xhs/test_s2a_round2_hardening.py -q
+```
+
+Results: `5 passed in 0.02s`; `187 passed in 10.08s`.
+
+The bounded supplement now completes all three fixed one-second read-only
+scroll attempts unless browser interaction/evaluation raises. No-growth still
+returns only the actually observed partial collection; it no longer stops the
+second and third timing-safe checks.

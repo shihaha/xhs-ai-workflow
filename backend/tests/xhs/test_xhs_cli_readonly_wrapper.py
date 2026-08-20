@@ -72,8 +72,8 @@ def test_user_posts_scrolls_fixed_page_slots_to_the_largest_observed_collection(
     rows = _bounded_user_posts_client(page).get_user_posts("user-1")
 
     assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 63)]
-    assert page.scrolls == 2
-    assert page.waits == [1000, 1000]
+    assert page.scrolls == 3
+    assert page.waits == [1000, 1000, 1000]
 
 
 def test_user_posts_keeps_the_real_partial_collection_when_scroll_adds_nothing() -> None:
@@ -84,8 +84,32 @@ def test_user_posts_keeps_the_real_partial_collection_when_scroll_adds_nothing()
     rows = _bounded_user_posts_client(page).get_user_posts("user-1")
 
     assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 33)]
-    assert page.scrolls == 1
-    assert page.waits == [1000]
+    assert page.scrolls == 3
+    assert page.waits == [1000, 1000, 1000]
+
+
+def test_user_posts_keeps_scrolling_when_the_first_follow_up_has_not_loaded_new_slots() -> None:
+    """The first fixed wait can be too early even though the next read-only scroll loads notes."""
+    first_page = [_note(note_id) for note_id in range(1, 33)]
+    complete_page = [
+        first_page,
+        [_note(note_id) for note_id in range(33, 63)],
+        [],
+        [],
+        [],
+    ]
+    page = _FakePage([
+        [first_page, [], [], [], []],
+        [first_page, [], [], [], []],
+        complete_page,
+        complete_page,
+    ])
+
+    rows = _bounded_user_posts_client(page).get_user_posts("user-1")
+
+    assert [row["id"] for row in rows] == [f"note-{note_id}" for note_id in range(1, 63)]
+    assert page.scrolls == 3
+    assert page.waits == [1000, 1000, 1000]
 
 
 def test_user_posts_deduplicates_repeated_note_ids_without_reordering_first_observations() -> None:
