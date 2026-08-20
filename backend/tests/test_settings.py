@@ -55,18 +55,28 @@ def test_default_xhs_cli_budget_exceeds_the_initial_read_and_bounded_scroll_wind
         _env_file=None,
     )
     adapter = XhsCliReadAdapter.from_settings(settings)
-    initial_user_posts_read_budget_seconds = 20.0
+    user_posts_goto_budget_seconds = 20.0
+    user_posts_start_wait_budget_seconds = 3.0
+    user_posts_data_wait_budget_seconds = 15.0
     bounded_scroll_wait_seconds = (
         wrapper._USER_POSTS_MAX_SCROLL_ATTEMPTS
         * wrapper._USER_POSTS_SCROLL_WAIT_MS
         / 1000
     )
-
-    assert settings.xhs_cli_timeout_seconds == 60.0
-    assert adapter._timeout_seconds == settings.xhs_cli_timeout_seconds
-    assert adapter._timeout_seconds > (
-        initial_user_posts_read_budget_seconds + bounded_scroll_wait_seconds
+    startup_and_parse_margin_seconds = 10.0
+    worst_case_budget_seconds = (
+        user_posts_goto_budget_seconds
+        + user_posts_start_wait_budget_seconds
+        + user_posts_data_wait_budget_seconds
+        + bounded_scroll_wait_seconds
     )
+
+    assert settings.xhs_cli_timeout_seconds == 90.0
+    assert adapter._timeout_seconds == settings.xhs_cli_timeout_seconds
+    assert adapter._timeout_seconds >= (
+        worst_case_budget_seconds + startup_and_parse_margin_seconds
+    )
+    assert adapter._timeout_seconds <= 120.0
 
 
 def test_xhs_cli_state_directory_must_be_isolated_inside_runtime(tmp_path: Path) -> None:

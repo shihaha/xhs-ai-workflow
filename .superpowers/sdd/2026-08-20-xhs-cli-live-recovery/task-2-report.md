@@ -214,3 +214,37 @@ maximum fixed-scroll wait budget. Existing non-environment Settings unit tests
 now explicitly disable dotenv loading, so the current external prepared-state
 path cannot make temporary-runtime tests fail before their assertions. The
 repository `.env` was not changed.
+
+## Round 5: worst-case child-budget margin
+
+### Root cause
+
+The 60-second default covered only a simplified initial-read estimate. The
+reviewed worst case is 20 seconds for the profile goto, up to 3 seconds for its
+fixed startup wait, 15 seconds for data readiness, and 20 seconds for bounded
+scroll waits: 58 seconds before child startup and output parsing overhead.
+
+### TDD evidence
+
+RED command:
+
+```powershell
+python -m pytest backend/tests/test_settings.py -q -k default_xhs_cli_budget
+```
+
+Before the round-5 production change: `1 failed, 5 deselected`; the Settings
+default was `60.0`, not the required `90.0`.
+
+GREEN commands:
+
+```powershell
+python -m pytest backend/tests/test_settings.py -q
+python -m pytest backend/tests/test_settings.py backend/tests/xhs/test_xhs_cli_readonly_wrapper.py backend/tests/xhs/test_cli_adapter.py backend/tests/xhs/test_s2a_round1_hardening.py backend/tests/xhs/test_s2a_round2_hardening.py -q
+```
+
+Results: `6 passed in 0.12s`; `196 passed in 10.22s`.
+
+The default timeout is now 90 seconds. The no-network Settings-to-adapter
+budget test explicitly accounts for `20 + 3 + 15 + 20` seconds and requires a
+fixed at-least-10-second startup/parse margin while retaining the existing
+120-second maximum. No wrapper, environment, or other module changed.

@@ -35,7 +35,7 @@ class Settings(BaseSettings):
         validation_alias="XHS_CLI_PYTHON_EXECUTABLE",
     )
     xhs_cli_timeout_seconds: float = Field(
-        default=60.0,
+        default=90.0,
         gt=0,
         le=120,
         validation_alias="XHS_CLI_TIMEOUT_SECONDS",
