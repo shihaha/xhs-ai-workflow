@@ -4,7 +4,9 @@
 
 **Goal:** Add a production read-only `xhs-cli` path that collects account profiles and notes, persists trusted evidence, exposes real task/API/UI state, and supplies account-note evidence to analysis.
 
-**Architecture:** A provider-neutral adapter runs a strict subprocess allowlist and returns existing `CollectionResult` facts. A durable collection service owns reserved jobs, raw artifacts, exact N/N persistence and shutdown; account/note tables and analysis trust checks never depend on native CLI JSON. The frontend starts collections and displays only persisted API state.
+**Architecture:** A provider-neutral adapter runs a strict subprocess allowlist and returns existing `CollectionResult` facts. A durable collection service owns reserved jobs, bounded account-sample artifacts, keyword-search artifacts, exact shop N/N and shutdown; account/note tables and analysis trust checks never depend on native CLI JSON. The frontend starts collections and displays only persisted API state.
+
+**2026-08-20 scope correction:** Account homepage collection is a latest-10 sample (default and hard limit 10), not full-history N/N. Fewer than 10 visible notes succeeds as `sample_exhausted`; overflow is truncated before artifact/SQLite persistence. Keyword research is separate: the tutorial calls for 5–10 qualifying notes per actual keyword, with a 2-note first-pass completeness check. Historical 62-note evidence remains preserved and is not the default input for new analysis. Any older `expected_note_count` or account-note exact-N/N examples below are superseded by this correction; strict full N/N remains unchanged for bounded shop products/images/manifests.
 
 **Tech Stack:** Python 3.12, FastAPI, SQLAlchemy 2, SQLite, Pydantic 2, `subprocess`, React 19, TypeScript, Vitest, Playwright.
 
@@ -16,7 +18,7 @@
 - Only `status`, `whoami`, `search`, `read`, `user`, and `user-posts` may execute; never invoke a Shell.
 - API input cannot choose executable, command, URL, Cookie, token, environment, or evidence path.
 - Cookie/token values never enter logs, database facts, artifacts, or API responses.
-- Only exact-complete results may persist normalized account/note facts and succeed the job atomically.
+- Only a trusted `bounded_sample` or truthful `sample_exhausted` result may persist normalized account-note facts and succeed atomically; captcha/limit/unknown ownership remains non-success.
 - Login expiry, captcha, rate-limit and account visibility failures are truthful `needs_human` facts.
 - No platform write operation and no automatic publication.
 
@@ -185,7 +187,7 @@ git commit -m "feat: persist trusted account note evidence"
 
 ```python
 def test_account_collection_returns_202_and_durable_queued_job(client):
-    response = client.post("/api/v1/accounts/u1/collections", json={"expected_note_count": 2})
+    response = client.post("/api/v1/accounts/u1/collections", json={"sample_limit": 10})
     assert response.status_code == 202
     assert client.get(f"/api/v1/jobs/{response.json()['job_id']}").json()["state"] == "queued"
 
@@ -214,8 +216,8 @@ Expected: missing service and routes.
 
 ```python
 class XhsCollectionService:
-    def submit_account(self, user_id: str, expected_note_count: int) -> Job:
-        return self._submit("xhs_account_collection", user_id, expected_note_count)
+    def submit_account(self, user_id: str, sample_limit: int = 10) -> Job:
+        return self._submit("xhs_account_collection", user_id, min(sample_limit, 10))
     def submit_search(self, keyword: str, expected_count: int) -> Job:
         return self._submit("xhs_note_search", keyword, expected_count)
     def close(self) -> bool:

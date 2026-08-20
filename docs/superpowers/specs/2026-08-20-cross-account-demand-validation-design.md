@@ -9,6 +9,8 @@ Reuse the existing grounded analysis and sealed evidence system. Do not create a
 
 Single-account reports are observation signals only. Cross-account analyses require at least two distinct accounts, and each supporting account must contribute one complete shop result plus trusted account-note evidence. The model proposes a cluster and citations; the service validates ownership and computes the evidence level.
 
+For Phase A, trusted account-note evidence means the current bounded account sample: the latest 10 unique public notes, or all visible notes with `sample_exhausted` when fewer than 10 exist. It never means a full-account archive. Historical 62-note evidence remains preserved but is not selected as the default input for a new analysis. Exact full N/N continues to apply to shop products, product images, manifests and hashes.
+
 ## Opportunity lifecycle
 
 - Two supporting accounts: `warming_candidate`.

@@ -36,7 +36,7 @@ export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapsh
   const [pollCount, setPollCount] = useState(0);
   const [pollError, setPollError] = useState<string | null>(null);
   const [searchKeyword, setSearchKeyword] = useState("");
-  const [searchExpected, setSearchExpected] = useState("1");
+  const [searchExpected, setSearchExpected] = useState("2");
   const [searches, setSearches] = useState<TrackedSearch[]>([]);
   const [activeSearchId, setActiveSearchId] = useState<string | null>(null);
   const mounted = useRef(true);
@@ -108,7 +108,7 @@ export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapsh
       <div className="panel-heading"><h2>Public note keyword search</h2><p>Local xhs-cli · normalized public facts only</p></div>
       <form className="action-form" onSubmit={event => { event.preventDefault(); void singleFlight(async () => {
         const count = Number(searchExpected);
-        if (!Number.isInteger(count) || count < 0 || count > 1000) throw new Error("Expected search notes must be a whole number from 0 to 1000.");
+        if (!Number.isInteger(count) || (count !== 2 && (count < 5 || count > 10))) throw new Error("Use 2 for the first pass or 5 to 10 for the target.");
         const keyword = searchKeyword.trim();
         if (!keyword) throw new Error("A note search keyword is required.");
         const queued = await startNoteSearch({ keyword, expected_count: count });
@@ -118,7 +118,8 @@ export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapsh
         setNotice(`Note search ${queued.job_id} queued.`);
       }); }}>
         <label>Note search keyword<input aria-label="Note search keyword" maxLength={500} required value={searchKeyword} onChange={event => setSearchKeyword(event.target.value)} /></label>
-        <label>Expected public notes<input aria-label="Expected public notes" min="0" max="1000" step="1" required type="number" value={searchExpected} onChange={event => setSearchExpected(event.target.value)} /></label>
+        <label>First-pass public notes per keyword<input aria-label="First-pass public notes per keyword" min="2" max="10" step="1" required type="number" value={searchExpected} onChange={event => setSearchExpected(event.target.value)} /></label>
+        <p className="field-help">The tutorial workflow targets 5–10 qualifying notes per actual keyword. The first pass collects 2 complete notes to verify evidence quality; later passes stop as soon as the target is met and deduplicate the same product across keywords.</p>
         <p className="field-help">Operator prerequisite: authenticate the trusted local xhs-cli session outside this application. Search accepts no Cookie, token, password, executable path, URL, or login action.</p>
         <button disabled={pending || activeSearchId !== null} type="submit">Search public notes</button>
       </form>

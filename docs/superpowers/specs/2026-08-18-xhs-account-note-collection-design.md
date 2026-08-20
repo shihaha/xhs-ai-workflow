@@ -33,8 +33,8 @@ V1 使用已审计并已下载的 `xhs-cli` 作为首个生产只读适配器，
 
 新增 `XhsCliReadAdapter`，实现：
 
-- `search_notes(CollectionRequest)`：按严格关键词搜索公开笔记。
-- `fetch_account(CollectionRequest)`：读取一个内部 `user_id` 的账号资料及账号笔记列表。
+- `search_notes(CollectionRequest)`：按关键词独立搜索公开笔记。教程业务口径为每个实际搜索词 5–10 篇达标笔记，首轮先取 2 篇验证完整性，同产品跨关键词去重并在达到目标时停止。
+- `fetch_account(CollectionRequest)`：读取一个内部 `user_id` 的账号资料及平台返回顺序中最新 10 篇唯一公开笔记；默认值和硬上限均为 10，不滚动归档账号全部历史笔记。
 - `fetch_products` 不实现，由 AdapterRegistry 将该能力解析到现有 Android 设备服务。
 
 新增两类保留任务：
@@ -70,20 +70,20 @@ V1 使用已审计并已下载的 `xhs-cli` 作为首个生产只读适配器，
 
 ### 原始证据
 
-每次外部命令的原始 JSON 先写到受管证据目录，再以 `JobArtifactRecord` 绑定：
+外部命令返回后先在内存中完成归属校验、去重和确定性截断，再把允许范围内的 JSON 写到受管证据目录并以 `JobArtifactRecord` 绑定。账号主页返回超过 10 篇时，第 11 篇及以后不得进入 SQLite 或 evidence artifact，也不得另存溢出原始 payload：
 
 - job ID、能力、账号 ID 或关键词。
 - 适配器名与版本。
 - 命令白名单标识，不保存命令行敏感值。
 - 原始文件相对路径、SHA-256、大小和采集时间。
-- N/N 计数、缺失与拒绝事实。
+- 账号样本的 `collection_scope=latest`、`sample_limit=10`、`persisted_count`、`available_count_observed`（如平台可靠返回）与 `bounded_sample/sample_exhausted`；关键词搜索记录独立请求数量；商品仍记录严格 N/N、缺失与拒绝事实。
 
-只有 `CollectionResult` 为 exact complete 时才在同一数据库事务中写账号/笔记事实并把 job 转为成功。partial、rejected、unknown-total 和 `needs_human` 只保存证据与状态，不升级为成功账号笔记。
+账号样本达到 10 篇时以 `bounded_sample` 成功；实际可见不足 10 篇时以真实 `sample_exhausted` 成功。验证码、上限、归属不明、partial、rejected、unknown-total 和 `needs_human` 仍只保存证据与状态，不升级为成功。一次平台读取直接完成同一任务的截断、artifact、SQLite 与终态持久化，不使用“先探数、再精确采集”的双请求。
 
 ## 6. API
 
 - `POST /api/v1/accounts/{user_id}/collections`
-  - body 只接受严格 `expected_note_count` 上限。
+  - body 使用 `sample_limit`，默认值和硬上限均为 10；旧 `expected_note_count` 调用只作兼容迁移并强制收敛到 10，同时记录迁移来源。
   - 返回 HTTP 202、job ID。
 - `POST /api/v1/notes/search-collections`
   - body 只接受规范化关键词和严格数量上限。
@@ -97,28 +97,30 @@ V1 使用已审计并已下载的 `xhs-cli` 作为首个生产只读适配器，
 ## 7. 分析接入
 
 - `analysis-evidence` 发现端点增加可信账号笔记证据。
-- 账号分析请求引用笔记时，服务端重新验证 job 类型、producer、artifact 路径/hash、账号归属与 N/N 完整性。
+- 账号分析请求引用笔记时，服务端重新验证 job 类型、producer、artifact 路径/hash、账号归属与当前有界样本完整性。
+- 新账号分析默认只消费当前任务产生的最新 10 篇样本；旧 62 篇证据保留历史记录，但不得自动作为当前账号全量输入。
 - 模型输出中的 evidence ID 必须属于当前分析请求允许集合。
-- 没有完整账号笔记证据时可以分析现有榜单/商品事实，但必须明确标记证据缺口；不能声称已经完成笔记深采。
+- 没有可信有界账号笔记样本时可以分析现有榜单/商品事实，但必须明确标记证据缺口；不能声称已经完成账号全部笔记采集。
 
 ## 8. 前端
 
 账号页增加：
 
 - “采集账号与笔记”按钮，single-flight 防重复。
-- 真实 job 状态、N/N、失败详情和人工处理提示。
+- 真实 job 状态、`bounded_sample/sample_exhausted`、失败详情和人工处理提示；不得把 10/10 显示为账号全部笔记。
 - 账号资料与笔记列表。
 - 笔记证据 ID 和来源链接。
 - 重新采集会创建新 job，旧 job 保留审计。
 
-雷达页增加关键词笔记搜索入口，搜索结果与账号采集结果明确区分。
+雷达页增加关键词笔记搜索入口，默认首轮 2 篇，并明确教程的每个实际搜索词 5–10 篇目标；搜索结果与账号主页最新 10 篇样本明确区分。
 
 ## 9. 测试与验收
 
 ### 自动测试
 
 - 子进程命令白名单、参数注入、超时、输出上限、非 JSON、敏感字段净化。
-- exact N/N、重复笔记、跨账号归属、原始证据 hash 和事务原子性。
+- 返回 1112 篇只保存最新 10 篇、返回 6 篇成功并标记 `sample_exhausted`、第 11 篇不进入 SQLite/artifact、重复笔记、跨账号归属、证据 hash 和事务原子性。
+- 关键词目标 5 篇时采够即停；首轮 2 篇与后续目标范围明确；商品 N/N 行为不变。
 - 通用 Jobs API 不能伪造专用任务/证据。
 - 登录失效、验证码、限流和命令不可用进入真实状态。
 - 分析只能引用当前账号的可信笔记证据。
@@ -127,7 +129,7 @@ V1 使用已审计并已下载的 `xhs-cli` 作为首个生产只读适配器，
 
 ### Live 验收
 
-用户在本机完成 `xhs-cli` 登录，不向应用或聊天提供密码/Cookie。至少用一个真实账号和一个关键词执行采集，核对来源页面、N/N、证据文件和数据库一致性。未完成前状态必须为 `not_run`。
+用户在本机完成 `xhs-cli` 登录，不向应用或聊天提供密码/Cookie。至少用一个真实账号和一个关键词执行采集，核对来源页面、账号有界样本计数、关键词请求计数、证据文件和数据库一致性；商品继续核对严格 N/N。未完成前状态必须为 `not_run`。
 
 ## 10. 非目标
 
@@ -135,4 +137,3 @@ V1 使用已审计并已下载的 `xhs-cli` 作为首个生产只读适配器，
 - 不发布、点赞、评论、收藏、关注或私信。
 - 不在本轮同时接入三个第三方仓库。
 - 不承诺绕过验证码、风控或平台页面限制。
-

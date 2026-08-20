@@ -120,10 +120,14 @@ describe("RadarPage", () => {
     const loadSearchResults = vi.fn().mockResolvedValue({ job_id: "search-job-1", keyword: "露营收纳", expected_count: 1, succeeded_count: 1, artifact_id: 9, collected_at: "2026-08-18T00:00:01Z", items: [{ note_id: "note-1", source_url: "https://www.xiaohongshu.com/explore/note-1", title: "露营装备收纳", summary: "公开摘要", user_id: "author-1" }] });
     render(<RadarPage loadRadar={vi.fn().mockResolvedValue({ snapshots: [], accounts: [] })} startNoteSearch={startNoteSearch} loadSearchJob={loadSearchJob} loadSearchResults={loadSearchResults} pollIntervalMs={1} />);
     await screen.findByText("No ranking evidence recorded");
+    expect(screen.getByLabelText("First-pass public notes per keyword")).toHaveValue(2);
+    expect(screen.getByText(/first pass collects 2 complete notes/i)).toBeVisible();
+    expect(screen.getByText(/targets 5–10 qualifying notes per actual keyword/i)).toBeVisible();
     fireEvent.change(screen.getByLabelText("Note search keyword"), { target: { value: "露营收纳" } });
     const button = screen.getByRole("button", { name: "Search public notes" });
     fireEvent.click(button); fireEvent.click(button);
     expect(startNoteSearch).toHaveBeenCalledTimes(1);
+    expect(startNoteSearch).toHaveBeenCalledWith({ keyword: "露营收纳", expected_count: 2 });
     expect(button).toBeDisabled();
     resolve({ job_id: "search-job-1", status: "queued" });
 
@@ -131,6 +135,18 @@ describe("RadarPage", () => {
     expect(screen.getByRole("link", { name: "Open search result" })).toHaveAttribute("href", "https://www.xiaohongshu.com/explore/note-1");
     expect(screen.getByText("1 / 1 public notes returned")).toBeVisible();
     expect(screen.queryByText(/artifact_id|evidence\/xhs\/|secret-sentinel/i)).not.toBeInTheDocument();
+  });
+
+  it("rejects keyword counts between the two-note first pass and the five-note target floor", async () => {
+    const startNoteSearch = vi.fn();
+    render(<RadarPage loadRadar={vi.fn().mockResolvedValue({ snapshots: [], accounts: [] })} startNoteSearch={startNoteSearch} />);
+    await screen.findByText("No ranking evidence recorded");
+    fireEvent.change(screen.getByLabelText("Note search keyword"), { target: { value: "收纳" } });
+    fireEvent.change(screen.getByLabelText("First-pass public notes per keyword"), { target: { value: "4" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search public notes" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/use 2 for the first pass or 5 to 10 for the target/i);
+    expect(startNoteSearch).not.toHaveBeenCalled();
   });
 
   it("shows needs-human search audit and stale polling errors without discarding the old job", async () => {

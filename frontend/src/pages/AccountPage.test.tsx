@@ -95,9 +95,13 @@ describe("AccountPage", () => {
     await screen.findByRole("heading", { name: "真实账号" });
 
     const start = screen.getByRole("button", { name: "Collect account and notes" });
+    expect(screen.queryByRole("spinbutton", { name: /account notes/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/latest 10 unique public notes/i)).toBeVisible();
+    expect(screen.getByText(/bounded sample, not the account's complete note history/i)).toBeVisible();
     fireEvent.click(start); fireEvent.click(start);
 
     expect(startAccountCollection).toHaveBeenCalledTimes(1);
+    expect(startAccountCollection).toHaveBeenCalledWith("author-1", { sample_limit: 10 });
     expect(start).toBeDisabled();
     resolve({ job_id: "xhs-job-1", status: "queued" });
     await waitFor(() => expect(screen.getByText("xhs-job-1")).toBeVisible());
@@ -137,7 +141,18 @@ describe("AccountPage", () => {
     expect(screen.getByRole("link", { name: "Open note source" })).toHaveAttribute("href", "https://www.xiaohongshu.com/explore/note-1");
     expect(screen.getAllByText("account-note:17", { exact: false })).not.toHaveLength(0);
     expect(screen.getByText(/does not replace exact shop N\/N verification/i)).toBeVisible();
+    expect(screen.getByText(/older persisted notes remain historical evidence/i)).toBeVisible();
     expect(screen.queryByText(/notes make this opportunity eligible/i)).not.toBeInTheDocument();
+  });
+
+  it("labels fewer than ten persisted account notes as an exhausted sample instead of full-account completeness", async () => {
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({
+      account, profile: null, notes: [], evidence: [], analyses: [], devices: [],
+      jobs: [{ ...accountJob("xhs-job-six", "succeeded"), input: { user_id: "author-1", sample_limit: 10 }, progress_current: 6, progress_total: 6 }],
+    })} />);
+
+    expect(await screen.findByText(/sample_exhausted: fewer than 10 public notes were available/i)).toBeVisible();
+    expect(screen.queryByText(/full-account complete/i)).not.toBeInTheDocument();
   });
 
   it("surfaces a stale collection read and bounds automatic polling", async () => {

@@ -171,7 +171,7 @@ export const ingestRankSnapshot = (payload: Record<string, unknown>) => postJson
 export const startQianfanCollection = (payload: { expected_count_per_scope: number }) => postJson<QianfanCollectionQueued>("/api/v1/radar/qianfan-collections", payload);
 export const fetchDevices = () => getJson<DeviceHealth[]>("/api/v1/devices");
 export const fetchJob = (jobId: string) => getJson<Job>(`/api/v1/jobs/${encodeURIComponent(jobId)}`);
-export const startAccountCollection = (userId: string, payload: { expected_note_count: number }) => postJson<CollectionQueued>(`/api/v1/accounts/${encodeURIComponent(userId)}/collections`, payload);
+export const startAccountCollection = (userId: string, payload: { sample_limit: 10 }) => postJson<CollectionQueued>(`/api/v1/accounts/${encodeURIComponent(userId)}/collections`, payload);
 export const fetchAccountProfile = (userId: string) => getJson<AccountProfile>(`/api/v1/accounts/${encodeURIComponent(userId)}/profile`);
 export const fetchAccountNotes = (userId: string) => getJson<AccountNote[]>(`/api/v1/accounts/${encodeURIComponent(userId)}/notes`);
 export const startNoteSearch = (payload: { keyword: string; expected_count: number }) => postJson<CollectionQueued>("/api/v1/notes/search-collections", payload);

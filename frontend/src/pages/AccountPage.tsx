@@ -41,13 +41,20 @@ export interface AccountPageProps {
   loadAccount?: () => Promise<AccountData>;
   queueShop?: (payload: Record<string, unknown>) => Promise<{ job_id: string; status: "queued" }>;
   createAnalysis?: (payload: AnalysisPayload) => Promise<unknown>;
-  startAccountCollection?: (userId: string, payload: { expected_note_count: number }) => Promise<CollectionQueued>;
+  startAccountCollection?: (userId: string, payload: { sample_limit: 10 }) => Promise<CollectionQueued>;
   loadCollectionJob?: (jobId: string) => Promise<Job>;
   pollIntervalMs?: number;
   maxPolls?: number;
 }
 
 const terminal = new Set<Job["state"]>(["needs_human", "succeeded", "failed", "cancelled"]);
+
+function accountSampleStatus(job: Job): string | null {
+  if (job.state !== "succeeded" || job.input.sample_limit !== 10) return null;
+  return job.progress_current < 10
+    ? "sample_exhausted: fewer than 10 public notes were available; all visible notes were saved."
+    : "bounded_sample: latest 10/10 notes saved; this is not full-account completeness.";
+}
 
 async function optionalFact<T>(load: () => Promise<T>, fallback: T): Promise<T> {
   try {
@@ -98,7 +105,6 @@ export function AccountPage({
   const loader = useMemo(() => loadAccount ?? (() => loadFor(accountId)), [accountId, loadAccount]);
   const [state, setState] = useState<{ kind: "loading" } | { kind: "error" } | { kind: "ready"; data: AccountData }>({ kind: "loading" });
   const [expected, setExpected] = useState("0");
-  const [expectedNotes, setExpectedNotes] = useState("1");
   const [verificationDir, setVerificationDir] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
@@ -195,28 +201,27 @@ export function AccountPage({
     {notice ? <p className="action-notice" role="status">{notice}</p> : null}{actionError ? <p className="action-error" role="alert">{actionError}</p> : null}
 
     <section className="operator-panel">
-      <div className="panel-heading"><h2>Read-only account and note collection</h2><p>Local xhs-cli · profile + exact note N/N</p></div>
+      <div className="panel-heading"><h2>Read-only account and note collection</h2><p>Local xhs-cli · profile + latest 10-note sample</p></div>
       <form className="action-form" onSubmit={event => { event.preventDefault(); void act(async () => {
-        const count = Number(expectedNotes);
-        if (!Number.isInteger(count) || count < 0 || count > 1000) throw new Error("Expected notes must be a whole number from 0 to 1000.");
-        const queued = await startAccountCollection(account.user_id, { expected_note_count: count });
+        const queued = await startAccountCollection(account.user_id, { sample_limit: 10 });
         if (!mounted.current) return "";
         setTrackedCollections(current => [...current, { job_id: queued.job_id, status: queued.status, polls: 0 }]);
         setActiveCollectionId(queued.job_id);
         return `Account collection ${queued.job_id} queued.`;
       }); }}>
-        <label>Expected account notes<input aria-label="Expected account notes" min="0" max="1000" step="1" required type="number" value={expectedNotes} onChange={event => setExpectedNotes(event.target.value)} /></label>
+        <p className="field-help">Collects the latest 10 unique public notes, or every currently visible note when fewer than 10 exist. This is a bounded sample, not the account's complete note history.</p>
         <p className="field-help">Operator prerequisite: authenticate the trusted local xhs-cli session outside this application. This form never accepts Cookie, token, password, executable path, URL, or login actions.</p>
         <button disabled={pending || activeCollectionId !== null} type="submit">Collect account and notes</button>
       </form>
       {trackedCollections.length === 0 && persistedXhsJobs.length === 0 ? <p className="panel-empty">No account-note collection has been recorded in this page session.</p> : <ol className="collection-list">
-        {trackedCollections.map(item => <li key={item.job_id}><header><strong>{item.status === "needs_human" ? "Human attention required" : item.status}</strong><code>{item.job_id}</code></header><p>{item.job ? `${item.job.progress_current} / ${item.job.progress_total ?? "unknown"} notes · ${item.job.current_stage ?? "stage not reported"}` : "Waiting for the first persisted job read."}{item.job?.error_category ? ` · ${item.job.error_category}` : ""}</p>{item.staleError ? <p className="action-error" role="alert">Account job read failed: {item.staleError}. The last displayed state is stale.</p> : null}{item.polls >= maxPolls && !terminal.has(item.status) ? <><p>Automatic account refresh stopped after {maxPolls} checks.</p><p className="field-help">The persisted job remains non-terminal. Continue refreshing this job or start a new collection; no terminal state is inferred.</p><button disabled={pending || activeCollectionId !== null} type="button" onClick={() => { setTrackedCollections(current => current.map(currentItem => currentItem.job_id === item.job_id ? { ...currentItem, polls: 0 } : currentItem)); setActiveCollectionId(item.job_id); }}>Continue refreshing {item.job_id}</button></> : null}{item.status === "needs_human" || item.status === "failed" ? <p className="field-help">Resolve the local xhs-cli session, captcha, rate-limit, or visibility issue outside the application, then create a new job. This job remains unchanged for audit.</p> : null}</li>)}
-        {persistedXhsJobs.filter(job => !trackedCollections.some(item => item.job_id === job.id)).map(job => <li key={job.id}><header><strong>{job.state}</strong><code>{job.id}</code></header><p>{job.progress_current} / {job.progress_total ?? "unknown"} notes{job.error_category ? ` · ${job.error_category}` : ""}</p></li>)}
+        {trackedCollections.map(item => <li key={item.job_id}><header><strong>{item.status === "needs_human" ? "Human attention required" : item.status}</strong><code>{item.job_id}</code></header><p>{item.job ? `${item.job.progress_current} / ${item.job.progress_total ?? "unknown"} sampled notes · ${item.job.current_stage ?? "stage not reported"}` : "Waiting for the first persisted job read."}{item.job?.error_category ? ` · ${item.job.error_category}` : ""}</p>{item.job && accountSampleStatus(item.job) ? <p className="field-help">{accountSampleStatus(item.job)}</p> : null}{item.staleError ? <p className="action-error" role="alert">Account job read failed: {item.staleError}. The last displayed state is stale.</p> : null}{item.polls >= maxPolls && !terminal.has(item.status) ? <><p>Automatic account refresh stopped after {maxPolls} checks.</p><p className="field-help">The persisted job remains non-terminal. Continue refreshing this job or start a new collection; no terminal state is inferred.</p><button disabled={pending || activeCollectionId !== null} type="button" onClick={() => { setTrackedCollections(current => current.map(currentItem => currentItem.job_id === item.job_id ? { ...currentItem, polls: 0 } : currentItem)); setActiveCollectionId(item.job_id); }}>Continue refreshing {item.job_id}</button></> : null}{item.status === "needs_human" || item.status === "failed" ? <p className="field-help">Resolve the local xhs-cli session, captcha, rate-limit, or visibility issue outside the application, then create a new job. This job remains unchanged for audit.</p> : null}</li>)}
+        {persistedXhsJobs.filter(job => !trackedCollections.some(item => item.job_id === job.id)).map(job => <li key={job.id}><header><strong>{job.state}</strong><code>{job.id}</code></header><p>{job.progress_current} / {job.progress_total ?? "unknown"} sampled notes{job.error_category ? ` · ${job.error_category}` : ""}</p>{accountSampleStatus(job) ? <p className="field-help">{accountSampleStatus(job)}</p> : null}</li>)}
       </ol>}
     </section>
 
     <section className="operator-panel">
-      <div className="panel-heading"><h2>Persisted public account snapshot</h2><p>{profile ? "1 profile" : "No profile"} · {notes.length} notes</p></div>
+      <div className="panel-heading"><h2>Persisted public account snapshot</h2><p>{profile ? "1 profile" : "No profile"} · {notes.length} sampled notes returned</p></div>
+      <p className="field-help">New account analysis uses the current latest-10 sample. Older persisted notes remain historical evidence and are not treated as the current account's complete note history.</p>
       {!profile ? <p className="panel-empty">No trusted account profile has been persisted. Run an exact account collection above.</p> : <div className="fact-list"><article><h3>{profile.nickname ?? profile.user_id}</h3>{profile.bio ? <p>{profile.bio}</p> : null}<p>Public stats: {Object.entries(profile.public_stats).map(([key, value]) => `${key} ${value}`).join(" · ") || "none returned"}</p><a href={profile.source_url} rel="noreferrer" target="_blank">Open profile source</a></article></div>}
       {notes.length === 0 ? <p className="panel-empty">No persisted public notes returned.</p> : <ol className="fact-list">{notes.map(note => <li key={`${note.user_id}:${note.note_id}`}><strong>{note.title ?? note.note_id}</strong>{note.summary ? <span>{note.summary}</span> : null}<span>{note.published_at ?? "Publish time not returned"} · {Object.entries(note.public_interactions).map(([key, value]) => `${key} ${value}`).join(" · ") || "No public interaction counts returned"}</span><a href={note.source_url} rel="noreferrer" target="_blank">Open note source</a></li>)}</ol>}
       {trustedAccountNoteEvidence.length ? <div><h3>Trusted selectable note evidence</h3><ul>{trustedAccountNoteEvidence.map(item => <li key={item.evidence_id}><code>{item.evidence_id}</code> · trusted account-note input</li>)}</ul><p className="field-help">Trusted account-note evidence can ground analysis claims. It does not replace exact shop N/N verification required for opportunity creation.</p></div> : null}

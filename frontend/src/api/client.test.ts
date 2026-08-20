@@ -84,12 +84,12 @@ describe("XHS account and note collection API", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "job-account" }) });
     vi.stubGlobal("fetch", fetchMock);
 
-    await startAccountCollection("u-1", { expected_note_count: 2 });
+    await startAccountCollection("u-1", { sample_limit: 10 });
     await fetchAccountProfile("u-1");
     await fetchAccountNotes("u-1");
     await fetchJob("job-account");
 
-    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/accounts/u-1/collections", expect.objectContaining({ method: "POST", body: '{"expected_note_count":2}' }));
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/accounts/u-1/collections", expect.objectContaining({ method: "POST", body: '{"sample_limit":10}' }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/accounts/u-1/profile", expect.any(Object));
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/accounts/u-1/notes", expect.any(Object));
     expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/v1/jobs/job-account", expect.any(Object));

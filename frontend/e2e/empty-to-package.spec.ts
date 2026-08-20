@@ -24,7 +24,7 @@ test("fresh temporary database reaches an available pending-publication package"
     await page.goto("/radar");
     await page.getByRole("link", { name: accountNames[index] }).click();
     await expect(page.getByText("Device available: controlled_device_ready")).toBeVisible();
-    await page.getByLabel("Expected account notes").fill("1");
+    await expect(page.getByText(/latest 10 unique public notes/i)).toBeVisible();
     await page.getByRole("button", { name: "Collect account and notes" }).click();
     await expect(page.getByText(/Account collection [0-9a-f-]+ queued/)).toBeVisible();
     await expect(page.getByRole("link", { name: "Open note source" })).toBeVisible({ timeout: 15_000 });
