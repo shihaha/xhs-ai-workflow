@@ -1,6 +1,12 @@
 # Implementation status
 
-Status date: 2026-08-19
+Status date: 2026-08-20
+
+## Active business phase
+
+Phase A is the only active implementation scope: cross-account demand validation and human opportunity review. Existing collection, evidence, recovery and media infrastructure is retained. Product construction, content research, templates, Skills, content generation and ZIP work are not being extended in this phase.
+
+The approved Phase A contract distinguishes single-account observation signals from market opportunities. Cross-account analysis requires at least two different accounts, complete trusted shop evidence and trusted account notes for every account. The server—not the model or operator—computes `warming_candidate` for two accounts and `validated_candidate` for three or more. Valid model clusters enter `pending_review`; only a human `approved` result may cross the product gate, while `rejected` history remains durable.
 
 ## Software scope
 

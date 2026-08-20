@@ -23,8 +23,12 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [ ] Confirm any `account-note:*` entry marked ineligible is labelled stale/untrusted, disabled for analysis selection and retained for human audit.
 - [ ] Select the new account's canonical `account-note:*` IDs together with its trusted shop evidence for analysis; confirm notes enrich claims but do not replace the exact shop N/N opportunity gate.
 - [ ] Confirm declared N, discovered N, verified N, missing list and image manifests agree.
-- [ ] Generate a grounded analysis and opportunity; every claim cites persisted evidence.
-- [ ] Create product/materials/content, review it, and export an available ZIP.
+- [ ] Run a single-account report and confirm it is displayed only as an observation signal and creates no opportunity row.
+- [ ] Collect a second independent ranked account with exact profile, note and shop evidence.
+- [ ] Run a two-account demand cluster and require every candidate to cite trusted shop and note evidence from both accounts.
+- [ ] Confirm a valid two-account candidate is `warming_candidate + pending_review` and that the evidence count is server-derived.
+- [ ] Approve or reject the candidate; confirm rejection retains history and an unapproved candidate cannot create a product.
+- [ ] Phase B–E product/content/ZIP UAT is deferred until the user separately approves those phases.
 - [ ] From a current review/approved revision, generate one managed image, verify its run/job/request ID/usage/database/file/hash facts, request one advisory visual assessment, and confirm the advice did not auto-approve any human visual check.
 - [ ] Compare ZIP manifest, text, images, sources, reviews, DB record, size and SHA-256.
 
@@ -49,6 +53,12 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - Bailian text live contract: **failed (2026-08-19)** — the configured text model and Key reached Bailian successfully with HTTP 200, but the returned JSON did not satisfy strict `AnalysisOutput` and was rejected as `model_output_invalid` after 7.796 seconds. The production adapter now sends the exact Pydantic JSON Schema and JSON-only/key-preservation instruction; focused contract tests pass, but the real provider output remains non-conformant. No model output, Key or full provider payload was persisted in this record, and no successful analysis fact is claimed.
 - Bailian image/vision live gate: **passed (2026-08-19)** — the final isolated opt-in run completed `2 passed in 19.25s` against the configured `wan2.6-t2i` and `qwen-vl-max` models. It proved real remote image generation and download, full local image decoding/validation, managed `output_image` persistence, strict visual-assessment parsing, provider request-ID presence and numeric usage projection. The content remained in human `review`; the advisory result did not auto-approve it. No credential value was printed or persisted in project files.
 - Seven-day real UAT: **not_run**.
+
+## Phase A execution status
+
+- Formal Phase A business specification: **approved / implementation in progress (2026-08-20)**.
+- Existing Stage 2 trusted account baseline: **passed** — one real ranked account, one public profile, 62 persisted public notes, and one new successful shop verification at `2/2/2`, zero missing, `complete=true`; the older `needs_human` shop job remains unchanged.
+- Second independent account and real cross-account cluster: **not_run**.
 
 Until every item above is evidenced, status is “software implemented / awaiting
 real UAT”, not “same effect as the tutorial proven”.
