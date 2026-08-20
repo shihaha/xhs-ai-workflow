@@ -2,6 +2,25 @@
 
 Date: 2026-08-20 (Asia/Shanghai)
 
+## 2026-08-21 approved evidence-sample result
+
+The user approved a general three-product evidence rule for large in-scope
+shops. `evidence_sample` takes the first three distinct products in the default
+shop order, forbids selection/skipping/fourth-product substitution, requires a
+trusted in-scope preflight and exact same-job detail screenshot, source,
+manifest, SHA and SQLite bindings, and remains explicitly
+`sample_complete=true` / `shop_complete=false`. The old
+`bounded_sample/test_override` remains ineligible for real opportunities.
+
+Real job `84f11a0d…` succeeded at `3/3`, missing `0`, stage
+`shop_evidence_sample_complete`, with 34 artifacts and persisted manifest and
+collection hashes. A fresh Database/AnalysisService read accepted its result as
+opportunity-eligible evidence. One subsequent real two-account analysis used
+two trusted shop facts and twenty trusted latest-note facts. Analysis
+`28856ff2…` failed closed as `evidence_grounding_failed`; it created zero
+opportunities and was not automatically retried. Phase A remains not passed and
+Phase B has not started.
+
 ## 2026-08-21 dynamic-card live result
 
 The latest authorized real-phone validation succeeded at exact `3/3` with no

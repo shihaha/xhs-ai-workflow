@@ -40,6 +40,7 @@ from backend.app.features.shops.service import (
     ANDROID_SHOP_JOB_TYPES,
     SHOP_TEST_OVERRIDE_REASON,
     ShopCollectionRead,
+    verify_shop_collection,
 )
 from backend.app.features.xhs.constants import (
     ACCOUNT_COLLECTION_ARTIFACT_KIND,
@@ -61,8 +62,7 @@ from backend.app.features.xhs.schemas import (
     public_counter_values,
 )
 from backend.app.features.xhs.staging_cleanup import sqlite_file_device_identity
-from backend.app.models.jobs import JobArtifactRecord
-from backend.app.models.jobs import JobState
+from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 
 
 PROMPT_VERSION = "tutorial-demand-radar-grounded-v1"
@@ -1117,16 +1117,30 @@ class AnalysisService:
         job_input = job.input_data
         job_account = job_input.get("account_user_id")
         expected_count = job_input.get("expected_count")
-        bounded_mode = file_result.get("collection_mode") == "bounded_sample"
-        bounded_sample = bounded_mode and _exact_bounded_shop_sample(file_result)
-        bounded_files = bounded_sample and _trusted_bounded_sample_indexes(
-            self.runtime_dir,
-            job.id,
-            file_result,
+        sample_mode = file_result.get("collection_mode")
+        bounded_sample = (
+            sample_mode == "bounded_sample"
+            and _exact_bounded_shop_sample(file_result)
+        )
+        evidence_sample = (
+            sample_mode == "evidence_sample"
+            and _exact_evidence_shop_sample(file_result)
+        )
+        sample_files = (
+            (bounded_sample or evidence_sample)
+            and _trusted_bounded_sample_indexes(
+                self.runtime_dir,
+                job.id,
+                file_result,
+                verify_product_files=evidence_sample,
+            )
+        )
+        trusted_evidence_gate = evidence_sample and self._trusted_in_scope_gate(
+            job_input.get("scope_gate_job_id"), job_account
         )
         full_shop_mode = parsed.collection_mode in {"legacy_full_shop", "full_shop"}
         bounded_job = (
-            bounded_files
+            sample_files
             and _strict_value(job_input.get("collection_mode"), "bounded_sample")
             and _strict_value(job_input.get("expected_count"), 3)
             and _strict_value(job_input.get("product_sample_limit"), 3)
@@ -1142,6 +1156,24 @@ class AnalysisService:
             and job.progress_current == 3
             and job.current_stage == "shop_sample_complete"
         )
+        evidence_sample_job = (
+            sample_files
+            and trusted_evidence_gate
+            and _strict_value(job_input.get("collection_mode"), "evidence_sample")
+            and _strict_value(job_input.get("expected_count"), 3)
+            and _strict_value(job_input.get("product_sample_limit"), 3)
+            and _strict_value(job_input.get("test_override"), False)
+            and job_input.get("test_override_reason") is None
+            and isinstance(job_input.get("scope_gate_job_id"), str)
+            and bool(job_input.get("scope_gate_job_id"))
+            and _strict_value(
+                job_input.get("available_count_observed"),
+                file_result.get("available_count_observed"),
+            )
+            and job.progress_total == 3
+            and job.progress_current == 3
+            and job.current_stage == "shop_evidence_sample_complete"
+        )
         full_shop_job = (
             full_shop_mode
             and parsed.expected_count == expected_count
@@ -1155,7 +1187,7 @@ class AnalysisService:
             or not job_account.strip()
             or isinstance(expected_count, bool)
             or not isinstance(expected_count, int)
-            or not (bounded_job or full_shop_job)
+            or not (bounded_job or evidence_sample_job or full_shop_job)
             or job.error_category is not None
         ):
             return None, None
@@ -1171,6 +1203,50 @@ class AnalysisService:
                 size_bytes=len(raw_result),
                 file_identity=file_snapshot.identity,
             ),
+        )
+
+    def _trusted_in_scope_gate(
+        self, gate_job_id: object, account_user_id: object
+    ) -> bool:
+        if not isinstance(gate_job_id, str) or not isinstance(account_user_id, str):
+            return False
+        with self.database.session() as session:
+            rows = session.execute(
+                select(JobArtifactRecord, JobRecord)
+                .join(JobRecord, JobRecord.id == JobArtifactRecord.job_id)
+                .where(
+                    JobRecord.id == gate_job_id,
+                    JobArtifactRecord.kind == "shop_scope_gate_result",
+                )
+            ).all()
+        if len(rows) != 1:
+            return False
+        artifact, gate = rows[0]
+        expected_path = Path("evidence") / "shops" / gate.id / "scope-gate.json"
+        snapshot = _read_contained_regular_file(
+            self.runtime_dir, expected_path, limit=MAX_TRUSTED_RESULT_BYTES
+        )
+        if snapshot is None:
+            return False
+        try:
+            payload = json.loads(snapshot.payload.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            return False
+        metadata = artifact.metadata_json
+        return (
+            gate.type in ANDROID_SHOP_JOB_TYPES
+            and _safe_job_state(gate.state) is JobState.succeeded
+            and gate.input_data.get("account_user_id") == account_user_id
+            and gate.input_data.get("collection_mode") == "preflight"
+            and artifact.producer == "external"
+            and artifact.path == expected_path.as_posix()
+            and isinstance(payload, dict)
+            and metadata.get("result") == payload
+            and metadata.get("sha256") == sha256(snapshot.payload).hexdigest()
+            and payload.get("job_id") == gate.id
+            and payload.get("account_user_id") == account_user_id
+            and payload.get("classification") == "in_scope"
+            and payload.get("deep_collection_allowed") is True
         )
 
 
@@ -1345,13 +1421,17 @@ def _eligible_for_opportunity(
         if not isinstance(result, dict):
             return False
         covered_accounts.add(account_user_id)
-        if result.get("collection_mode") == "bounded_sample":
+        collection_mode = result.get("collection_mode")
+        if collection_mode == "bounded_sample":
             # Controlled/test samples may remain readable for diagnostics and
             # account reports, but they are never commercial opportunity
             # evidence.  A future evidence_sample mode requires an explicit
             # business rule and must not reuse test_override.
             return False
-        if result.get("status") != "succeeded" or result.get("complete") is not True:
+        if collection_mode == "evidence_sample":
+            if not _exact_evidence_shop_sample(result):
+                return False
+        elif result.get("status") != "succeeded" or result.get("complete") is not True:
             return False
         verification = result.get("verification")
         if not isinstance(verification, dict) or verification.get("complete") is not True:
@@ -1443,15 +1523,39 @@ def _eligible_for_opportunity(
 
 
 def _exact_bounded_shop_sample(result: dict[str, Any]) -> bool:
+    return _exact_three_product_shop_sample(
+        result,
+        collection_mode="bounded_sample",
+        test_override=True,
+        test_override_reason=SHOP_TEST_OVERRIDE_REASON,
+    )
+
+
+def _exact_evidence_shop_sample(result: dict[str, Any]) -> bool:
+    return _exact_three_product_shop_sample(
+        result,
+        collection_mode="evidence_sample",
+        test_override=False,
+        test_override_reason=None,
+    )
+
+
+def _exact_three_product_shop_sample(
+    result: dict[str, Any],
+    *,
+    collection_mode: str,
+    test_override: bool,
+    test_override_reason: str | None,
+) -> bool:
     verification = result.get("verification")
     if not isinstance(verification, dict):
         return False
     exact_result_values = {
         "status": "succeeded",
-        "collection_mode": "bounded_sample",
+        "collection_mode": collection_mode,
         "product_sample_limit": 3,
-        "test_override": True,
-        "test_override_reason": SHOP_TEST_OVERRIDE_REASON,
+        "test_override": test_override,
+        "test_override_reason": test_override_reason,
         "expected_count": 3,
         "discovered_count": 3,
         "collected_count": 3,
@@ -1486,35 +1590,6 @@ def _exact_bounded_shop_sample(result: dict[str, Any]) -> bool:
     binding_paths = (
         result.get("sample_manifest_path"),
         result.get("sample_collection_path"),
-    )
-
-
-def _exact_account_sample_result(
-    result: CollectionResult,
-    *,
-    expected_item_count: int,
-    available_count: int,
-    completeness: str,
-) -> bool:
-    sample = result.raw_evidence.get("latest_sample")
-    return (
-        result.status == "succeeded"
-        and result.detail is None
-        and result.complete
-        and result.expected_count_known
-        and result.expected_count == expected_item_count
-        and result.succeeded_count == expected_item_count
-        and result.observed_count == expected_item_count
-        and result.raw_observation_count == expected_item_count
-        and result.duplicate_observation_count == 0
-        and len(result.items) == expected_item_count
-        and not result.rejected_items
-        and not result.missing_items
-        and result.overflow_count == 0
-        and isinstance(sample, dict)
-        and _strict_value(sample.get("sample_limit"), 10)
-        and _strict_value(sample.get("available_count_observed"), available_count)
-        and _strict_value(sample.get("completeness"), completeness)
     )
     binding_digests = (
         result.get("sample_manifest_sha256"),
@@ -1552,10 +1627,41 @@ def _exact_account_sample_result(
     )
 
 
+def _exact_account_sample_result(
+    result: CollectionResult,
+    *,
+    expected_item_count: int,
+    available_count: int,
+    completeness: str,
+) -> bool:
+    sample = result.raw_evidence.get("latest_sample")
+    return (
+        result.status == "succeeded"
+        and result.detail is None
+        and result.complete
+        and result.expected_count_known
+        and result.expected_count == expected_item_count
+        and result.succeeded_count == expected_item_count
+        and result.observed_count == expected_item_count
+        and result.raw_observation_count == expected_item_count
+        and result.duplicate_observation_count == 0
+        and len(result.items) == expected_item_count
+        and not result.rejected_items
+        and not result.missing_items
+        and result.overflow_count == 0
+        and isinstance(sample, dict)
+        and _strict_value(sample.get("sample_limit"), 10)
+        and _strict_value(sample.get("available_count_observed"), available_count)
+        and _strict_value(sample.get("completeness"), completeness)
+    )
+
+
 def _trusted_bounded_sample_indexes(
     runtime_dir: Path,
     job_id: str,
     result: dict[str, Any],
+    *,
+    verify_product_files: bool = False,
 ) -> bool:
     expected_dir = Path("evidence") / "shops" / job_id / "sample-products"
     expected_manifest = expected_dir / "manifest.json"
@@ -1653,13 +1759,40 @@ def _trusted_bounded_sample_indexes(
         collection_urls.append(collection_item.get("source_url"))
         product_dirs.append(product_dir)
         image_paths.append(image)
-    return (
+    indexes_match = (
         len(result_urls) == 3
         and manifest_urls == result_urls
         and collection_urls == result_urls
         and len(set(product_dirs)) == 3
         and len(set(image_paths)) == 3
     )
+    if not indexes_match:
+        return False
+    if not verify_product_files:
+        return True
+    try:
+        verification = verify_shop_collection(
+            runtime_dir / expected_dir,
+            expected_count=3,
+            expected_source_urls=[str(url) for url in result_urls],
+        )
+    except (OSError, ValueError):
+        return False
+    if not verification.complete:
+        return False
+    for manifest_item in manifest_products:
+        image = PurePosixPath(str(manifest_item["image"]))
+        snapshot = _read_contained_regular_file(
+            runtime_dir,
+            expected_dir / Path(*image.parts),
+            limit=MAX_TRUSTED_RESULT_BYTES,
+        )
+        if (
+            snapshot is None
+            or sha256(snapshot.payload).hexdigest() != manifest_item["sha256"]
+        ):
+            return False
+    return True
 
 
 def _validated_opportunity_projection(
@@ -1713,11 +1846,15 @@ def _validated_opportunity_projection(
                     else {}
                 )
                 title = data.get("title") or raw.get("title")
-                image_count = sum(
-                    isinstance(path, str)
-                    and f"product_{index}_" in path
-                    and path.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
-                    for path in artifacts
+                image_count = (
+                    1
+                    if result.get("collection_mode") == "evidence_sample"
+                    else sum(
+                        isinstance(path, str)
+                        and f"product_{index}_" in path
+                        and path.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+                        for path in artifacts
+                    )
                 )
                 if image_count < 1:
                     raise ValueError(

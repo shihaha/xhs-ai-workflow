@@ -219,6 +219,37 @@ describe("AccountPage", () => {
     expect(screen.queryByText("Full shop complete: yes")).not.toBeInTheDocument();
   });
 
+  it("labels an opportunity-eligible evidence sample without claiming full-shop completeness", async () => {
+    render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({
+      account, evidence: [], analyses: [], devices: [],
+      jobs: [{
+        id: "shop-evidence-sample-1",
+        type: "android_shop_collection",
+        input: { account_user_id: "author-1", collection_mode: "evidence_sample", product_sample_limit: 3 },
+        state: "succeeded",
+        progress_current: 3,
+        progress_total: 3,
+        current_stage: "shop_evidence_sample_complete",
+        error_category: null,
+        retry_count: 0,
+        created_at: "2026-08-21T00:00:00Z",
+        updated_at: "2026-08-21T00:01:00Z",
+        started_at: "2026-08-21T00:00:00Z",
+        completed_at: "2026-08-21T00:01:00Z",
+        lease_expires_at: null,
+        logs: [],
+        artifacts: [{
+          kind: "shop_collection_result",
+          path: "evidence/shops/shop-evidence-sample-1/result.json",
+          metadata: { result: { collection_mode: "evidence_sample", product_sample_limit: 3, sample_complete: true, shop_complete: false, succeeded_count: 3, expected_count: 3 } },
+        }],
+      }],
+    })} />);
+
+    expect(await screen.findByText("Evidence sample complete: 3 / 3 products")).toBeVisible();
+    expect(screen.getByText("Full shop complete: no")).toBeVisible();
+  });
+
   it("labels fewer than ten persisted account notes as an exhausted sample instead of full-account completeness", async () => {
     render(<AccountPage accountId="author-1" loadAccount={vi.fn().mockResolvedValue({
       account, profile: null, notes: [], evidence: [], analyses: [], devices: [],

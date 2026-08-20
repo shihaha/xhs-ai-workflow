@@ -1,3 +1,4 @@
+import hashlib
 import json
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -346,6 +347,197 @@ def _complete_shop_artifact(fixture: _Fixture, account_user_id: str) -> str:
         relative_path = f"evidence/shops/{job.id}/result.json"
         target = fixture.runtime_dir / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        artifact = JobArtifactRecord(
+            job_id=job.id,
+            kind="shop_collection_result",
+            producer="android_shop_worker_v1",
+            path=relative_path,
+            metadata_json={"result": result},
+            created_at=now,
+        )
+        session.add(artifact)
+        session.commit()
+        return f"artifact:{artifact.id}"
+
+
+def _evidence_sample_shop_artifact(
+    fixture: _Fixture, account_user_id: str
+) -> str:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    with fixture.database.session() as session:
+        gate = JobRecord(
+            type="android_shop_collection",
+            input_data={
+                "account_user_id": account_user_id,
+                "collection_mode": "preflight",
+            },
+            state=JobState.succeeded,
+            progress_current=3,
+            progress_total=3,
+            current_stage="scope_gate_in_scope",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(gate)
+        session.flush()
+        gate_result = {
+            "job_id": gate.id,
+            "account_user_id": account_user_id,
+            "classification": "in_scope",
+            "deep_collection_allowed": True,
+        }
+        gate_relative = f"evidence/shops/{gate.id}/scope-gate.json"
+        gate_path = fixture.runtime_dir / gate_relative
+        gate_path.parent.mkdir(parents=True)
+        gate_path.write_text(
+            json.dumps(gate_result, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        session.add(JobArtifactRecord(
+            job_id=gate.id,
+            kind="shop_scope_gate_result",
+            producer="external",
+            path=gate_relative,
+            metadata_json={
+                "result": gate_result,
+                "sha256": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
+            },
+            created_at=now,
+        ))
+        job = JobRecord(
+            type="android_shop_collection",
+            input_data={
+                "account_user_id": account_user_id,
+                "expected_count": 3,
+                "available_count_observed": 18,
+                "collection_mode": "evidence_sample",
+                "product_sample_limit": 3,
+                "scope_gate_job_id": gate.id,
+                "test_override": False,
+            },
+            state=JobState.succeeded,
+            progress_current=3,
+            progress_total=3,
+            current_stage="shop_evidence_sample_complete",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(job)
+        session.flush()
+        sample_dir = fixture.runtime_dir / "evidence" / "shops" / job.id / "sample-products"
+        sample_dir.mkdir(parents=True)
+        items: list[dict[str, Any]] = []
+        manifest_products: list[dict[str, str]] = []
+        collection_products: list[dict[str, str]] = []
+        for index in range(1, 4):
+            source_url = (
+                f"https://www.xiaohongshu.com/goods/{account_user_id}-{index}"
+            )
+            product_dir = f"{index:02d}_product-{index}"
+            image_relative = f"{product_dir}/images/detail.png"
+            image = sample_dir / image_relative
+            image.parent.mkdir(parents=True)
+            image.write_bytes(f"sample-image-{account_user_id}-{index}".encode())
+            image_sha = hashlib.sha256(image.read_bytes()).hexdigest()
+            (sample_dir / product_dir / "detail.json").write_text(
+                json.dumps(
+                    {
+                        "link": source_url,
+                        "title": f"Product {account_user_id} {index}",
+                        "image_manifest": [
+                            {"file": "images/detail.png", "sha256": image_sha}
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            items.append({
+                "id": f"product-{account_user_id}-{index}",
+                "kind": "shop_product",
+                "source_url": source_url,
+                "raw_evidence": {"title": f"Product {account_user_id} {index}"},
+                "data": {"title": f"Product {account_user_id} {index}"},
+            })
+            manifest_products.append({
+                "source_url": source_url,
+                "image": image_relative,
+                "sha256": image_sha,
+            })
+            collection_products.append({
+                "source_url": source_url,
+                "product_dir": product_dir,
+            })
+        manifest_path = sample_dir / "manifest.json"
+        collection_path = sample_dir / "collection.json"
+        manifest_path.write_text(
+            json.dumps({"products": manifest_products}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        collection_path.write_text(
+            json.dumps(
+                {"unique_product_link_count": 3, "products": collection_products},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = {
+            "job_id": job.id,
+            "status": "succeeded",
+            "detail": None,
+            "selector_profile_version": "xhs-shop-v1",
+            "expected_count": 3,
+            "discovered_count": 3,
+            "collected_count": 3,
+            "raw_observation_count": 3,
+            "duplicate_observation_count": 0,
+            "succeeded_count": 3,
+            "missing_count": 0,
+            "missing_items": [],
+            "collection_missing_count": 0,
+            "collection_missing_items": [],
+            "rejected_count": 0,
+            "rejected_items": [],
+            "overflow_count": 0,
+            "evidence_artifacts": [],
+            "items": items,
+            "verification": {
+                "expected_count": 3,
+                "discovered_count": 3,
+                "succeeded_count": 3,
+                "missing_count": 0,
+                "missing_items": [],
+                "overflow_count": 0,
+                "issues": [],
+                "complete": True,
+            },
+            "complete": False,
+            "collection_mode": "evidence_sample",
+            "product_sample_limit": 3,
+            "available_count_observed": 18,
+            "test_override": False,
+            "test_override_reason": None,
+            "sample_complete": True,
+            "shop_complete": False,
+            "scope_classification": None,
+            "scope_reason": None,
+            "sample_manifest_path": manifest_path.relative_to(
+                fixture.runtime_dir
+            ).as_posix(),
+            "sample_manifest_sha256": hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+            "sample_collection_path": collection_path.relative_to(
+                fixture.runtime_dir
+            ).as_posix(),
+            "sample_collection_sha256": hashlib.sha256(
+                collection_path.read_bytes()
+            ).hexdigest(),
+        }
+        relative_path = f"evidence/shops/{job.id}/result.json"
+        target = fixture.runtime_dir / relative_path
         target.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
         artifact = JobArtifactRecord(
             job_id=job.id,
@@ -1242,6 +1434,86 @@ def test_cross_account_opportunity_level_and_review_are_server_derived(
             opportunity.id,
             OpportunityReviewCreate(decision="reject", reason="late change"),
         )
+
+
+def test_three_product_evidence_samples_can_support_a_warming_candidate(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    accounts: list[tuple[str, str, str]] = []
+    for account_id in ("u1", "u2"):
+        _job_id, note_row_id = fixture.collect(account_id)
+        accounts.append((
+            account_id,
+            _evidence_sample_shop_artifact(fixture, account_id),
+            f"account-note:{note_row_id}",
+        ))
+    service = fixture.analysis(_ModelSpy(_cross_account_output(accounts)))
+
+    created = service.create(AnalysisCreate(
+        analysis_type="account_opportunity",
+        account_user_ids=["u1", "u2"],
+        evidence_ids=[
+            evidence_id
+            for _account_id, shop_id, note_id in accounts
+            for evidence_id in (shop_id, note_id)
+        ],
+    ))
+
+    assert created.status == "succeeded"
+    [opportunity] = service.list_opportunities()
+    assert opportunity.evidence_level == "warming_candidate"
+    assert opportunity.review_status == "pending_review"
+    assert opportunity.supporting_account_count == 2
+    assert len(opportunity.supporting_products) == 6
+
+
+def test_evidence_sample_requires_a_real_hash_bound_in_scope_gate(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    shop_id = _evidence_sample_shop_artifact(fixture, "u1")
+    artifact_id = int(shop_id.removeprefix("artifact:"))
+    with fixture.database.session() as session:
+        artifact = session.get(JobArtifactRecord, artifact_id)
+        assert artifact is not None
+        job = session.get(JobRecord, artifact.job_id)
+        assert job is not None
+        job.input_data = {**job.input_data, "scope_gate_job_id": "missing-gate"}
+        session.commit()
+    model = _ModelSpy()
+
+    created = fixture.analysis(model).create(AnalysisCreate(
+        analysis_type="account_report",
+        account_user_id="u1",
+        evidence_ids=[shop_id],
+    ))
+
+    assert created.status == "needs_human"
+    assert created.error_category == "deep_verification_incomplete"
+    assert model.calls == []
+
+
+def test_evidence_sample_rejects_tampered_product_image_before_model(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    shop_id = _evidence_sample_shop_artifact(fixture, "u1")
+    [image, *_] = sorted(
+        fixture.runtime_dir.glob("evidence/shops/*/sample-products/*/images/detail.png")
+    )
+    image.write_bytes(b"tampered-image")
+    model = _ModelSpy()
+
+    created = fixture.analysis(model).create(AnalysisCreate(
+        analysis_type="account_report",
+        account_user_id="u1",
+        evidence_ids=[shop_id],
+    ))
+
+    assert created.status == "needs_human"
+    assert created.error_category == "deep_verification_incomplete"
+    assert model.calls == []
 
 
 def test_cross_account_support_must_match_each_evidence_owner(tmp_path: Path) -> None:

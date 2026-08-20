@@ -7,6 +7,13 @@ remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
 last_updated: 2026-08-20 (Phase A handoff)
 
+## 2026-08-21 approved evidence-sample UAT
+
+- The approved business rule now uses the first three distinct products encountered in the shop's default order. It forbids selection, skipping and fourth-product substitution; requires a trusted `in_scope` preflight plus same-job detail screenshots, source identities, manifest/collection SHA and SQLite bindings; and persists `evidence_sample`, `sample_complete=true`, `shop_complete=false` without reusing `test_override`.
+- Real job `84f11a0d…` succeeded at exact `3/3`, missing `0`, with 34 artifacts and hash-bound manifest/collection files. A restarted analysis trust reader accepted its `shop_collection_result` as opportunity-eligible evidence. Historical jobs, including the later deterministic-only ambiguous preflight `e0d1747b…`, remain unchanged.
+- One real two-account analysis then consumed two trusted shop facts and twenty trusted latest-note facts. Analysis `28856ff2…` failed closed as `evidence_grounding_failed`; no Opportunity, `warming_candidate` or `pending_review` row was created, and no automatic model retry was run.
+- Phase A real UAT therefore remains not passed. The evidence-sample collection gate is proven live, but the real cross-account model output has not yet passed strict schema and evidence grounding. Phase B remains unstarted.
+
 ## 2026-08-21 dynamic-card live verification
 
 - The bounded dynamic-card repair now waits for two consecutive stable product/bounds samples after a swipe, relocates the same title/price signature immediately before each click, uses a reliable current clickable-card region when present, and allows one fresh same-target retry when the detail postcondition is absent.

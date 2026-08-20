@@ -2,6 +2,23 @@
 
 Status date: 2026-08-21
 
+## Approved evidence-sample live result
+
+Large in-scope shops now have one approved non-test collection mode:
+`evidence_sample` takes the first three distinct products in default shop order,
+forbids selection/skipping/fourth-product substitution, requires a trusted
+`in_scope` preflight and exact detail/source/image/manifest/hash/SQLite
+bindings, and persists `sample_complete=true` with `shop_complete=false`.
+Unlike `bounded_sample/test_override`, an exact evidence sample may support
+Phase A cross-account demand validation.
+
+Real job `84f11a0d…` succeeded at 3/3 with zero missing and 34 artifacts. A
+restart trust read accepted the result. The first real two-account analysis then
+used two trusted shop facts and twenty trusted note facts, but analysis
+`28856ff2…` failed closed as `evidence_grounding_failed`; zero Opportunity,
+`warming_candidate` or `pending_review` rows were created and no automatic
+retry was run. Phase A real UAT remains not passed; Phase B remains unstarted.
+
 ## Dynamic-card live verification result
 
 The Android adapter candidate now uses three bounded behaviors required by the

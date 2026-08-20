@@ -76,7 +76,11 @@ class ShopCollectionCreate(BaseModel):
     expected_count: StrictInt = Field(default=3, ge=0)
     available_count_observed: StrictInt | None = Field(default=None, ge=0)
     collection_mode: Literal[
-        "preflight", "legacy_full_shop", "bounded_sample", "full_shop"
+        "preflight",
+        "legacy_full_shop",
+        "bounded_sample",
+        "evidence_sample",
+        "full_shop",
     ] = "preflight"
     product_sample_limit: StrictInt | None = Field(default=None, ge=1, le=3)
     test_override: bool = False
@@ -126,6 +130,22 @@ class ShopCollectionCreate(BaseModel):
             if self.available_count_observed is None:
                 self.available_count_observed = self.expected_count
             self.expected_count = 3
+        elif self.collection_mode == "evidence_sample":
+            if self.test_override or self.test_override_reason is not None:
+                raise ValueError("evidence_sample cannot use test_override")
+            observed = (
+                self.available_count_observed
+                if self.available_count_observed is not None
+                else self.expected_count
+            )
+            if observed < 3:
+                raise ValueError("evidence_sample requires at least three visible products")
+            if self.product_sample_limit != 3:
+                raise ValueError("evidence_sample requires product_sample_limit=3")
+            if not self.scope_gate_job_id:
+                raise ValueError("evidence_sample requires a trusted in_scope gate job")
+            self.available_count_observed = observed
+            self.expected_count = 3
         elif self.test_override or self.test_override_reason is not None:
             raise ValueError("test_override is only valid for bounded_sample")
         if self.collection_mode == "full_shop" and not self.scope_gate_job_id:
@@ -162,7 +182,11 @@ class ShopCollectionRead(BaseModel):
     verification: ShopVerificationResult | None = None
     complete: bool
     collection_mode: Literal[
-        "preflight", "legacy_full_shop", "bounded_sample", "full_shop"
+        "preflight",
+        "legacy_full_shop",
+        "bounded_sample",
+        "evidence_sample",
+        "full_shop",
     ] = "legacy_full_shop"
     product_sample_limit: int | None = None
     available_count_observed: int | None = None
@@ -204,9 +228,9 @@ class ShopCollectionRead(BaseModel):
             raise ValueError("bounded sample evidence bindings must be all present or all absent")
         if (
             all(value is not None for value in bindings)
-            and self.collection_mode != "bounded_sample"
+            and self.collection_mode not in {"bounded_sample", "evidence_sample"}
         ):
-            raise ValueError("sample evidence bindings require bounded_sample mode")
+            raise ValueError("sample evidence bindings require a sample mode")
         return self
 
 
@@ -300,7 +324,7 @@ class ShopCollectionService:
             raise ValueError(
                 "account scope is already out_of_scope_physical; in_scope is required"
             )
-        if payload.collection_mode == "full_shop":
+        if payload.collection_mode in {"full_shop", "evidence_sample"}:
             self._require_trusted_in_scope_gate(payload)
         with self._lifecycle_lock:
             if not self._accepting_work:
@@ -726,7 +750,15 @@ class ShopCollectionService:
                 )
             else:
                 read = read.model_copy(update={"complete": False})
-        elif result.status == "succeeded" and payload.collection_mode == "bounded_sample":
+        elif result.status == "succeeded" and payload.collection_mode in {
+            "bounded_sample",
+            "evidence_sample",
+        }:
+            evidence_error = (
+                "evidence_sample_invalid"
+                if payload.collection_mode == "evidence_sample"
+                else "bounded_sample_evidence_invalid"
+            )
             try:
                 binding = self._materialize_bounded_sample_evidence(
                     job_id, result.items
@@ -756,7 +788,7 @@ class ShopCollectionService:
                 read = read.model_copy(
                     update={
                         "status": "needs_human",
-                        "detail": "bounded_sample_evidence_invalid",
+                        "detail": evidence_error,
                         "complete": False,
                     }
                 )
@@ -782,7 +814,7 @@ class ShopCollectionService:
                     read = read.model_copy(
                         update={
                             "status": "needs_human",
-                            "detail": "bounded_sample_evidence_invalid",
+                            "detail": evidence_error,
                             "complete": False,
                         }
                     )
@@ -860,7 +892,7 @@ class ShopCollectionService:
                             "complete": False,
                         }
                     )
-        if payload.collection_mode == "bounded_sample":
+        if payload.collection_mode in {"bounded_sample", "evidence_sample"}:
             read = read.model_copy(
                 update={
                     "sample_complete": bool(
@@ -1098,8 +1130,12 @@ class ShopCollectionService:
         if result.status == "succeeded":
             state = JobState.succeeded
             current_stage = (
-                "shop_sample_complete"
-                if result.collection_mode == "bounded_sample"
+                (
+                    "shop_evidence_sample_complete"
+                    if result.collection_mode == "evidence_sample"
+                    else "shop_sample_complete"
+                )
+                if result.collection_mode in {"bounded_sample", "evidence_sample"}
                 else (
                     f"scope_gate_{result.scope_classification}"
                     if result.collection_mode == "preflight"
@@ -1335,7 +1371,11 @@ def _shop_collection_read(
     expected_count: int,
     result: CollectionResult,
     collection_mode: Literal[
-        "preflight", "legacy_full_shop", "bounded_sample", "full_shop"
+        "preflight",
+        "legacy_full_shop",
+        "bounded_sample",
+        "evidence_sample",
+        "full_shop",
     ],
     product_sample_limit: int | None,
     available_count_observed: int | None,

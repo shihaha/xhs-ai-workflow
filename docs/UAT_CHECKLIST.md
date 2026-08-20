@@ -11,7 +11,16 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Verify the third real product after the dynamic-card repair. Latest authorized job `5319ba52…` succeeded at `3/3`, zero rejected, with three restart-readable discoveries and three distinct source identities.
 - [x] Preserve the earlier runner-error job `fe7b58b5…` unchanged at `failed 0/3`; it remains historical audit evidence and was not rewritten.
 - [ ] Confirm byte-for-byte SHA consistency for every historical Android artifact. Ten screenshots and two discovery JSON files match; ten XML files do not match their metadata SHA after Windows newline expansion.
-- [ ] Phase A remains not passed. No cross-account analysis, Opportunity, `pending_review`, `warming_candidate`, or Phase B action was run.
+- [x] Preserve the pre-evidence-sample checkpoint where no cross-account analysis, Opportunity, `pending_review`, `warming_candidate`, or Phase B action had run; the later real analysis attempt is recorded below without rewriting this history.
+
+## 2026-08-21 approved evidence sample
+
+- [x] Freeze the general rule at the first three distinct products in default shop order; prohibit selection, skipping and fourth-product replacement.
+- [x] Require trusted `in_scope` preflight plus same-job detail screenshots, source identities, manifest/collection hashes and SQLite bindings; keep `sample_complete=true` and `shop_complete=false`.
+- [x] Real job `84f11a0d…` succeeded at 3/3 with zero missing, 34 artifacts and restart-readable opportunity-eligible shop evidence.
+- [x] Run one real two-account analysis with two trusted shop facts and twenty trusted latest-note facts. Analysis `28856ff2…` failed closed as `evidence_grounding_failed`; no automatic retry was run.
+- [ ] Obtain one strictly grounded real analysis result. Current Opportunity, `warming_candidate` and `pending_review` counts remain zero.
+- [ ] Phase A remains not passed; Phase B remains unstarted.
 
 ## Prerequisites
 

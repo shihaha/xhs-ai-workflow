@@ -61,12 +61,15 @@ result，包括 job、账号、稳定身份、可用来源链接、可见元数�
 
 单账号分析只形成观察信号。跨账号商品/需求聚类必须覆盖至少两个不同的 `account_user_id`，且每个支撑账号都必须有可信账号笔记和完整 shop artifact。商品与图片通过 shop artifact、manifest、SHA-256 和来源链接追溯。
 
-店铺采集分为三种业务语义：`preflight` 只用少量真实商品判断
+店铺采集分为四种业务语义：`preflight` 只用少量真实商品判断
 `in_scope/out_of_scope_physical/needs_human`，永远不能成为 Opportunity 证据；
-`full_shop` 只用于规模较小或确需完整画像的店铺；正式 `evidence_sample` 只有在用户
-批准最小/最大样本、代表性、充分条件和机会资格后才允许实现。现有
-`bounded_sample/test_override` 只属于测试、debug 或受控预检，必须保持
-`shop_complete=false`，且永远不能成为真实 Phase A Opportunity 的合格商业证据。
+`full_shop` 只用于规模较小或确需完整画像的店铺；经用户批准的正式
+`evidence_sample` 固定采集店铺默认排序下连续遇到的前 3 个不同商品，不得挑选、
+跳过或用第 4 件替换失败项。三件均须绑定详情页、稳定来源身份、真实图片、
+manifest、SHA-256、SQLite 和同一任务证据，且必须已有可信 `in_scope` preflight；
+成功时写 `sample_complete=true`、`shop_complete=false`，可以参与 Phase A 跨账号
+需求验证。现有 `bounded_sample/test_override` 仍只属于测试、debug 或受控预检，
+必须保持 `shop_complete=false`，且永远不能成为真实 Opportunity 证据。
 
 证据等级是本系统规则，不是平台官方结论：一个账号为观察信号且不得生成机会；两个账号为 `warming_candidate`；三个及以上不同账号为 `validated_candidate`。等级只由服务端根据经验证证据计算，模型和人工均不得直接改写。
 

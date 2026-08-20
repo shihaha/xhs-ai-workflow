@@ -302,6 +302,73 @@ def test_test_override_processes_three_products_even_when_eighteen_were_discover
     ]
 
 
+def test_evidence_sample_persists_the_first_three_products_without_claiming_full_shop(
+    tmp_path: Path,
+) -> None:
+    """A large in-scope shop must produce a trusted three-item sample, not fake N/N."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(
+        Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir
+    )
+    adapter = _CaptureExpectedAdapter(
+        jobs,
+        titles=["电子版兑换券一", "电子版兑换券二", "电子版兑换券三"],
+    )
+    scheduled: list[tuple[Callable[..., Any], tuple[Any, ...]]] = []
+    service = ShopCollectionService(
+        job_service=jobs,
+        device_adapter=adapter,
+        submitter=_capturing_submitter(scheduled),
+    )
+    gate = service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1",
+            account_name="账号甲",
+            collection_mode="preflight",
+            available_count_observed=18,
+        )
+    )
+    gate_action, gate_args = scheduled.pop()
+    gate_result = gate_action(*gate_args)
+    assert gate_result is not None
+    assert gate_result.scope_classification == "in_scope"
+
+    queued = service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1",
+            account_name="账号甲",
+            expected_count=18,
+            available_count_observed=18,
+            collection_mode="evidence_sample",
+            product_sample_limit=3,
+            scope_gate_job_id=gate.job_id,
+        )
+    )
+    action, args = scheduled.pop()
+    result = action(*args)
+
+    assert adapter.requests[-1].expected_count == 3
+    assert result is not None
+    assert result.status == "succeeded"
+    assert result.collection_mode == "evidence_sample"
+    assert result.expected_count == 3
+    assert result.succeeded_count == 3
+    assert result.sample_complete is True
+    assert result.shop_complete is False
+    assert result.complete is False
+    job = jobs.get(queued.job_id)
+    assert job.state is JobState.succeeded
+    assert job.progress_current == 3
+    assert job.progress_total == 3
+    assert job.current_stage == "shop_evidence_sample_complete"
+    artifact = next(
+        item for item in job.artifacts if item.kind == "shop_collection_result"
+    )
+    assert artifact.metadata["result"]["collection_mode"] == "evidence_sample"
+    assert artifact.metadata["result"]["sample_complete"] is True
+    assert artifact.metadata["result"]["shop_complete"] is False
+
+
 @pytest.mark.parametrize(
     ("profile", "titles", "expected"),
     [

@@ -32,7 +32,7 @@ The ranking page reads stored snapshots. The backend can reserve the fixed Qianf
 
 Shop verification can be queued from an account using a runtime-relative evidence directory. Content export creates a local pending-publication ZIP only and never publishes to Xiaohongshu.
 
-One account is an observation signal, not a market opportunity. Cross-account analysis requires at least two distinct accounts with trusted notes and complete shop evidence. The service computes the evidence level, persists valid clusters as `pending_review`, and requires an explicit human `approved` decision before any product record can be created.
+One account is an observation signal, not a market opportunity. Cross-account analysis requires at least two distinct accounts with trusted notes and either complete shop evidence or an approved three-product `evidence_sample`. The sample is the first three distinct products in the shop's default order, remains explicitly `shop_complete=false`, and requires exact source/image/manifest/hash/SQLite bindings. The service computes the evidence level, persists valid clusters as `pending_review`, and requires an explicit human `approved` decision before any product record can be created.
 
 Frontend verification:
 
