@@ -63,6 +63,9 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - Real cross-account cluster and human review: **not_run / not fabricated** — the second account lacks trusted shop evidence. No real `pending_review`, `warming_candidate`, approval or rejection was claimed. See `docs/PHASE_A_UAT_REPORT.md`.
 - [x] Dedicated visible Chrome + manual login + localhost CDP production control: `real-account-A` produced a succeeded durable account job, one trusted artifact and a latest-10 profile/note snapshot; a restarted Database/Service read the same ten owner-bound notes.
 - [ ] Next ranked candidate shop gate: its CDP profile/latest-10 persisted successfully, but the real Android preflight stopped at 2/3 with `needs_human/selector_changed` and 26 Android artifacts. Do not count it as a qualified account or retry beyond the approved bounded run.
+- [x] Persist account-level physical-scope decisions without rewriting historical jobs; restart-read and pre-Android skip verified against the REPor evidence.
+- [x] Treat preflight as at most three representative products; deterministic physical evidence after item 1 stops before item 2/3, while ambiguous evidence remains fail-closed.
+- [ ] Ranked continuation after the correction: 17 new accounts were inspected before stopping the overrun. Eight ended as first-item `out_of_scope_physical`; one digital preflight passed but full discovery stopped truthfully at 2 items with `selector_changed`. No new qualified account, N/N shop, cross-account analysis, opportunity, or pending review exists.
 
 Until every item above is evidenced, status is “software implemented / awaiting
 real UAT”, not “same effect as the tutorial proven”.

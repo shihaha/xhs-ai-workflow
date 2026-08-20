@@ -124,3 +124,26 @@ handoff.
 Current real status is `sample 0/3`, `shop_complete=false`. Phase A remains
 blocked at durable second-account shop evidence. No cross-account analysis,
 candidate, review, product workflow or Phase B activity was started.
+
+## 2026-08-20 physical-scope correction and bounded continuation
+
+The account-level delivery-scope decision is now durable and evidence-bound. The
+previous REPor Android job remains `needs_human/selector_changed`; a separate
+human decision records `out_of_scope_physical`, cites its two persisted discovery
+artifacts, survives a database/service restart, and prevents future Android work
+for the same account.
+
+Focused verification passed: 31 scope/service tests and 3 Android preflight
+boundary tests, plus compile and diff checks. A clean-cwd run of the two complete
+shop test files produced 89 passes and the same four pre-existing
+legacy/preflight expectation failures already recorded before this correction.
+
+The ranked continuation inspected 17 previously unprocessed accounts before the
+run was stopped for exceeding the original five-candidate bound. Eight accounts
+were deterministically excluded after the first physical product; one additional
+physical decision was persisted despite a later truthful selector failure. One
+account produced explicit digital-delivery evidence, but its full-shop discovery
+stopped at 2 products with `needs_human/selector_changed`, so no N/N shop evidence
+or qualified account was created. Other accounts failed closed at the bounded
+account sample or Android entry. No cross-account analysis ran, and no opportunity
+or pending review was fabricated.

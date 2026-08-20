@@ -163,3 +163,19 @@ the known account. One further ranked account also persisted profile/latest-10,
 but its Android scope preflight ended at 2/3 with
 `needs_human/selector_changed`; therefore no new qualified account, analysis,
 opportunity or review state was created.
+
+### Account delivery-scope gate
+
+Phase A now persists an account-level `unknown | in_scope |
+out_of_scope_physical | needs_human` decision with source, timestamp and evidence
+references. It does not alter Qianfan scoring. Android preflight persists each
+real discovery before re-evaluating scope, stops at the first decisive physical
+or digital result, and never treats 1/3 or 2/3 as shop completeness. Deterministic
+fulfilment evidence is evaluated first; only ambiguous evidence can use the
+existing Bailian text adapter under a strict cited schema.
+
+The production REPor decision was persisted separately from its unchanged
+historical failure and was verified after restart. Real ranked continuation found
+one digital-delivery preflight, but its full discovery failed closed after two
+products. Consequently the implementation gate is available, while the real
+Phase A UAT still has no additional qualified account or pending review.

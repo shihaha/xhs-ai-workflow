@@ -595,3 +595,26 @@ D:\AI_WORKSPACE\xhs-intelligence-workbench
   `60 passed`、production build、compile、audit、secret/boundary scans 通过。干净 cwd
   全 backend 为 `1451 passed, 3 skipped, 5 failed`；5 个已知失败分别为 1 个百炼
   image usage 旧期望和 4 个 shop legacy/preflight 旧期望，本轮未跨范围修复。
+
+## 2026-08-20 实体账号前置门收口与后续候选实测
+
+- 店铺范围判断不改变千帆评分，也不使用账号名或笔记标题预先过滤候选。候选进入
+  Android 调查后，最多读取 3 件真实代表商品；每件 discovery 先落 SQLite/artifact，
+  再按真实履约证据判断。明确实体或数字交付时立即停止，只有歧义才调用现有百炼
+  文本适配器。
+- REPor 历史任务 `a5905707-4055-4733-8022-f64a111f42ed` 仍为
+  `needs_human/selector_changed`。新增账号级人工判定 artifact 将其标记为
+  `out_of_scope_physical`，绑定原 2 个 discovery evidence；重启后复读一致，后续会在
+  Android 调度前跳过，旧任务和原 artifacts 未改写。
+- 软件回归：范围分类与持久化聚焦 `31 passed`；Android 最大 3 件与第 1/2 件
+  early-stop 聚焦 `3 passed`；compileall 与 diff-check 通过。两个完整 shop 测试文件在
+  干净 cwd 为 `89 passed, 4 failed`，4 项是交付前已记录的 legacy/preflight 旧期望，
+  本轮未顺手修复。
+- 真实续跑按千帆既有顺序调查了 17 个未处理账号；这已超过原 Phase A 计划的最多
+  5 个新候选，因此已停止继续扩展。结果：8 个账号在第 1 件即明确为实体并持久化
+  `out_of_scope_physical`；另 1 个账号在取得第 1 件实体证据后返回历史真实
+  `selector_changed`，但账号范围判定仍已持久化；7 个账号在账号样本或 Android
+  入口处 fail-closed；1 个数字交付账号通过 preflight，但全店 discovery 在 2 件后
+  `selector_changed`，未形成 N/N。
+- 真实合格账号没有增加，跨账号分析未运行，`opportunities=0`、
+  `pending_review=0`。Phase A real UAT 仍未通过，Phase B 未开始。
