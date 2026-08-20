@@ -230,6 +230,28 @@ def test_tutorial_shop_parser_keeps_title_price_sales_rank_and_coordinates() -> 
     assert (product.center_x, product.center_y) == (310, 150)
 
 
+def test_shop_parser_skips_cards_hidden_behind_fixed_shop_chrome() -> None:
+    """Scrolled-off cards under fixed tabs must never be clicked as live products."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="综合" bounds="[50,386][150,443]" />
+  <node text="销量" bounds="[240,386][340,443]" />
+  <node text="被顶部栏遮住的旧商品" bounds="[20,320][560,380]" />
+  <node content-desc="到手价¥68.00已售10+" bounds="[20,390][560,440]" />
+  <node text="当前可点击的真实商品" bounds="[20,900][560,960]" />
+  <node content-desc="到手价¥88.00已售20+" bounds="[20,970][560,1020]" />
+  <node text="首页" bounds="[145,1569][259,1654]" />
+  <node text="分类" bounds="[529,1569][643,1654]" />
+</hierarchy>"""
+
+    products = parse_shop_hierarchy(xml)
+
+    assert [product.title for product in products] == ["当前可点击的真实商品"]
+    assert [(product.center_x, product.center_y) for product in products] == [
+        (290, 930)
+    ]
+
+
 def test_live_uiautomator_screenshot_default_pillow_shape_is_accepted(
     tmp_path: Path,
 ) -> None:
@@ -769,10 +791,10 @@ def test_duplicate_url_card_is_an_explicit_rejected_observation(tmp_path: Path) 
     assert result.missing_items[0].reference == "expected_product:2"
 
 
-def test_overlapping_viewports_use_unique_urls_for_nn_and_keep_duplicate_evidence(
+def test_overlapping_viewports_skip_the_same_card_even_when_share_urls_change(
     tmp_path: Path,
 ) -> None:
-    """Counting the repeated B card in A,B then B,C as overflow would fail a real 3/3."""
+    """A,B then B,C is three cards even when B produces a fresh short link."""
     first_viewport = """<?xml version="1.0" encoding="UTF-8"?>
 <hierarchy>
   <node text="商品甲完整标题" bounds="[20,120][600,180]" />
@@ -794,7 +816,7 @@ def test_overlapping_viewports_use_unique_urls_for_nn_and_keep_duplicate_evidenc
             450: "https://xhslink.com/product-b",
         },
         {
-            150: "https://xhslink.com/product-b",
+            150: "https://xhslink.com/product-b-fresh-link",
             450: "https://xhslink.com/product-c",
         },
     ]
@@ -825,11 +847,15 @@ def test_overlapping_viewports_use_unique_urls_for_nn_and_keep_duplicate_evidenc
 
     assert result.status == "succeeded"
     assert result.succeeded_count == 3
-    assert result.observed_count == 4
-    assert result.raw_observation_count == 4
-    assert result.duplicate_observation_count == 1
-    assert len(result.rejected_items) == 1
-    assert result.rejected_items[0].reason == "duplicate_source_url"
+    assert result.observed_count == 3
+    assert result.raw_observation_count == 3
+    assert result.duplicate_observation_count == 0
+    assert result.rejected_items == []
+    assert {str(item.source_url) for item in result.items} == {
+        "https://xhslink.com/product-a",
+        "https://xhslink.com/product-b",
+        "https://xhslink.com/product-c",
+    }
     assert result.missing_items == []
     assert result.overflow_count == 0
     assert result.complete is True

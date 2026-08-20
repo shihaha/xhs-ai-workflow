@@ -159,6 +159,25 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
         bounds = _bounds(element.attrib.get("bounds", ""))
         nodes.append({"text": text, "description": description, "bounds": bounds})
 
+    fixed_shop_tabs = {"综合", "销量", "新品", "价格"}
+    fixed_bottom_tabs = {"首页", "分类", "上新"}
+    top_occlusion = max(
+        (
+            node["bounds"][3]
+            for node in nodes
+            if node["text"] in fixed_shop_tabs and node["bounds"] is not None
+        ),
+        default=None,
+    )
+    bottom_occlusion = min(
+        (
+            node["bounds"][1]
+            for node in nodes
+            if node["text"] in fixed_bottom_tabs and node["bounds"] is not None
+        ),
+        default=None,
+    )
+
     products: list[ShopProductPosition] = []
     seen: set[tuple[str, int, int]] = set()
     for index, node in enumerate(nodes):
@@ -193,6 +212,11 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
             continue
         title_node = max(title_candidates, key=lambda item: len(item["text"]))
         x1, y1, x2, y2 = title_node["bounds"]
+        center_y = (y1 + y2) // 2
+        if top_occlusion is not None and center_y <= top_occlusion:
+            continue
+        if bottom_occlusion is not None and center_y >= bottom_occlusion:
+            continue
         key = (title_node["text"], (x1 + x2) // 2, (y1 + y2) // 2)
         if key in seen:
             continue
@@ -209,6 +233,18 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
             )
         )
     return products
+
+
+def _overlapping_shop_card_prefix(
+    previous: list[ShopProductPosition], current: list[ShopProductPosition]
+) -> int:
+    """Return the longest previous suffix repeated at the current viewport start."""
+    previous_signatures = [(item.title, item.price) for item in previous]
+    current_signatures = [(item.title, item.price) for item in current]
+    for size in range(min(len(previous_signatures), len(current_signatures)), 0, -1):
+        if previous_signatures[-size:] == current_signatures[:size]:
+            return size
+    return 0
 
 
 class AndroidDeviceAdapter:
@@ -497,6 +533,7 @@ class AndroidDeviceAdapter:
             visited_card_positions: set[tuple[str, int, int]] = set()
             seen_urls: set[str] = set()
             observation_count = 0
+            previous_products: list[ShopProductPosition] = []
             for screen_index in range(self.max_shop_screens):
                 cancelled = self._cancelled_result(
                     request, job_id, items, rejected_items, artifact_paths, transitions
@@ -529,7 +566,12 @@ class AndroidDeviceAdapter:
                 screen_fingerprint = sha256(
                     shop_screen.hierarchy.encode("utf-8")
                 ).hexdigest()
-                for product in products:
+                overlapping_prefix = _overlapping_shop_card_prefix(
+                    previous_products, products
+                )
+                for product_index, product in enumerate(products):
+                    if product_index < overlapping_prefix:
+                        continue
                     traversal_key = (
                         screen_fingerprint,
                         product.center_x,
@@ -844,6 +886,7 @@ class AndroidDeviceAdapter:
                             transitions=transitions,
                         )
 
+                previous_products = products
                 if self._is_end(shop_screen.hierarchy):
                     break
                 if expected is not None and len(items) >= expected:
