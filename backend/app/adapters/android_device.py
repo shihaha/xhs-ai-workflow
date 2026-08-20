@@ -248,6 +248,46 @@ def _overlapping_shop_card_prefix(
     return 0
 
 
+def _shop_coupon_close_position(xml: str) -> tuple[int, int] | None:
+    """Locate the close control for the single coupon overlay observed in live UAT."""
+    if not all(
+        marker in xml for marker in ("恭喜获得", "部分商品可用", "关注并领取")
+    ):
+        return None
+    try:
+        root = ET.fromstring(xml)
+    except (ET.ParseError, TypeError):
+        return None
+    claim_bottom: int | None = None
+    candidates: list[tuple[int, int, int]] = []
+    for element in root.iter("node"):
+        bounds = _bounds(element.attrib.get("bounds", ""))
+        if bounds is None:
+            continue
+        description = _clean_text(element.attrib.get("content-desc", ""))
+        if description == "关注并领取":
+            claim_bottom = bounds[3]
+            continue
+        if (
+            element.attrib.get("class") == "android.view.ViewGroup"
+            and element.attrib.get("clickable") == "true"
+            and not _clean_text(element.attrib.get("text", ""))
+            and not description
+        ):
+            x1, y1, x2, y2 = bounds
+            width = x2 - x1
+            height = y2 - y1
+            if 40 <= width <= 160 and 40 <= height <= 160:
+                candidates.append((y1, (x1 + x2) // 2, (y1 + y2) // 2))
+    if claim_bottom is None:
+        return None
+    below_claim = [candidate for candidate in candidates if candidate[0] >= claim_bottom]
+    if len(below_claim) != 1:
+        return None
+    _, center_x, center_y = below_claim[0]
+    return center_x, center_y
+
+
 class AndroidDeviceAdapter:
     """Collect XHS product links without bypassing login or challenge screens."""
 
@@ -512,6 +552,7 @@ class AndroidDeviceAdapter:
                 ready=lambda hierarchy: (
                     self._blocked_reason(hierarchy) is not None
                     or self._is_shop_hierarchy(hierarchy)
+                    or _shop_coupon_close_position(hierarchy) is not None
                 ),
             )
             cancelled = self._cancelled_result(
@@ -531,10 +572,43 @@ class AndroidDeviceAdapter:
                     transitions=transitions,
                 )
 
+            coupon_close = _shop_coupon_close_position(shop_screen.hierarchy)
+            if coupon_close is not None:
+                device.click(*coupon_close)
+                shop_screen = capture(
+                    "shop_page_after_coupon",
+                    ready=lambda hierarchy: (
+                        self._blocked_reason(hierarchy) is not None
+                        or self._is_shop_hierarchy(hierarchy)
+                    ),
+                )
+                cancelled = self._cancelled_result(
+                    request,
+                    job_id,
+                    items,
+                    rejected_items,
+                    artifact_paths,
+                    transitions,
+                )
+                if cancelled is not None:
+                    return cancelled
+                blocked = self._blocked_reason(shop_screen.hierarchy)
+                if blocked is not None:
+                    return self._result(
+                        request=request,
+                        status="needs_human",
+                        detail=blocked,
+                        items=items,
+                        rejected_items=rejected_items,
+                        artifacts=artifact_paths,
+                        transitions=transitions,
+                    )
+
             visited_card_positions: set[tuple[str, int, int]] = set()
             seen_urls: set[str] = set()
             observation_count = 0
             previous_products: list[ShopProductPosition] = []
+            natural_end_reached = False
             for screen_index in range(self.max_shop_screens):
                 cancelled = self._cancelled_result(
                     request, job_id, items, rejected_items, artifact_paths, transitions
@@ -910,6 +984,7 @@ class AndroidDeviceAdapter:
 
                 previous_products = products
                 if self._is_end(shop_screen.hierarchy):
+                    natural_end_reached = True
                     break
                 if expected is not None and len(items) >= expected:
                     break
@@ -986,6 +1061,23 @@ class AndroidDeviceAdapter:
         )
         identity_observed = raw_observed - duplicate_observations
         non_duplicate_rejections = len(rejected_items) - duplicate_observations
+        preflight_natural_end = (
+            request.parameters.get("collection_mode") == "preflight"
+            and natural_end_reached
+            and identity_observed > 0
+            and identity_observed < expected
+            and non_duplicate_rejections == 0
+        )
+        if preflight_natural_end:
+            return self._result(
+                request=request.model_copy(update={"expected_count": identity_observed}),
+                status="succeeded",
+                detail=None,
+                items=items,
+                rejected_items=rejected_items,
+                artifacts=artifact_paths,
+                transitions=transitions,
+            )
         if identity_observed > expected:
             status = "failed"
             detail = "discovered_count_exceeds_expected"

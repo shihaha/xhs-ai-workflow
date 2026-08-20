@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import stat
 from collections.abc import Callable
@@ -12,9 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from threading import Event, RLock
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
+import httpx
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 from backend.app.adapters.android_device import DEFAULT_SELECTOR_PROFILE_VERSION
@@ -414,6 +416,7 @@ class ShopCollectionService:
                         "account_user_id": payload.account_user_id,
                         "account_name": payload.account_name,
                         "device_id": payload.device_id,
+                        "collection_mode": payload.collection_mode,
                         "selector_profile_version": payload.selector_profile_version,
                         "job_id": job_id,
                         "is_cancelled": self._cancellation_callback(job_id),
@@ -581,6 +584,7 @@ class ShopCollectionService:
                     verification_dir,
                     expected_count=payload.expected_count,
                     expected_source_urls=[str(item.source_url) for item in result.items],
+                    source_identity_resolver=_resolve_xhs_goods_identity,
                 )
             except (InvalidVerificationPath, ValueError) as error:
                 self.job_service.append_log(
@@ -920,6 +924,7 @@ def verify_shop_collection(
     *,
     expected_count: int,
     expected_source_urls: list[str] | None = None,
+    source_identity_resolver: Callable[[str], str] | None = None,
 ) -> ShopVerificationResult:
     """Verify exact product evidence without converting partial artifacts into N/N."""
     if isinstance(expected_count, bool) or expected_count < 0:
@@ -1031,11 +1036,26 @@ def verify_shop_collection(
         succeeded += 1
 
     discovered = len(entries)
-    if expected_source_urls is not None and (
-        len(discovered_urls) != len(expected_source_urls)
-        or set(discovered_urls) != set(expected_source_urls)
-    ):
-        issues.append("collected_source_url_mismatch")
+    if expected_source_urls is not None:
+        discovered_identities = discovered_urls
+        expected_identities = expected_source_urls
+        if source_identity_resolver is not None:
+            try:
+                discovered_identities = [
+                    source_identity_resolver(url) for url in discovered_urls
+                ]
+                expected_identities = [
+                    source_identity_resolver(url) for url in expected_source_urls
+                ]
+            except (ValueError, httpx.HTTPError):
+                discovered_identities = []
+                expected_identities = expected_source_urls
+        if (
+            len(discovered_identities) != len(expected_identities)
+            or len(set(discovered_identities)) != len(discovered_identities)
+            or set(discovered_identities) != set(expected_identities)
+        ):
+            issues.append("collected_source_url_mismatch")
     for index in range(discovered, expected_count):
         missing.append(
             ShopVerificationMissing(
@@ -1061,6 +1081,37 @@ def verify_shop_collection(
         issues=issues,
         complete=complete,
     )
+
+
+def _resolve_xhs_goods_identity(source_url: str) -> str:
+    """Resolve a public share URL to its stable XHS goods id without credentials."""
+    allowed_hosts = {"xhslink.com", "www.xiaohongshu.com"}
+    current = source_url
+    with httpx.Client(
+        follow_redirects=False,
+        timeout=10,
+        headers={"User-Agent": "Mozilla/5.0"},
+    ) as client:
+        for _ in range(6):
+            parsed = urlsplit(current)
+            if (
+                parsed.scheme != "https"
+                or (parsed.hostname or "").lower() not in allowed_hosts
+            ):
+                raise ValueError("unsupported_xhs_product_url")
+            with client.stream("GET", current) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("xhs_product_redirect_missing")
+                    current = urljoin(current, location)
+                    continue
+                response.raise_for_status()
+                match = re.fullmatch(r"/goods-detail/([0-9a-f]{24})", parsed.path)
+                if match is None:
+                    raise ValueError("xhs_product_identity_missing")
+                return f"xhs-goods:{match.group(1)}"
+    raise ValueError("xhs_product_redirect_limit")
 
 
 def _shop_collection_read(

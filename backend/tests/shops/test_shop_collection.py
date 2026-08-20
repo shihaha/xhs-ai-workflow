@@ -48,6 +48,13 @@ SHOP_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <node content-desc="到手价¥19.90已售1.2万+" bounds="[20,225][600,280]" />
   <node text="没有更多商品了" bounds="[0,1400][720,1500]" />
 </hierarchy>"""
+SHOP_COUPON_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="恭喜获得 " bounds="[210,600][510,680]" />
+  <node text="部分商品可用" bounds="[210,900][510,960]" />
+  <node content-desc="关注并领取" clickable="true" bounds="[317,1651][855,1794]" />
+  <node class="android.view.ViewGroup" clickable="true" bounds="[544,1930][628,2014]" />
+</hierarchy>"""
 DETAIL_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <hierarchy>
   <node text="高质量课程资料合集" bounds="[20,100][600,180]" />
@@ -391,6 +398,43 @@ def test_collection_waits_for_delayed_shop_hierarchy_before_selector_ruling(
 
     assert result.status == "succeeded"
     assert device.shop_dumps >= 2
+
+
+def test_collection_dismisses_observed_shop_coupon_once_before_parsing_products(
+    tmp_path: Path,
+) -> None:
+    """The observed coupon overlay is closed once without broad popup automation."""
+
+    class CouponShopDevice(_FakeU2Device):
+        def __init__(self) -> None:
+            super().__init__()
+            self.coupon_visible = True
+
+        def dump_hierarchy(self, *, compressed: bool = False) -> str:
+            if self.screen == "shop" and self.coupon_visible:
+                return SHOP_COUPON_XML
+            return super().dump_hierarchy(compressed=compressed)
+
+        def click(self, x: int, y: int) -> None:
+            if self.screen == "shop" and self.coupon_visible:
+                self.actions.append(("click", x, y))
+                self.coupon_visible = False
+                return
+            super().click(x, y)
+
+    device = CouponShopDevice()
+
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={"account_user_id": "account-1"},
+            expected_count=1,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.succeeded_count == 1
+    assert device.actions.count(("click", 586, 1972)) == 1
 
 
 def test_collection_reports_device_disconnect_during_profile_transition(
@@ -741,6 +785,36 @@ def test_partial_shop_collection_reports_explicit_expected_discovered_and_missin
     assert len(result.missing_items) == 1
     assert result.missing_items[0].reason == "expected_product_not_discovered"
     assert result.complete is False
+
+
+def test_preflight_accepts_explicit_natural_end_below_three_representatives(
+    tmp_path: Path,
+) -> None:
+    """Preflight inspects up to three products; a proven two-product shop is enough."""
+    device = _FakeU2Device(
+        shop_xml=SAME_TITLE_SHOP_XML,
+        links_by_y={
+            150: "https://xhslink.com/product-a",
+            450: "https://xhslink.com/product-b",
+        },
+    )
+
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={
+                "account_user_id": "account-1",
+                "collection_mode": "preflight",
+            },
+            expected_count=3,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.expected_count == 2
+    assert result.succeeded_count == 2
+    assert result.missing_items == []
+    assert result.complete is True
     assert str(result.items[0].source_url) == "https://xhslink.com/product-a"
 
 

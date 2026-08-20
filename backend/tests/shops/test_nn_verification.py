@@ -80,6 +80,31 @@ def test_nn_verification_requires_unique_urls_dirs_matching_details_and_hashes(
     assert result.complete is True
 
 
+def test_nn_verification_compares_dynamic_share_links_by_stable_product_identity(
+    tmp_path: Path,
+) -> None:
+    """Two fresh share links for the same product must not fail exact evidence binding."""
+    account_dir = tmp_path / "account"
+    account_dir.mkdir()
+    captured_link = "https://xhslink.com/m/captured-link"
+    fresh_link = "https://xhslink.com/m/fresh-link"
+    _write_product(account_dir, "01_product-a", captured_link)
+    _write_collection(
+        account_dir,
+        [{"source_url": captured_link, "product_dir": "01_product-a"}],
+    )
+
+    result = verify_shop_collection(
+        account_dir,
+        expected_count=1,
+        expected_source_urls=[fresh_link],
+        source_identity_resolver=lambda _url: "xhs-goods:stable-product-a",
+    )
+
+    assert result.complete is True
+    assert result.issues == []
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     [("detail_link", "detail_url_mismatch"), ("hash", "image_hash_mismatch")],
