@@ -23,36 +23,36 @@ const opportunity = {
 describe("OpportunitiesPage", () => {
   it("shows the Phase A boundary and a truthful empty state", async () => {
     render(<OpportunitiesPage loadOpportunities={vi.fn().mockResolvedValue({ opportunities: [], accounts: [], evidence: [] })} />);
-    expect(await screen.findByText("No cross-account candidates yet")).toBeVisible();
-    expect(screen.getByText(/Phase B has not started/)).toBeVisible();
-    expect(screen.queryByRole("button", { name: /Create product/ })).not.toBeInTheDocument();
+    expect(await screen.findByText("暂时没有跨账号候选")).toBeVisible();
+    expect(screen.getByText(/Phase B 尚未开始/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /创建产品/ })).not.toBeInTheDocument();
   });
 
   it("submits two complete accounts with their trusted shop and note evidence", async () => {
     const createAnalysis = vi.fn().mockResolvedValue({ status: "succeeded" });
     const load = vi.fn().mockResolvedValue({ opportunities: [], accounts: [account("a"), account("b")], evidence: [...evidence("a"), ...evidence("b")] });
     render(<OpportunitiesPage loadOpportunities={load} createAnalysis={createAnalysis} />);
-    await screen.findByText("Account a · shop 1 · notes 1 · complete");
-    fireEvent.click(screen.getByLabelText("Select Account a"));
-    fireEvent.click(screen.getByLabelText("Select Account b"));
-    fireEvent.click(screen.getByRole("button", { name: "Run cross-account clustering" }));
+    await screen.findByText("Account a · 店铺证据 1 · 笔记证据 1 · 完整");
+    fireEvent.click(screen.getByLabelText("选择 Account a"));
+    fireEvent.click(screen.getByLabelText("选择 Account b"));
+    fireEvent.click(screen.getByRole("button", { name: "运行跨账号需求分析" }));
     await waitFor(() => expect(createAnalysis).toHaveBeenCalledWith({
       analysis_type: "account_opportunity",
       account_user_ids: ["a", "b"],
       evidence_ids: ["artifact:1", "account-note:10", "artifact:2", "account-note:20"],
     }));
-    expect(await screen.findByText(/Cross-account analysis completed/)).toBeVisible();
+    expect(await screen.findByText(/跨账号分析已完成/)).toBeVisible();
   });
 
   it("renders evidence ownership and performs one-way human review", async () => {
     const review = vi.fn().mockResolvedValue({ ...opportunity, review_status: "approved" });
     const load = vi.fn().mockResolvedValue({ opportunities: [opportunity], accounts: [account("a"), account("b")], evidence: [...evidence("a"), ...evidence("b")] });
     render(<OpportunitiesPage loadOpportunities={load} reviewOpportunity={review} />);
-    expect(await screen.findByText("warming_candidate · 2 supporting accounts")).toBeVisible();
+    expect(await screen.findByText("升温候选 · 2 个支撑账号")).toBeVisible();
     expect(screen.getByText(/artifact:1/)).toBeVisible();
     expect(screen.getByText("Product A")).toBeVisible();
     expect(screen.getByText("Note B")).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "Approve Shared demand" }));
+    fireEvent.click(screen.getByRole("button", { name: "批准：Shared demand" }));
     await waitFor(() => expect(review).toHaveBeenCalledWith("opp-1", { decision: "approve" }));
   });
 
@@ -61,9 +61,9 @@ describe("OpportunitiesPage", () => {
     const review = vi.fn(() => new Promise<typeof opportunity>(done => { resolve = done; }));
     render(<OpportunitiesPage loadOpportunities={vi.fn().mockResolvedValue({ opportunities: [opportunity], accounts: [], evidence: [] })} reviewOpportunity={review} />);
     await screen.findByText("Shared demand");
-    const reject = screen.getByRole("button", { name: "Reject Shared demand" });
+    const reject = screen.getByRole("button", { name: "拒绝：Shared demand" });
     expect(reject).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Rejection reason for Shared demand"), { target: { value: "No common demand" } });
+    fireEvent.change(screen.getByLabelText("拒绝 Shared demand 的原因"), { target: { value: "No common demand" } });
     fireEvent.click(reject); fireEvent.click(reject);
     expect(review).toHaveBeenCalledTimes(1);
     expect(review).toHaveBeenCalledWith("opp-1", { decision: "reject", reason: "No common demand" });
@@ -73,6 +73,6 @@ describe("OpportunitiesPage", () => {
 
   it("keeps API failure visible and retryable", async () => {
     render(<OpportunitiesPage loadOpportunities={vi.fn().mockRejectedValue(new Error("offline"))} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load opportunities");
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法加载机会候选");
   });
 });

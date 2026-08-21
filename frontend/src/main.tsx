@@ -13,16 +13,16 @@ export function App({ pathname = window.location.pathname }: { pathname?: string
   const accountMatch = /^\/accounts\/([^/]+)$/.exec(pathname);
   return (
     <div className="app-shell">
-      <a className="skip-link" href="#main-content">Skip to main content</a>
+      <a className="skip-link" href="#main-content">跳到主要内容</a>
       <header className="app-header">
-        <a className="product-name" href="/status">XHS Intelligence Workbench</a>
-        <nav aria-label="Workbench">
-          <a aria-current={pathname === "/radar" ? "page" : undefined} href="/radar">Radar</a>
-          <a aria-current={pathname.startsWith("/accounts/") ? "page" : undefined} href="/radar">Accounts</a>
-          <a aria-current={pathname === "/opportunities" ? "page" : undefined} href="/opportunities">Opportunities</a>
-          <a aria-current={pathname === "/content" ? "page" : undefined} href="/content">Content studio</a>
-          <a aria-current={pathname === "/status" ? "page" : undefined} href="/status">System status</a>
-          <a aria-current={pathname === "/jobs" ? "page" : undefined} href="/jobs">Jobs</a>
+        <a className="product-name" href="/status">小红书需求雷达工作台</a>
+        <nav aria-label="工作台导航">
+          <a aria-current={pathname === "/radar" ? "page" : undefined} href="/radar">需求雷达</a>
+          <a aria-current={pathname.startsWith("/accounts/") ? "page" : undefined} href="/radar">账号证据</a>
+          <a aria-current={pathname === "/opportunities" ? "page" : undefined} href="/opportunities">机会审核</a>
+          <a aria-current={pathname === "/content" ? "page" : undefined} href="/content">内容工作台</a>
+          <a aria-current={pathname === "/status" ? "page" : undefined} href="/status">系统状态</a>
+          <a aria-current={pathname === "/jobs" ? "page" : undefined} href="/jobs">任务记录</a>
         </nav>
       </header>
       {pathname === "/radar" ? <RadarPage /> : accountMatch ? <AccountPage accountId={decodeURIComponent(accountMatch[1])} /> : pathname === "/opportunities" ? <OpportunitiesPage /> : pathname === "/content" ? <ContentStudioPage /> : pathname === "/status" ? <SystemStatusPage /> : pathname === "/jobs" ? <JobsPage /> : <NotFoundPage />}
@@ -34,8 +34,8 @@ function NotFoundPage() {
   return (
     <main className="workbench-page" id="main-content">
       <section className="message-panel">
-        <h1>Route not found</h1>
-        <p>Choose System status or Jobs from the workbench navigation.</p>
+        <h1>页面不存在</h1>
+        <p>请从工作台导航中选择“系统状态”或“任务记录”。</p>
       </section>
     </main>
   );
