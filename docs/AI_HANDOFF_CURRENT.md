@@ -5,22 +5,23 @@
 ## Repository State
 
 - branch: `feature/system-v1`
-- commit SHA: `4874f889b4b0b73a3f5ff30f2794c22713171637`（生成本次交接前核验的远端基线；包含本文件的最终提交 SHA 需在提交推送后由分支引用和交付结果确认，因为 Git 提交不能在自身内容中自引用其最终 SHA）
 - date: `2026-08-21`
-- current phase: `Phase A — 人工审核门禁`
+- current engineering state: `Phase A evidence/analyze loop complete; user has approved continuing the current Opportunity into product research, but local persistence of the review decision must still be verified/applied through the existing human-review path.`
+- architecture alignment for ChatGPT / Codex: `docs/CODEX_NEXT_OBJECTIVE.md`
 
 ## What Changed
 
-- 建立统一 GitHub AI 交接入口：`docs/AI_HANDOFF_CURRENT.md`。
-- 从已经持久化的 SQLite 分析结果生成当前 Opportunity 的人工审核报告：`docs/opportunity_reviews/5859e6c9-0485-451b-9152-05896c0d037b.md`。
-- 本次没有重新调用百炼，没有修改 Opportunity 状态，没有批准或拒绝候选，没有启动 Phase B。
+- 用户在当前对话中已经明确表示：可以批准“七宗罪心理测试数字内容市场机会”继续推进。
+- 该批准被定义为：**批准进入独立的产品研究/产品定义工作段**，不是批准某个具体产品方案，不授权自动制作产品，也不授权自动进入内容系统。
+- 新增 `docs/CODEX_NEXT_OBJECTIVE.md`，用于统一 ChatGPT、Codex 和人工操作者对完整架构、两个断点和后续接口的理解。
+- 当前没有把 Phase B（产品研究/定义）或 Phase C（产品制作）自动化强行写入主系统。
 
 ## Real Execution Result
 
 - 已读取持久化 analysis `5859e6c9-0485-451b-9152-05896c0d037b`。
 - 该分析真实状态为 `succeeded`，一次请求收到模型响应，生成一个待人工审核 Opportunity。
-- Opportunity 为“七宗罪心理测试数字内容市场机会”，当前仍为 `warming_candidate + pending_review`。
-- 审核报告保留了模型持久化的账号需求画像、产品聚类、跨账号共同需求结论、理由、差异、证据引用和 Opportunity 字段；未重新总结模型结论。
+- Opportunity 为“七宗罪心理测试数字内容市场机会”，最后一次已核验持久化状态仍是 `warming_candidate + pending_review`。
+- 当前用户已经在对话层作出“批准继续研究”的决定；如果 SQLite/API 仍显示 `pending_review`，下一步应通过现有人工审核路径持久化该决定，而不是重写历史 evidence/analysis。
 
 ## Current Business State
 
@@ -28,14 +29,42 @@
 - in_scope accounts: `2`。
 - current analysis: `succeeded`。
 - Opportunity: `warming_candidate`。
-- review status: `pending_review`。
-- Phase A: 真实证据闭环和当前跨账号分析已完成，当前只等待该 Opportunity 的用户人工审核。
-- Phase B: `未启动，未获授权`。即使用户批准本 Opportunity，也只关闭 Phase A 的审核门禁；进入 Phase B 仍需用户另行明确授权。
+- last verified persisted review status: `pending_review`。
+- user decision in current chat: `approve continuing this Opportunity into product research`。
+- Phase A discovery/evidence goal: 已完成。
+- Product research / product definition: 下一独立工作段；当前不要求自动化进主系统。
+- Product build: 只有产品定义再次经用户批准后，才建立独立 Codex/AI 制作任务。
+- Content system: 只有真实成品完成并通过人工 UAT 后才接入。
 
-## Current Blockers
+## Current Architecture
 
-- 当前唯一 blocker 是用户对 Opportunity `caed5776-ef38-4a0a-90fe-57ae2291583e` 作出人工批准或拒绝决定。
-- 当前不存在需要手机、百炼重试、工程修复或重新采集才能完成本次审核的 blocker。
+完整业务链明确为四段：
+
+1. **A — 需求雷达系统（当前仓库）**：回答“什么方向值得继续研究？”并输出 Opportunity。
+2. **B — 产品研究 / 产品定义（当前独立工作段）**：回答“这个机会具体应该做什么产品？”；AI 研究，人最终立项。
+3. **C — 产品制作（当前独立工作段）**：把被批准的产品定义做成真实可交付成品；软件类可由独立 Codex 项目开发，人做关键视觉/功能/UAT验收。
+4. **D — 内容系统（产品完成后接入）**：围绕已经完成的产品做产品分析、关键词、对标、拆解、模板、Skill、日更和内容审查。
+
+当前有意保留两个断点：
+
+- Gap 1: `approved Opportunity → approved Product Definition`
+- Gap 2: `approved Product Definition → Finished Product`
+
+不要把内容系统误当成产品制作系统，也不要让 Opportunity 自动跳过 B/C 进入内容生产。
+
+详细边界和接口见 `docs/CODEX_NEXT_OBJECTIVE.md`。
+
+## Current Blockers / Next Work
+
+当前没有需要继续扫榜、继续凑第二个账号或重跑跨账号 analysis 的 blocker。
+
+下一步按顺序：
+
+1. 若本地 Opportunity 仍是 `pending_review`，使用现有人工审核路径持久化用户批准；保留历史不可变。
+2. 以当前七宗罪 Opportunity 作为第一个真实案例，单独开展产品研究/产品定义。
+3. 产品研究完成后，再由用户做第二次决定：`批准具体产品立项 / 继续研究 / 放弃`。
+4. 若批准具体产品，建立独立产品制作任务；不要由当前需求雷达后台自动制造。
+5. 成品经人工 UAT 后，再设计/执行到内容系统的正式交接。
 
 ## Historical Non-blocking Issues
 
@@ -46,13 +75,11 @@
 
 ## Tests / Verification
 
-- SQLite/API 状态复核：`PASS`。本地 API 对 `2026-08-20` 候选漏斗返回 `71` 条，分布为 `2 in_scope`、`31 out_of_scope_physical`、`36 needs_human`、`2 collection_failed`；Opportunity 仍为 `warming_candidate + pending_review`，`reviewed_at=null`、`rejection_reason=null`。
-- 文档来源断言：`PASS`。analysis/Opportunity 的关键持久化字段、共同需求、共同点、关键差异和 rationale 与 SQLite 一致；账号标识仅作明确别名替换。
-- 隐私检查：`PASS`。两份新增文档未包含完整账号内部标识，未命中 Bearer、`sk-` 或带值的 API Key/Token/password/Cookie 秘密格式。
-- 交接章节契约：`PASS`。固定九个章节全部存在。
-- `git diff --check`: `PASS`（Windows 行尾转换提示不属于 whitespace error）。
+- 最近一次 SQLite/API 状态复核：`PASS`；当时 Opportunity 仍为 `warming_candidate + pending_review`，`reviewed_at=null`、`rejection_reason=null`。
+- 文档来源断言：`PASS`。analysis/Opportunity 的关键持久化字段、共同需求、共同点、关键差异和 rationale 与 SQLite 一致。
+- 隐私检查：新增交接文档不记录 API Key、Cookie、Token、password 或完整敏感账号标识。
 - 最近一次前端验证：`65 passed`，production build 通过。
-- 本次未修改生产代码，未以历史测试结果冒充本次代码回归。
+- 本次更新是目标/架构同步，不冒充本地 Opportunity review 已经持久化，也不冒充 Phase B/C 已实现。
 
 ## Important IDs
 
@@ -63,10 +90,12 @@
 - Account A shop artifact ID: `artifact:1612`
 - Account B shop artifact ID: `artifact:1554`
 
-未记录 API Key、Cookie、Token、password 或完整敏感账号标识。
-
 ## Next Decision Needed
 
-- decision owner: `用户人工决策`
-- decision: 阅读 `docs/opportunity_reviews/5859e6c9-0485-451b-9152-05896c0d037b.md` 后，决定批准或拒绝当前 Opportunity。
-- 本交接不授权 AI 自动批准、拒绝、重跑分析或进入 Phase B。
+当前用户层已经决定：**继续研究当前 Opportunity。**
+
+下一次真正需要用户做的新业务决定，不再是“这个 Opportunity 要不要看”，而是：
+
+> 产品研究完成以后，是否批准某个**具体 Product Definition**进入制作。
+
+在该决定之前，不允许自动创建正式产品、自动进入内容系统或自动发布。
