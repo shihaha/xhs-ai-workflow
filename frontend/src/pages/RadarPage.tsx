@@ -114,7 +114,7 @@ export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapsh
   };
 
   if (state.kind === "loading") return <main className="workbench-page" id="main-content"><section className="loading-panel" aria-busy="true"><p role="status">Loading demand radar</p></section></main>;
-  if (state.kind === "error") return <main className="workbench-page" id="main-content"><section className="message-panel" role="alert"><h1>Could not load demand radar</h1><p>The persisted ranking endpoints did not return a result.</p><button type="button" onClick={() => void refresh()}>Retry demand radar</button></section></main>;
+  if (state.kind === "error") return <main className="workbench-page" id="main-content"><section className="message-panel" role="alert"><h1>无法加载需求雷达</h1><p>已保存的榜单数据接口没有返回有效结果。</p><button type="button" onClick={() => void refresh()}>重新加载需求雷达</button></section></main>;
   const { snapshots, accounts, funnel = [] } = state.data;
   const latestSourceDate = snapshots.map(item => item.source_date).sort().at(-1);
   const succeeded = scopeJobs.filter(job => job.state === "succeeded").length;

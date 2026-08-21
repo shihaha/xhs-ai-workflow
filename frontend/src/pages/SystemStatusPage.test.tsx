@@ -21,19 +21,21 @@ describe("SystemStatusPage", () => {
   it("shows a factual loading state while health is being requested", () => {
     render(<SystemStatusPage loadHealth={() => new Promise<HealthResponse>(() => {})} />);
 
-    expect(screen.getByRole("status")).toHaveTextContent("Loading system checks");
-    expect(screen.getByLabelText("Loading system checks")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("status")).toHaveTextContent("正在检查系统状态");
+    expect(screen.getByLabelText("正在检查系统状态")).toHaveAttribute("aria-busy", "true");
   });
 
   it("renders every reported check and does not infer unavailable prerequisites", async () => {
     render(<SystemStatusPage loadHealth={vi.fn().mockResolvedValue(healthFixture)} />);
 
-    expect(await screen.findByRole("heading", { name: "System status" })).toBeVisible();
-    expect(screen.getByText("Degraded")).toBeVisible();
-    expect(screen.getAllByText("Available")).toHaveLength(2);
-    expect(screen.getAllByText("Unavailable")).toHaveLength(2);
+    expect(await screen.findByRole("heading", { name: "系统状态" })).toBeVisible();
+    expect(screen.getByText("部分功能不可用")).toBeVisible();
+    expect(screen.getAllByText("可用")).toHaveLength(2);
+    expect(screen.getAllByText("不可用")).toHaveLength(2);
     expect(screen.getByText(/workbench\.sqlite3/)).toBeVisible();
-    expect(screen.getAllByText("adb")).toHaveLength(2);
+    expect(screen.getByText("Android设备")).toBeVisible();
+    expect(screen.getByText("百炼")).toBeVisible();
+    expect(screen.getByText("adb")).toBeVisible();
     expect(screen.getByText(/Chrome\\Application\\chrome\.exe/)).toBeVisible();
   });
 
@@ -41,7 +43,7 @@ describe("SystemStatusPage", () => {
     const loadHealth = vi.fn().mockRejectedValue(new Error("Network unavailable"));
     render(<SystemStatusPage loadHealth={loadHealth} />);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load system checks");
-    expect(screen.getByRole("button", { name: "Retry system checks" })).toBeEnabled();
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法加载系统状态");
+    expect(screen.getByRole("button", { name: "重新检查" })).toBeEnabled();
   });
 });

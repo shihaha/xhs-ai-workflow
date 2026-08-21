@@ -34,18 +34,18 @@ export function SystemStatusPage({ loadHealth = fetchHealth }: SystemStatusPageP
 
 export function SystemStatusView({ health }: { health: HealthResponse }) {
   const checks = Object.entries(health.checks);
-  const overallLabel = health.status === "healthy" ? "Healthy" : "Degraded";
+  const overallLabel = health.status === "healthy" ? "全部正常" : "部分功能不可用";
 
   return (
     <main className="workbench-page" id="main-content">
       <header className="page-heading">
-        <p className="eyebrow">Local prerequisites</p>
-        <h1>System status</h1>
-        <p>Live checks reported by the local API. No external integration is probed here.</p>
+        <p className="eyebrow">本机运行条件</p>
+        <h1>系统状态</h1>
+        <p>这里显示本机接口返回的实时检查结果，不代表外部平台一定可用。</p>
       </header>
 
       <section aria-labelledby="overall-status-heading" className="status-summary">
-        <h2 id="overall-status-heading">Overall status</h2>
+        <h2 id="overall-status-heading">总体状态</h2>
         <p className={`state state--${health.status}`} role="status">
           {overallLabel}
         </p>
@@ -53,8 +53,8 @@ export function SystemStatusView({ health }: { health: HealthResponse }) {
 
       <section aria-labelledby="checks-heading" className="operator-panel">
         <div className="panel-heading">
-          <h2 id="checks-heading">Reported checks</h2>
-          <p>{checks.length} checks returned</p>
+          <h2 id="checks-heading">检查项目</h2>
+          <p>共返回 {checks.length} 项检查</p>
         </div>
         <dl className="check-list">
           {checks.map(([name, check]) => (
@@ -67,12 +67,21 @@ export function SystemStatusView({ health }: { health: HealthResponse }) {
 }
 
 function HealthCheckRow({ check, name }: { check: HealthCheck; name: string }) {
-  const label = check.healthy ? "Available" : "Unavailable";
-  const detail = check.path ?? check.executable ?? "No location reported";
+  const label = check.healthy ? "可用" : "不可用";
+  const detail = check.path ?? check.executable ?? "没有提供路径";
+  const displayName = ({
+    database: "数据库",
+    adb: "Android设备",
+    browser: "浏览器",
+    bailian: "百炼",
+    bailian_text: "百炼文本模型",
+    bailian_vision: "百炼视觉模型",
+    bailian_image: "百炼图片模型",
+  } as Record<string, string>)[name] ?? name;
 
   return (
     <div className="check-row">
-      <dt>{name}</dt>
+      <dt>{displayName}</dt>
       <dd>
         <span className={`state state--${check.healthy ? "healthy" : "unavailable"}`}>
           {label}
@@ -86,9 +95,9 @@ function HealthCheckRow({ check, name }: { check: HealthCheck; name: string }) {
 function LoadingSystemChecks() {
   return (
     <main className="workbench-page" id="main-content">
-      <section aria-busy="true" aria-label="Loading system checks" className="loading-panel">
-        <p className="eyebrow">Local prerequisites</p>
-        <p role="status">Loading system checks</p>
+      <section aria-busy="true" aria-label="正在检查系统状态" className="loading-panel">
+        <p className="eyebrow">本机运行条件</p>
+        <p role="status">正在检查系统状态</p>
         <div aria-hidden="true" className="loading-line" />
         <div aria-hidden="true" className="loading-line loading-line--short" />
       </section>
@@ -100,10 +109,10 @@ function SystemStatusError({ onRetry }: { onRetry: () => Promise<void> }) {
   return (
     <main className="workbench-page" id="main-content">
       <section className="message-panel" role="alert">
-        <h1>Could not load system checks</h1>
-        <p>The local health endpoint did not return a result. Check that the backend is running, then try again.</p>
+        <h1>无法加载系统状态</h1>
+        <p>本机健康检查接口没有返回结果。请确认后端正在运行，然后重新检查。</p>
         <button onClick={() => void onRetry()} type="button">
-          Retry system checks
+          重新检查
         </button>
       </section>
     </main>

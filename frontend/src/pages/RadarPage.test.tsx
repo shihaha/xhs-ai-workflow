@@ -86,8 +86,8 @@ describe("RadarPage", () => {
 
   it("shows an actionable API error instead of stale data", async () => {
     render(<RadarPage loadRadar={vi.fn().mockRejectedValue(new Error("offline"))} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load demand radar");
-    expect(screen.getByRole("button", { name: "Retry demand radar" })).toBeEnabled();
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法加载需求雷达");
+    expect(screen.getByRole("button", { name: "重新加载需求雷达" })).toBeEnabled();
   });
 
   it("submits operator-captured snapshot JSON through the persisted API", async () => {
