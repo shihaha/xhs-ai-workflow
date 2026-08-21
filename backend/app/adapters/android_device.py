@@ -1291,15 +1291,15 @@ class AndroidDeviceAdapter:
             return early_result.model_copy(
                 update={"raw_evidence": {"scope_early_stop": scope_early_stop_decision}}
             )
-        preflight_natural_end = (
-            request.parameters.get("collection_mode") == "preflight"
+        bounded_natural_end = (
+            request.parameters.get("collection_mode") in {"preflight", "evidence_sample"}
             and natural_end_reached
             and identity_observed > 0
             and identity_observed < expected
             and non_duplicate_rejections == 0
         )
-        if preflight_natural_end:
-            return self._result(
+        if bounded_natural_end:
+            natural_end_result = self._result(
                 request=request.model_copy(update={"expected_count": identity_observed}),
                 status="succeeded",
                 detail=None,
@@ -1307,6 +1307,9 @@ class AndroidDeviceAdapter:
                 rejected_items=rejected_items,
                 artifacts=artifact_paths,
                 transitions=transitions,
+            )
+            return natural_end_result.model_copy(
+                update={"raw_evidence": {"natural_end_reached": True}}
             )
         if identity_observed > expected:
             status = "failed"
@@ -1560,7 +1563,8 @@ class AndroidDeviceAdapter:
         hierarchy_path = self._contained_path(hierarchy_relative)
         screenshot_path.parent.mkdir(parents=True, exist_ok=True)
         screenshot_path.write_bytes(screenshot)
-        hierarchy_path.write_text(hierarchy, encoding="utf-8")
+        hierarchy_bytes = hierarchy.encode("utf-8")
+        hierarchy_path.write_bytes(hierarchy_bytes)
         screenshot_artifact = self.job_service.attach_artifact(
             job_id,
             kind=_IMAGE_SCREENSHOT_KIND,
@@ -1578,7 +1582,7 @@ class AndroidDeviceAdapter:
             metadata={
                 "transition": transition,
                 "selector_profile_version": self.selector_profile_version,
-                "sha256": sha256(hierarchy.encode("utf-8")).hexdigest(),
+                "sha256": sha256(hierarchy_bytes).hexdigest(),
             },
         )
         return _ScreenEvidence(

@@ -5,7 +5,15 @@ repository: shihaha/xhs-ai-workflow
 branch: feature/system-v1
 remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
-last_updated: 2026-08-21 (Phase A candidate scope funnel checkpoint)
+last_updated: 2026-08-21 (short-shop evidence and CDP live verification)
+
+## 2026-08-21 short-shop evidence and CDP live verification
+
+- The current shop-sample rule is now `min(3, proven available products)`: shops with three or more products still use the first three distinct products in default order; a one- or two-product shop is accepted only when the same Android run observes the natural end marker, collects every available product without non-duplicate rejection, and binds every item to same-job detail/source/image evidence. An ordinary 1/3 or 2/3 partial remains fail-closed.
+- RED tests reproduced the former 1/3 and 2/3 partial behavior and the Windows XML byte-hash mismatch. GREEN tests cover one- and two-product natural ends, the unchanged three-product path, and SHA-256 over the exact XML bytes written to disk.
+- The dedicated visible Chrome at localhost CDP was used directly. Historical CDP failures remain unchanged. New job `7c11ae26…` succeeded at latest `10/10`; profile and ten owner-bound notes remained readable after service restart.
+- Final Android evidence job `a4d99cb9…` truthfully persisted `available_count_observed=2`, kept the collection cap at three, then succeeded at exact available `2/2`, `sample_complete=true`, `shop_complete=false`, with two distinct stable product identities and two distinct HTTPS sources. All 23 artifacts exist; all 22 SHA-bearing artifacts match current bytes, including all 10 XML files. Five XML files contain the preserved natural-end marker. Manifest and collection hashes match, and restart readback preserved the same result.
+- No cross-account analysis, Opportunity review, approval, product construction or other Phase B action was run in this increment. Historical failed/partial jobs and artifacts were not changed. Phase A remains open because older XML artifacts retain their documented current-byte mismatch and the historical malformed Opportunity remains unreviewed; Phase B remains unstarted.
 
 ## 2026-08-21 connected-phone ranked continuation
 
@@ -14,12 +22,12 @@ last_updated: 2026-08-21 (Phase A candidate scope funnel checkpoint)
 - A new natural digital candidate was found at position 61. Android preflight job `151a887f…` succeeded after 2 representative products with final `scope_gate_in_scope`; it has 25 artifacts and remains restart-readable.
 - The required public profile/latest-10 collection then stopped once as `cdp_unavailable` (`d3a4d2d1…`). The formal exact-three evidence sample (`77fedee2…`) entered the real shop and persisted two product discoveries plus detail/share evidence, but the third required product was missing. It is truthfully `partial/expected_products_missing`, `2/3`, `sample_complete=false`, `shop_complete=false`; no fourth product, retry, cross-account analysis or Opportunity followed.
 - Across those three jobs, SQLite references 49 existing artifact files. Of 47 artifacts carrying SHA metadata, 27 current bytes match and 20 Android XML hierarchy files reproduce the separately known Windows newline/hash mismatch. Restart readback preserved the gate success, CDP failure, partial evidence sample, artifact counts and 2-account `in_scope` funnel state.
-- Current blocker is no longer ADB. Completion now requires the trusted localhost CDP profile to be available and a valid exact-three same-job evidence sample for the new account. Phase A remains open; Phase B remains unstarted.
+- This checkpoint is historical and is superseded by the short-shop/CDP verification above. Its failed jobs remain unchanged. Phase A remains open; Phase B remains unstarted.
 
 ## 2026-08-21 Phase A candidate business-scope funnel
 
 - The original Qianfan score and stable score order are unchanged. A new evidence-bound prescreen now sits between scoring and Android: `likely_digital`, `clearly_physical`, or fail-open `uncertain`. It cannot produce `in_scope`, shop evidence or an Opportunity, and an existing Android decision remains authoritative.
-- Candidate replacement is account-level and may continue beyond rank 20. It always selects the next remaining score-ordered candidate and accepts no product category or matching direction. This is separate from the unchanged shop-level rule: exactly the first three distinct products encountered, with no fourth-product substitution.
+- Candidate replacement is account-level and may continue beyond rank 20. It always selects the next remaining score-ordered candidate and accepts no product category or matching direction. The current shop rule is the first three distinct products, or all one/two products only when the same run proves the shop's natural end; no fourth-product substitution is allowed.
 - Real 2026-08-20 pool UAT prescreened all 71 ranked candidates: 4 `clearly_physical`, 2 `likely_digital`, and 65 `uncertain`. All 71 jobs, structured artifacts and SQLite rows persisted; 71/71 current files match both saved payloads and SHA-256, and restart readback returned all 71 classifications.
 - Existing Android history remained authoritative: after prescreen, the funnel exposed 1 `in_scope`, 9 `out_of_scope_physical`, 7 `needs_human`, and 54 waiting candidates. The next two score-ordered candidates (positions 8 and 9) were admitted sequentially but failed immediately as `device_disconnected`; direct ADB output contained no attached device or discoverable mDNS service. Their failed jobs remain durable and the system did not loop further.
 - Automated verification: Radar `112 passed`; directly relevant Android/shop `33 passed`; analysis `178 passed, 1 skipped`; frontend `65 passed`; production build passed. The whole backend tree reported `1498 passed, 3 skipped, 5 failed`; the failures are one unchanged media-usage expectation and four unchanged legacy/shop-scope expectations, outside all modified files and absent from the focused funnel path. They were recorded, not fixed by expanding scope. `git diff --check` reports no whitespace errors. Ruff/Black were unavailable in the installed Python environment and were not installed for this bounded task.

@@ -123,14 +123,22 @@ class _CaptureExpectedAdapter(_UnusedAdapter):
         jobs: JobService | None = None,
         *,
         titles: list[str] | None = None,
+        returned_count: int | None = None,
+        natural_end_reached: bool = False,
     ) -> None:
         self.requests: list[CollectionRequest] = []
         self.jobs = jobs
         self.titles = titles or ["连衣裙", "衬衫", "半身裙"]
+        self.returned_count = returned_count
+        self.natural_end_reached = natural_end_reached
 
     def collect_shop(self, request: CollectionRequest) -> CollectionResult:
         self.requests.append(request)
-        expected = request.expected_count or 0
+        expected = (
+            self.returned_count
+            if self.returned_count is not None
+            else request.expected_count or 0
+        )
         job_id = str(request.parameters["job_id"])
         raw_evidence: list[dict[str, Any]] = []
         for index in range(expected):
@@ -176,6 +184,9 @@ class _CaptureExpectedAdapter(_UnusedAdapter):
             missing_items=[],
             overflow_count=0,
             complete=True,
+            raw_evidence=(
+                {"natural_end_reached": True} if self.natural_end_reached else {}
+            ),
         )
 
 
@@ -367,6 +378,73 @@ def test_evidence_sample_persists_the_first_three_products_without_claiming_full
     assert artifact.metadata["result"]["collection_mode"] == "evidence_sample"
     assert artifact.metadata["result"]["sample_complete"] is True
     assert artifact.metadata["result"]["shop_complete"] is False
+
+
+@pytest.mark.parametrize("available_count", [1, 2])
+def test_evidence_sample_uses_all_products_when_adapter_proves_natural_end(
+    tmp_path: Path,
+    available_count: int,
+) -> None:
+    """A proven 1-2 product shop must not remain a misleading partial 1/3 or 2/3."""
+    runtime_dir = tmp_path / "runtime"
+    jobs = JobService(
+        Database(runtime_dir / "workbench.sqlite3"), runtime_dir=runtime_dir
+    )
+    adapter = _CaptureExpectedAdapter(
+        jobs,
+        titles=["电子版兑换券一", "电子版兑换券二", "电子版兑换券三"],
+    )
+    scheduled: list[tuple[Callable[..., Any], tuple[Any, ...]]] = []
+    service = ShopCollectionService(
+        job_service=jobs,
+        device_adapter=adapter,
+        submitter=_capturing_submitter(scheduled),
+    )
+    gate = service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1",
+            account_name="账号甲",
+            collection_mode="preflight",
+            available_count_observed=3,
+        )
+    )
+    gate_action, gate_args = scheduled.pop()
+    assert gate_action(*gate_args) is not None
+    adapter.returned_count = available_count
+    adapter.natural_end_reached = True
+
+    queued = service.enqueue(
+        ShopCollectionCreate(
+            account_user_id="account-1",
+            account_name="账号甲",
+            expected_count=3,
+            available_count_observed=available_count,
+            collection_mode="evidence_sample",
+            product_sample_limit=3,
+            scope_gate_job_id=gate.job_id,
+        )
+    )
+    action, args = scheduled.pop()
+    result = action(*args)
+
+    assert adapter.requests[-1].expected_count == 3
+    assert result is not None
+    assert result.status == "succeeded", (
+        result.status,
+        result.detail,
+        result.expected_count,
+        result.missing_count,
+        result.verification,
+    )
+    assert result.expected_count == available_count
+    assert result.available_count_observed == available_count
+    assert result.succeeded_count == available_count
+    assert result.sample_complete is True
+    assert result.shop_complete is False
+    job = jobs.get(queued.job_id)
+    assert job.state is JobState.succeeded
+    assert job.progress_current == available_count
+    assert job.progress_total == available_count
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,25 @@
 
 Status date: 2026-08-21
 
+## Short-shop evidence and XML byte-hash correction
+
+The current evidence contract uses the first three distinct products when at
+least three exist. It accepts one or two only when the same Android run reaches
+an explicit natural end, has no non-duplicate rejection and successfully binds
+every available item. The service derives the exact target from that trusted
+adapter result; generic partial collections remain fail-closed.
+
+Android hierarchy artifacts are now written from the same UTF-8 byte sequence
+used to calculate their SHA-256, removing Windows newline conversion from new
+evidence. Historical artifacts are unchanged.
+
+New live CDP job `7c11ae26…` succeeded at latest 10/10. Final live Android job
+`a4d99cb9…` truthfully persisted two observed products and succeeded at exact available 2/2 with 23 artifacts, two distinct
+discoveries and a complete bounded sample. All 22 SHA-bearing files match,
+including ten XML files; manifest/collection hashes and restart readback also
+match. No cross-account analysis or Phase B action ran. Phase A remains open
+because historical XML mismatches and the historical review item remain.
+
 ## Connected-phone ranked continuation
 
 The previously blocked live path resumed after ADB reported one authorized
@@ -17,10 +36,12 @@ discoveries, `expected_products_missing`, `sample_complete=false` and no fourth
 replacement. Consequently the account cannot yet enter specific-demand
 analysis.
 
-No files are missing across the three jobs. Twenty XML artifacts fail their
+No files are missing across the three historical jobs. Twenty XML artifacts fail their
 saved/current SHA comparison because of the already documented Windows newline
 expansion; 27 other SHA-bearing artifacts match. No production code changed in
-this continuation. Phase A remains incomplete and Phase B is unstarted.
+this historical continuation. The newer short-shop verification above
+supersedes its blocker statement; Phase A remains incomplete and Phase B is
+unstarted.
 
 ## Ranked candidate business-scope funnel
 

@@ -2,6 +2,30 @@
 
 Date: 2026-08-20 (Asia/Shanghai)
 
+## 2026-08-21 short-shop evidence and CDP result
+
+The formal sample target remains three for shops that have at least three
+products. A same-run Android natural-end marker may now prove that a shop has
+only one or two products; only then does the exact target become the proven
+available count. Every available item must still have same-job detail,
+distinct source identity, image, manifest and SQLite evidence. Partial results
+without that proof remain ineligible.
+
+RED tests reproduced both short-shop failures and the Windows XML byte-hash
+mismatch. The minimal production change passed the new one/two-product tests
+and the existing three-product path. New CDP job `7c11ae26…` then persisted a
+latest-10 account sample. Final Android job `a4d99cb9…` truthfully persisted
+two observed products and a successful 2/2 evidence sample with two discoveries, two stable identities, two distinct
+HTTPS sources, `sample_complete=true` and `shop_complete=false`.
+
+All 23 Android artifacts exist. All 22 artifacts carrying SHA metadata match
+their current bytes, including ten XML hierarchies; five hierarchies retain the
+natural-end marker. Manifest and collection hashes match. After service
+restart, the shop remained 2/2 and the account profile plus ten notes remained
+readable. Historical failed jobs and their byte mismatches were not rewritten.
+No analysis, Opportunity or Phase B action ran in this increment. Phase A
+remains open and Phase B remains unstarted.
+
 ## 2026-08-21 connected-phone continuation result
 
 After the phone returned as an authorized ADB device, Xiaohongshu was launched

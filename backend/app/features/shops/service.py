@@ -138,8 +138,8 @@ class ShopCollectionCreate(BaseModel):
                 if self.available_count_observed is not None
                 else self.expected_count
             )
-            if observed < 3:
-                raise ValueError("evidence_sample requires at least three visible products")
+            if observed < 1:
+                raise ValueError("evidence_sample requires at least one visible product")
             if self.product_sample_limit != 3:
                 raise ValueError("evidence_sample requires product_sample_limit=3")
             if not self.scope_gate_job_id:
@@ -703,14 +703,31 @@ class ShopCollectionService:
         payload: ShopCollectionCreate,
         result: CollectionResult,
     ) -> ShopCollectionRead:
+        short_natural_end_sample = bool(
+            payload.collection_mode == "evidence_sample"
+            and result.status == "succeeded"
+            and result.complete
+            and result.expected_count in {1, 2}
+            and result.succeeded_count == result.expected_count
+            and len(result.items) == result.expected_count
+            and result.raw_evidence.get("natural_end_reached") is True
+        )
+        effective_expected_count = (
+            result.expected_count if short_natural_end_sample else payload.expected_count
+        )
+        effective_available_count = (
+            effective_expected_count
+            if short_natural_end_sample
+            else payload.available_count_observed
+        )
         read = _shop_collection_read(
             job_id=job_id,
             selector_profile_version=payload.selector_profile_version,
-            expected_count=payload.expected_count,
+            expected_count=effective_expected_count,
             result=result,
             collection_mode=payload.collection_mode,
             product_sample_limit=payload.product_sample_limit,
-            available_count_observed=payload.available_count_observed,
+            available_count_observed=effective_available_count,
             test_override=payload.test_override,
             test_override_reason=payload.test_override_reason,
         )
@@ -761,7 +778,7 @@ class ShopCollectionService:
             )
             try:
                 binding = self._materialize_bounded_sample_evidence(
-                    job_id, result.items
+                    job_id, result.items, expected_count=effective_expected_count
                 )
                 read = read.model_copy(
                     update={
@@ -773,7 +790,7 @@ class ShopCollectionService:
                 )
                 verification = verify_shop_collection(
                     binding.verification_dir,
-                    expected_count=payload.expected_count,
+                    expected_count=effective_expected_count,
                     expected_source_urls=[str(item.source_url) for item in result.items],
                 )
             except (InvalidVerificationPath, ValueError) as error:
@@ -897,7 +914,7 @@ class ShopCollectionService:
                 update={
                     "sample_complete": bool(
                         read.status == "succeeded"
-                        and read.succeeded_count == payload.expected_count
+                        and read.succeeded_count == effective_expected_count
                         and read.missing_count == 0
                     ),
                     "shop_complete": False,
@@ -981,11 +998,15 @@ class ShopCollectionService:
         return resolved
 
     def _materialize_bounded_sample_evidence(
-        self, job_id: str, items: list[CollectionItem]
+        self,
+        job_id: str,
+        items: list[CollectionItem],
+        *,
+        expected_count: int,
     ) -> _BoundedSampleEvidenceBinding:
-        """Bind the three selected products to their real, same-job detail screenshots."""
-        if len(items) != 3:
-            raise ValueError("bounded sample requires exactly three accepted products")
+        """Bind the accepted sample to its real, same-job detail screenshots."""
+        if len(items) != expected_count:
+            raise ValueError("bounded sample product count does not match its exact target")
         job = self.job_service.get(job_id)
         screenshot_artifacts = {
             artifact.path: artifact
@@ -1078,7 +1099,7 @@ class ShopCollectionService:
             )
         _write_json_evidence_once(
             sample_dir / "collection.json",
-            {"unique_product_link_count": 3, "products": products},
+            {"unique_product_link_count": expected_count, "products": products},
         )
         _write_json_evidence_once(
             sample_dir / "manifest.json", {"products": sha_manifest}

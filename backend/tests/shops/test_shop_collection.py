@@ -838,6 +838,48 @@ def test_preflight_accepts_explicit_natural_end_below_three_representatives(
     assert str(result.items[0].source_url) == "https://xhslink.com/product-a"
 
 
+@pytest.mark.parametrize(
+    ("shop_xml", "links_by_y", "expected_available"),
+    [
+        (SHOP_XML, {150: "https://xhslink.com/product-a"}, 1),
+        (
+            SAME_TITLE_SHOP_XML,
+            {
+                150: "https://xhslink.com/product-a",
+                450: "https://xhslink.com/product-b",
+            },
+            2,
+        ),
+    ],
+)
+def test_evidence_sample_accepts_proven_natural_end_below_three_products(
+    tmp_path: Path,
+    shop_xml: str,
+    links_by_y: dict[int, str],
+    expected_available: int,
+) -> None:
+    """A shop with a proven natural end has an exact sample of its 1-2 products."""
+    device = _FakeU2Device(shop_xml=shop_xml, links_by_y=links_by_y)
+
+    result = _adapter(tmp_path, device).collect_shop(
+        CollectionRequest(
+            capability="shop_products",
+            parameters={
+                "account_user_id": "account-1",
+                "collection_mode": "evidence_sample",
+            },
+            expected_count=3,
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert result.expected_count == expected_available
+    assert result.succeeded_count == expected_available
+    assert result.missing_items == []
+    assert result.complete is True
+    assert result.raw_evidence == {"natural_end_reached": True}
+
+
 def test_preflight_stops_inside_a_viewport_after_three_representatives(
     tmp_path: Path,
 ) -> None:
@@ -1546,6 +1588,10 @@ def test_each_screen_transition_persists_contained_screenshot_and_hierarchy(
         absolute = (runtime_dir / artifact.path).resolve()
         absolute.relative_to(runtime_dir.resolve())
         assert absolute.is_file()
+        if artifact.kind == "android_ui_hierarchy":
+            assert hashlib.sha256(absolute.read_bytes()).hexdigest() == artifact.metadata[
+                "sha256"
+            ]
 
 
 def test_unique_product_discovery_survives_job_stop_and_service_restart(

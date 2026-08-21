@@ -3,16 +3,26 @@
 Automated and controlled-fixture checks cannot pass these gates. Record dates,
 operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
+## 2026-08-21 short-shop and CDP verification
+
+- [x] Keep three as the cap for shops with at least three products; accept exactly one or two only when the same Android run proves the natural end and collects every available item without non-duplicate rejection.
+- [x] Preserve ordinary 1/3 and 2/3 results as fail-closed; do not skip products or substitute a fourth item.
+- [x] RED/GREEN the one-product, two-product, unchanged three-product and exact-written-XML-hash paths.
+- [x] Use the dedicated visible Chrome through localhost CDP. New job `7c11ae26…` persisted latest 10/10 and remained readable after restart.
+- [x] Run a final real Android evidence job with truthful input. `a4d99cb9…` persisted `available_count_observed=2`, then succeeded at proven available 2/2 with two distinct discoveries/sources and `sample_complete=true`, while `shop_complete=false` remains truthful.
+- [x] Verify 23/23 files present, 22/22 SHA-bearing artifacts matching current bytes, manifest/collection hashes matching, natural-end XML evidence present, and restart readback consistent.
+- [ ] Historical XML mismatches remain unchanged and still prevent declaring the entire Phase A UAT passed. No Phase B action has started.
+
 ## 2026-08-21 connected-phone continuation
 
 - [x] Restore one authorized ADB device and confirm `com.xingin.xhs` in the foreground; preserve the earlier disconnected jobs unchanged.
 - [x] Continue strictly in original score order from position 18 through position 61, with no category input, targeted pairing or concurrent Android jobs.
 - [x] Persist final funnel counts: 2 in-scope, 31 physical, 26 needs-human, 2 failed and 10 waiting from 71 candidates.
 - [x] Obtain one new natural `in_scope` account at position 61. Preflight `151a887f…` succeeded after 2 representative products and remains restart-readable with 25 artifacts.
-- [ ] Complete profile/latest-10 for the new account. The single authorized job `d3a4d2d1…` stopped at `cdp_unavailable`; it was not retried.
-- [ ] Complete the exact-three formal evidence sample. Job `77fedee2…` persisted two real discoveries but stopped at `expected_products_missing`, so it remains 2/3 with `sample_complete=false` and no fourth-item replacement.
+- [x] Complete profile/latest-10 for the new account in a new job. `7c11ae26…` succeeded at 10/10; historical `d3a4d2d1…` remains unchanged.
+- [x] Complete the formal sample under the current short-shop rule. Final job `a4d99cb9…` proved the natural end and succeeded at exact available 2/2; historical `77fedee2…` remains unchanged at partial 2/3.
 - [ ] Resolve or formally close the current-byte hash mismatch affecting 20 XML hierarchy artifacts in these new jobs. The other 27 SHA-bearing files match; no artifact file is missing.
-- [ ] Do not run unified specific-demand analysis until the new account has trusted profile/notes and a valid exact-three opportunity-eligible shop artifact.
+- [x] Keep unified specific-demand analysis stopped during this repair. The new account now has trusted profile/notes and opportunity-eligible shop evidence, but no analysis was run in this increment.
 - [ ] Phase A remains open; Phase B remains unstarted.
 
 ## 2026-08-21 ranked candidate scope funnel
