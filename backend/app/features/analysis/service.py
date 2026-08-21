@@ -1201,8 +1201,8 @@ class AnalysisService:
                 job_input.get("available_count_observed"),
                 file_result.get("available_count_observed"),
             )
-            and job.progress_total == 3
-            and job.progress_current == 3
+            and job.progress_total == file_result.get("expected_count")
+            and job.progress_current == file_result.get("expected_count")
             and job.current_stage == "shop_evidence_sample_complete"
         )
         full_shop_job = (
@@ -1563,6 +1563,22 @@ def _exact_bounded_shop_sample(result: dict[str, Any]) -> bool:
 
 
 def _exact_evidence_shop_sample(result: dict[str, Any]) -> bool:
+    expected_count = result.get("expected_count")
+    if (
+        isinstance(expected_count, int)
+        and not isinstance(expected_count, bool)
+        and expected_count in {1, 2}
+    ):
+        if result.get("natural_end_reached") is not True:
+            return False
+        return _exact_product_shop_sample(
+            result,
+            collection_mode="evidence_sample",
+            test_override=False,
+            test_override_reason=None,
+            expected_count=expected_count,
+            exact_available_count=True,
+        )
     return _exact_three_product_shop_sample(
         result,
         collection_mode="evidence_sample",
@@ -1578,6 +1594,25 @@ def _exact_three_product_shop_sample(
     test_override: bool,
     test_override_reason: str | None,
 ) -> bool:
+    return _exact_product_shop_sample(
+        result,
+        collection_mode=collection_mode,
+        test_override=test_override,
+        test_override_reason=test_override_reason,
+        expected_count=3,
+        exact_available_count=False,
+    )
+
+
+def _exact_product_shop_sample(
+    result: dict[str, Any],
+    *,
+    collection_mode: str,
+    test_override: bool,
+    test_override_reason: str | None,
+    expected_count: int,
+    exact_available_count: bool,
+) -> bool:
     verification = result.get("verification")
     if not isinstance(verification, dict):
         return False
@@ -1587,12 +1622,12 @@ def _exact_three_product_shop_sample(
         "product_sample_limit": 3,
         "test_override": test_override,
         "test_override_reason": test_override_reason,
-        "expected_count": 3,
-        "discovered_count": 3,
-        "collected_count": 3,
-        "raw_observation_count": 3,
+        "expected_count": expected_count,
+        "discovered_count": expected_count,
+        "collected_count": expected_count,
+        "raw_observation_count": expected_count,
         "duplicate_observation_count": 0,
-        "succeeded_count": 3,
+        "succeeded_count": expected_count,
         "missing_count": 0,
         "collection_missing_count": 0,
         "rejected_count": 0,
@@ -1602,9 +1637,9 @@ def _exact_three_product_shop_sample(
         "complete": False,
     }
     exact_verification_values = {
-        "expected_count": 3,
-        "discovered_count": 3,
-        "succeeded_count": 3,
+        "expected_count": expected_count,
+        "discovered_count": expected_count,
+        "succeeded_count": expected_count,
         "missing_count": 0,
         "overflow_count": 0,
         "complete": True,
@@ -1629,7 +1664,8 @@ def _exact_three_product_shop_sample(
     if (
         isinstance(available_count, bool)
         or not isinstance(available_count, int)
-        or available_count < 3
+        or available_count < expected_count
+        or (exact_available_count and available_count != expected_count)
         or any(not isinstance(path, str) or not path for path in binding_paths)
         or any(
             not isinstance(digest, str)
@@ -1644,16 +1680,16 @@ def _exact_three_product_shop_sample(
     ):
         return False
     items = result.get("items")
-    if not isinstance(items, list) or len(items) != 3:
+    if not isinstance(items, list) or len(items) != expected_count:
         return False
     item_ids = [item.get("id") for item in items if isinstance(item, dict)]
     urls = [item.get("source_url") for item in items if isinstance(item, dict)]
     return (
-        len(item_ids) == 3
-        and len(set(item_ids)) == 3
+        len(item_ids) == expected_count
+        and len(set(item_ids)) == expected_count
         and all(isinstance(item_id, str) and item_id for item_id in item_ids)
-        and len(urls) == 3
-        and len(set(urls)) == 3
+        and len(urls) == expected_count
+        and len(set(urls)) == expected_count
         and all(isinstance(url, str) and url for url in urls)
     )
 
@@ -1694,6 +1730,13 @@ def _trusted_bounded_sample_indexes(
     *,
     verify_product_files: bool = False,
 ) -> bool:
+    expected_count = result.get("expected_count")
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count not in {1, 2, 3}
+    ):
+        return False
     expected_dir = Path("evidence") / "shops" / job_id / "sample-products"
     expected_manifest = expected_dir / "manifest.json"
     expected_collection = expected_dir / "collection.json"
@@ -1733,7 +1776,9 @@ def _trusted_bounded_sample_indexes(
         or set(manifest) != {"products"}
         or not isinstance(collection, dict)
         or set(collection) != {"unique_product_link_count", "products"}
-        or not _strict_value(collection.get("unique_product_link_count"), 3)
+        or not _strict_value(
+            collection.get("unique_product_link_count"), expected_count
+        )
     ):
         return False
     manifest_products = manifest.get("products")
@@ -1741,11 +1786,11 @@ def _trusted_bounded_sample_indexes(
     items = result.get("items")
     if (
         not isinstance(manifest_products, list)
-        or len(manifest_products) != 3
+        or len(manifest_products) != expected_count
         or not isinstance(collection_products, list)
-        or len(collection_products) != 3
+        or len(collection_products) != expected_count
         or not isinstance(items, list)
-        or len(items) != 3
+        or len(items) != expected_count
     ):
         return False
     result_urls = [item.get("source_url") for item in items if isinstance(item, dict)]
@@ -1791,11 +1836,11 @@ def _trusted_bounded_sample_indexes(
         product_dirs.append(product_dir)
         image_paths.append(image)
     indexes_match = (
-        len(result_urls) == 3
+        len(result_urls) == expected_count
         and manifest_urls == result_urls
         and collection_urls == result_urls
-        and len(set(product_dirs)) == 3
-        and len(set(image_paths)) == 3
+        and len(set(product_dirs)) == expected_count
+        and len(set(image_paths)) == expected_count
     )
     if not indexes_match:
         return False
@@ -1804,7 +1849,7 @@ def _trusted_bounded_sample_indexes(
     try:
         verification = verify_shop_collection(
             runtime_dir / expected_dir,
-            expected_count=3,
+            expected_count=expected_count,
             expected_source_urls=[str(url) for url in result_urls],
         )
     except (OSError, ValueError):

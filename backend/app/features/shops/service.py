@@ -194,6 +194,7 @@ class ShopCollectionRead(BaseModel):
     test_override_reason: str | None = None
     sample_complete: bool = False
     shop_complete: bool = False
+    natural_end_reached: bool = False
     scope_classification: Literal[
         "in_scope", "out_of_scope_physical", "needs_human"
     ] | None = None
@@ -731,6 +732,8 @@ class ShopCollectionService:
             test_override=payload.test_override,
             test_override_reason=payload.test_override_reason,
         )
+        if short_natural_end_sample:
+            read = read.model_copy(update={"natural_end_reached": True})
         scope_decision: ShopScopeDecision | None = None
         if payload.collection_mode in {"preflight", "bounded_sample"} and result.items:
             early_decision = result.raw_evidence.get("scope_early_stop")

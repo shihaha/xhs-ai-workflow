@@ -270,6 +270,7 @@ def test_test_override_processes_three_products_even_when_eighteen_were_discover
     assert result.expected_count == 3
     assert result.sample_complete is True
     assert result.shop_complete is False
+    assert result.natural_end_reached is False
     assert result.complete is False
     assert result.collection_mode == "bounded_sample"
     assert result.available_count_observed == 18
@@ -366,6 +367,7 @@ def test_evidence_sample_persists_the_first_three_products_without_claiming_full
     assert result.succeeded_count == 3
     assert result.sample_complete is True
     assert result.shop_complete is False
+    assert result.natural_end_reached is False
     assert result.complete is False
     job = jobs.get(queued.job_id)
     assert job.state is JobState.succeeded
@@ -441,6 +443,7 @@ def test_evidence_sample_uses_all_products_when_adapter_proves_natural_end(
     assert result.succeeded_count == available_count
     assert result.sample_complete is True
     assert result.shop_complete is False
+    assert result.natural_end_reached is True
     job = jobs.get(queued.job_id)
     assert job.state is JobState.succeeded
     assert job.progress_current == available_count

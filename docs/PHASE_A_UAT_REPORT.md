@@ -14,17 +14,25 @@ without that proof remain ineligible.
 RED tests reproduced both short-shop failures and the Windows XML byte-hash
 mismatch. The minimal production change passed the new one/two-product tests
 and the existing three-product path. New CDP job `7c11ae26…` then persisted a
-latest-10 account sample. Final Android job `a4d99cb9…` truthfully persisted
-two observed products and a successful 2/2 evidence sample with two discoveries, two stable identities, two distinct
+latest-10 account sample. Final Android job `fb293aa0…` truthfully persisted
+two observed products, `natural_end_reached=true`, and a successful 2/2 evidence sample with two discoveries, two stable identities, two distinct
 HTTPS sources, `sample_complete=true` and `shop_complete=false`.
 
 All 23 Android artifacts exist. All 22 artifacts carrying SHA metadata match
 their current bytes, including ten XML hierarchies; five hierarchies retain the
 natural-end marker. Manifest and collection hashes match. After service
 restart, the shop remained 2/2 and the account profile plus ten notes remained
-readable. Historical failed jobs and their byte mismatches were not rewritten.
-No analysis, Opportunity or Phase B action ran in this increment. Phase A
-remains open and Phase B remains unstarted.
+readable. Clean replacement job `8c369a80…` also succeeded for the other
+qualified account at 3/3 with 33/33 SHA-bearing artifacts matching current
+bytes. Historical failed jobs and their byte mismatches were not rewritten.
+
+Unified analysis `26979db8…` consumed the two clean shop facts and twenty
+latest-note facts. It succeeded with two demand profiles,
+`has_specific_shared_demand=false`, `common_demand=null` and
+`opportunities=[]`; the Opportunity table did not grow. Restart readback
+preserved both evidence eligibility and the analysis. The current Phase A
+two-account decision loop is complete without a candidate. Phase B remains
+unstarted.
 
 ## 2026-08-21 connected-phone continuation result
 
@@ -52,7 +60,8 @@ All 49 referenced artifact files for the gate, XHS attempt and evidence sample
 exist. Of 47 artifacts with SHA metadata, 27 match current bytes and 20 Android
 XML hierarchy files reproduce the known Windows newline/hash mismatch. Restart
 readback preserved every terminal state and the two-account in-scope funnel.
-Phase A remains open and Phase B remains unstarted.
+This historical checkpoint remained open at the time and is superseded by the
+short-shop and unified-analysis result above. Phase B remains unstarted.
 
 ## 2026-08-21 candidate business-scope funnel result
 

@@ -15,11 +15,19 @@ used to calculate their SHA-256, removing Windows newline conversion from new
 evidence. Historical artifacts are unchanged.
 
 New live CDP job `7c11ae26…` succeeded at latest 10/10. Final live Android job
-`a4d99cb9…` truthfully persisted two observed products and succeeded at exact available 2/2 with 23 artifacts, two distinct
+`fb293aa0…` truthfully persisted two observed products plus the natural-end
+proof and succeeded at exact available 2/2 with 23 artifacts, two distinct
 discoveries and a complete bounded sample. All 22 SHA-bearing files match,
 including ten XML files; manifest/collection hashes and restart readback also
-match. No cross-account analysis or Phase B action ran. Phase A remains open
-because historical XML mismatches and the historical review item remain.
+match. The analysis trust reader accepts this shape only with the persisted
+natural-end proof and exact matching counts/files. Clean replacement job
+`8c369a80…` succeeded for the other account at 3/3 with 33/33 SHA matches.
+
+Unified real analysis `26979db8…` then consumed two clean shop facts and twenty
+latest-note facts. It succeeded with no specific shared demand and zero
+Opportunities; restart readback matched. The current Phase A two-account
+decision loop is complete without a candidate. Historical mismatches remain
+immutable audit history, and Phase B is unstarted.
 
 ## Connected-phone ranked continuation
 
@@ -39,8 +47,9 @@ analysis.
 No files are missing across the three historical jobs. Twenty XML artifacts fail their
 saved/current SHA comparison because of the already documented Windows newline
 expansion; 27 other SHA-bearing artifacts match. No production code changed in
-this historical continuation. The newer short-shop verification above
-supersedes its blocker statement; Phase A remains incomplete and Phase B is
+this historical continuation. The newer short-shop verification and unified
+analysis above supersede its blocker statement; the current Phase A
+two-account decision loop is complete without a candidate, and Phase B is
 unstarted.
 
 ## Ranked candidate business-scope funnel

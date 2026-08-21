@@ -9,9 +9,12 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Preserve ordinary 1/3 and 2/3 results as fail-closed; do not skip products or substitute a fourth item.
 - [x] RED/GREEN the one-product, two-product, unchanged three-product and exact-written-XML-hash paths.
 - [x] Use the dedicated visible Chrome through localhost CDP. New job `7c11ae26…` persisted latest 10/10 and remained readable after restart.
-- [x] Run a final real Android evidence job with truthful input. `a4d99cb9…` persisted `available_count_observed=2`, then succeeded at proven available 2/2 with two distinct discoveries/sources and `sample_complete=true`, while `shop_complete=false` remains truthful.
+- [x] Run a final real Android evidence job with truthful input. `fb293aa0…` persisted `available_count_observed=2` and `natural_end_reached=true`, then succeeded at proven available 2/2 with two distinct discoveries/sources and `sample_complete=true`, while `shop_complete=false` remains truthful.
 - [x] Verify 23/23 files present, 22/22 SHA-bearing artifacts matching current bytes, manifest/collection hashes matching, natural-end XML evidence present, and restart readback consistent.
-- [ ] Historical XML mismatches remain unchanged and still prevent declaring the entire Phase A UAT passed. No Phase B action has started.
+- [x] Replace the other qualified account's trusted sample without rewriting history. Job `8c369a80…` succeeded at 3/3 with 34 files and 33/33 SHA-bearing artifacts matching current bytes.
+- [x] Persist and trust-read the short-shop natural-end flag; reject the same 2/2 shape when that proof is absent.
+- [x] Run unified analysis `26979db8…` over two clean shop facts and twenty note facts. It returned no specific shared demand and `opportunities=[]`; restart readback matched.
+- [x] Complete the current Phase A two-account decision loop without manufacturing a candidate. Historical XML mismatches remain immutable audit history. No Phase B action has started.
 
 ## 2026-08-21 connected-phone continuation
 
@@ -20,10 +23,10 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Persist final funnel counts: 2 in-scope, 31 physical, 26 needs-human, 2 failed and 10 waiting from 71 candidates.
 - [x] Obtain one new natural `in_scope` account at position 61. Preflight `151a887f…` succeeded after 2 representative products and remains restart-readable with 25 artifacts.
 - [x] Complete profile/latest-10 for the new account in a new job. `7c11ae26…` succeeded at 10/10; historical `d3a4d2d1…` remains unchanged.
-- [x] Complete the formal sample under the current short-shop rule. Final job `a4d99cb9…` proved the natural end and succeeded at exact available 2/2; historical `77fedee2…` remains unchanged at partial 2/3.
+- [x] Complete the formal sample under the current short-shop rule. Final job `fb293aa0…` proved the natural end and succeeded at exact available 2/2; historical `77fedee2…` remains unchanged at partial 2/3.
 - [ ] Resolve or formally close the current-byte hash mismatch affecting 20 XML hierarchy artifacts in these new jobs. The other 27 SHA-bearing files match; no artifact file is missing.
 - [x] Keep unified specific-demand analysis stopped during this repair. The new account now has trusted profile/notes and opportunity-eligible shop evidence, but no analysis was run in this increment.
-- [ ] Phase A remains open; Phase B remains unstarted.
+- [x] This historical checkpoint was open at the time and is superseded by the completed short-shop and unified-analysis checks above; Phase B remains unstarted.
 
 ## 2026-08-21 ranked candidate scope funnel
 
@@ -37,7 +40,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [ ] Real ranked Android continuation: positions 8 and 9 each failed once with `device_disconnected`; direct ADB and mDNS checks found no attached device. No further candidates were queued.
 - [ ] Continue from the next score-ordered candidate only after a phone is actually listed and authorized; then complete profile, latest-10 notes and the exact-three evidence sample for any new `in_scope` account.
 - [ ] Run one unified specific-demand analysis over all newly qualified accounts. Do not pre-pair accounts; persist `opportunities=[]` if there is no concrete shared demand.
-- [ ] Phase A overall acceptance remains open; Phase B remains unstarted.
+- [x] This historical funnel checkpoint was open at the time and is superseded by the completed two-account decision loop above; Phase B remains unstarted.
 
 ## 2026-08-21 bounded Android click repair
 

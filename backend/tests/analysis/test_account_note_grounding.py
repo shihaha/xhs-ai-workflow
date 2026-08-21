@@ -374,7 +374,11 @@ def _complete_shop_artifact(fixture: _Fixture, account_user_id: str) -> str:
 
 
 def _evidence_sample_shop_artifact(
-    fixture: _Fixture, account_user_id: str
+    fixture: _Fixture,
+    account_user_id: str,
+    *,
+    sample_count: int = 3,
+    natural_end_reached: bool = False,
 ) -> str:
     now = datetime.now(UTC).replace(tzinfo=None)
     with fixture.database.session() as session:
@@ -421,15 +425,17 @@ def _evidence_sample_shop_artifact(
             input_data={
                 "account_user_id": account_user_id,
                 "expected_count": 3,
-                "available_count_observed": 18,
+                "available_count_observed": (
+                    sample_count if sample_count < 3 else 18
+                ),
                 "collection_mode": "evidence_sample",
                 "product_sample_limit": 3,
                 "scope_gate_job_id": gate.id,
                 "test_override": False,
             },
             state=JobState.succeeded,
-            progress_current=3,
-            progress_total=3,
+            progress_current=sample_count,
+            progress_total=sample_count,
             current_stage="shop_evidence_sample_complete",
             created_at=now,
             updated_at=now,
@@ -441,7 +447,7 @@ def _evidence_sample_shop_artifact(
         items: list[dict[str, Any]] = []
         manifest_products: list[dict[str, str]] = []
         collection_products: list[dict[str, str]] = []
-        for index in range(1, 4):
+        for index in range(1, sample_count + 1):
             source_url = (
                 f"https://www.xiaohongshu.com/goods/{account_user_id}-{index}"
             )
@@ -489,7 +495,10 @@ def _evidence_sample_shop_artifact(
         )
         collection_path.write_text(
             json.dumps(
-                {"unique_product_link_count": 3, "products": collection_products},
+                {
+                    "unique_product_link_count": sample_count,
+                    "products": collection_products,
+                },
                 ensure_ascii=False,
             )
             + "\n",
@@ -500,12 +509,12 @@ def _evidence_sample_shop_artifact(
             "status": "succeeded",
             "detail": None,
             "selector_profile_version": "xhs-shop-v1",
-            "expected_count": 3,
-            "discovered_count": 3,
-            "collected_count": 3,
-            "raw_observation_count": 3,
+            "expected_count": sample_count,
+            "discovered_count": sample_count,
+            "collected_count": sample_count,
+            "raw_observation_count": sample_count,
             "duplicate_observation_count": 0,
-            "succeeded_count": 3,
+            "succeeded_count": sample_count,
             "missing_count": 0,
             "missing_items": [],
             "collection_missing_count": 0,
@@ -516,9 +525,9 @@ def _evidence_sample_shop_artifact(
             "evidence_artifacts": [],
             "items": items,
             "verification": {
-                "expected_count": 3,
-                "discovered_count": 3,
-                "succeeded_count": 3,
+                "expected_count": sample_count,
+                "discovered_count": sample_count,
+                "succeeded_count": sample_count,
                 "missing_count": 0,
                 "missing_items": [],
                 "overflow_count": 0,
@@ -528,7 +537,10 @@ def _evidence_sample_shop_artifact(
             "complete": False,
             "collection_mode": "evidence_sample",
             "product_sample_limit": 3,
-            "available_count_observed": 18,
+            "available_count_observed": (
+                sample_count if sample_count < 3 else 18
+            ),
+            "natural_end_reached": natural_end_reached,
             "test_override": False,
             "test_override_reason": None,
             "sample_complete": True,
@@ -562,6 +574,31 @@ def _evidence_sample_shop_artifact(
         session.add(artifact)
         session.commit()
         return f"artifact:{artifact.id}"
+
+
+@pytest.mark.parametrize(
+    ("natural_end_reached", "expected_eligible"),
+    [(True, True), (False, False)],
+)
+def test_short_evidence_sample_requires_persisted_natural_end_for_eligibility(
+    tmp_path: Path,
+    natural_end_reached: bool,
+    expected_eligible: bool,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    evidence_id = _evidence_sample_shop_artifact(
+        fixture,
+        "account-a",
+        sample_count=2,
+        natural_end_reached=natural_end_reached,
+    )
+
+    discovered = fixture.analysis(_ModelSpy()).list_evidence(
+        account_user_id="account-a"
+    )
+
+    row = next(item for item in discovered if item.evidence_id == evidence_id)
+    assert row.eligible_for_opportunity is expected_eligible
 
 
 def _cross_account_output(
