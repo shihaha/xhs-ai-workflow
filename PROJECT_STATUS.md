@@ -5,7 +5,14 @@ repository: shihaha/xhs-ai-workflow
 branch: feature/system-v1
 remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
-last_updated: 2026-08-20 (Phase A handoff)
+last_updated: 2026-08-21 (Phase A grounded-candidate checkpoint)
+
+## 2026-08-21 grounded two-account candidate
+
+- The first real analysis failure was narrowed to the service-side evidence-grounding layer: the provider output had already passed the strict JSON schema, but the model prompt did not expose the validator's exact account-coverage, evidence-ownership and support-citation rules. The rejected output was not persisted, so no unsupported claim is made about which individual field failed.
+- A RED test proved those rules were absent from the prompt. The minimal GREEN change states the existing validator contract without weakening it. The analysis grounding regression is `70 passed`.
+- One authorized, non-retried real analysis then reused the same two accounts and 22 trusted facts. Analysis `37d7fca6…` succeeded and durably created exactly one two-account `warming_candidate` at `pending_review`, backed by two trusted shop facts and twenty trusted note facts. All support IDs are included in the candidate citations.
+- The candidate has not been approved or rejected. No product/content/ZIP or other Phase B action has started. The Phase A demand-validation milestone is now proven; overall UAT remains open for explicit human review and the separately recorded historical XML byte-hash limitation.
 
 ## 2026-08-21 approved evidence-sample UAT
 

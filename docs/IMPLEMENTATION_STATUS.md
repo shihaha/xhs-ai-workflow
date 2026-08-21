@@ -2,6 +2,25 @@
 
 Status date: 2026-08-21
 
+## Grounded two-account candidate live result
+
+The first real model response passed strict schema parsing but failed the
+service-side evidence-grounding rules. Because rejected model output is not
+persisted, the exact offending field is unavailable. A RED test demonstrated
+that the prompt did not state the validator's exact account-coverage,
+evidence-ownership and support-citation requirements. The minimal GREEN change
+now exposes those existing rules without weakening any check; the analysis
+regression passes `70/70`.
+
+One authorized real call reused the same two accounts and 22 trusted facts.
+Analysis `37d7fca6…` succeeded and durably created one
+`warming_candidate + pending_review`. Restart reads confirm support from both
+accounts, two trusted shop facts and twenty trusted note facts, with all support
+IDs included in the candidate citations. The candidate remains unreviewed. No
+Phase B product, content or ZIP work has started. The demand-validation
+milestone is proven, while full UAT remains open for human review and the known
+historical XML current-byte hash limitation.
+
 ## Approved evidence-sample live result
 
 Large in-scope shops now have one approved non-test collection mode:

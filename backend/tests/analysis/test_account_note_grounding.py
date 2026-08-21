@@ -47,6 +47,14 @@ def test_analysis_uses_the_sqlite_bounded_windows_volume_identity() -> None:
     assert 0 <= identity[0] <= 9_223_372_036_854_775_807
 
 
+def test_model_prompt_exposes_cross_account_grounding_contract() -> None:
+    prompt = analysis_module._system_prompt()
+
+    assert "supporting_accounts must cover every requested account exactly once" in prompt
+    assert "shop_evidence_ids and note_evidence_ids must belong to that account" in prompt
+    assert "include every supporting evidence ID in the opportunity evidence_ids" in prompt
+
+
 class _AccountAdapter:
     def note_id_for(self, user_id: str) -> str:
         return f"note-{user_id}"

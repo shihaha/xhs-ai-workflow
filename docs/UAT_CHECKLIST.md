@@ -19,8 +19,10 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Require trusted `in_scope` preflight plus same-job detail screenshots, source identities, manifest/collection hashes and SQLite bindings; keep `sample_complete=true` and `shop_complete=false`.
 - [x] Real job `84f11a0d…` succeeded at 3/3 with zero missing, 34 artifacts and restart-readable opportunity-eligible shop evidence.
 - [x] Run one real two-account analysis with two trusted shop facts and twenty trusted latest-note facts. Analysis `28856ff2…` failed closed as `evidence_grounding_failed`; no automatic retry was run.
-- [ ] Obtain one strictly grounded real analysis result. Current Opportunity, `warming_candidate` and `pending_review` counts remain zero.
-- [ ] Phase A remains not passed; Phase B remains unstarted.
+- [x] Expose the existing account-coverage, evidence-ownership and support-citation contract to the model; observe RED before the prompt change and GREEN after it (`70/70` analysis regression).
+- [x] Obtain one strictly grounded real analysis result. Analysis `37d7fca6…` created exactly one two-account `warming_candidate + pending_review`, using two trusted shop facts and twenty trusted note facts with all support IDs cited.
+- [ ] Complete explicit human review of the candidate. It remains unreviewed; no product, content, ZIP or other Phase B action has started.
+- [ ] Close the separately recorded historical XML current-byte hash limitation before declaring the entire Phase A UAT fully passed.
 
 ## Prerequisites
 
@@ -44,8 +46,8 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [ ] Confirm declared N, discovered N, verified N, missing list and image manifests agree.
 - [ ] Run a single-account report and confirm it is displayed only as an observation signal and creates no opportunity row.
 - [ ] Collect a second independent ranked account with exact profile, note and shop evidence.
-- [ ] Run a two-account demand cluster and require every candidate to cite trusted shop and note evidence from both accounts.
-- [ ] Confirm a valid two-account candidate is `warming_candidate + pending_review` and that the evidence count is server-derived.
+- [x] Run a two-account demand cluster and require every candidate to cite trusted shop and note evidence from both accounts.
+- [x] Confirm a valid two-account candidate is `warming_candidate + pending_review` and that the evidence count is server-derived.
 - [ ] Approve or reject the candidate; confirm rejection retains history and an unapproved candidate cannot create a product.
 - [ ] Phase B–E product/content/ZIP UAT is deferred until the user separately approves those phases.
 - [ ] From a current review/approved revision, generate one managed image, verify its run/job/request ID/usage/database/file/hash facts, request one advisory visual assessment, and confirm the advice did not auto-approve any human visual check.

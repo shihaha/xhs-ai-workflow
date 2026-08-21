@@ -2,6 +2,25 @@
 
 Date: 2026-08-20 (Asia/Shanghai)
 
+## 2026-08-21 grounded candidate result
+
+The failed analysis `28856ff2…` had passed provider-side strict schema parsing
+and failed only in the service's evidence-grounding layer. Its rejected output
+was not persisted, so the exact offending field cannot be reconstructed. A RED
+test showed that the prompt omitted the validator's account-coverage,
+evidence-ownership and support-citation contract; the minimal GREEN change
+exposes those existing rules without relaxing validation. The focused analysis
+file passes `70/70`.
+
+One authorized real call then reused the same two accounts and 22 trusted facts.
+Analysis `37d7fca6…` succeeded and persisted exactly one
+`warming_candidate + pending_review`. Its support covers both accounts, two
+trusted shop facts and twenty trusted note facts, and every support ID is also
+present in the candidate citations. The candidate remains unreviewed. No Phase
+B action was run. The Phase A demand-validation milestone is proven, while
+overall UAT remains open for explicit human review and the historical XML
+current-byte hash limitation.
+
 ## 2026-08-21 approved evidence-sample result
 
 The user approved a general three-product evidence rule for large in-scope

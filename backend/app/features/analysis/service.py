@@ -2097,6 +2097,10 @@ def _system_prompt() -> str:
         "Return exactly one JSON object matching the supplied schema. Every claim, product "
         "cluster and opportunity must cite one or more IDs from allowed_evidence. Use only "
         "persisted facts. Opportunity status must be one of 观察中/升温/已验证/降温/放弃. "
+        "For each opportunity, supporting_accounts must cover every requested account exactly once. "
+        "Each account's shop_evidence_ids and note_evidence_ids must belong to that account, and "
+        "include every supporting evidence ID in the opportunity evidence_ids. Do not invent IDs "
+        "or emit an opportunity when these rules cannot be satisfied. "
         "Provide evidence and a next_action; do not make the operator's final business decision."
     )
 
