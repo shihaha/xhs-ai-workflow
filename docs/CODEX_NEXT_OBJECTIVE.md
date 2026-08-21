@@ -15,13 +15,13 @@
 - title: `七宗罪心理测试数字内容市场机会`
 - Opportunity ID: `caed5776-ef38-4a0a-90fe-57ae2291583e`
 - analysis ID: `5859e6c9-0485-451b-9152-05896c0d037b`
-- persisted state at last verified read: `warming_candidate + pending_review`
+- persisted state at last verified read: `warming_candidate + approved`
 
 用户已经在对话中明确表示：**可以批准该 Opportunity 继续推进。**
 
 重要：这代表“批准继续研究这个机会”，不等于“已经批准某个具体产品方案”，更不等于“允许系统自动制作或发布产品”。
 
-如果本地 SQLite / API 仍是 `pending_review`，应通过现有人工审核路径持久化用户批准；不要篡改历史 evidence、analysis 或旧 Opportunity 记录。
+该决定已于 `2026-08-21 08:56:58.175625` 通过现有人工审核 API 持久化为 `approved`。历史 evidence、analysis 和旧 Opportunity 记录均未改写。
 
 ## 2. 已确认的整体业务架构
 
@@ -184,9 +184,9 @@ D 不得根据缺失信息自行编造产品事实。
 
 ## 6. 当前下一步
 
-1. 通过现有人工审核路径，把当前 Opportunity 的用户批准决定持久化（如果本地状态仍是 `pending_review`）。
+1. 当前 Opportunity 的用户批准决定已经通过现有人工审核路径持久化；无需再次审核或重跑分析。
 2. 不立即开发 Phase B 自动化。
-3. 以当前七宗罪 Opportunity 作为第一个真实案例，单独开展一次产品研究/定义工作。
+3. 下一项 AI 工作是以当前七宗罪 Opportunity 作为第一个真实案例，单独开展一次产品研究/定义工作。
 4. 产品定义经用户批准后，再建立独立 Codex 产品制作任务。
 5. 产品制作和 UAT 完成后，再设计 `Finished Product Dossier → 内容系统` 的正式接入。
 
