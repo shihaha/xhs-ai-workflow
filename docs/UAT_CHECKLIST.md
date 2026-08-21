@@ -3,6 +3,18 @@
 Automated and controlled-fixture checks cannot pass these gates. Record dates,
 operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
+## 2026-08-21 connected-phone continuation
+
+- [x] Restore one authorized ADB device and confirm `com.xingin.xhs` in the foreground; preserve the earlier disconnected jobs unchanged.
+- [x] Continue strictly in original score order from position 18 through position 61, with no category input, targeted pairing or concurrent Android jobs.
+- [x] Persist final funnel counts: 2 in-scope, 31 physical, 26 needs-human, 2 failed and 10 waiting from 71 candidates.
+- [x] Obtain one new natural `in_scope` account at position 61. Preflight `151a887f…` succeeded after 2 representative products and remains restart-readable with 25 artifacts.
+- [ ] Complete profile/latest-10 for the new account. The single authorized job `d3a4d2d1…` stopped at `cdp_unavailable`; it was not retried.
+- [ ] Complete the exact-three formal evidence sample. Job `77fedee2…` persisted two real discoveries but stopped at `expected_products_missing`, so it remains 2/3 with `sample_complete=false` and no fourth-item replacement.
+- [ ] Resolve or formally close the current-byte hash mismatch affecting 20 XML hierarchy artifacts in these new jobs. The other 27 SHA-bearing files match; no artifact file is missing.
+- [ ] Do not run unified specific-demand analysis until the new account has trusted profile/notes and a valid exact-three opportunity-eligible shop artifact.
+- [ ] Phase A remains open; Phase B remains unstarted.
+
 ## 2026-08-21 ranked candidate scope funnel
 
 - [x] Keep the tutorial Qianfan score unchanged and preserve its stable descending order.

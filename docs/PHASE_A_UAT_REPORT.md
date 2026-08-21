@@ -2,6 +2,34 @@
 
 Date: 2026-08-20 (Asia/Shanghai)
 
+## 2026-08-21 connected-phone continuation result
+
+After the phone returned as an authorized ADB device, Xiaohongshu was launched
+and verified in the foreground. The ranked funnel continued from position 18,
+one terminal job at a time. No previous disconnected job was retried or
+rewritten, and no category or desired demand was supplied to candidate
+selection.
+
+The run reached position 61. Across the complete 71-candidate projection, 2 are
+now final in-scope, 31 physical, 26 needs-human, 2 collection-failed and 10
+waiting. Accounts without a verifiable shop entry stayed needs-human. One shop
+that failed on its third item stayed at 2/3; no fourth item replaced it.
+
+Position 61 naturally produced the second final in-scope account. Preflight job
+`151a887f…` succeeded after two representative products with 25 artifacts. The
+next profile/latest-10 job `d3a4d2d1…` failed closed as `cdp_unavailable`.
+Formal evidence-sample job `77fedee2…` persisted two real product discoveries
+and their detail/share evidence, then stopped because the third required item
+was missing. Its durable result is partial, `expected_products_missing`, 2/3,
+`sample_complete=false` and `shop_complete=false`. It is not opportunity-
+eligible, so no cross-account analysis or Opportunity was created.
+
+All 49 referenced artifact files for the gate, XHS attempt and evidence sample
+exist. Of 47 artifacts with SHA metadata, 27 match current bytes and 20 Android
+XML hierarchy files reproduce the known Windows newline/hash mismatch. Restart
+readback preserved every terminal state and the two-account in-scope funnel.
+Phase A remains open and Phase B remains unstarted.
+
 ## 2026-08-21 candidate business-scope funnel result
 
 This increment does not change the tutorial scoring formula. It adds a low-cost,

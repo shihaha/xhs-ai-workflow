@@ -7,6 +7,15 @@ remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
 last_updated: 2026-08-21 (Phase A candidate scope funnel checkpoint)
 
+## 2026-08-21 connected-phone ranked continuation
+
+- The phone was restored as one authorized ADB `device` and Xiaohongshu was confirmed in the foreground. Historical disconnected jobs were not retried or rewritten. The funnel resumed at position 18 and then advanced strictly one terminal job at a time, skipping only candidates that already had a terminal decision or were clearly physical.
+- Positions 18–61 were processed in original score order. The resulting full 71-candidate funnel is now: 2 `in_scope`, 31 `out_of_scope_physical`, 26 `needs_human`, 2 collection failures, and 10 still waiting. Most `needs_human` rows opened a normal account profile with no verifiable shop entry; position 32 retained a strict third-item `selector_changed` result at 2/3 without fourth-item substitution.
+- A new natural digital candidate was found at position 61. Android preflight job `151a887f…` succeeded after 2 representative products with final `scope_gate_in_scope`; it has 25 artifacts and remains restart-readable.
+- The required public profile/latest-10 collection then stopped once as `cdp_unavailable` (`d3a4d2d1…`). The formal exact-three evidence sample (`77fedee2…`) entered the real shop and persisted two product discoveries plus detail/share evidence, but the third required product was missing. It is truthfully `partial/expected_products_missing`, `2/3`, `sample_complete=false`, `shop_complete=false`; no fourth product, retry, cross-account analysis or Opportunity followed.
+- Across those three jobs, SQLite references 49 existing artifact files. Of 47 artifacts carrying SHA metadata, 27 current bytes match and 20 Android XML hierarchy files reproduce the separately known Windows newline/hash mismatch. Restart readback preserved the gate success, CDP failure, partial evidence sample, artifact counts and 2-account `in_scope` funnel state.
+- Current blocker is no longer ADB. Completion now requires the trusted localhost CDP profile to be available and a valid exact-three same-job evidence sample for the new account. Phase A remains open; Phase B remains unstarted.
+
 ## 2026-08-21 Phase A candidate business-scope funnel
 
 - The original Qianfan score and stable score order are unchanged. A new evidence-bound prescreen now sits between scoring and Android: `likely_digital`, `clearly_physical`, or fail-open `uncertain`. It cannot produce `in_scope`, shop evidence or an Opportunity, and an existing Android decision remains authoritative.

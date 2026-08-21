@@ -2,6 +2,26 @@
 
 Status date: 2026-08-21
 
+## Connected-phone ranked continuation
+
+The previously blocked live path resumed after ADB reported one authorized
+device and Xiaohongshu foreground readiness. Candidate advancement remained
+serialized and score-ordered through position 61. The live funnel now contains
+2 in-scope, 31 physical, 26 needs-human, 2 failed and 10 waiting candidates.
+
+The second in-scope account is real and natural, not targeted: Android gate
+`151a887f…` succeeded and restart-read correctly. Its downstream evidence is
+not complete. XHS profile/latest-10 job `d3a4d2d1…` is `cdp_unavailable`, and
+formal shop evidence job `77fedee2…` is a strict 2/3 partial with two persisted
+discoveries, `expected_products_missing`, `sample_complete=false` and no fourth
+replacement. Consequently the account cannot yet enter specific-demand
+analysis.
+
+No files are missing across the three jobs. Twenty XML artifacts fail their
+saved/current SHA comparison because of the already documented Windows newline
+expansion; 27 other SHA-bearing artifacts match. No production code changed in
+this continuation. Phase A remains incomplete and Phase B is unstarted.
+
 ## Ranked candidate business-scope funnel
 
 The Phase A flow now keeps eight boundaries explicit: original Qianfan scoring;
