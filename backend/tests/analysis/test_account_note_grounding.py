@@ -369,6 +369,21 @@ def _complete_shop_artifact(fixture: _Fixture, account_user_id: str) -> str:
             created_at=now,
         )
         session.add(artifact)
+        hierarchy_relative = f"evidence/android/{job.id}/001-account_profile.xml"
+        hierarchy_path = fixture.runtime_dir / hierarchy_relative
+        hierarchy_path.parent.mkdir(parents=True, exist_ok=True)
+        hierarchy_path.write_bytes(b"trusted-hierarchy")
+        session.add(JobArtifactRecord(
+            job_id=job.id,
+            kind="android_ui_hierarchy",
+            producer="android_shop_worker_v1",
+            path=hierarchy_relative,
+            metadata_json={
+                "sha256": hashlib.sha256(hierarchy_path.read_bytes()).hexdigest(),
+                "size_bytes": hierarchy_path.stat().st_size,
+            },
+            created_at=now,
+        ))
         session.commit()
         return f"artifact:{artifact.id}"
 
@@ -572,6 +587,21 @@ def _evidence_sample_shop_artifact(
             created_at=now,
         )
         session.add(artifact)
+        hierarchy_relative = f"evidence/android/{job.id}/001-account_profile.xml"
+        hierarchy_path = fixture.runtime_dir / hierarchy_relative
+        hierarchy_path.parent.mkdir(parents=True, exist_ok=True)
+        hierarchy_path.write_bytes(b"trusted-hierarchy")
+        session.add(JobArtifactRecord(
+            job_id=job.id,
+            kind="android_ui_hierarchy",
+            producer="android_shop_worker_v1",
+            path=hierarchy_relative,
+            metadata_json={
+                "sha256": hashlib.sha256(hierarchy_path.read_bytes()).hexdigest(),
+                "size_bytes": hierarchy_path.stat().st_size,
+            },
+            created_at=now,
+        ))
         session.commit()
         return f"artifact:{artifact.id}"
 
@@ -599,6 +629,47 @@ def test_short_evidence_sample_requires_persisted_natural_end_for_eligibility(
 
     row = next(item for item in discovered if item.evidence_id == evidence_id)
     assert row.eligible_for_opportunity is expected_eligible
+
+
+def test_shop_evidence_rejects_any_sha_bearing_job_artifact_with_changed_bytes(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    evidence_id = _evidence_sample_shop_artifact(fixture, "account-a")
+    artifact_id = int(evidence_id.removeprefix("artifact:"))
+    with fixture.database.session() as session:
+        result_artifact = session.get(JobArtifactRecord, artifact_id)
+        assert result_artifact is not None
+        relative = (
+            Path("evidence")
+            / "android"
+            / result_artifact.job_id
+            / "001-account_profile.xml"
+        )
+        absolute = fixture.runtime_dir / relative
+        absolute.parent.mkdir(parents=True, exist_ok=True)
+        absolute.write_bytes(b"changed-current-bytes")
+        session.add(
+            JobArtifactRecord(
+                job_id=result_artifact.job_id,
+                kind="android_ui_hierarchy",
+                producer="android_shop_worker_v1",
+                path=relative.as_posix(),
+                metadata_json={
+                    "sha256": hashlib.sha256(b"original-bytes").hexdigest(),
+                    "size_bytes": len(b"changed-current-bytes"),
+                },
+                created_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+        )
+        session.commit()
+
+    discovered = fixture.analysis(_ModelSpy()).list_evidence(
+        account_user_id="account-a"
+    )
+
+    row = next(item for item in discovered if item.evidence_id == evidence_id)
+    assert row.eligible_for_opportunity is False
 
 
 def _cross_account_output(
@@ -1647,6 +1718,57 @@ def test_opportunity_without_positive_specific_demand_cannot_be_approved(
     rejected = service.review_opportunity(
         opportunity_id,
         OpportunityReviewCreate(decision="reject", reason="No shared demand"),
+    )
+    assert rejected.review_status == "rejected"
+
+
+def test_opportunity_cannot_be_approved_after_shop_evidence_loses_trust(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    accounts: list[tuple[str, str, str]] = []
+    for account_id in ("u1", "u2"):
+        _job_id, note_row_id = fixture.collect(account_id)
+        accounts.append((
+            account_id,
+            _complete_shop_artifact(fixture, account_id),
+            f"account-note:{note_row_id}",
+        ))
+    service = fixture.analysis(_ModelSpy(_cross_account_output(accounts)))
+    created = service.create(AnalysisCreate(
+        analysis_type="account_opportunity",
+        account_user_ids=[item[0] for item in accounts],
+        evidence_ids=[
+            evidence_id
+            for _account_id, shop_id, note_id in accounts
+            for evidence_id in (shop_id, note_id)
+        ],
+    ))
+    assert created.status == "succeeded"
+    [opportunity] = service.list_opportunities()
+    first_shop_artifact_id = int(accounts[0][1].removeprefix("artifact:"))
+    with fixture.database.session() as session:
+        result_artifact = session.get(JobArtifactRecord, first_shop_artifact_id)
+        assert result_artifact is not None
+        hierarchy = session.scalar(
+            select(JobArtifactRecord).where(
+                JobArtifactRecord.job_id == result_artifact.job_id,
+                JobArtifactRecord.kind == "android_ui_hierarchy",
+            )
+        )
+        assert hierarchy is not None
+        (fixture.runtime_dir / hierarchy.path).write_bytes(b"changed-after-analysis")
+
+    with pytest.raises(OpportunityStateError):
+        service.review_opportunity(
+            opportunity.id,
+            OpportunityReviewCreate(decision="approve"),
+        )
+    rejected = service.review_opportunity(
+        opportunity.id,
+        OpportunityReviewCreate(
+            decision="reject", reason="Evidence no longer trusted"
+        ),
     )
     assert rejected.review_status == "rejected"
 

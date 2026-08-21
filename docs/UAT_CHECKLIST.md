@@ -3,7 +3,19 @@
 Automated and controlled-fixture checks cannot pass these gates. Record dates,
 operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
-## 2026-08-21 short-shop and CDP verification
+## 2026-08-21 ranks 62–71 and formal XML closure
+
+- [x] Process positions 62–71 strictly in original score order. All ten retained `uncertain` prescreen and ended Android `needs_human 0/3`; no targeted pairing or new in-scope account was introduced.
+- [x] Persist final funnel counts: 2 in-scope, 31 out-of-scope physical, 36 needs-human, 2 failed and 0 waiting.
+- [x] Preserve failed lock-screen evidence job `f987e4f1…`; after proving that external cause, run one clean replacement. Job `8507e249…` succeeded at natural-end 2/2 with 25 artifacts and 24/24 SHA matches.
+- [x] Verify both current funnel accounts have trusted profile, latest-10 and clean shop evidence. Position 61 job `fb293aa0…` remains 2/2 with 22/22 SHA-bearing files matching.
+- [x] RED/GREEN the missing trust rule: any SHA-bearing artifact mismatch makes its shop result ineligible, and approval revalidates current evidence trust. Historical artifact `401` is now ineligible without being rewritten.
+- [x] Run one clean-only unified analysis over 2 accounts and 22 eligible facts. `5d4e235a…` failed closed as `model_retry_exhausted`; do not loop-retry or manufacture an Opportunity.
+- [x] Formally classify old newline-expanded XML artifacts as `legacy_historical_audit_limitation`: current exact-byte writer and current clean jobs are verified; historical jobs/artifacts stay immutable and the limitation is no longer a current blocker.
+- [x] Keep the pre-gate `73728a7c…` pending candidate as immutable audit history; it uses evidence that is no longer eligible and cannot pass the current approval trust gate.
+- [x] Keep Phase B unstarted. The current blocker is the failed clean-only unified provider run, not the historical XML limitation.
+
+## Historical checkpoint: 2026-08-21 short-shop and CDP verification
 
 - [x] Keep three as the cap for shops with at least three products; accept exactly one or two only when the same Android run proves the natural end and collects every available item without non-duplicate rejection.
 - [x] Preserve ordinary 1/3 and 2/3 results as fail-closed; do not skip products or substitute a fourth item.
@@ -16,7 +28,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Run unified analysis `26979db8…` over two clean shop facts and twenty note facts. It returned no specific shared demand and `opportunities=[]`; restart readback matched.
 - [x] Complete the current Phase A two-account decision loop without manufacturing a candidate. Historical XML mismatches remain immutable audit history. No Phase B action has started.
 
-## 2026-08-21 connected-phone continuation
+## Historical checkpoint: 2026-08-21 connected-phone continuation
 
 - [x] Restore one authorized ADB device and confirm `com.xingin.xhs` in the foreground; preserve the earlier disconnected jobs unchanged.
 - [x] Continue strictly in original score order from position 18 through position 61, with no category input, targeted pairing or concurrent Android jobs.
@@ -24,7 +36,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Obtain one new natural `in_scope` account at position 61. Preflight `151a887f…` succeeded after 2 representative products and remains restart-readable with 25 artifacts.
 - [x] Complete profile/latest-10 for the new account in a new job. `7c11ae26…` succeeded at 10/10; historical `d3a4d2d1…` remains unchanged.
 - [x] Complete the formal sample under the current short-shop rule. Final job `fb293aa0…` proved the natural end and succeeded at exact available 2/2; historical `77fedee2…` remains unchanged at partial 2/3.
-- [ ] Resolve or formally close the current-byte hash mismatch affecting 20 XML hierarchy artifacts in these new jobs. The other 27 SHA-bearing files match; no artifact file is missing.
+- [x] Formally close this historical checkpoint's 20 XML mismatches as `legacy_historical_audit_limitation`: newer clean jobs use exact-byte hashing and match current bytes; these immutable old files remain audit evidence and are non-blocking.
 - [x] Keep unified specific-demand analysis stopped during this repair. The new account now has trusted profile/notes and opportunity-eligible shop evidence, but no analysis was run in this increment.
 - [x] This historical checkpoint was open at the time and is superseded by the completed short-shop and unified-analysis checks above; Phase B remains unstarted.
 
@@ -37,9 +49,9 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Keep Android final `in_scope | out_of_scope_physical | needs_human` authoritative over prescreen, including after restart.
 - [x] Keep the separate shop evidence rule unchanged: first three distinct products in default encounter order; no skip and no fourth replacement.
 - [x] Real pool prescreen: 71 candidates yielded 4 clearly physical, 2 likely digital and 65 uncertain. All 71 artifacts have complete cited payloads and valid saved/current SHA bindings; restart returned 71/71.
-- [ ] Real ranked Android continuation: positions 8 and 9 each failed once with `device_disconnected`; direct ADB and mDNS checks found no attached device. No further candidates were queued.
-- [ ] Continue from the next score-ordered candidate only after a phone is actually listed and authorized; then complete profile, latest-10 notes and the exact-three evidence sample for any new `in_scope` account.
-- [ ] Run one unified specific-demand analysis over all newly qualified accounts. Do not pre-pair accounts; persist `opportunities=[]` if there is no concrete shared demand.
+- [x] Preserve positions 8 and 9 as historical `device_disconnected` jobs, then continue only after the phone became available; no historical job was rewritten.
+- [x] Continue through the final score-ordered candidate. No positions 62–71 account became in-scope, so no additional profile/latest-10/shop sample was warranted.
+- [x] Run one clean-only specific-demand analysis over the current eligible pool. `5d4e235a…` failed closed as `model_retry_exhausted`; no automatic loop retry or manufactured Opportunity followed.
 - [x] This historical funnel checkpoint was open at the time and is superseded by the completed two-account decision loop above; Phase B remains unstarted.
 
 ## 2026-08-21 bounded Android click repair
@@ -49,7 +61,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Preserve historical job `d21d3e81…` at `needs_human`, `2/3`, `selector_changed`; restart-read the same 22 artifacts and two discoveries.
 - [x] Verify the third real product after the dynamic-card repair. Latest authorized job `5319ba52…` succeeded at `3/3`, zero rejected, with three restart-readable discoveries and three distinct source identities.
 - [x] Preserve the earlier runner-error job `fe7b58b5…` unchanged at `failed 0/3`; it remains historical audit evidence and was not rewritten.
-- [ ] Confirm byte-for-byte SHA consistency for every historical Android artifact. Ten screenshots and two discovery JSON files match; ten XML files do not match their metadata SHA after Windows newline expansion.
+- [x] Preserve the ten historical XML mismatches unchanged and classify them as non-blocking `legacy_historical_audit_limitation`; current production and eligible evidence are validated separately with exact-byte SHA.
 - [x] Preserve the pre-evidence-sample checkpoint where no cross-account analysis, Opportunity, `pending_review`, `warming_candidate`, or Phase B action had run; the later real analysis attempt is recorded below without rewriting this history.
 
 ## 2026-08-21 approved evidence sample
@@ -65,7 +77,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Require the final common-demand conclusion itself to cite every requested account; block approval in both backend and UI unless the parent analysis has a positive specific-demand conclusion. Legacy/negative candidates remain rejectable.
 - [x] Re-run the same two accounts and same 22 evidence IDs once. Analysis `3322dda1…` succeeded with `has_specific_shared_demand=false`, `common_demand=null`, and zero output/database Opportunities. Restart readback and the evidence trust fingerprint match.
 - [ ] Complete explicit human disposition of the historical candidate if desired. It remains unreviewed and unchanged; the corrected real analysis did not reproduce it. No product, content, ZIP or other Phase B action has started.
-- [ ] Close the separately recorded historical XML current-byte hash limitation before declaring the entire Phase A UAT fully passed.
+- [x] Formally close the historical XML current-byte hash limitation as non-blocking: exact-written-byte production hashing is verified, current eligible shop jobs match all SHA-bearing files, and old artifacts remain immutable audit history.
 
 ## Prerequisites
 

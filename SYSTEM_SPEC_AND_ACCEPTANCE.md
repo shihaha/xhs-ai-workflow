@@ -4,6 +4,22 @@
 日期：2026-08-21
 状态：Phase A 已批准实施；Phase B–E 仅定义业务边界
 
+## 2026-08-21 当前验收状态
+
+- 当前 71 位真实千帆候选已按原始评分顺序处理完毕；第 62～71 位均为
+  `uncertain -> needs_human`，没有新增 `in_scope`，没有人工选品类或配对。
+- 当前候选池有 2 个具备 profile、latest-10 和 clean shop evidence 的
+  Opportunity-eligible `in_scope` 账号。它们的正式 2/2 evidence jobs 分别为
+  `8507e249…` 与 `fb293aa0…`，全部 SHA-bearing artifacts 当前字节一致。
+- clean-only 统一分析 `5d4e235a…` 使用 2 个账号、22 条证据，但百炼最终
+  `model_retry_exhausted`。因此本轮没有可批准的最新 Opportunity，Phase B 不得启动。
+- 旧 Windows newline XML mismatch 正式分类为
+  `legacy_historical_audit_limitation`：历史 jobs/artifacts 永久保留且不改写；当前 XML
+  生产路径按实际写盘 bytes 计算 SHA，当前 eligible evidence 不依赖旧 mismatch，故该
+  历史限制不再是 Phase A 当前 blocker。
+- 一个较早分析曾基于后来失去 eligibility 的旧 shop evidence 生成 pending candidate；
+  它保留作历史审计，批准时必须重新验证当前证据信任，不能据此进入 Phase B。
+
 ## 0. 规格优先级与防跑偏协议
 
 本文件是小红书工作台的最高优先级业务规格。其后依次为

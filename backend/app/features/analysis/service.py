@@ -428,6 +428,26 @@ class AnalysisService:
                         "Opportunity cannot be approved without a positive "
                         "specific-demand conclusion."
                     )
+                try:
+                    approval_input = AnalysisCreate(
+                        analysis_type=analysis.analysis_type,
+                        account_user_id=analysis.account_user_id,
+                        account_user_ids=list(analysis.account_user_ids_json),
+                        evidence_ids=list(analysis.evidence_ids_json),
+                    )
+                    current_evidence = self._resolve_evidence_in_session(
+                        session, approval_input
+                    )
+                except (ValidationError, EvidenceNotFound, EvidenceAccountMismatch):
+                    current_evidence = None
+                if current_evidence is None or not _eligible_for_opportunity(
+                    current_evidence.facts,
+                    required_accounts=approval_input.account_scope,
+                ):
+                    raise OpportunityStateError(
+                        "Opportunity cannot be approved because its evidence is "
+                        "no longer opportunity-eligible."
+                    )
             result = session.execute(
                 update(OpportunityRecord)
                 .where(
@@ -1222,6 +1242,8 @@ class AnalysisService:
             or job.error_category is not None
         ):
             return None, None
+        if not self._all_sha_bearing_job_artifacts_match(job.id):
+            return None, None
         digest = sha256(raw_result).hexdigest()
         return (
             parsed.model_dump(mode="json"),
@@ -1235,6 +1257,38 @@ class AnalysisService:
                 file_identity=file_snapshot.identity,
             ),
         )
+
+    def _all_sha_bearing_job_artifacts_match(self, job_id: str) -> bool:
+        with self.database.session() as session:
+            artifacts = session.scalars(
+                select(JobArtifactRecord).where(JobArtifactRecord.job_id == job_id)
+            ).all()
+        checked = 0
+        for artifact in artifacts:
+            expected_sha = artifact.metadata_json.get("sha256")
+            if expected_sha is None:
+                continue
+            if (
+                not isinstance(expected_sha, str)
+                or len(expected_sha) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in expected_sha
+                )
+            ):
+                return False
+            snapshot = _read_contained_regular_file(
+                self.runtime_dir,
+                Path(artifact.path),
+                limit=MAX_TRUSTED_ACCOUNT_RESULT_BYTES,
+            )
+            if (
+                snapshot is None
+                or sha256(snapshot.payload).hexdigest() != expected_sha
+            ):
+                return False
+            checked += 1
+        return checked > 0
 
     def _trusted_in_scope_gate(
         self, gate_job_id: object, account_user_id: object

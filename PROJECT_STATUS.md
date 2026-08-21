@@ -5,9 +5,17 @@ repository: shihaha/xhs-ai-workflow
 branch: feature/system-v1
 remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
-last_updated: 2026-08-21 (short-shop evidence and CDP live verification)
+last_updated: 2026-08-21 (71-candidate closure and clean-evidence trust gate)
 
-## 2026-08-21 short-shop evidence and CDP live verification
+## 2026-08-21 71-candidate closure and clean-evidence trust gate
+
+- Positions 62–71 were processed strictly in original score order. Every one retained its existing `uncertain` prescreen and finished Android preflight as `needs_human 0/3`; no account was selected by category, no pair was targeted, and no new in-scope account was created. The 71-candidate funnel is now 2 `in_scope`, 31 `out_of_scope_physical`, 36 `needs_human`, 2 collection failures and 0 waiting.
+- The two current funnel accounts each retain a trusted profile, latest-10 notes and one clean shop fact. Position 10 received clean replacement job `8507e249…`, which truthfully proved a two-product natural end and succeeded 2/2 with 25 artifacts and 24/24 SHA-bearing files matching current bytes. Position 61 continues to use `fb293aa0…`, 2/2 with 23 artifacts and 22/22 SHA matches. The lock-screen failure `f987e4f1…` remains immutable `needs_human 0/3` history.
+- Investigation proved that older position-10 result `artifact:401` remained opportunity-eligible despite eight current-byte XML mismatches. RED/GREEN now requires every SHA-bearing artifact in a shop job to match current bytes and revalidates that trust again before approval. The old artifact is ineligible; the two clean artifacts remain eligible. Historical files and metadata were not rewritten.
+- A pre-fix analysis `73728a7c…` produced one pending candidate for a specific social personality-test demand, but it cited the now-ineligible legacy shop result. It remains immutable history and cannot pass the current approval trust gate. The one clean-only unified run `5d4e235a…` used the current two accounts and 22 eligible facts but failed closed as `model_retry_exhausted`; it was not loop-retried and created no Opportunity.
+- The historical Windows newline mismatch is formally classified `legacy_historical_audit_limitation`: current XML writes hash the exact bytes written, current eligible evidence is clean, and old immutable jobs remain available for audit. It is no longer the current Phase A blocker. The current blocker is the failed clean-only unified provider run; Phase B remains unstarted.
+
+## Historical checkpoint: 2026-08-21 short-shop evidence and CDP verification
 
 - The current shop-sample rule is now `min(3, proven available products)`: shops with three or more products still use the first three distinct products in default order; a one- or two-product shop is accepted only when the same Android run observes the natural end marker, collects every available product without non-duplicate rejection, and binds every item to same-job detail/source/image evidence. An ordinary 1/3 or 2/3 partial remains fail-closed.
 - RED tests reproduced the former 1/3 and 2/3 partial behavior and the Windows XML byte-hash mismatch. GREEN tests cover one- and two-product natural ends, the unchanged three-product path, and SHA-256 over the exact XML bytes written to disk.
@@ -16,7 +24,7 @@ last_updated: 2026-08-21 (short-shop evidence and CDP live verification)
 - Unified real analysis `26979db8…` used the two clean shop facts and twenty latest-note facts. Bailian `deepseek-v4-flash` with prompt `tutorial-demand-radar-specific-demand-v2` produced two account demand profiles, `has_specific_shared_demand=false`, `common_demand=null` and `opportunities=[]`; no Opportunity row was added. Restart readback returned the same result.
 - The current Phase A two-account evidence and specific-demand decision loop is complete and truthfully stops without a candidate. Historical failed/partial jobs and artifacts remain audit history and were not changed. No review, approval, product construction or other Phase B action ran; Phase B remains unstarted.
 
-## 2026-08-21 connected-phone ranked continuation
+## Historical checkpoint: 2026-08-21 connected-phone ranked continuation
 
 - The phone was restored as one authorized ADB `device` and Xiaohongshu was confirmed in the foreground. Historical disconnected jobs were not retried or rewritten. The funnel resumed at position 18 and then advanced strictly one terminal job at a time, skipping only candidates that already had a terminal decision or were clearly physical.
 - Positions 18–61 were processed in original score order. The resulting full 71-candidate funnel is now: 2 `in_scope`, 31 `out_of_scope_physical`, 26 `needs_human`, 2 collection failures, and 10 still waiting. Most `needs_human` rows opened a normal account profile with no verifiable shop entry; position 32 retained a strict third-item `selector_changed` result at 2/3 without fourth-item substitution.

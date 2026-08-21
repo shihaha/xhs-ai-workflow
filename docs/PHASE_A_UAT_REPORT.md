@@ -2,7 +2,38 @@
 
 Date: 2026-08-20 (Asia/Shanghai)
 
-## 2026-08-21 short-shop evidence and CDP result
+## 2026-08-21 final ranked-pool and clean-evidence result
+
+Positions 62–71 were run one at a time in original Qianfan score order. All ten
+were already `uncertain` at prescreen and all ten finished Android preflight as
+`needs_human 0/3`. No new in-scope account, profile collection, note collection
+or evidence sample was therefore warranted. The final funnel is 2 in-scope, 31
+physical, 36 needs-human, 2 collection failures and 0 waiting.
+
+Readback exposed that position 10 still had one opportunity-eligible legacy
+full-shop result with eight SHA-bearing XML files whose current bytes differed.
+After a lock-screen attempt was preserved as `needs_human`, clean replacement
+job `8507e249…` succeeded at proven natural-end 2/2 with 25 artifacts and 24/24
+SHA matches. Position 61 uses clean job `fb293aa0…`, with 23 artifacts and 22/22
+SHA matches. A RED/GREEN trust gate now rejects a shop result when any
+SHA-bearing artifact from that job differs and repeats the trust check before
+human approval. The old files and metadata remain unchanged.
+
+Analysis `73728a7c…` ran before that gate and produced one pending personality-
+test candidate from the now-ineligible legacy shop result. It remains immutable
+audit history and cannot pass the current approval trust check. The subsequent
+clean-only analysis `5d4e235a…` used 2 accounts and 22 eligible facts but failed
+closed after the provider exhausted three attempts (`model_retry_exhausted`). It
+was not loop-retried and created no Opportunity.
+
+The old newline mismatch is formally closed as
+`legacy_historical_audit_limitation`: exact-written-byte hashing is covered and
+used by current production jobs, both current eligible shop facts are clean,
+and old immutable artifacts remain for audit. It is non-blocking. The current
+Phase A decision is still incomplete because the clean-only unified provider
+run failed; Phase B remains unstarted.
+
+## Historical checkpoint: 2026-08-21 short-shop evidence and CDP result
 
 The formal sample target remains three for shops that have at least three
 products. A same-run Android natural-end marker may now prove that a shop has
@@ -34,7 +65,7 @@ preserved both evidence eligibility and the analysis. The current Phase A
 two-account decision loop is complete without a candidate. Phase B remains
 unstarted.
 
-## 2026-08-21 connected-phone continuation result
+## Historical checkpoint: 2026-08-21 connected-phone continuation result
 
 After the phone returned as an authorized ADB device, Xiaohongshu was launched
 and verified in the foreground. The ranked funnel continued from position 18,

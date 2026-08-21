@@ -2,7 +2,28 @@
 
 Status date: 2026-08-21
 
-## Short-shop evidence and XML byte-hash correction
+## Ranked-pool closure and current trust status
+
+The real 71-candidate pool has no waiting rows. Positions 62–71 were processed
+serially and all ten ended `uncertain -> needs_human`; final funnel counts are 2
+in-scope, 31 physical, 36 needs-human and 2 failed. No targeted pairing or new
+in-scope account was introduced.
+
+Opportunity eligibility now requires every SHA-bearing artifact belonging to a
+shop job to match its current file bytes. Approval repeats current evidence
+resolution, so a previously created candidate cannot be approved after its
+evidence loses trust. RED/GREEN covers both rules. The old position-10 shop fact
+is now ineligible without rewriting it; clean replacements `8507e249…` and
+`fb293aa0…` are the two current eligible shop facts, with 24/24 and 22/22 SHA
+matches respectively.
+
+The exact-byte XML writer remains the production path. Old newline-expanded XML
+artifacts are now `legacy_historical_audit_limitation`: immutable, auditable and
+non-blocking. Clean-only unified analysis `5d4e235a…` used 2 accounts and 22
+facts but failed closed as `model_retry_exhausted`, so no latest trustworthy
+Opportunity is available and Phase B remains unstarted.
+
+## Historical checkpoint: short-shop evidence and XML byte-hash correction
 
 The current evidence contract uses the first three distinct products when at
 least three exist. It accepts one or two only when the same Android run reaches
@@ -29,7 +50,7 @@ Opportunities; restart readback matched. The current Phase A two-account
 decision loop is complete without a candidate. Historical mismatches remain
 immutable audit history, and Phase B is unstarted.
 
-## Connected-phone ranked continuation
+## Historical checkpoint: connected-phone ranked continuation
 
 The previously blocked live path resumed after ADB reported one authorized
 device and Xiaohongshu foreground readiness. Candidate advancement remained
