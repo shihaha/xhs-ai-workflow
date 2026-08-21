@@ -151,3 +151,47 @@ class AccountRead(AccountScore):
     score_status: Literal["scored", "insufficient_metrics"]
     ranking_evidence_count: int = Field(ge=1)
     best_rank: int = Field(ge=1)
+
+
+class CandidatePrescreenCreate(BaseModel):
+    source_date: date
+    limit: int = Field(default=100, ge=1, le=1000)
+
+
+class CandidateFunnelRead(AccountRead):
+    candidate_position: int = Field(ge=1)
+    prescreen_classification: Literal[
+        "pending", "likely_digital", "clearly_physical", "uncertain"
+    ]
+    prescreen_reason: str | None = None
+    prescreen_evidence_ids: list[str] = Field(default_factory=list)
+    prescreened_at: datetime | None = None
+    android_scope_classification: Literal[
+        "unknown", "in_scope", "out_of_scope_physical", "needs_human"
+    ] = "unknown"
+    android_job_state: Literal[
+        "none", "queued", "running", "succeeded", "needs_human", "failed", "cancelled"
+    ] = "none"
+    status: Literal[
+        "pending_prescreen",
+        "clearly_physical_skipped",
+        "likely_digital_waiting_preflight",
+        "uncertain_waiting_preflight",
+        "preflight_active",
+        "in_scope",
+        "out_of_scope_physical",
+        "needs_human",
+        "collection_failed",
+    ]
+
+
+class CandidateAdvanceCreate(BaseModel):
+    source_date: date
+    device_id: str | None = Field(default=None, min_length=1, max_length=500)
+
+
+class CandidateAdvanceQueued(BaseModel):
+    account_user_id: str
+    candidate_position: int
+    job_id: str
+    status: Literal["queued"] = "queued"

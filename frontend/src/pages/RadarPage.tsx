@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { fetchAccounts, fetchHealth, fetchJob, fetchJobs, fetchNoteSearchResults, fetchRankSnapshots, ingestRankSnapshot as postSnapshot, startNoteSearch as postNoteSearch, startQianfanCollection as postCollection, type Account, type CollectionQueued, type HealthResponse, type Job, type NoteSearchResults, type QianfanCollectionQueued, type RankSnapshot } from "../api/client";
+import { advanceCandidateFunnel as postAdvanceCandidate, fetchAccounts, fetchCandidateFunnel, fetchHealth, fetchJob, fetchJobs, fetchNoteSearchResults, fetchRankSnapshots, ingestRankSnapshot as postSnapshot, runCandidatePrescreen as postCandidatePrescreen, startNoteSearch as postNoteSearch, startQianfanCollection as postCollection, type Account, type CandidateAdvanceQueued, type CandidateFunnel, type CollectionQueued, type HealthResponse, type Job, type NoteSearchResults, type QianfanCollectionQueued, type RankSnapshot } from "../api/client";
 
-type RadarData = { snapshots: RankSnapshot[]; accounts: Account[]; health?: HealthResponse };
+type RadarData = { snapshots: RankSnapshot[]; accounts: Account[]; funnel?: CandidateFunnel[]; health?: HealthResponse };
 type TrackedSearch = { job_id: string; status: Job["state"]; polls: number; job?: Job; staleError?: string; results?: NoteSearchResults };
 export interface RadarPageProps {
   loadRadar?: () => Promise<RadarData>;
@@ -12,18 +12,41 @@ export interface RadarPageProps {
   startNoteSearch?: (payload: { keyword: string; expected_count: number }) => Promise<CollectionQueued>;
   loadSearchJob?: (jobId: string) => Promise<Job>;
   loadSearchResults?: (jobId: string) => Promise<NoteSearchResults>;
+  runPrescreen?: (payload: { source_date: string; limit: number }) => Promise<CandidateFunnel[]>;
+  advanceCandidate?: (payload: { source_date: string }) => Promise<CandidateAdvanceQueued>;
   pollIntervalMs?: number;
   searchMaxPolls?: number;
 }
 
 const defaultLoad = async (): Promise<RadarData> => {
   const [snapshots, accounts, health] = await Promise.all([fetchRankSnapshots(), fetchAccounts(), fetchHealth()]);
-  return { snapshots, accounts, health };
+  const latestSourceDate = snapshots.map(item => item.source_date).sort().at(-1);
+  const funnel = latestSourceDate ? await fetchCandidateFunnel(latestSourceDate) : [];
+  return { snapshots, accounts, funnel, health };
 };
 
 const terminal = new Set(["needs_human", "succeeded", "failed", "cancelled"]);
 
-export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapshot, startCollection = postCollection, loadCollectionJobs = fetchJobs, startNoteSearch = postNoteSearch, loadSearchJob = fetchJob, loadSearchResults = fetchNoteSearchResults, pollIntervalMs = 1000, searchMaxPolls = 60 }: RadarPageProps) {
+const prescreenLabel = (value: CandidateFunnel["prescreen_classification"]) => ({
+  pending: "待范围预筛",
+  likely_digital: "疑似数字",
+  clearly_physical: "明显实体",
+  uncertain: "无法判断",
+}[value]);
+
+const candidateStatusLabel = (value: CandidateFunnel["status"]) => ({
+  pending_prescreen: "待范围预筛",
+  clearly_physical_skipped: "明显实体，已跳过",
+  likely_digital_waiting_preflight: "疑似数字，等待 Android preflight",
+  uncertain_waiting_preflight: "无法判断，等待 Android preflight",
+  preflight_active: "Android preflight 进行中",
+  in_scope: "已确认 in_scope",
+  out_of_scope_physical: "已确认 out_of_scope_physical",
+  needs_human: "needs_human",
+  collection_failed: "真实采集失败，继续补位",
+}[value]);
+
+export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapshot, startCollection = postCollection, loadCollectionJobs = fetchJobs, startNoteSearch = postNoteSearch, loadSearchJob = fetchJob, loadSearchResults = fetchNoteSearchResults, runPrescreen = postCandidatePrescreen, advanceCandidate = postAdvanceCandidate, pollIntervalMs = 1000, searchMaxPolls = 60 }: RadarPageProps) {
   const [state, setState] = useState<{ kind: "loading" } | { kind: "error" } | { kind: "ready"; data: RadarData }>({ kind: "loading" });
   const [snapshotJson, setSnapshotJson] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
@@ -92,7 +115,8 @@ export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapsh
 
   if (state.kind === "loading") return <main className="workbench-page" id="main-content"><section className="loading-panel" aria-busy="true"><p role="status">Loading demand radar</p></section></main>;
   if (state.kind === "error") return <main className="workbench-page" id="main-content"><section className="message-panel" role="alert"><h1>Could not load demand radar</h1><p>The persisted ranking endpoints did not return a result.</p><button type="button" onClick={() => void refresh()}>Retry demand radar</button></section></main>;
-  const { snapshots, accounts } = state.data;
+  const { snapshots, accounts, funnel = [] } = state.data;
+  const latestSourceDate = snapshots.map(item => item.source_date).sort().at(-1);
   const succeeded = scopeJobs.filter(job => job.state === "succeeded").length;
   const stateCounts = scopeJobs.reduce<Record<string, number>>((counts, job) => ({ ...counts, [job.state]: (counts[job.state] ?? 0) + 1 }), {});
   const profile = scopeJobs.map(job => job.input.selector_profile_version).find(value => typeof value === "string") as string | undefined;
@@ -134,6 +158,12 @@ export function RadarPage({ loadRadar = defaultLoad, ingestSnapshot = postSnapsh
     </section>
     <section className="operator-panel"><div className="panel-heading"><h2>Import captured ranking snapshot</h2><p>Manual evidence import · not automatic collection</p></div><form className="action-form" onSubmit={event => { event.preventDefault(); void singleFlight(async () => { const parsed = JSON.parse(snapshotJson) as unknown; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Snapshot JSON must be one object."); const result = await ingestSnapshot(parsed as Record<string, unknown>); setNotice(`Snapshot ${result.id} persisted. Persisted facts were reloaded.`); setState({ kind: "ready", data: await loadRadar() }); }); }}><label>Captured ranking snapshot JSON<textarea aria-label="Captured ranking snapshot JSON" required value={snapshotJson} onChange={event => setSnapshotJson(event.target.value)} /></label><p className="field-help">Paste a real captured RankSnapshotInput object. This imports evidence through the existing API; it does not start the Playwright collector.</p><button disabled={pending} type="submit">Import captured snapshot</button></form></section>
     {notice ? <p className="action-notice" role="status">{notice}</p> : null}{actionError ? <p className="action-error" role="alert">{actionError}</p> : null}
+    <section className="operator-panel" aria-labelledby="candidate-funnel-heading">
+      <div className="panel-heading"><h2 id="candidate-funnel-heading">Phase A 候选业务范围漏斗</h2><p>低成本预筛 ≠ 真实店铺最终核验</p></div>
+      <p className="field-help">候选始终按教程原评分顺序推进。明显实体账号在 Android 前跳过；疑似数字和无法判断的账号仍必须进入原有 Android preflight。这里不会定向寻找同类账号，也不会改变单店前 3 件商品规则。</p>
+      <div className="button-row"><button disabled={pending || !latestSourceDate} type="button" onClick={() => void singleFlight(async () => { if (!latestSourceDate) throw new Error("没有可用于预筛的真实千帆日期。"); const rows = await runPrescreen({ source_date: latestSourceDate, limit: 1000 }); setState({ kind: "ready", data: { ...state.data, funnel: rows } }); setNotice(`已按评分顺序完成 ${rows.length} 个候选的低成本预筛。`); })}>按评分顺序执行低成本预筛</button><button disabled={pending || !latestSourceDate} type="button" onClick={() => void singleFlight(async () => { if (!latestSourceDate) throw new Error("没有可用于补位的真实千帆日期。"); const queued = await advanceCandidate({ source_date: latestSourceDate }); setNotice(`第 ${queued.candidate_position} 名候选已进入 Android preflight：${queued.job_id}`); setState({ kind: "ready", data: await loadRadar() }); })}>处理下一名候选</button></div>
+      {funnel.length === 0 ? <p className="panel-empty">尚未形成候选范围漏斗。先对当前真实排名池执行低成本预筛。</p> : <ol className="collection-list">{funnel.map(candidate => <li key={candidate.user_id}><header><strong>{candidate.account_name}</strong><span>{candidateStatusLabel(candidate.status)}</span></header><p>第 {candidate.candidate_position} 名 · 千帆原始 best rank {candidate.best_rank} · 原始评分 {candidate.score_status === "scored" ? candidate.score : "指标不足"}</p><p><strong>低成本预筛：</strong> {prescreenLabel(candidate.prescreen_classification)}</p><p>{candidate.prescreen_reason ?? "尚未执行预筛"}</p><p><strong>预筛证据：</strong> {candidate.prescreen_evidence_ids.length ? candidate.prescreen_evidence_ids.join(", ") : "尚无"}</p><p><strong>最终店铺核验：</strong> {candidate.android_scope_classification === "unknown" ? "尚未执行" : candidate.android_scope_classification} · Android job {candidate.android_job_state}</p><a href={`/accounts/${encodeURIComponent(candidate.user_id)}`}>查看账号证据</a></li>)}</ol>}
+    </section>
     {snapshots.length === 0 && accounts.length === 0 ? <section className="message-panel" role="status"><h2>No ranking evidence recorded</h2><p>Run a controlled ranking collection or submit a real captured snapshot through the API. This page never inserts sample data.</p></section> : <>
       <section className="operator-panel" aria-labelledby="snapshots-heading"><div className="panel-heading"><h2 id="snapshots-heading">Ranking snapshots</h2></div>{snapshots.length === 0 ? <p className="panel-empty">No snapshots returned.</p> : <ol className="fact-list">{snapshots.map(snapshot => <li key={snapshot.id}><strong>{snapshot.board} · {snapshot.dimension}</strong><span>{snapshot.source_date} · {snapshot.deduplicated_count} deduplicated / {snapshot.submitted_count} submitted</span><a href={snapshot.source_url}>Source evidence</a></li>)}</ol>}</section>
       <section className="operator-panel" aria-labelledby="accounts-heading"><div className="panel-heading"><h2 id="accounts-heading">Ranked account candidates</h2></div>{accounts.length === 0 ? <p className="panel-empty">No ranked accounts returned.</p> : <div className="table-scroll"><table><thead><tr><th>Account</th><th>Score</th><th>Fans</th><th>Evidence</th><th>Coverage</th></tr></thead><tbody>{accounts.map(account => <tr key={account.user_id}><th><a href={`/accounts/${encodeURIComponent(account.user_id)}`}>{account.account_name}</a><small>{account.user_id}</small></th><td>{account.score_status === "insufficient_metrics" ? "insufficient_metrics" : account.score}</td><td>{account.fans}</td><td>{account.gmv} · {account.pay} · {account.read}</td><td>{account.ranking_evidence_count} appearances · best rank {account.best_rank} · {account.nday} days · {account.nboard} boards</td></tr>)}</tbody></table></div>}</section>

@@ -3,6 +3,20 @@
 Automated and controlled-fixture checks cannot pass these gates. Record dates,
 operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
+## 2026-08-21 ranked candidate scope funnel
+
+- [x] Keep the tutorial Qianfan score unchanged and preserve its stable descending order.
+- [x] Persist three-state low-cost prescreen results with account, timestamp, reason, cited public facts, raw digests, artifact payload and SHA-256; invalid/failed classification falls open to `uncertain`.
+- [x] Prove that `likely_digital` remains Android `unknown`, cannot qualify as analysis evidence, and cannot bypass the existing three-product preflight.
+- [x] Prove ordered account replacement beyond rank 20 and prohibit category/direction input or targeted second-account pairing.
+- [x] Keep Android final `in_scope | out_of_scope_physical | needs_human` authoritative over prescreen, including after restart.
+- [x] Keep the separate shop evidence rule unchanged: first three distinct products in default encounter order; no skip and no fourth replacement.
+- [x] Real pool prescreen: 71 candidates yielded 4 clearly physical, 2 likely digital and 65 uncertain. All 71 artifacts have complete cited payloads and valid saved/current SHA bindings; restart returned 71/71.
+- [ ] Real ranked Android continuation: positions 8 and 9 each failed once with `device_disconnected`; direct ADB and mDNS checks found no attached device. No further candidates were queued.
+- [ ] Continue from the next score-ordered candidate only after a phone is actually listed and authorized; then complete profile, latest-10 notes and the exact-three evidence sample for any new `in_scope` account.
+- [ ] Run one unified specific-demand analysis over all newly qualified accounts. Do not pre-pair accounts; persist `opportunities=[]` if there is no concrete shared demand.
+- [ ] Phase A overall acceptance remains open; Phase B remains unstarted.
+
 ## 2026-08-21 bounded Android click repair
 
 - [x] Prove the scroll failure from retained screenshot/XML: column-major DOM order caused overlap zero and a repeated first-card click.

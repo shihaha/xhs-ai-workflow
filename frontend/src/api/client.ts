@@ -108,6 +108,17 @@ export interface ShopPreflightCreate {
   collection_mode: "preflight";
   device_id?: string;
 }
+export interface CandidateFunnel extends Account {
+  candidate_position: number;
+  prescreen_classification: "pending" | "likely_digital" | "clearly_physical" | "uncertain";
+  prescreen_reason: string | null;
+  prescreen_evidence_ids: string[];
+  prescreened_at: string | null;
+  android_scope_classification: "unknown" | "in_scope" | "out_of_scope_physical" | "needs_human";
+  android_job_state: "none" | JobState;
+  status: "pending_prescreen" | "clearly_physical_skipped" | "likely_digital_waiting_preflight" | "uncertain_waiting_preflight" | "preflight_active" | "in_scope" | "out_of_scope_physical" | "needs_human" | "collection_failed";
+}
+export interface CandidateAdvanceQueued { account_user_id: string; candidate_position: number; job_id: string; status: "queued"; }
 export interface AccountProfile {
   user_id: string; source_url: string; nickname: string | null; bio: string | null;
   public_stats: Record<string, number>; collection_job_id: string; collection_artifact_id: number; collected_at: string;
@@ -176,6 +187,9 @@ async function getAllPages<T>(path: string): Promise<T[]> {
 
 export const fetchRankSnapshots = () => getAllPages<RankSnapshot>("/api/v1/radar/rank-snapshots");
 export const fetchAccounts = () => getAllPages<Account>("/api/v1/radar/accounts");
+export const fetchCandidateFunnel = (sourceDate: string) => getJson<CandidateFunnel[]>(`/api/v1/radar/candidate-funnel?source_date=${encodeURIComponent(sourceDate)}&limit=1000`);
+export const runCandidatePrescreen = (payload: { source_date: string; limit: number }) => postJson<CandidateFunnel[]>("/api/v1/radar/candidate-prescreens", payload);
+export const advanceCandidateFunnel = (payload: { source_date: string; device_id?: string }) => postJson<CandidateAdvanceQueued>("/api/v1/radar/candidate-funnel/advance", payload);
 export const ingestRankSnapshot = (payload: Record<string, unknown>) => postJson<RankSnapshot>("/api/v1/radar/rank-snapshots", payload);
 export const startQianfanCollection = (payload: { expected_count_per_scope: number }) => postJson<QianfanCollectionQueued>("/api/v1/radar/qianfan-collections", payload);
 export const fetchDevices = () => getJson<DeviceHealth[]>("/api/v1/devices");

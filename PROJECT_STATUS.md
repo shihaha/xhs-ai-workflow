@@ -5,7 +5,16 @@ repository: shihaha/xhs-ai-workflow
 branch: feature/system-v1
 remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
-last_updated: 2026-08-21 (Phase A specific-demand correction checkpoint)
+last_updated: 2026-08-21 (Phase A candidate scope funnel checkpoint)
+
+## 2026-08-21 Phase A candidate business-scope funnel
+
+- The original Qianfan score and stable score order are unchanged. A new evidence-bound prescreen now sits between scoring and Android: `likely_digital`, `clearly_physical`, or fail-open `uncertain`. It cannot produce `in_scope`, shop evidence or an Opportunity, and an existing Android decision remains authoritative.
+- Candidate replacement is account-level and may continue beyond rank 20. It always selects the next remaining score-ordered candidate and accepts no product category or matching direction. This is separate from the unchanged shop-level rule: exactly the first three distinct products encountered, with no fourth-product substitution.
+- Real 2026-08-20 pool UAT prescreened all 71 ranked candidates: 4 `clearly_physical`, 2 `likely_digital`, and 65 `uncertain`. All 71 jobs, structured artifacts and SQLite rows persisted; 71/71 current files match both saved payloads and SHA-256, and restart readback returned all 71 classifications.
+- Existing Android history remained authoritative: after prescreen, the funnel exposed 1 `in_scope`, 9 `out_of_scope_physical`, 7 `needs_human`, and 54 waiting candidates. The next two score-ordered candidates (positions 8 and 9) were admitted sequentially but failed immediately as `device_disconnected`; direct ADB output contained no attached device or discoverable mDNS service. Their failed jobs remain durable and the system did not loop further.
+- Automated verification: Radar `112 passed`; directly relevant Android/shop `33 passed`; analysis `178 passed, 1 skipped`; frontend `65 passed`; production build passed. The whole backend tree reported `1498 passed, 3 skipped, 5 failed`; the failures are one unchanged media-usage expectation and four unchanged legacy/shop-scope expectations, outside all modified files and absent from the focused funnel path. They were recorded, not fixed by expanding scope. `git diff --check` reports no whitespace errors. Ruff/Black were unavailable in the installed Python environment and were not installed for this bounded task.
+- The prescreen/artifact/restart portion is proven live. Ranked Android continuation, an additional qualified digital account, its profile/latest-10/evidence sample, and an all-qualified-account specific-demand run remain incomplete because the phone was not attached. Phase A overall remains open and Phase B remains unstarted.
 
 ## 2026-08-21 specific-demand semantic correction
 

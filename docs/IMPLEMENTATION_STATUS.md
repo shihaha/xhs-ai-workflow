@@ -2,6 +2,42 @@
 
 Status date: 2026-08-21
 
+## Ranked candidate business-scope funnel
+
+The Phase A flow now keeps eight boundaries explicit: original Qianfan scoring;
+Top-N priority rather than a hard rank-20 stop; evidence-bound low-cost scope
+prescreen; authoritative Android scope; score-ordered account replacement;
+the unchanged first-three-products shop sample; unified specific-demand
+analysis over qualified accounts; and human Opportunity review.
+
+The new Radar service reads persisted ranking/profile/latest-10 facts, writes an
+immutable job artifact with cited evidence and hashes, and returns only
+`likely_digital`, `clearly_physical` or fail-open `uncertain`. It never upgrades
+prescreen evidence to shop evidence. The next-candidate endpoint accepts a date
+and optional device only; it has no category or matching input and queues the
+existing exact-three Android preflight for the next eligible score position.
+The Radar UI presents Chinese operator labels and displays prescreen and final
+Android results separately.
+
+General RED/GREEN coverage includes clear physical evidence, ambiguity,
+classifier failure, non-eligibility of likely-digital facts for analysis,
+rank-21 replacement, non-targeted ordering, active-job serialization, and
+Android-final precedence. Current verification is Radar 112 passed, focused
+shop 33 passed, analysis 178 passed/1 skipped, frontend 65 passed, and a passing
+production build.
+
+The whole backend tree additionally reported 1498 passed, 3 skipped and 5
+failures in unchanged media and legacy/shop-scope expectations. Focused tests
+for every modified production path remain green; the unrelated failures were
+not repaired in this bounded Phase A increment.
+
+Real UAT persisted and hash-verified all 71 candidates (4 physical, 2 likely
+digital, 65 uncertain) and restart-read the same 71. The first two new ordered
+continuations failed as `device_disconnected`; ADB listed no attached device.
+Therefore the code and low-cost live chain are implemented, while real Android
+continuation, additional qualified-account evidence and the subsequent unified
+analysis remain incomplete. Phase B is unstarted.
+
 ## Specific-demand semantic gate and review explanation
 
 The real `37d7fca6…` output proved a missing business contract: it produced two

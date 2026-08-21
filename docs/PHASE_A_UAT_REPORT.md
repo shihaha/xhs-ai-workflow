@@ -2,6 +2,48 @@
 
 Date: 2026-08-20 (Asia/Shanghai)
 
+## 2026-08-21 candidate business-scope funnel result
+
+This increment does not change the tutorial scoring formula. It adds a low-cost,
+evidence-bound screen after score ordering and before Android work. The screen
+can say likely digital, clearly physical or uncertain; only clearly supported
+physical accounts are skipped. Likely digital and uncertain remain Android
+unknown. Android scope is still final, and prescreen artifacts are not accepted
+as shop or Opportunity evidence.
+
+The account candidate sequence can continue past the first 20 entries, but it
+cannot accept a category or matching target. Exclusion and terminal collection
+failure advance to the next original score position. This account replacement
+does not change the separate single-shop rule of exactly the first three
+distinct products encountered, without skipping or fourth-item replacement.
+
+The real 2026-08-20 pool contained 71 score-ordered candidates. One authorized
+prescreen pass persisted 4 clearly physical, 2 likely digital and 65 uncertain
+results. Direct SQLite/filesystem validation found 71 artifact rows, 71 complete
+payloads and 71 valid current-file/persisted SHA-256 bindings. After process
+restart, the API returned all 71 classifications. Existing Android decisions
+remained final: the merged funnel showed 1 in-scope, 9 physical, 7 needs-human
+and 54 waiting candidates before new continuation attempts.
+
+The next two eligible candidates were positions 8 and 9. Each was queued only
+after the prior request had already terminated, and each immediately persisted
+`failed/device_disconnected`. Direct ADB output listed no device and mDNS found
+no service, so no third attempt was made. No old job, artifact, analysis or
+Opportunity was rewritten. No new account profile, note sample, product evidence
+sample, cross-account analysis or Phase B action followed.
+
+Verification passed: Radar 112, focused Android/shop 33, analysis 178 with one
+conditional skip, frontend 65, and the production frontend build. The live
+prescreen and restart trust chain are proven; live ranked Android replacement
+and a larger qualified digital-account pool remain blocked by the absent phone.
+Phase A is not declared complete.
+
+The additional whole-backend run was not fully green: 1498 passed, 3 skipped
+and 5 failed. One failure is an unchanged media token-usage expectation; four
+are unchanged legacy/shop-scope expectations. None enters the modified Radar
+funnel or its focused Android path. They remain recorded and were not used to
+justify unrelated code changes.
+
 ## 2026-08-21 specific-demand semantic result
 
 The persisted output of analysis `37d7fca6…` contained two separate product

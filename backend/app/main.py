@@ -147,7 +147,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             runtime_dir=app.state.settings.runtime_dir,
             max_artifact_bytes=app.state.settings.xhs_cli_max_output_bytes,
         )
-        app.state.radar_service = RadarService(app.state.database)
+        app.state.radar_service = RadarService(
+            app.state.database, job_service=app.state.job_service
+        )
         page_factory = persistent_qianfan_page_factory(
             browser_executable=app.state.settings.browser_executable,
             user_data_dir=app.state.settings.qianfan_browser_profile_dir,

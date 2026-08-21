@@ -46,6 +46,38 @@ describe("RadarPage", () => {
     expect(screen.getByText("4.25")).toBeVisible();
   });
 
+  it("shows the ranked scope funnel without presenting prescreen as final shop verification", async () => {
+    render(<RadarPage loadRadar={vi.fn().mockResolvedValue({
+      snapshots: [{ id: 4, source_date: "2026-08-21", collected_at: "2026-08-21T08:00:00", board: "成交榜", dimension: "优秀账号", source_url: "https://qianfan.example/rank", raw_evidence: {}, submitted_count: 2, deduplicated_count: 2, items: [] }],
+      accounts: [],
+      funnel: [
+        { user_id: "physical", account_name: "实体账号", candidate_position: 1, score: 4.5, score_status: "scored", ranking_evidence_count: 2, best_rank: 1, evidence: 1, credibility: 1, accessibility: 1, fans: 1000, gmv: "1万-5万", pay: "15%-25%", read: "3万-5万", nday: 1, nboard: 1, prescreen_classification: "clearly_physical", prescreen_reason: "公开证据明确显示实体商品及物流发货。", prescreen_evidence_ids: ["rank-item:1"], prescreened_at: "2026-08-21T08:10:00Z", android_scope_classification: "unknown", android_job_state: "none", status: "clearly_physical_skipped" },
+        { user_id: "digital", account_name: "数字账号", candidate_position: 2, score: 4.2, score_status: "scored", ranking_evidence_count: 1, best_rank: 2, evidence: 1, credibility: 1, accessibility: 1, fans: 1200, gmv: "1万-5万", pay: "15%-25%", read: "3万-5万", nday: 1, nboard: 1, prescreen_classification: "likely_digital", prescreen_reason: "公开证据出现数字交付线索。", prescreen_evidence_ids: ["rank-item:2"], prescreened_at: "2026-08-21T08:10:01Z", android_scope_classification: "unknown", android_job_state: "none", status: "likely_digital_waiting_preflight" },
+      ],
+    })} />);
+
+    expect(await screen.findByRole("heading", { name: "Phase A 候选业务范围漏斗" })).toBeVisible();
+    expect(screen.getByText("第 1 名 · 千帆原始 best rank 1 · 原始评分 4.5")).toBeVisible();
+    expect(screen.getByText("明显实体，已跳过")).toBeVisible();
+    expect(screen.getByText("疑似数字，等待 Android preflight")).toBeVisible();
+    expect(screen.getAllByText(/尚未执行 · Android job none/)).toHaveLength(2);
+    expect(screen.getByText("rank-item:1")).toBeVisible();
+  });
+
+  it("runs prescreen and advances only the system-selected next ranked candidate", async () => {
+    const runPrescreen = vi.fn().mockResolvedValue([]);
+    const advanceCandidate = vi.fn().mockResolvedValue({ account_user_id: "next", candidate_position: 21, job_id: "job-next", status: "queued" });
+    const loadRadar = vi.fn().mockResolvedValue({ snapshots: [{ id: 1, source_date: "2026-08-21", collected_at: "2026-08-21T08:00:00", board: "成交榜", dimension: "优秀账号", source_url: "https://qianfan.example/rank", raw_evidence: {}, submitted_count: 1, deduplicated_count: 1, items: [] }], accounts: [], funnel: [] });
+    render(<RadarPage loadRadar={loadRadar} runPrescreen={runPrescreen} advanceCandidate={advanceCandidate} />);
+    await screen.findByRole("heading", { name: "Phase A 候选业务范围漏斗" });
+    fireEvent.click(screen.getByRole("button", { name: "按评分顺序执行低成本预筛" }));
+    await waitFor(() => expect(runPrescreen).toHaveBeenCalledWith({ source_date: "2026-08-21", limit: 1000 }));
+    fireEvent.click(screen.getByRole("button", { name: "处理下一名候选" }));
+    await waitFor(() => expect(advanceCandidate).toHaveBeenCalledWith({ source_date: "2026-08-21" }));
+    expect(await screen.findByText(/第 21 名候选已进入 Android preflight/)).toBeVisible();
+    await waitFor(() => expect(loadRadar).toHaveBeenCalledTimes(2));
+  });
+
   it("shows missing score inputs without inventing a numeric score", async () => {
     render(<RadarPage loadRadar={vi.fn().mockResolvedValue({ snapshots: [], accounts: [{ user_id: "author-2", account_name: "缺指标账号", score: null, score_status: "insufficient_metrics", ranking_evidence_count: 4, best_rank: 2, evidence: 0, credibility: 0, accessibility: 0, fans: 0, gmv: "—", pay: "—", read: "—", nday: 2, nboard: 2 }] })} />);
     expect(await screen.findByText("insufficient_metrics")).toBeVisible();
