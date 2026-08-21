@@ -5,15 +5,24 @@ repository: shihaha/xhs-ai-workflow
 branch: feature/system-v1
 remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
-last_updated: 2026-08-21 (71-candidate closure and clean-evidence trust gate)
+last_updated: 2026-08-21 (bounded provider verification and pending human review)
 
-## 2026-08-21 71-candidate closure and clean-evidence trust gate
+## 2026-08-21 bounded clean-evidence provider verification
+
+- SQLite analysis `5d4e235a…` records three bounded 60-second attempts, each as `timeout`, with `output_json=null`, empty usage and no Opportunity. It remains immutable failed history; this was not three negative AI judgments.
+- After explicit user approval, one new verification used a 120-second request timeout and `max_attempts=1`. Analysis `5859e6c9…` succeeded on its first and only provider request in 45,797 ms with `deepseek-v4-flash`, prompt `tutorial-demand-radar-specific-demand-v2`, 243,276 prompt tokens and 4,984 completion tokens.
+- The persisted positive conclusion names the specific shared demand as “七宗罪与人格心理测试数字内容”. It created exactly one current `warming_candidate + pending_review`, titled “七宗罪心理测试数字内容市场机会”, using the two current clean shop facts and account-bound note evidence. SQLite and the main backend service read the same analysis and Opportunity.
+- The new candidate has not been approved or rejected. The earlier `73728a7c…` candidate cites now-ineligible legacy shop evidence and cannot pass the approval trust gate; the older `37d7fca6…` candidate lacks the current positive specific-demand contract and cannot be approved. All three remain visible as separate audit records.
+- The frontend stale-process failure was operational, not evidence loss: the old port-8000 backend returned HTTP 500 for `/analyses`. It was restarted against the current runtime; browser verification then showed the current opportunity and common demand with no console error. The observed system-status and radar error copy is Chinese. Frontend regression is `65 passed` and the production build passes.
+- Current Phase A status: clean evidence and the AI analysis path have completed; explicit human disposition of the current candidate is still pending. Approval would only satisfy the Phase A review gate. Phase B remains unstarted and requires separate user authorization.
+
+## Historical checkpoint: 2026-08-21 71-candidate closure and clean-evidence trust gate
 
 - Positions 62–71 were processed strictly in original score order. Every one retained its existing `uncertain` prescreen and finished Android preflight as `needs_human 0/3`; no account was selected by category, no pair was targeted, and no new in-scope account was created. The 71-candidate funnel is now 2 `in_scope`, 31 `out_of_scope_physical`, 36 `needs_human`, 2 collection failures and 0 waiting.
 - The two current funnel accounts each retain a trusted profile, latest-10 notes and one clean shop fact. Position 10 received clean replacement job `8507e249…`, which truthfully proved a two-product natural end and succeeded 2/2 with 25 artifacts and 24/24 SHA-bearing files matching current bytes. Position 61 continues to use `fb293aa0…`, 2/2 with 23 artifacts and 22/22 SHA matches. The lock-screen failure `f987e4f1…` remains immutable `needs_human 0/3` history.
 - Investigation proved that older position-10 result `artifact:401` remained opportunity-eligible despite eight current-byte XML mismatches. RED/GREEN now requires every SHA-bearing artifact in a shop job to match current bytes and revalidates that trust again before approval. The old artifact is ineligible; the two clean artifacts remain eligible. Historical files and metadata were not rewritten.
 - A pre-fix analysis `73728a7c…` produced one pending candidate for a specific social personality-test demand, but it cited the now-ineligible legacy shop result. It remains immutable history and cannot pass the current approval trust gate. The one clean-only unified run `5d4e235a…` used the current two accounts and 22 eligible facts but failed closed as `model_retry_exhausted`; it was not loop-retried and created no Opportunity.
-- The historical Windows newline mismatch is formally classified `legacy_historical_audit_limitation`: current XML writes hash the exact bytes written, current eligible evidence is clean, and old immutable jobs remain available for audit. It is no longer the current Phase A blocker. The current blocker is the failed clean-only unified provider run; Phase B remains unstarted.
+- At this checkpoint, the historical Windows newline mismatch was formally classified `legacy_historical_audit_limitation` and the failed clean-only provider run remained the blocker. The later bounded provider success and current pending-review state are recorded above. Phase B remains unstarted.
 
 ## Historical checkpoint: 2026-08-21 short-shop evidence and CDP verification
 

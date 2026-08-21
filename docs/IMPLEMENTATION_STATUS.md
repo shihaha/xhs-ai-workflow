@@ -2,7 +2,33 @@
 
 Status date: 2026-08-21
 
-## Ranked-pool closure and current trust status
+## Bounded provider verification and current review state
+
+The model adapter configuration was not changed in production for this check.
+One user-authorized temporary service set the text-model timeout to 120 seconds
+and `max_attempts=1`, then reused the current two-account clean evidence request.
+Analysis `5859e6c9…` succeeded in 45,797 ms and persisted one positive specific-
+demand conclusion plus one `warming_candidate + pending_review`. The historical
+three-timeout analysis `5d4e235a…` remains unchanged.
+
+The current opportunity is “七宗罪心理测试数字内容市场机会”; its common demand
+is “七宗罪与人格心理测试数字内容”. It is not approved. The service will resolve
+and revalidate current evidence again if an operator approves it. Historical
+candidates that lack the current contract or rely on ineligible evidence remain
+visible but cannot pass that gate.
+
+The frontend review failure came from a stale backend process on the proxy's
+port 8000, where `/analyses` returned HTTP 500. Restarting that process against
+the current runtime restored the page without changing evidence or analysis
+records. The observed system-status page and radar error state now use Chinese
+copy. Full frontend verification is `65 passed`; the production build and a
+browser check of the current candidate pass.
+
+Implementation and live-state boundary: the AI analysis path is now proven for
+the current clean evidence, while the human review state is still
+`pending_review`. Phase B is not authorized or started.
+
+## Historical checkpoint: ranked-pool closure and trust status
 
 The real 71-candidate pool has no waiting rows. Positions 62–71 were processed
 serially and all ten ended `uncertain -> needs_human`; final funnel counts are 2
@@ -20,8 +46,10 @@ matches respectively.
 The exact-byte XML writer remains the production path. Old newline-expanded XML
 artifacts are now `legacy_historical_audit_limitation`: immutable, auditable and
 non-blocking. Clean-only unified analysis `5d4e235a…` used 2 accounts and 22
-facts but failed closed as `model_retry_exhausted`, so no latest trustworthy
-Opportunity is available and Phase B remains unstarted.
+facts but failed closed as `model_retry_exhausted`, so no trustworthy
+Opportunity was available at that checkpoint. The later bounded provider
+success and current pending-review state are recorded above; Phase B remains
+unstarted.
 
 ## Historical checkpoint: short-shop evidence and XML byte-hash correction
 

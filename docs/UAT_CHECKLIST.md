@@ -3,7 +3,18 @@
 Automated and controlled-fixture checks cannot pass these gates. Record dates,
 operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 
-## 2026-08-21 ranks 62–71 and formal XML closure
+## 2026-08-21 bounded provider verification and review gate
+
+- [x] Preserve failed analysis `5d4e235a…` unchanged. SQLite records three attempts and three `timeout` categories, no model output, no usage and no Opportunity.
+- [x] Run exactly one user-authorized provider request with a 120-second timeout and `max_attempts=1`. Analysis `5859e6c9…` succeeded in 45,797 ms with 243,276 prompt tokens and 4,984 completion tokens.
+- [x] Persist the model's specific shared demand, “七宗罪与人格心理测试数字内容”, and exactly one current `warming_candidate + pending_review` using current clean shop and note evidence.
+- [x] Read the saved analysis and Opportunity through SQLite and the main backend service. Keep historical failed analyses, ineligible evidence and malformed candidates unchanged.
+- [x] Restore the stale port-8000 backend used by the frontend proxy. Verify the opportunity page in a real browser: current title and common demand are present, no load-error panel appears and no console error is emitted.
+- [x] Translate the observed system-status and demand-radar error states to Chinese; pass all 65 frontend tests and the production build.
+- [ ] Approve or reject the current “七宗罪心理测试数字内容市场机会” after human review. Approval is one-way and must revalidate current evidence trust.
+- [x] Keep Phase B unstarted. A Phase A approval does not itself authorize product creation; Phase B requires separate user approval.
+
+## Historical checkpoint: 2026-08-21 ranks 62–71 and formal XML closure
 
 - [x] Process positions 62–71 strictly in original score order. All ten retained `uncertain` prescreen and ended Android `needs_human 0/3`; no targeted pairing or new in-scope account was introduced.
 - [x] Persist final funnel counts: 2 in-scope, 31 out-of-scope physical, 36 needs-human, 2 failed and 0 waiting.
@@ -13,7 +24,7 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Run one clean-only unified analysis over 2 accounts and 22 eligible facts. `5d4e235a…` failed closed as `model_retry_exhausted`; do not loop-retry or manufacture an Opportunity.
 - [x] Formally classify old newline-expanded XML artifacts as `legacy_historical_audit_limitation`: current exact-byte writer and current clean jobs are verified; historical jobs/artifacts stay immutable and the limitation is no longer a current blocker.
 - [x] Keep the pre-gate `73728a7c…` pending candidate as immutable audit history; it uses evidence that is no longer eligible and cannot pass the current approval trust gate.
-- [x] Keep Phase B unstarted. The current blocker is the failed clean-only unified provider run, not the historical XML limitation.
+- [x] At this checkpoint, keep Phase B unstarted because the clean-only unified provider run failed; the later bounded provider result and current review gate are recorded above.
 
 ## Historical checkpoint: 2026-08-21 short-shop and CDP verification
 

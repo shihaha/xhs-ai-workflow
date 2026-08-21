@@ -11,8 +11,13 @@
 - 当前候选池有 2 个具备 profile、latest-10 和 clean shop evidence 的
   Opportunity-eligible `in_scope` 账号。它们的正式 2/2 evidence jobs 分别为
   `8507e249…` 与 `fb293aa0…`，全部 SHA-bearing artifacts 当前字节一致。
-- clean-only 统一分析 `5d4e235a…` 使用 2 个账号、22 条证据，但百炼最终
-  `model_retry_exhausted`。因此本轮没有可批准的最新 Opportunity，Phase B 不得启动。
+- clean-only 统一分析 `5d4e235a…` 使用 2 个账号、22 条证据，但百炼三次均在
+  60 秒超时；该失败记录保持不变。随后经用户明确批准的一次有界验证把单次等待
+  上限设为 120 秒并把内部尝试限制为 1。分析 `5859e6c9…` 在 45.797 秒返回，
+  使用同一模型、同一 prompt version 和当前 clean evidence，持久化共同具体需求
+  “七宗罪与人格心理测试数字内容”及 1 个 `warming_candidate + pending_review`。
+- 最新候选尚未人工批准。人工批准只能完成 Phase A 审核门禁，不会自动创建产品或
+  启动 Phase B；Phase B 仍需用户另行明确批准。
 - 旧 Windows newline XML mismatch 正式分类为
   `legacy_historical_audit_limitation`：历史 jobs/artifacts 永久保留且不改写；当前 XML
   生产路径按实际写盘 bytes 计算 SHA，当前 eligible evidence 不依赖旧 mismatch，故该

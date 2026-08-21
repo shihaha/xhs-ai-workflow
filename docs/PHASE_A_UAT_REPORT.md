@@ -2,7 +2,43 @@
 
 Date: 2026-08-20 (Asia/Shanghai)
 
-## 2026-08-21 final ranked-pool and clean-evidence result
+## 2026-08-21 bounded provider verification and current review state
+
+Analysis `5d4e235a…` remains the exact historical failure: its three model
+attempts each reached the configured 60-second timeout. It has no output,
+usage or Opportunity. Those facts show a provider timeout, not three negative
+business judgments.
+
+The user then authorized one bounded verification. A temporary local service
+used the same runtime database and current code with a 120-second timeout and
+`max_attempts=1`. Analysis `5859e6c9…` received a valid response on that single
+request after 45,797 ms. Bailian `deepseek-v4-flash` reported 243,276 prompt
+tokens and 4,984 completion tokens under prompt
+`tutorial-demand-radar-specific-demand-v2`.
+
+The saved conclusion states `has_specific_shared_demand=true` and names the
+common demand as “七宗罪与人格心理测试数字内容”. It created one current
+`warming_candidate + pending_review`, “七宗罪心理测试数字内容市场机会”. The
+candidate cites both current clean shop facts and account-bound note evidence.
+SQLite and the main backend service returned the same analysis and Opportunity.
+
+No human review decision has been recorded. The earlier `73728a7c…` candidate
+uses a legacy shop fact that is now ineligible, and the older `37d7fca6…`
+candidate lacks the current positive specific-demand contract; neither can pass
+the current approval gate. They remain visible as immutable audit history.
+
+The review UI initially failed because its port-8000 backend process was stale
+and returned HTTP 500 for `/analyses`; port 8001 and SQLite remained healthy.
+Restarting port 8000 against the current runtime restored all four review-page
+reads. Browser verification found the current title and common demand, no load
+error and no console error. The observed system-status and radar error text is
+now Chinese; all 65 frontend tests and the production build pass.
+
+Phase A now waits only for explicit human disposition of the current candidate.
+Approval would complete the Phase A review gate, not start product work. Phase B
+remains unstarted and requires separate user authorization.
+
+## Historical checkpoint: 2026-08-21 final ranked-pool and clean-evidence result
 
 Positions 62–71 were run one at a time in original Qianfan score order. All ten
 were already `uncertain` at prescreen and all ten finished Android preflight as
@@ -29,9 +65,10 @@ was not loop-retried and created no Opportunity.
 The old newline mismatch is formally closed as
 `legacy_historical_audit_limitation`: exact-written-byte hashing is covered and
 used by current production jobs, both current eligible shop facts are clean,
-and old immutable artifacts remain for audit. It is non-blocking. The current
-Phase A decision is still incomplete because the clean-only unified provider
-run failed; Phase B remains unstarted.
+and old immutable artifacts remain for audit. It is non-blocking. At this
+checkpoint, Phase A remained incomplete because the clean-only unified provider
+run failed. The later bounded provider success is recorded above; Phase B
+remains unstarted.
 
 ## Historical checkpoint: 2026-08-21 short-shop evidence and CDP result
 
