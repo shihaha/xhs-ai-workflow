@@ -21,6 +21,7 @@ from backend.app.adapters.contracts import (
 import backend.app.db as db_module
 import backend.app.features.analysis.service as analysis_module
 from backend.app.db import Database, canonical_raw_evidence_digest
+from backend.app.features.analysis.models import OpportunityRecord
 from backend.app.features.analysis.schemas import AnalysisCreate, OpportunityReviewCreate
 from backend.app.features.analysis.service import (
     AnalysisService,
@@ -53,6 +54,9 @@ def test_model_prompt_exposes_cross_account_grounding_contract() -> None:
     assert "supporting_accounts must cover every requested account exactly once" in prompt
     assert "shop_evidence_ids and note_evidence_ids must belong to that account" in prompt
     assert "include every supporting evidence ID in the opportunity evidence_ids" in prompt
+    assert "same sufficiently specific, actionable market demand" in prompt
+    assert "Broad umbrella needs" in prompt
+    assert "opportunities=[]" in prompt
 
 
 class _AccountAdapter:
@@ -578,6 +582,30 @@ def _cross_account_output(
             "summary": "The products and public notes share one demand.",
             "evidence_ids": evidence_ids,
         }],
+        "account_demand_profiles": [
+            {
+                "account_user_id": account_id,
+                "primary_offering": "Compact camping storage guide",
+                "target_user": "Campers with limited packing space",
+                "core_purchase_motivation": "Keep camping equipment organized in a small vehicle",
+                "delivery_format": "Digital packing guide",
+                "usage_scenarios": ["Packing for a weekend camping trip"],
+                "evidence_ids": [shop_id, note_id],
+            }
+            for account_id, shop_id, note_id in accounts
+        ],
+        "cross_account_conclusion": {
+            "has_specific_shared_demand": True,
+            "common_demand": "Organize camping equipment in limited vehicle space",
+            "commonalities": [
+                "Every account targets campers who need compact, organized packing."
+            ],
+            "key_differences": ["The guides use different packing layouts."],
+            "rationale": (
+                "The accounts independently address the same user, problem and usage scenario."
+            ),
+            "evidence_ids": evidence_ids,
+        },
         "opportunities": [{
             "title": "Cross-account demand",
             "status": "观察中",
@@ -593,6 +621,75 @@ def _cross_account_output(
                 for account_id, shop_id, note_id in accounts
             ],
         }],
+    }
+
+
+def _unrelated_cross_account_output(
+    accounts: list[tuple[str, str, str]],
+) -> dict[str, Any]:
+    first, second = accounts
+    all_evidence_ids = [
+        evidence_id
+        for _account_id, shop_id, note_id in accounts
+        for evidence_id in (shop_id, note_id)
+    ]
+    return {
+        "claims": [
+            {
+                "claim": "One account serves home organization buyers.",
+                "evidence_ids": [first[1], first[2]],
+            },
+            {
+                "claim": "The other account serves professional exam candidates.",
+                "evidence_ids": [second[1], second[2]],
+            },
+        ],
+        "product_clusters": [
+            {
+                "name": "Home organization templates",
+                "summary": "Downloadable household organization checklists.",
+                "evidence_ids": [first[1], first[2]],
+            },
+            {
+                "name": "Professional exam lessons",
+                "summary": "Recorded lessons and practice questions for certification exams.",
+                "evidence_ids": [second[1], second[2]],
+            },
+        ],
+        "account_demand_profiles": [
+            {
+                "account_user_id": first[0],
+                "primary_offering": "Downloadable household organization checklists",
+                "target_user": "People organizing a new home",
+                "core_purchase_motivation": "Reduce clutter and remember household tasks",
+                "delivery_format": "Digital checklist templates",
+                "usage_scenarios": ["Moving into a new home", "Weekly household planning"],
+                "evidence_ids": [first[1], first[2]],
+            },
+            {
+                "account_user_id": second[0],
+                "primary_offering": "Professional certification exam lessons",
+                "target_user": "Candidates preparing for a professional exam",
+                "core_purchase_motivation": "Pass a time-bounded certification exam",
+                "delivery_format": "Recorded lessons and practice questions",
+                "usage_scenarios": ["Exam preparation", "Practice before a test date"],
+                "evidence_ids": [second[1], second[2]],
+            },
+        ],
+        "cross_account_conclusion": {
+            "has_specific_shared_demand": False,
+            "common_demand": None,
+            "commonalities": ["Both sell digital products"],
+            "key_differences": [
+                "The target users, purchase motivations, use scenarios and outcomes are unrelated."
+            ],
+            "rationale": (
+                "A shared delivery medium is not evidence that both accounts validate one "
+                "specific market demand."
+            ),
+            "evidence_ids": all_evidence_ids,
+        },
+        "opportunities": [],
     }
 
 
@@ -1389,6 +1486,132 @@ def test_duplicate_account_note_ids_are_rejected_before_service_or_model() -> No
             account_user_id="u1",
             evidence_ids=["account-note:1", "account-note:1"],
         )
+
+
+def test_unrelated_grounded_accounts_persist_reasoned_no_opportunity(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    accounts: list[tuple[str, str, str]] = []
+    for account_id in ("home-organizer", "exam-tutor"):
+        _job_id, note_row_id = fixture.collect(account_id)
+        accounts.append((
+            account_id,
+            _complete_shop_artifact(fixture, account_id),
+            f"account-note:{note_row_id}",
+        ))
+    model = _ModelSpy(_unrelated_cross_account_output(accounts))
+    service = fixture.analysis(model)
+
+    created = service.create(AnalysisCreate(
+        analysis_type="account_opportunity",
+        account_user_ids=[item[0] for item in accounts],
+        evidence_ids=[
+            evidence_id
+            for _account_id, shop_id, note_id in accounts
+            for evidence_id in (shop_id, note_id)
+        ],
+    ))
+
+    assert created.status == "succeeded"
+    assert created.output is not None
+    assert created.output.cross_account_conclusion is not None
+    assert created.output.cross_account_conclusion.has_specific_shared_demand is False
+    assert len(created.output.account_demand_profiles) == 2
+    assert created.output.opportunities == []
+    assert service.list_opportunities() == []
+
+
+def test_shared_demand_conclusion_must_cite_every_requested_account(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    accounts: list[tuple[str, str, str]] = []
+    for account_id in ("u1", "u2"):
+        _job_id, note_row_id = fixture.collect(account_id)
+        accounts.append((
+            account_id,
+            _complete_shop_artifact(fixture, account_id),
+            f"account-note:{note_row_id}",
+        ))
+    output = _cross_account_output(accounts)
+    output["cross_account_conclusion"]["evidence_ids"] = [
+        accounts[0][1],
+        accounts[0][2],
+    ]
+    service = fixture.analysis(_ModelSpy(output))
+
+    created = service.create(AnalysisCreate(
+        analysis_type="account_opportunity",
+        account_user_ids=[item[0] for item in accounts],
+        evidence_ids=[
+            evidence_id
+            for _account_id, shop_id, note_id in accounts
+            for evidence_id in (shop_id, note_id)
+        ],
+    ))
+
+    assert created.status == "failed"
+    assert created.error_category == "evidence_grounding_failed"
+    assert service.list_opportunities() == []
+
+
+def test_opportunity_without_positive_specific_demand_cannot_be_approved(
+    tmp_path: Path,
+) -> None:
+    fixture = _Fixture(tmp_path)
+    accounts: list[tuple[str, str, str]] = []
+    for account_id in ("home-organizer", "exam-tutor"):
+        _job_id, note_row_id = fixture.collect(account_id)
+        accounts.append((
+            account_id,
+            _complete_shop_artifact(fixture, account_id),
+            f"account-note:{note_row_id}",
+        ))
+    service = fixture.analysis(_ModelSpy(_unrelated_cross_account_output(accounts)))
+    evidence_ids = [
+        evidence_id
+        for _account_id, shop_id, note_id in accounts
+        for evidence_id in (shop_id, note_id)
+    ]
+    created = service.create(AnalysisCreate(
+        analysis_type="account_opportunity",
+        account_user_ids=[item[0] for item in accounts],
+        evidence_ids=evidence_ids,
+    ))
+    assert created.status == "succeeded"
+    now = datetime.now(UTC).replace(tzinfo=None)
+    with fixture.database.session() as session:
+        record = OpportunityRecord(
+            analysis_id=created.id,
+            title="Legacy unsupported candidate",
+            status="升温",
+            summary="Persisted before the specific-demand approval gate.",
+            evidence_ids_json=evidence_ids,
+            review_status="pending_review",
+            evidence_level="warming_candidate",
+            supporting_accounts_json=[],
+            supporting_products_json=[],
+            supporting_notes_json=[],
+            reviewed_at=None,
+            rejection_reason=None,
+            next_action="human review",
+            created_at=now,
+        )
+        session.add(record)
+        session.commit()
+        opportunity_id = record.id
+
+    with pytest.raises(OpportunityStateError):
+        service.review_opportunity(
+            opportunity_id,
+            OpportunityReviewCreate(decision="approve"),
+        )
+    rejected = service.review_opportunity(
+        opportunity_id,
+        OpportunityReviewCreate(decision="reject", reason="No shared demand"),
+    )
+    assert rejected.review_status == "rejected"
 
 
 @pytest.mark.parametrize(

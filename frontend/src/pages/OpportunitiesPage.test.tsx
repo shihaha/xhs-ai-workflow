@@ -19,6 +19,41 @@ const opportunity = {
   supporting_notes: [{ account_user_id: "b", evidence_id: "account-note:20", note_id: "n2", title: "Note B", source_url: "https://example.com/n2" }],
   reviewed_at: null, rejection_reason: null, next_action: "human review", created_at: "2026-08-20T08:00:00",
 };
+const noSharedDemandAnalysis = {
+  id: "analysis-no-shared-demand", analysis_type: "account_opportunity", account_user_id: null,
+  account_user_ids: ["a", "b"], status: "succeeded" as const,
+  evidence_ids: ["artifact:1", "account-note:10", "artifact:2", "account-note:20"],
+  provider: "alibaba_bailian", model: "model-x", prompt_version: "semantic-v2",
+  output: {
+    account_demand_profiles: [
+      { account_user_id: "a", primary_offering: "Home organization templates", target_user: "New homeowners", core_purchase_motivation: "Reduce household clutter", delivery_format: "Digital templates", usage_scenarios: ["Moving home"], evidence_ids: ["artifact:1", "account-note:10"] },
+      { account_user_id: "b", primary_offering: "Professional exam lessons", target_user: "Exam candidates", core_purchase_motivation: "Pass a certification exam", delivery_format: "Recorded lessons", usage_scenarios: ["Exam preparation"], evidence_ids: ["artifact:2", "account-note:20"] },
+    ],
+    cross_account_conclusion: {
+      has_specific_shared_demand: false, common_demand: null,
+      commonalities: ["Both sell digital products"],
+      key_differences: ["Target users and problems are unrelated"],
+      rationale: "A shared delivery medium does not prove one specific market demand.",
+      evidence_ids: ["artifact:1", "account-note:10", "artifact:2", "account-note:20"],
+    },
+    opportunities: [],
+  },
+};
+const positiveSharedDemandAnalysis = {
+  ...noSharedDemandAnalysis,
+  id: "analysis-1",
+  output: {
+    ...noSharedDemandAnalysis.output,
+    cross_account_conclusion: {
+      has_specific_shared_demand: true,
+      common_demand: "A specific shared demand",
+      commonalities: ["Both solve the same concrete problem"],
+      key_differences: ["Different delivery details"],
+      rationale: "Both accounts independently validate the same concrete buying need.",
+      evidence_ids: ["artifact:1", "account-note:10", "artifact:2", "account-note:20"],
+    },
+  },
+};
 
 describe("OpportunitiesPage", () => {
   it("shows the Phase A boundary and a truthful empty state", async () => {
@@ -26,6 +61,21 @@ describe("OpportunitiesPage", () => {
     expect(await screen.findByText("暂时没有跨账号候选")).toBeVisible();
     expect(screen.getByText(/Phase B 尚未开始/)).toBeVisible();
     expect(screen.queryByRole("button", { name: /创建产品/ })).not.toBeInTheDocument();
+  });
+
+  it("shows why grounded accounts did not form a shared demand", async () => {
+    render(<OpportunitiesPage loadOpportunities={vi.fn().mockResolvedValue({
+      opportunities: [], accounts: [account("a"), account("b")],
+      evidence: [...evidence("a"), ...evidence("b")], analyses: [noSharedDemandAnalysis],
+    })} />);
+
+    expect(await screen.findByText("AI判断：不存在共同具体需求")).toBeVisible();
+    expect(screen.getByText(/主要售卖内容：Home organization templates/)).toBeVisible();
+    expect(screen.getByText(/主要售卖内容：Professional exam lessons/)).toBeVisible();
+    expect(screen.getByText("Both sell digital products")).toBeVisible();
+    expect(screen.getByText("Target users and problems are unrelated")).toBeVisible();
+    expect(screen.getByText("A shared delivery medium does not prove one specific market demand.")).toBeVisible();
+    expect(screen.getAllByText(/artifact:1/).length).toBeGreaterThan(0);
   });
 
   it("submits two complete accounts with their trusted shop and note evidence", async () => {
@@ -46,14 +96,24 @@ describe("OpportunitiesPage", () => {
 
   it("renders evidence ownership and performs one-way human review", async () => {
     const review = vi.fn().mockResolvedValue({ ...opportunity, review_status: "approved" });
-    const load = vi.fn().mockResolvedValue({ opportunities: [opportunity], accounts: [account("a"), account("b")], evidence: [...evidence("a"), ...evidence("b")] });
+    const load = vi.fn().mockResolvedValue({ opportunities: [opportunity], accounts: [account("a"), account("b")], evidence: [...evidence("a"), ...evidence("b")], analyses: [positiveSharedDemandAnalysis] });
     render(<OpportunitiesPage loadOpportunities={load} reviewOpportunity={review} />);
     expect(await screen.findByText("升温候选 · 2 个支撑账号")).toBeVisible();
-    expect(screen.getByText(/artifact:1/)).toBeVisible();
+    expect(screen.getAllByText(/artifact:1/).length).toBeGreaterThan(0);
     expect(screen.getByText("Product A")).toBeVisible();
     expect(screen.getByText("Note B")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "批准：Shared demand" }));
     await waitFor(() => expect(review).toHaveBeenCalledWith("opp-1", { decision: "approve" }));
+  });
+
+  it("does not offer approval for a legacy candidate without a positive shared-demand conclusion", async () => {
+    render(<OpportunitiesPage loadOpportunities={vi.fn().mockResolvedValue({
+      opportunities: [opportunity], accounts: [], evidence: [], analyses: [],
+    })} />);
+
+    expect(await screen.findByText("共同需求判断说明缺失")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "批准：Shared demand" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "拒绝：Shared demand" })).toBeVisible();
   });
 
   it("requires a rejection reason and blocks duplicate review requests", async () => {

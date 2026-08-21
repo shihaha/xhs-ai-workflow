@@ -2,6 +2,35 @@
 
 Status date: 2026-08-21
 
+## Specific-demand semantic gate and review explanation
+
+The real `37d7fca6…` output proved a missing business contract: it produced two
+different product clusters but promoted their shared marketing method into a
+single Opportunity. Cross-account analysis now requires a cited demand profile
+for each account and a cited conclusion stating the common demand,
+commonalities, key differences and rationale. Shared sales channels and broad
+needs such as saving money are insufficient. If no specific shared demand
+exists, the structured result must use `common_demand=null` and
+`opportunities=[]`; the service rejects a contradictory Opportunity while
+retaining all previous grounding checks.
+
+The opportunity page loads persisted Analysis records and explains what each
+account proves, the proposed common demand, similarities, differences,
+rationale and supporting evidence. Historical candidates without the new
+explanation are labelled as incomplete for approval rather than rewritten.
+
+The bounded independent review also closed two Important gaps: a cross-account
+conclusion must itself cite every requested account, and approval now requires
+a positive specific-demand conclusion. Legacy or negative candidates remain
+rejectable but cannot be approved, including through direct API use.
+
+The analysis backend regression is `178 passed, 1 skipped`; frontend tests are
+`63 passed`; the frontend build passes. Real analysis `3322dda1…` reused the
+same two accounts and 22 evidence IDs, succeeded with the v2 prompt, and
+persisted a negative shared-demand conclusion with zero Opportunities. Its
+trust fingerprint and restart readback match. The historical analysis and
+pending Opportunity remain unchanged. Phase B remains unstarted.
+
 ## Grounded two-account candidate live result
 
 The first real model response passed strict schema parsing but failed the

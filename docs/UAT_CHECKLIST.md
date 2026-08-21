@@ -21,7 +21,11 @@ operator, job IDs, evidence paths, package ID/hash, and any recovery action.
 - [x] Run one real two-account analysis with two trusted shop facts and twenty trusted latest-note facts. Analysis `28856ff2…` failed closed as `evidence_grounding_failed`; no automatic retry was run.
 - [x] Expose the existing account-coverage, evidence-ownership and support-citation contract to the model; observe RED before the prompt change and GREEN after it (`70/70` analysis regression).
 - [x] Obtain one strictly grounded real analysis result. Analysis `37d7fca6…` created exactly one two-account `warming_candidate + pending_review`, using two trusted shop facts and twenty trusted note facts with all support IDs cited.
-- [ ] Complete explicit human review of the candidate. It remains unreviewed; no product, content, ZIP or other Phase B action has started.
+- [x] Preserve the raw `37d7fca6…` model output and prove it used the shared marketing method “both promote shop products through notes” as the Opportunity rather than finding one shared concrete demand.
+- [x] Add a general specific-demand RED/GREEN contract without shop-specific text: per-account offering/user/motivation/delivery/scenario profiles; explicit commonality/difference/rationale; broad umbrella needs and sales channels are insufficient; no shared demand requires `opportunities=[]`.
+- [x] Require the final common-demand conclusion itself to cite every requested account; block approval in both backend and UI unless the parent analysis has a positive specific-demand conclusion. Legacy/negative candidates remain rejectable.
+- [x] Re-run the same two accounts and same 22 evidence IDs once. Analysis `3322dda1…` succeeded with `has_specific_shared_demand=false`, `common_demand=null`, and zero output/database Opportunities. Restart readback and the evidence trust fingerprint match.
+- [ ] Complete explicit human disposition of the historical candidate if desired. It remains unreviewed and unchanged; the corrected real analysis did not reproduce it. No product, content, ZIP or other Phase B action has started.
 - [ ] Close the separately recorded historical XML current-byte hash limitation before declaring the entire Phase A UAT fully passed.
 
 ## Prerequisites

@@ -2,6 +2,40 @@
 
 Date: 2026-08-20 (Asia/Shanghai)
 
+## 2026-08-21 specific-demand semantic result
+
+The persisted output of analysis `37d7fca6…` contained two separate product
+clusters (`尾单服装配饰` and `美食优惠券`) but created an Opportunity because both
+accounts promoted shop products through Xiaohongshu notes. The provider did not
+identify one shared concrete customer problem. The existing prompt, schema and
+service validated citation truth, evidence ownership and account coverage but
+had no specific-demand semantic contract.
+
+General RED tests used unrelated home-organization and professional-exam
+accounts. The GREEN contract requires one demand profile per account (offering,
+target user, motivation/problem, delivery format and use scenarios) and one
+cross-account conclusion (specific shared demand, commonalities, differences,
+rationale and evidence). Broad umbrella needs and shared channels/marketing
+methods are explicitly insufficient. A negative conclusion cannot carry an
+Opportunity. Existing evidence grounding was not relaxed.
+
+A bounded independent review found and closed two remaining Important gaps:
+the final conclusion must cite every requested account, and candidates whose
+parent analysis lacks a positive specific-demand conclusion cannot be approved
+through either the API or UI. They may still be rejected without rewriting
+history.
+
+Backend analysis regression is `178 passed, 1 skipped`; frontend regression is
+`63 passed`; the frontend build passes. One valid real provider call reused the
+same two accounts and same 22 evidence IDs. Analysis `3322dda1…` succeeded under
+`tutorial-demand-radar-specific-demand-v2`, concluded that low price was only a
+broad strategy across unrelated food-coupon and clothing-tailstock needs, and
+persisted `has_specific_shared_demand=false`, `common_demand=null`, and
+`opportunities=[]`. SQLite contains no Opportunity linked to the new analysis.
+Its trust fingerprint matches the historical analysis and restart readback is
+consistent. Analysis `37d7fca6…` and its `pending_review` Opportunity remain
+unchanged. Phase B was not started.
+
 ## 2026-08-21 grounded candidate result
 
 The failed analysis `28856ff2…` had passed provider-side strict schema parsing

@@ -51,6 +51,43 @@ class ProductCluster(_StrictModel):
     _validate_evidence_ids = field_validator("evidence_ids")(_canonical_evidence_ids)
 
 
+class AccountDemandProfile(_StrictModel):
+    account_user_id: str = Field(min_length=1, max_length=500)
+    primary_offering: str = Field(min_length=1, max_length=2000)
+    target_user: str = Field(min_length=1, max_length=2000)
+    core_purchase_motivation: str = Field(min_length=1, max_length=2000)
+    delivery_format: str = Field(min_length=1, max_length=2000)
+    usage_scenarios: list[str] = Field(min_length=1, max_length=20)
+    evidence_ids: list[EvidenceId] = Field(min_length=1)
+
+    _validate_evidence_ids = field_validator("evidence_ids")(_canonical_evidence_ids)
+
+
+class CrossAccountDemandConclusion(_StrictModel):
+    has_specific_shared_demand: bool
+    common_demand: str | None = Field(default=None, max_length=2000)
+    commonalities: list[str] = Field(max_length=20)
+    key_differences: list[str] = Field(max_length=20)
+    rationale: str = Field(min_length=1, max_length=4000)
+    evidence_ids: list[EvidenceId] = Field(min_length=1)
+
+    _validate_evidence_ids = field_validator("evidence_ids")(_canonical_evidence_ids)
+
+    @model_validator(mode="after")
+    def require_specific_demand_only_for_positive_conclusion(
+        self,
+    ) -> "CrossAccountDemandConclusion":
+        if self.has_specific_shared_demand:
+            if self.common_demand is None or not self.common_demand.strip():
+                raise ValueError("a positive conclusion requires a specific common demand")
+            if not self.commonalities:
+                raise ValueError("a positive conclusion requires concrete commonalities")
+            self.common_demand = self.common_demand.strip()
+        elif self.common_demand is not None:
+            raise ValueError("a negative conclusion must not claim a common demand")
+        return self
+
+
 class OpportunityAccountSupport(_StrictModel):
     account_user_id: str = Field(min_length=1, max_length=500)
     shop_evidence_ids: list[EvidenceId] = Field(min_length=1, max_length=100)
@@ -92,6 +129,8 @@ class OpportunityCard(_StrictModel):
 class AnalysisOutput(_StrictModel):
     claims: list[CitedClaim] = Field(min_length=1)
     product_clusters: list[ProductCluster]
+    account_demand_profiles: list[AccountDemandProfile] = Field(default_factory=list)
+    cross_account_conclusion: CrossAccountDemandConclusion | None = None
     opportunities: list[OpportunityCard]
 
 

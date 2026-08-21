@@ -124,7 +124,10 @@ export interface NoteSearchResults {
   job_id: string; keyword: string; expected_count: number; succeeded_count: number;
   artifact_id: number; collected_at: string; items: SearchNote[];
 }
-export interface Analysis { id: string; analysis_type: string; account_user_id: string | null; account_user_ids: string[]; status: "succeeded" | "failed" | "needs_human"; evidence_ids: string[]; output?: Record<string, unknown> | null; error_category?: string | null; error_detail?: string | null; provider?: string; model?: string; prompt_version?: string; created_at?: string; }
+export interface AccountDemandProfile { account_user_id: string; primary_offering: string; target_user: string; core_purchase_motivation: string; delivery_format: string; usage_scenarios: string[]; evidence_ids: string[]; }
+export interface CrossAccountDemandConclusion { has_specific_shared_demand: boolean; common_demand: string | null; commonalities: string[]; key_differences: string[]; rationale: string; evidence_ids: string[]; }
+export interface AnalysisOutput { account_demand_profiles?: AccountDemandProfile[]; cross_account_conclusion?: CrossAccountDemandConclusion | null; opportunities?: Array<Record<string, unknown>>; [key: string]: unknown; }
+export interface Analysis { id: string; analysis_type: string; account_user_id: string | null; account_user_ids: string[]; status: "succeeded" | "failed" | "needs_human"; evidence_ids: string[]; output?: AnalysisOutput | null; error_category?: string | null; error_detail?: string | null; provider?: string; model?: string; prompt_version?: string; created_at?: string; }
 export interface OpportunityAccountSupport { account_user_id: string; shop_evidence_ids: string[]; note_evidence_ids: string[]; }
 export interface SupportingProduct { account_user_id: string; evidence_id: string; product_id: string; title: string | null; source_url: string; image_evidence_count: number; }
 export interface SupportingNote { account_user_id: string; evidence_id: string; note_id: string; title: string | null; source_url: string; }

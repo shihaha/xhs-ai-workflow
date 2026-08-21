@@ -5,7 +5,17 @@ repository: shihaha/xhs-ai-workflow
 branch: feature/system-v1
 remote_url: https://github.com/shihaha/xhs-ai-workflow.git
 source_codex_thread: codex://threads/01a00ec6-75b8-72e3-9281-48c69ffe26fb
-last_updated: 2026-08-21 (Phase A grounded-candidate checkpoint)
+last_updated: 2026-08-21 (Phase A specific-demand correction checkpoint)
+
+## 2026-08-21 specific-demand semantic correction
+
+- SQLite preserved the exact output of analysis `37d7fca6…`: the model created separate `尾单服装配饰` and `美食优惠券` clusters, then formed `小红书店铺商品推广机会` only because both accounts promoted shop products through notes. This proved that a shared marketing method had been accepted as a shared market demand.
+- The root cause was contractual: the prompt/schema/service required trusted evidence, exact ownership and complete account coverage, but did not require per-account demand profiles or a sufficiently specific shared demand. General RED fixtures used unrelated home-organization and professional-exam accounts; they did not encode either real shop.
+- The minimal GREEN contract adds per-account offering/user/motivation/delivery/scenario profiles plus a cross-account conclusion containing the common demand, commonalities, differences, rationale and evidence. Broad umbrella needs and shared sales methods are explicitly insufficient. A negative conclusion requires `common_demand=null` and `opportunities=[]`; the service rejects an Opportunity attached to that conclusion. Existing evidence grounding remains unchanged.
+- A bounded independent review closed two Important gaps: the final conclusion must cite evidence from every requested account, and a historical or negative candidate without a positive specific-demand conclusion can be rejected but cannot be approved through either the API or UI.
+- Backend analysis regression is `178 passed, 1 skipped`; frontend regression is `63 passed`; the production frontend build passes. The opportunity page now exposes the persisted AI judgment process and marks historical candidates without that explanation as incomplete for approval.
+- One valid, non-retried real provider call reused the same two accounts and the same 22 evidence IDs. Analysis `3322dda1…` succeeded with prompt `tutorial-demand-radar-specific-demand-v2`, explicitly concluded that low price is a broad strategy rather than a shared concrete need, and persisted `opportunities=[]`. Its trust fingerprint matches `37d7fca6…`; restart readback returned the same result. The old analysis and its `pending_review` Opportunity remain unchanged.
+- Phase B remains unstarted. Phase A overall UAT is still open because the separately recorded historical Android XML current-byte hash limitation remains unresolved; the old malformed candidate has not been approved, rejected, deleted or rewritten.
 
 ## 2026-08-21 grounded two-account candidate
 

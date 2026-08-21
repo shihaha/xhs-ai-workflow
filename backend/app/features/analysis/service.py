@@ -65,7 +65,7 @@ from backend.app.features.xhs.staging_cleanup import sqlite_file_device_identity
 from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 
 
-PROMPT_VERSION = "tutorial-demand-radar-grounded-v1"
+PROMPT_VERSION = "tutorial-demand-radar-specific-demand-v2"
 MAX_TRUSTED_RESULT_BYTES = 5 * 1024 * 1024
 MAX_TRUSTED_ACCOUNT_RESULT_BYTES = 20 * 1024 * 1024
 MAX_TRUSTED_SAMPLE_INDEX_BYTES = 1024 * 1024
@@ -228,6 +228,12 @@ class AnalysisService:
         try:
             output = AnalysisOutput.model_validate(model_result.output)
             _validate_grounding(output, allowed=set(payload.evidence_ids))
+            if payload.analysis_type != "account_report":
+                _validate_cross_account_demand_contract(
+                    output,
+                    evidence=evidence,
+                    required_accounts=payload.account_scope,
+                )
             if payload.analysis_type == "account_report" and output.opportunities:
                 raise ValueError("Single-account reports cannot create opportunities.")
             if output.opportunities and not eligible:
@@ -397,6 +403,31 @@ class AnalysisService:
         review_status = "approved" if payload.decision == "approve" else "rejected"
         rejection_reason = payload.reason if payload.decision == "reject" else None
         with self.database.session() as session:
+            existing = session.get(OpportunityRecord, opportunity_id)
+            if existing is None:
+                raise OpportunityNotFound(
+                    f"Opportunity {opportunity_id} does not exist."
+                )
+            if existing.review_status != "pending_review":
+                raise OpportunityStateError(
+                    "Opportunity review is final and cannot be changed."
+                )
+            if payload.decision == "approve":
+                analysis = session.get(AnalysisRecord, existing.analysis_id)
+                try:
+                    conclusion = (
+                        AnalysisOutput.model_validate(analysis.output_json)
+                        .cross_account_conclusion
+                        if analysis is not None and analysis.output_json is not None
+                        else None
+                    )
+                except ValidationError:
+                    conclusion = None
+                if conclusion is None or not conclusion.has_specific_shared_demand:
+                    raise OpportunityStateError(
+                        "Opportunity cannot be approved without a positive "
+                        "specific-demand conclusion."
+                    )
             result = session.execute(
                 update(OpportunityRecord)
                 .where(
@@ -2076,10 +2107,50 @@ def _safe_model_attempts(value: object) -> list[dict[str, object]]:
 def _validate_grounding(output: AnalysisOutput, *, allowed: set[str]) -> None:
     citation_groups = [item.evidence_ids for item in output.claims]
     citation_groups += [item.evidence_ids for item in output.product_clusters]
+    citation_groups += [item.evidence_ids for item in output.account_demand_profiles]
+    if output.cross_account_conclusion is not None:
+        citation_groups.append(output.cross_account_conclusion.evidence_ids)
     citation_groups += [item.evidence_ids for item in output.opportunities]
     for citations in citation_groups:
         if not citations or not set(citations).issubset(allowed):
             raise ValueError("Every conclusion must cite only request evidence.")
+
+
+def _validate_cross_account_demand_contract(
+    output: AnalysisOutput,
+    *,
+    evidence: list[dict[str, Any]],
+    required_accounts: frozenset[str],
+) -> None:
+    profiles = output.account_demand_profiles
+    if {item.account_user_id for item in profiles} != set(required_accounts):
+        raise ValueError("Demand profiles must cover every requested account exactly once.")
+    if len(profiles) != len(required_accounts):
+        raise ValueError("Demand profiles must contain one profile per requested account.")
+    facts_by_id = {
+        fact.get("evidence_id"): fact
+        for fact in evidence
+        if isinstance(fact.get("evidence_id"), str)
+    }
+    for profile in profiles:
+        if any(
+            facts_by_id[evidence_id].get("account_user_id") != profile.account_user_id
+            for evidence_id in profile.evidence_ids
+        ):
+            raise ValueError("Each demand profile may cite only evidence owned by that account.")
+    conclusion = output.cross_account_conclusion
+    if conclusion is None:
+        raise ValueError("Cross-account analyses require a specific-demand conclusion.")
+    conclusion_accounts = {
+        facts_by_id[evidence_id].get("account_user_id")
+        for evidence_id in conclusion.evidence_ids
+    }
+    if conclusion_accounts != set(required_accounts):
+        raise ValueError(
+            "The cross-account conclusion must cite evidence from every requested account."
+        )
+    if not conclusion.has_specific_shared_demand and output.opportunities:
+        raise ValueError("No opportunity may be emitted without a specific shared demand.")
 
 
 def _digest(payload: AnalysisCreate, evidence: list[dict[str, Any]]) -> str:
@@ -2100,7 +2171,16 @@ def _system_prompt() -> str:
         "For each opportunity, supporting_accounts must cover every requested account exactly once. "
         "Each account's shop_evidence_ids and note_evidence_ids must belong to that account, and "
         "include every supporting evidence ID in the opportunity evidence_ids. Do not invent IDs "
-        "or emit an opportunity when these rules cannot be satisfied. "
+        "or emit an opportunity when these rules cannot be satisfied. For cross-account analysis, "
+        "first produce one account_demand_profile per requested account covering its primary "
+        "offering, target user, core purchase motivation or problem, delivery format and usage "
+        "scenarios. Then decide whether the accounts validate the same sufficiently specific, "
+        "actionable market demand. Product forms may differ only when the rationale clearly explains "
+        "how they solve that same concrete demand. Broad umbrella needs such as saving money, making "
+        "money, learning, efficiency or beauty, and shared marketing methods or sales channels, are "
+        "not sufficient by themselves. Record concrete commonalities, key differences and a rationale "
+        "in cross_account_conclusion. If no credible specific shared demand exists, set "
+        "has_specific_shared_demand=false, common_demand=null and opportunities=[]. "
         "Provide evidence and a next_action; do not make the operator's final business decision."
     )
 

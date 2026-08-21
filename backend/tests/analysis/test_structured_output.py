@@ -46,7 +46,11 @@ def test_adapter_validates_strict_structured_json() -> None:
 
     result = adapter.generate_structured(_request(), AnalysisOutput)
 
-    assert result.output == output
+    assert result.output == {
+        **output,
+        "account_demand_profiles": [],
+        "cross_account_conclusion": None,
+    }
     assert result.usage["total_tokens"] == 7
     assert "secret" not in json.dumps(result.raw_evidence)
 
