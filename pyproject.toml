@@ -25,6 +25,9 @@ dev = [
     "pytest>=8,<9",
 ]
 
+[tool.setuptools.packages.find]
+include = ["backend*"]
+
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]
 filterwarnings = [
