@@ -112,9 +112,13 @@ class KeywordPlanReplace(StrictModel):
         return items
 
 
+class GeneratedKeywordPlanOutput(KeywordPlanReplace):
+    """Exact model output contract for the tutorial keyword-layout step."""
+
+
 class KeywordPlanItemRead(StrictModel):
     id: str
-    dossier_id: str
+    run_id: str
     position: int
     keyword: str
     category: KeywordCategory
@@ -126,5 +130,13 @@ class KeywordPlanItemRead(StrictModel):
 
 class KeywordPlanRead(StrictModel):
     dossier_id: str
+    run_id: str | None
+    source: Literal["manual", "ai"] | None
+    provider: str | None
+    model: str | None
+    prompt_version: str | None
+    usage: dict[str, int]
+    duration_ms: int | None
+    created_at: datetime | None
     count: int
     items: list[KeywordPlanItemRead]
