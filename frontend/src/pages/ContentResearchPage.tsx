@@ -2,17 +2,23 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   createFinishedProductDossier,
+  fetchBenchmarkOverview,
   fetchFinishedProductDossiers,
   fetchKeywordPlan,
   generateKeywordPlan as postGenerateKeywordPlan,
+  startBenchmarkSearch as postStartBenchmarkSearch,
+  type BenchmarkOverview,
+  type BenchmarkSearch,
   type FinishedProductDossier,
   type FinishedProductDossierCreate,
   type KeywordPlan,
+  type KeywordPlanItem,
 } from "../api/contentResearch";
 
 type ResearchData = {
   dossiers: FinishedProductDossier[];
   keywordPlans: Record<string, KeywordPlan>;
+  benchmarkOverviews?: Record<string, BenchmarkOverview>;
 };
 
 type Draft = {
@@ -46,22 +52,34 @@ const EMPTY_DRAFT: Draft = {
 const defaultLoad = async (): Promise<ResearchData> => {
   const dossiers = await fetchFinishedProductDossiers();
   const keywordPlans: Record<string, KeywordPlan> = {};
+  const benchmarkOverviews: Record<string, BenchmarkOverview> = {};
   await Promise.all(dossiers.map(async dossier => {
-    keywordPlans[dossier.id] = await fetchKeywordPlan(dossier.id);
+    const [plan, benchmarks] = await Promise.all([
+      fetchKeywordPlan(dossier.id),
+      fetchBenchmarkOverview(dossier.id),
+    ]);
+    keywordPlans[dossier.id] = plan;
+    benchmarkOverviews[dossier.id] = benchmarks;
   }));
-  return { dossiers, keywordPlans };
+  return { dossiers, keywordPlans, benchmarkOverviews };
 };
 
 export interface ContentResearchPageProps {
   loadResearch?: () => Promise<ResearchData>;
   createDossier?: (payload: FinishedProductDossierCreate) => Promise<FinishedProductDossier>;
   generateKeywordPlan?: (dossierId: string) => Promise<KeywordPlan>;
+  startBenchmarkSearch?: (
+    dossierId: string,
+    keywordItemId: string,
+    stage: "probe" | "full",
+  ) => Promise<BenchmarkSearch>;
 }
 
 export function ContentResearchPage({
   loadResearch = defaultLoad,
   createDossier = createFinishedProductDossier,
   generateKeywordPlan = postGenerateKeywordPlan,
+  startBenchmarkSearch = postStartBenchmarkSearch,
 }: ContentResearchPageProps) {
   const [state, setState] = useState<
     | { kind: "loading" }
@@ -150,6 +168,7 @@ export function ContentResearchPage({
           <div className="record-stack">
             {state.data.dossiers.map(dossier => {
               const plan = state.data.keywordPlans[dossier.id];
+              const benchmarks = state.data.benchmarkOverviews?.[dossier.id];
               return (
                 <article className="studio-record" key={dossier.id}>
                   <header>
@@ -172,7 +191,16 @@ export function ContentResearchPage({
                       {plan?.count ? "重新生成关键词网络" : "AI 生成关键词网络"}
                     </button>
                   </div>
-                  <KeywordPlanView plan={plan} />
+                  <KeywordPlanView
+                    plan={plan}
+                    benchmarks={benchmarks}
+                    pending={pending}
+                    onStart={(keywordItemId, stage) => void runAction(async () => {
+                      const search = await startBenchmarkSearch(dossier.id, keywordItemId, stage);
+                      const label = stage === "probe" ? "测试采集" : "完整采集";
+                      return `${label}已进入任务队列：${search.keyword} · ${search.expected_count} 篇`;
+                    })}
+                  />
                 </article>
               );
             })}
@@ -202,7 +230,17 @@ export function ContentResearchPage({
   );
 }
 
-function KeywordPlanView({ plan }: { plan?: KeywordPlan }) {
+function KeywordPlanView({
+  plan,
+  benchmarks,
+  pending,
+  onStart,
+}: {
+  plan?: KeywordPlan;
+  benchmarks?: BenchmarkOverview;
+  pending: boolean;
+  onStart: (keywordItemId: string, stage: "probe" | "full") => void;
+}) {
   if (!plan?.run_id || plan.count === 0) {
     return <p className="field-help">还没有关键词网络。教程要求每个成品建立 10–20 个找对标用的关键词。</p>;
   }
@@ -212,10 +250,11 @@ function KeywordPlanView({ plan }: { plan?: KeywordPlan }) {
         最新 Run：{plan.source === "ai" ? "AI" : "人工"} · {plan.count} 个词
         {plan.model ? ` · ${plan.model}` : ""}
         {plan.prompt_version ? ` · ${plan.prompt_version}` : ""}
+        {benchmarks ? ` · 去重后完整对标 ${benchmarks.unique_full_note_count} 篇` : ""}
       </p>
       <div className="table-scroll">
         <table>
-          <thead><tr><th>顺序</th><th>关键词</th><th>类型</th><th>扩展</th><th>目标笔记</th></tr></thead>
+          <thead><tr><th>顺序</th><th>关键词</th><th>类型</th><th>扩展</th><th>目标</th><th>对标采集</th></tr></thead>
           <tbody>
             {plan.items.map(item => (
               <tr key={item.id}>
@@ -224,6 +263,7 @@ function KeywordPlanView({ plan }: { plan?: KeywordPlan }) {
                 <td>{item.category}</td>
                 <td>{item.expand ? "是" : "否"}</td>
                 <td>{item.target_count}</td>
+                <td><BenchmarkAction item={item} overview={benchmarks} pending={pending} onStart={onStart} /></td>
               </tr>
             ))}
           </tbody>
@@ -231,6 +271,65 @@ function KeywordPlanView({ plan }: { plan?: KeywordPlan }) {
       </div>
     </section>
   );
+}
+
+function BenchmarkAction({
+  item,
+  overview,
+  pending,
+  onStart,
+}: {
+  item: KeywordPlanItem;
+  overview?: BenchmarkOverview;
+  pending: boolean;
+  onStart: (keywordItemId: string, stage: "probe" | "full") => void;
+}) {
+  const probe = latestSearch(overview, item.id, "probe");
+  const full = latestSearch(overview, item.id, "full");
+
+  if (full?.result_status === "trusted") {
+    return <span className="state state--succeeded">已完成 {full.succeeded_count}/{full.expected_count}</span>;
+  }
+  if (full) {
+    if (full.job_state === "failed" || full.job_state === "cancelled") {
+      return <button disabled={pending} type="button" onClick={() => onStart(item.id, "full")}>重试完整采集</button>;
+    }
+    if (full.job_state === "needs_human") {
+      return <span className="state state--needs_human">完整采集需人工处理</span>;
+    }
+    if (full.job_state === "succeeded" && full.result_status === "untrusted") {
+      return <span className="state state--failed">完整采集证据不可信</span>;
+    }
+    return <span className={`state state--${full.job_state}`}>完整采集 {full.progress_current}/{full.expected_count}</span>;
+  }
+
+  if (probe?.result_status === "trusted") {
+    return <button disabled={pending} type="button" onClick={() => onStart(item.id, "full")}>采集 {item.target_count} 篇</button>;
+  }
+  if (probe) {
+    if (probe.job_state === "failed" || probe.job_state === "cancelled") {
+      return <button disabled={pending} type="button" onClick={() => onStart(item.id, "probe")}>重试测试采集</button>;
+    }
+    if (probe.job_state === "needs_human") {
+      return <span className="state state--needs_human">测试采集需人工处理</span>;
+    }
+    if (probe.job_state === "succeeded" && probe.result_status === "untrusted") {
+      return <span className="state state--failed">测试证据不可信</span>;
+    }
+    return <span className={`state state--${probe.job_state}`}>测试采集 {probe.progress_current}/2</span>;
+  }
+
+  return <button disabled={pending} type="button" onClick={() => onStart(item.id, "probe")}>测试采集 2 篇</button>;
+}
+
+function latestSearch(
+  overview: BenchmarkOverview | undefined,
+  keywordItemId: string,
+  stage: "probe" | "full",
+): BenchmarkSearch | undefined {
+  return overview?.searches
+    .filter(search => search.keyword_item_id === keywordItemId && search.stage === stage)
+    .sort((a, b) => b.attempt - a.attempt)[0];
 }
 
 function lines(value: string): string[] {
