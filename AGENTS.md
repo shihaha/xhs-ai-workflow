@@ -44,3 +44,13 @@ Priority when facts conflict:
 `current handoff / current code / current UAT` > `tutorial text` > `shared reference implementation`.
 
 Preserve historical evidence and fail closed when current evidence/trust requirements are not met.
+
+## Research branch: `research/xhs-workbench-next`
+
+When working on the next-generation workbench research branch, also read `docs/WORKBENCH_RESEARCH_INDEX.md` before architecture selection or implementation.
+
+This branch is for durable project understanding, external architecture research, open-source evaluation, and ADRs. Do not change current Phase A business behavior as part of research.
+
+Material findings that would otherwise need to be rediscovered in a future chat/session must be written into the research documents and committed. Distinguish verified repository facts, unresolved inferences, design proposals, and accepted decisions.
+
+Recovered or reconstructed proprietary source may be studied conceptually, but must not be copied or vendored into the product without a valid license and explicit legal basis.
