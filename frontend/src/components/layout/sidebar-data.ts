@@ -22,7 +22,8 @@ export const workbenchNavGroups: WorkbenchNavGroup[] = [
   {
     title: "内容系统",
     items: [
-      { label: "内容工作台", href: "/content", active: pathname => pathname === "/content" },
+      { label: "成品资料", href: "/content/research", active: pathname => pathname === "/content/research" },
+      { label: "内容生产", href: "/content", active: pathname => pathname === "/content" },
     ],
   },
   {
