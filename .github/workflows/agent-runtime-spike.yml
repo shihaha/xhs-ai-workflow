@@ -102,3 +102,58 @@ jobs:
         run: npm test -- --run
       - name: Build spike frontend
         run: npm run build
+
+  spike-static:
+    name: Spike compile and boundary checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile Python sources
+        run: python -m compileall -q backend tools frontend/e2e/fixture_app.py
+      - name: Scan release boundaries
+        run: python tools/scan_release_boundaries.py --root .
+      - name: Scan tracked files for secret-shaped values
+        shell: bash
+        run: |
+          if git grep -n -I -E '(sk-[A-Za-z0-9_-]{20,}|Bearer[[:space:]]+[A-Za-z0-9_-]{30,})' -- .; then
+            echo 'Potential secret-shaped value found in a tracked file.' >&2
+            exit 1
+          fi
+
+  spike-controlled-e2e:
+    name: Spike controlled fresh-runtime E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install Python dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Run controlled Playwright E2E
+        working-directory: frontend
+        run: npm run test:e2e
