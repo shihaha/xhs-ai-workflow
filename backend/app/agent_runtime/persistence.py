@@ -7,17 +7,21 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, select
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from backend.app.agent_runtime.types import AgentRunState, ModelTurn, RunBudget, RunUsage
-from backend.app.db import Base, Database
+from backend.app.db import Database
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-class AgentRunRecord(Base):
+class AgentRuntimeBase(DeclarativeBase):
+    """Separate metadata keeps spike tables out of the production schema registry."""
+
+
+class AgentRunRecord(AgentRuntimeBase):
     __tablename__ = "agent_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -38,7 +42,7 @@ class AgentRunRecord(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-class AgentStepRecord(Base):
+class AgentStepRecord(AgentRuntimeBase):
     __tablename__ = "agent_steps"
     __table_args__ = (UniqueConstraint("run_id", "step_index", name="uq_agent_step_index"),)
 
@@ -58,7 +62,7 @@ class AgentStepRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
-class PermissionDecisionRecord(Base):
+class PermissionDecisionRecord(AgentRuntimeBase):
     __tablename__ = "permission_decisions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -70,7 +74,7 @@ class PermissionDecisionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
-class HumanActionRecord(Base):
+class HumanActionRecord(AgentRuntimeBase):
     __tablename__ = "human_actions"
     __table_args__ = (UniqueConstraint("run_id", "tool_call_id", name="uq_human_action_call"),)
 
@@ -85,7 +89,7 @@ class HumanActionRecord(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-class AgentCheckpointRecord(Base):
+class AgentCheckpointRecord(AgentRuntimeBase):
     __tablename__ = "agent_checkpoints"
     __table_args__ = (UniqueConstraint("run_id", "step_index", name="uq_agent_checkpoint_step"),)
 
@@ -284,7 +288,16 @@ class AgentRunStore:
                 session.expunge(record)
             return record
 
-    def resolve_human_action(self, action_id: str, *, approved: bool, note: str | None = None) -> HumanActionRecord:
+    def resolve_human_action(
+        self,
+        action_id: str,
+        *,
+        approved: bool,
+        note: str | None = None,
+        resume_run: bool = False,
+    ) -> HumanActionRecord:
+        """Resolve approval and optionally reopen the run in one SQLite transaction."""
+
         with self.database.sessions.begin() as session:
             record = session.get(HumanActionRecord, action_id)
             if record is None:
@@ -294,6 +307,19 @@ class AgentRunStore:
             record.status = "approved" if approved else "denied"
             record.resolution_json = {"approved": approved, "note": note}
             record.resolved_at = _utcnow()
+            if resume_run:
+                if not approved:
+                    raise ValueError("cannot resume a denied human action")
+                run = session.get(AgentRunRecord, record.run_id)
+                if run is None:
+                    raise KeyError(f"agent run not found: {record.run_id}")
+                if run.state != AgentRunState.needs_human.value:
+                    raise ValueError("human action run is not waiting for approval")
+                run.state = AgentRunState.running.value
+                run.error_category = None
+                run.error_detail = None
+                run.updated_at = _utcnow()
+                run.completed_at = None
             session.flush()
             session.expunge(record)
             return record
