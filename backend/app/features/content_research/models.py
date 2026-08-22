@@ -149,7 +149,9 @@ class BenchmarkSearchRecord(Base):
     attempt: Mapped[int] = mapped_column(Integer, nullable=False)
     keyword: Mapped[str] = mapped_column(String(500), nullable=False)
     expected_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    xhs_job_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    xhs_job_id: Mapped[str] = mapped_column(
+        ForeignKey("jobs.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(nullable=False)
 
     dossier: Mapped[FinishedProductDossierRecord] = relationship(back_populates="benchmark_searches")
