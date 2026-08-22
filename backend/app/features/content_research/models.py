@@ -90,7 +90,7 @@ class KeywordPlanRecord(Base):
         UniqueConstraint("run_id", "keyword", name="uq_content_keyword_per_run"),
         UniqueConstraint("run_id", "position", name="uq_content_keyword_position"),
         CheckConstraint("position >= 1 AND position <= 20", name="ck_content_keyword_position"),
-        CheckConstraint("target_count >= 1 AND target_count <= 50", name="ck_content_keyword_target_count"),
+        CheckConstraint("target_count >= 5 AND target_count <= 10", name="ck_content_keyword_target_count"),
         CheckConstraint(
             "category IN ('main','positioning','visual','audience','pain','scenario','selling_point','question','comparison')",
             name="ck_content_keyword_category",
