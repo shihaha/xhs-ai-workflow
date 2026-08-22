@@ -10,6 +10,8 @@ from backend.app.features.content_research.schemas import (
 )
 from backend.app.features.content_research.service import (
     ContentResearchConflict,
+    ContentResearchModelFailure,
+    ContentResearchModelUnavailable,
     ContentResearchNotFound,
     ContentResearchService,
 )
@@ -30,6 +32,10 @@ def _translate(error: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(error))
     if isinstance(error, ContentResearchConflict):
         return HTTPException(status_code=409, detail=str(error))
+    if isinstance(error, ContentResearchModelUnavailable):
+        return HTTPException(status_code=503, detail=str(error))
+    if isinstance(error, ContentResearchModelFailure):
+        return HTTPException(status_code=502, detail=str(error))
     return HTTPException(status_code=422, detail=str(error))
 
 
@@ -70,9 +76,30 @@ def replace_keyword_plan(
         raise _translate(error) from error
 
 
+@router.post("/dossiers/{dossier_id}/keywords/generate", response_model=KeywordPlanRead)
+def generate_keyword_plan(dossier_id: str, request: Request) -> KeywordPlanRead:
+    try:
+        return _service(request).generate_keyword_plan(dossier_id)
+    except (
+        ContentResearchConflict,
+        ContentResearchNotFound,
+        ContentResearchModelUnavailable,
+        ContentResearchModelFailure,
+    ) as error:
+        raise _translate(error) from error
+
+
 @router.get("/dossiers/{dossier_id}/keywords", response_model=KeywordPlanRead)
 def get_keyword_plan(dossier_id: str, request: Request) -> KeywordPlanRead:
     try:
         return _service(request).get_keyword_plan(dossier_id)
+    except ContentResearchNotFound as error:
+        raise _translate(error) from error
+
+
+@router.get("/dossiers/{dossier_id}/keyword-runs", response_model=list[KeywordPlanRead])
+def list_keyword_plan_runs(dossier_id: str, request: Request) -> list[KeywordPlanRead]:
+    try:
+        return _service(request).list_keyword_plan_runs(dossier_id)
     except ContentResearchNotFound as error:
         raise _translate(error) from error
