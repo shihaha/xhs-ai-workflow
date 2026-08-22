@@ -11,7 +11,8 @@ describe("workbench shell", () => {
     expect(screen.getByRole("navigation", { name: "工作台导航" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "雷达总览" })).toHaveAttribute("href", "/radar");
     expect(screen.getByRole("link", { name: "机会审核" })).toHaveAttribute("href", "/opportunities");
-    expect(screen.getByRole("link", { name: "内容工作台" })).toHaveAttribute("href", "/content");
+    expect(screen.getByRole("link", { name: "成品资料" })).toHaveAttribute("href", "/content/research");
+    expect(screen.getByRole("link", { name: "内容生产" })).toHaveAttribute("href", "/content");
     expect(screen.getByRole("link", { name: "任务记录" })).toHaveAttribute("href", "/jobs");
     expect(screen.getByRole("link", { name: "系统状态" })).toHaveAttribute("aria-current", "page");
   });
