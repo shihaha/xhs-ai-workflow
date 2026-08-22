@@ -1,12 +1,13 @@
 name: verify
 
 on:
-  push:
-    branches:
-      - feature/workbench-ui-v2
   pull_request:
     branches:
       - feature/system-v1
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   software-verification:
