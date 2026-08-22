@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { WorkbenchShell } from "./components/layout/WorkbenchShell";
 import { JobsPage } from "./pages/JobsPage";
 import { AccountPage } from "./pages/AccountPage";
+import { ContentResearchPage } from "./pages/ContentResearchPage";
 import { ContentStudioPage } from "./pages/ContentStudioPage";
 import { OpportunitiesPage } from "./pages/OpportunitiesPage";
 import { RadarPage } from "./pages/RadarPage";
@@ -19,13 +20,15 @@ export function App({ pathname = window.location.pathname }: { pathname?: string
       ? <AccountPage accountId={decodeURIComponent(accountMatch[1])} />
       : pathname === "/opportunities"
         ? <OpportunitiesPage />
-        : pathname === "/content"
-          ? <ContentStudioPage />
-          : pathname === "/status"
-            ? <SystemStatusPage />
-            : pathname === "/jobs"
-              ? <JobsPage />
-              : <NotFoundPage />;
+        : pathname === "/content/research"
+          ? <ContentResearchPage />
+          : pathname === "/content"
+            ? <ContentStudioPage />
+            : pathname === "/status"
+              ? <SystemStatusPage />
+              : pathname === "/jobs"
+                ? <JobsPage />
+                : <NotFoundPage />;
 
   return <WorkbenchShell pathname={pathname}>{page}</WorkbenchShell>;
 }
