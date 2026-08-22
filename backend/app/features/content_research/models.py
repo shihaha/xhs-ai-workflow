@@ -43,6 +43,11 @@ class FinishedProductDossierRecord(Base):
         cascade="all, delete-orphan",
         order_by="KeywordPlanRunRecord.created_at",
     )
+    benchmark_searches: Mapped[list["BenchmarkSearchRecord"]] = relationship(
+        back_populates="dossier",
+        cascade="all, delete-orphan",
+        order_by="BenchmarkSearchRecord.created_at",
+    )
 
 
 class KeywordPlanRunRecord(Base):
@@ -107,3 +112,44 @@ class KeywordPlanRecord(Base):
     created_at: Mapped[datetime] = mapped_column(nullable=False)
 
     run: Mapped[KeywordPlanRunRecord] = relationship(back_populates="items")
+
+
+class BenchmarkSearchRecord(Base):
+    """Bind one tutorial benchmark-search attempt to one real XHS search job."""
+
+    __tablename__ = "content_benchmark_searches"
+    __table_args__ = (
+        UniqueConstraint("xhs_job_id", name="uq_content_benchmark_xhs_job"),
+        UniqueConstraint(
+            "keyword_item_id", "stage", "attempt",
+            name="uq_content_benchmark_keyword_stage_attempt",
+        ),
+        CheckConstraint("stage IN ('probe','full')", name="ck_content_benchmark_stage"),
+        CheckConstraint("attempt >= 1", name="ck_content_benchmark_attempt"),
+        CheckConstraint("expected_count >= 1 AND expected_count <= 50", name="ck_content_benchmark_expected_count"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    dossier_id: Mapped[str] = mapped_column(
+        ForeignKey("content_product_dossiers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    keyword_run_id: Mapped[str] = mapped_column(
+        ForeignKey("content_keyword_plan_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    keyword_item_id: Mapped[str] = mapped_column(
+        ForeignKey("content_keyword_plan_items.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    stage: Mapped[str] = mapped_column(String(20), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    keyword: Mapped[str] = mapped_column(String(500), nullable=False)
+    expected_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    xhs_job_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    dossier: Mapped[FinishedProductDossierRecord] = relationship(back_populates="benchmark_searches")
