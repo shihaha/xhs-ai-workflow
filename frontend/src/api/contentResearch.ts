@@ -28,7 +28,7 @@ export type KeywordCategory =
 
 export interface KeywordPlanItem {
   id: string;
-  dossier_id: string;
+  run_id: string;
   position: number;
   keyword: string;
   category: KeywordCategory;
@@ -40,6 +40,14 @@ export interface KeywordPlanItem {
 
 export interface KeywordPlan {
   dossier_id: string;
+  run_id: string | null;
+  source: "manual" | "ai" | null;
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  usage: Record<string, number>;
+  duration_ms: number | null;
+  created_at: string | null;
   count: number;
   items: KeywordPlanItem[];
 }
@@ -100,4 +108,15 @@ export const createFinishedProductDossier = (payload: FinishedProductDossierCrea
 export const fetchKeywordPlan = (dossierId: string) =>
   requestJson<KeywordPlan>(
     `/api/v1/content-research/dossiers/${encodeURIComponent(dossierId)}/keywords`,
+  );
+
+export const generateKeywordPlan = (dossierId: string) =>
+  requestJson<KeywordPlan>(
+    `/api/v1/content-research/dossiers/${encodeURIComponent(dossierId)}/keywords/generate`,
+    { method: "POST" },
+  );
+
+export const fetchKeywordPlanRuns = (dossierId: string) =>
+  requestJson<KeywordPlan[]>(
+    `/api/v1/content-research/dossiers/${encodeURIComponent(dossierId)}/keyword-runs`,
   );
