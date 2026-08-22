@@ -6,12 +6,20 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.app.agent_runtime.context import DefaultContextBuilder
+from backend.app.agent_runtime.events import (
+    EventSink,
+    NullEventSink,
+    RuntimeEvent,
+    RuntimeEventType,
+    SafeEventSink,
+)
 from backend.app.agent_runtime.model import ModelDriver
 from backend.app.agent_runtime.permissions import PermissionPolicy, PermissionRequest
 from backend.app.agent_runtime.persistence import AgentRunRecord, AgentRunStore
 from backend.app.agent_runtime.tools import (
     ToolInputError,
     ToolRegistry,
+    ToolTimeoutError,
     ToolUnavailableError,
 )
 from backend.app.agent_runtime.types import (
@@ -39,6 +47,7 @@ class AgentRuntime:
         context_builder: DefaultContextBuilder | None = None,
         budget: RunBudget | None = None,
         prompt_version: str = "agent-runtime-spike-v1",
+        event_sink: EventSink | None = None,
     ) -> None:
         self.store = store
         self.model = model
@@ -47,12 +56,18 @@ class AgentRuntime:
         self.context_builder = context_builder or DefaultContextBuilder()
         self.budget = budget or RunBudget()
         self.prompt_version = prompt_version
+        self.events = SafeEventSink(event_sink or NullEventSink())
 
     def start(self, goal: str) -> RuntimeOutcome:
         run = self.store.create_run(
             goal=goal,
             budget=self.budget,
             prompt_version=self.prompt_version,
+        )
+        self._emit(
+            RuntimeEventType.run_started,
+            run.id,
+            payload={"prompt_version": self.prompt_version},
         )
         return self._drive(run.id)
 
@@ -80,7 +95,21 @@ class AgentRuntime:
             action = NextAction.model_validate(human.request_json["action"])
             assert action.tool_name is not None
             tool = self.tools.resolve(action.tool_name)
+            self._emit(
+                RuntimeEventType.before_tool_validate,
+                run_id,
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                payload={"resume": True},
+            )
             validated = self.tools.validate(tool, action.arguments)
+            self._emit(
+                RuntimeEventType.after_tool_validate,
+                run_id,
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                payload={"resume": True, "valid": True},
+            )
         except (KeyError, AssertionError, ToolUnavailableError, ToolInputError, ValueError) as exc:
             return self._fail(run_id, "resume_validation_failed", str(exc))
 
@@ -90,7 +119,18 @@ class AgentRuntime:
         return self._drive(run_id)
 
     def recover_interrupted(self, run_id: str) -> RuntimeOutcome:
-        self.store.recover_interrupted(run_id)
+        before = self.store.get_run(run_id)
+        recovered = self.store.recover_interrupted(run_id)
+        if before.state == AgentRunState.running.value and recovered.state == AgentRunState.needs_human.value:
+            self._emit(
+                RuntimeEventType.run_error,
+                run_id,
+                payload={
+                    "category": recovered.error_category,
+                    "detail": recovered.error_detail,
+                    "recoverable": True,
+                },
+            )
         return self._outcome(run_id)
 
     def _drive(self, run_id: str) -> RuntimeOutcome:
@@ -123,19 +163,37 @@ class AgentRuntime:
                 },
             )
 
+            self._emit(
+                RuntimeEventType.before_model,
+                run_id,
+                payload={"model_call_index": run.model_calls + 1},
+            )
             try:
                 turn = self.model.next_action(context)
             except Exception as exc:
                 return self._fail(run_id, "model_error", f"{type(exc).__name__}: {exc}")
 
             self.store.add_model_usage(run_id, turn)
-            self.store.append_step(
+            model_step = self.store.append_step(
                 run_id,
                 kind=AgentStepKind.model.value,
                 status="succeeded",
                 tool_name=turn.action.tool_name,
                 tool_call_id=turn.action.tool_call_id,
                 output_json={"action": turn.action.model_dump(mode="json")},
+            )
+            self._emit(
+                RuntimeEventType.after_model,
+                run_id,
+                step_index=model_step.step_index,
+                tool_name=turn.action.tool_name,
+                tool_call_id=turn.action.tool_call_id,
+                payload={
+                    "action": turn.action.action,
+                    "input_tokens": turn.input_tokens,
+                    "output_tokens": turn.output_tokens,
+                    "model_name": turn.model_name,
+                },
             )
 
             run = self.store.get_run(run_id)
@@ -146,7 +204,7 @@ class AgentRuntime:
             action = turn.action
             if action.action == "finish":
                 assert action.final_output is not None
-                self.store.append_step(
+                output_step = self.store.append_step(
                     run_id,
                     kind=AgentStepKind.output.value,
                     status="succeeded",
@@ -157,13 +215,32 @@ class AgentRuntime:
                     AgentRunState.succeeded,
                     final_output=action.final_output,
                 )
-                self.store.checkpoint(
+                checkpoint = self.store.checkpoint(
                     run_id,
                     state_json={"state": AgentRunState.succeeded.value, "final_output": action.final_output},
                 )
-                return self._outcome(run_id)
+                self._emit(
+                    RuntimeEventType.checkpoint_committed,
+                    run_id,
+                    step_index=checkpoint.step_index,
+                    payload={"state": AgentRunState.succeeded.value},
+                )
+                outcome = self._outcome(run_id)
+                self._emit(
+                    RuntimeEventType.run_finished,
+                    run_id,
+                    step_index=output_step.step_index,
+                    payload={"state": outcome.state.value},
+                )
+                return outcome
 
             assert action.tool_name is not None
+            self._emit(
+                RuntimeEventType.before_tool_validate,
+                run_id,
+                tool_name=action.tool_name,
+                tool_call_id=action.tool_call_id,
+            )
             try:
                 tool = self.tools.resolve(action.tool_name)
                 validated = self.tools.validate(tool, action.arguments)
@@ -171,6 +248,13 @@ class AgentRuntime:
                 return self._fail(run_id, "tool_unavailable", str(exc))
             except ToolInputError as exc:
                 return self._fail(run_id, "tool_input_invalid", str(exc))
+            self._emit(
+                RuntimeEventType.after_tool_validate,
+                run_id,
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                payload={"valid": True},
+            )
 
             permission = self.permissions.decide(
                 PermissionRequest(
@@ -187,7 +271,7 @@ class AgentRuntime:
                 decision=permission.decision.value,
                 reason=permission.reason,
             )
-            self.store.append_step(
+            permission_step = self.store.append_step(
                 run_id,
                 kind=AgentStepKind.permission.value,
                 status=permission.decision.value,
@@ -195,6 +279,14 @@ class AgentRuntime:
                 tool_call_id=action.tool_call_id,
                 input_json={"arguments": validated.model_dump(mode="json")},
                 output_json={"decision": permission.decision.value, "reason": permission.reason},
+            )
+            self._emit(
+                RuntimeEventType.permission_decision,
+                run_id,
+                step_index=permission_step.step_index,
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                payload={"decision": permission.decision.value, "reason": permission.reason},
             )
 
             if permission.decision == PermissionDecision.deny:
@@ -212,13 +304,29 @@ class AgentRuntime:
                     error_category="approval_required",
                     error_detail=permission.reason,
                 )
-                self.store.checkpoint(
+                checkpoint = self.store.checkpoint(
                     run_id,
                     state_json={
                         "state": AgentRunState.needs_human.value,
                         "human_action_id": human.id,
                         "tool_call_id": action.tool_call_id,
                     },
+                )
+                self._emit(
+                    RuntimeEventType.checkpoint_committed,
+                    run_id,
+                    step_index=checkpoint.step_index,
+                    tool_name=tool.name,
+                    tool_call_id=action.tool_call_id,
+                    payload={"state": AgentRunState.needs_human.value},
+                )
+                self._emit(
+                    RuntimeEventType.human_action_required,
+                    run_id,
+                    step_index=permission_step.step_index,
+                    tool_name=tool.name,
+                    tool_call_id=action.tool_call_id,
+                    payload={"human_action_id": human.id, "reason": permission.reason},
                 )
                 return self._outcome(run_id, human_action_id=human.id)
 
@@ -245,10 +353,45 @@ class AgentRuntime:
             status="started",
             tool_name=tool.name,
             tool_call_id=action.tool_call_id,
-            input_json={"arguments": validated_json, "idempotent": tool.idempotent},
+            input_json={
+                "arguments": validated_json,
+                "idempotent": tool.idempotent,
+                "timeout_seconds": tool.timeout_seconds,
+            },
+        )
+        self._emit(
+            RuntimeEventType.before_tool,
+            run_id,
+            step_index=step.step_index,
+            tool_name=tool.name,
+            tool_call_id=action.tool_call_id,
+            payload={"timeout_seconds": tool.timeout_seconds},
         )
         try:
-            result = self.tools.execute_validated(tool, validated)
+            result = self.tools.execute_validated(
+                tool,
+                validated,
+                run_id=run_id,
+                tool_call_id=action.tool_call_id,
+            )
+            persisted = result.model_dump(mode="json")
+        except ToolTimeoutError as exc:
+            detail = str(exc)
+            self.store.update_step(
+                step.id,
+                status="failed",
+                error_category="tool_timeout",
+                error_detail=detail,
+            )
+            self._emit(
+                RuntimeEventType.after_tool,
+                run_id,
+                step_index=step.step_index,
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                payload={"status": "failed", "error_category": "tool_timeout"},
+            )
+            return self._fail(run_id, "tool_timeout", detail)
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
             self.store.update_step(
@@ -257,22 +400,45 @@ class AgentRuntime:
                 error_category="tool_execution_failed",
                 error_detail=detail,
             )
+            self._emit(
+                RuntimeEventType.after_tool,
+                run_id,
+                step_index=step.step_index,
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                payload={"status": "failed", "error_category": "tool_execution_failed"},
+            )
             return self._fail(run_id, "tool_execution_failed", detail)
 
-        persisted = result.model_dump(mode="json")
         self.store.update_step(
             step.id,
             status="succeeded",
             output_json=persisted,
             evidence_refs=result.evidence_refs,
         )
-        self.store.checkpoint(
+        self._emit(
+            RuntimeEventType.after_tool,
+            run_id,
+            step_index=step.step_index,
+            tool_name=tool.name,
+            tool_call_id=action.tool_call_id,
+            payload={"status": "succeeded", "evidence_refs": result.evidence_refs},
+        )
+        checkpoint = self.store.checkpoint(
             run_id,
             state_json={
                 "state": AgentRunState.running.value,
                 "last_committed_tool_call_id": action.tool_call_id,
                 "last_committed_tool": tool.name,
             },
+        )
+        self._emit(
+            RuntimeEventType.checkpoint_committed,
+            run_id,
+            step_index=checkpoint.step_index,
+            tool_name=tool.name,
+            tool_call_id=action.tool_call_id,
+            payload={"state": AgentRunState.running.value},
         )
         return None
 
@@ -293,7 +459,7 @@ class AgentRuntime:
         return None
 
     def _fail(self, run_id: str, category: str, detail: str) -> RuntimeOutcome:
-        self.store.append_step(
+        error_step = self.store.append_step(
             run_id,
             kind=AgentStepKind.error.value,
             status="failed",
@@ -306,7 +472,20 @@ class AgentRuntime:
             error_category=category,
             error_detail=detail,
         )
-        return self._outcome(run_id)
+        outcome = self._outcome(run_id)
+        self._emit(
+            RuntimeEventType.run_error,
+            run_id,
+            step_index=error_step.step_index,
+            payload={"category": category, "detail": detail, "recoverable": False},
+        )
+        self._emit(
+            RuntimeEventType.run_finished,
+            run_id,
+            step_index=error_step.step_index,
+            payload={"state": outcome.state.value},
+        )
+        return outcome
 
     def _outcome(self, run_id: str, *, human_action_id: str | None = None) -> RuntimeOutcome:
         run = self.store.get_run(run_id)
@@ -318,4 +497,25 @@ class AgentRuntime:
             error_category=run.error_category,
             error_detail=run.error_detail,
             usage=self.store.usage(run_id),
+        )
+
+    def _emit(
+        self,
+        event_type: RuntimeEventType,
+        run_id: str,
+        *,
+        step_index: int | None = None,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.events.emit(
+            RuntimeEvent(
+                event_type=event_type,
+                run_id=run_id,
+                step_index=step_index,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                payload=payload or {},
+            )
         )
