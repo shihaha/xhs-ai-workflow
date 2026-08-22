@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class AgentRunState(str, Enum):
@@ -38,6 +38,8 @@ class PermissionDecision(str, Enum):
 
 class NextAction(BaseModel):
     """One bounded model decision; never hidden chain-of-thought."""
+
+    model_config = ConfigDict(extra="forbid")
 
     action: Literal["tool", "finish"]
     tool_name: str | None = None
