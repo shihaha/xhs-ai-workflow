@@ -1,0 +1,42 @@
+name: Agent Runtime Spike Verification
+
+on:
+  push:
+    branches:
+      - spike/agent-runtime-pydantic-v1
+  workflow_dispatch:
+
+jobs:
+  baseline:
+    name: Existing baseline backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/xhs-workbench-next
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install baseline
+        run: python -m pip install -e '.[dev]'
+      - name: Run baseline backend tests
+        run: python -m pytest -q
+
+  spike:
+    name: Spike backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install spike
+        run: python -m pip install -e '.[dev]'
+      - name: Run agent runtime tests
+        run: python -m pytest backend/tests/agent_runtime -q
+      - name: Run full backend tests
+        run: python -m pytest -q
