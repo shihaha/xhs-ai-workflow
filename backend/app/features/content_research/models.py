@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
@@ -37,18 +38,52 @@ class FinishedProductDossierRecord(Base):
     uat_status: Mapped[str] = mapped_column(String(20), nullable=False)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
 
-    keywords: Mapped[list["KeywordPlanRecord"]] = relationship(
+    keyword_runs: Mapped[list["KeywordPlanRunRecord"]] = relationship(
         back_populates="dossier",
+        cascade="all, delete-orphan",
+        order_by="KeywordPlanRunRecord.created_at",
+    )
+
+
+class KeywordPlanRunRecord(Base):
+    __tablename__ = "content_keyword_plan_runs"
+    __table_args__ = (
+        CheckConstraint("source IN ('manual','ai')", name="ck_content_keyword_run_source"),
+        CheckConstraint("duration_ms IS NULL OR duration_ms >= 0", name="ck_content_keyword_run_duration"),
+        CheckConstraint(
+            "(source = 'manual' AND provider IS NULL AND model IS NULL AND prompt_version IS NULL) "
+            "OR (source = 'ai' AND provider IS NOT NULL AND model IS NOT NULL AND prompt_version IS NOT NULL)",
+            name="ck_content_keyword_run_provenance",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    dossier_id: Mapped[str] = mapped_column(
+        ForeignKey("content_product_dossiers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    prompt_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    usage_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+
+    dossier: Mapped[FinishedProductDossierRecord] = relationship(back_populates="keyword_runs")
+    items: Mapped[list["KeywordPlanRecord"]] = relationship(
+        back_populates="run",
         cascade="all, delete-orphan",
         order_by="KeywordPlanRecord.position",
     )
 
 
 class KeywordPlanRecord(Base):
-    __tablename__ = "content_keyword_plan"
+    __tablename__ = "content_keyword_plan_items"
     __table_args__ = (
-        UniqueConstraint("dossier_id", "keyword", name="uq_content_keyword_per_dossier"),
-        UniqueConstraint("dossier_id", "position", name="uq_content_keyword_position"),
+        UniqueConstraint("run_id", "keyword", name="uq_content_keyword_per_run"),
+        UniqueConstraint("run_id", "position", name="uq_content_keyword_position"),
         CheckConstraint("position >= 1 AND position <= 20", name="ck_content_keyword_position"),
         CheckConstraint("target_count >= 1 AND target_count <= 50", name="ck_content_keyword_target_count"),
         CheckConstraint(
@@ -58,8 +93,8 @@ class KeywordPlanRecord(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    dossier_id: Mapped[str] = mapped_column(
-        ForeignKey("content_product_dossiers.id", ondelete="CASCADE"),
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("content_keyword_plan_runs.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -71,4 +106,4 @@ class KeywordPlanRecord(Base):
     target_count: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
 
-    dossier: Mapped[FinishedProductDossierRecord] = relationship(back_populates="keywords")
+    run: Mapped[KeywordPlanRunRecord] = relationship(back_populates="items")
