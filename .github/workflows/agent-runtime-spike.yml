@@ -11,7 +11,7 @@ env:
   PYTHONPATH: .
 
 jobs:
-  baseline:
+  baseline-backend:
     name: Existing baseline backend tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -35,7 +35,7 @@ jobs:
       - name: Run baseline backend tests
         run: python -m pytest -q
 
-  spike:
+  spike-backend:
     name: Spike backend tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -58,3 +58,47 @@ jobs:
         run: python -m pytest backend/tests/agent_runtime -q
       - name: Run full backend tests
         run: python -m pytest -q
+
+  baseline-frontend:
+    name: Existing baseline frontend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/xhs-workbench-next
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install baseline frontend dependencies
+        run: npm ci
+      - name: Run baseline frontend tests
+        run: npm test -- --run
+      - name: Build baseline frontend
+        run: npm run build
+
+  spike-frontend:
+    name: Spike frontend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install spike frontend dependencies
+        run: npm ci
+      - name: Run spike frontend tests
+        run: npm test -- --run
+      - name: Build spike frontend
+        run: npm run build
