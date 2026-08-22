@@ -92,7 +92,7 @@ class AgentRuntime:
     def _drive(self, run_id: str) -> RuntimeOutcome:
         while True:
             run = self.store.get_run(run_id)
-            exceeded = self._budget_failure(run)
+            exceeded = self._budget_failure(run, before_model=True)
             if exceeded is not None:
                 return self._fail(run_id, "budget_exhausted", exceeded)
 
@@ -135,7 +135,7 @@ class AgentRuntime:
             )
 
             run = self.store.get_run(run_id)
-            exceeded = self._budget_failure(run)
+            exceeded = self._budget_failure(run, before_model=False)
             if exceeded is not None:
                 return self._fail(run_id, "budget_exhausted", exceeded)
 
@@ -272,10 +272,12 @@ class AgentRuntime:
         )
         return None
 
-    def _budget_failure(self, run: AgentRunRecord) -> str | None:
+    def _budget_failure(self, run: AgentRunRecord, *, before_model: bool) -> str | None:
         if run.step_count >= self.budget.max_steps:
             return f"max_steps={self.budget.max_steps} reached"
-        if run.model_calls >= self.budget.max_model_calls:
+        # Equality blocks the *next* request but must not invalidate the request
+        # that just consumed the final allowed slot.
+        if before_model and run.model_calls >= self.budget.max_model_calls:
             return f"max_model_calls={self.budget.max_model_calls} reached"
         if run.input_tokens > self.budget.max_input_tokens:
             return f"input token budget exceeded ({run.input_tokens}>{self.budget.max_input_tokens})"
