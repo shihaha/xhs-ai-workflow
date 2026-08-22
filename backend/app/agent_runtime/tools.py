@@ -87,6 +87,12 @@ class ToolRegistry:
         return tool
 
     def validate(self, tool: ToolSpec, arguments: dict[str, Any]) -> BaseModel:
+        known_fields = set(tool.input_model.model_fields)
+        unknown_fields = sorted(set(arguments) - known_fields)
+        if unknown_fields:
+            raise ToolInputError(
+                f"unknown arguments for {tool.name}: {', '.join(unknown_fields)}"
+            )
         try:
             return tool.input_model.model_validate(arguments)
         except ValidationError as exc:
