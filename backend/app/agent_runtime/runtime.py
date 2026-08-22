@@ -63,7 +63,12 @@ class AgentRuntime:
         human = self.store.pending_human_action(run_id)
         if human is None:
             raise ValueError("run has no pending human action")
-        self.store.resolve_human_action(human.id, approved=approved, note=note)
+        self.store.resolve_human_action(
+            human.id,
+            approved=approved,
+            note=note,
+            resume_run=approved,
+        )
         if not approved:
             return self._fail(
                 run_id,
@@ -79,7 +84,6 @@ class AgentRuntime:
         except (KeyError, AssertionError, ToolUnavailableError, ToolInputError, ValueError) as exc:
             return self._fail(run_id, "resume_validation_failed", str(exc))
 
-        self.store.set_state(run_id, AgentRunState.running)
         outcome = self._execute_tool(run_id, action, tool, validated.model_dump(mode="json"))
         if outcome is not None:
             return outcome
