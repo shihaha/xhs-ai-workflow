@@ -95,7 +95,7 @@ class KeywordPlanItemCreate(StrictModel):
     category: KeywordCategory
     expand: bool = False
     scope: str = Field(min_length=1, max_length=100)
-    target_count: int = Field(ge=1, le=50)
+    target_count: int = Field(ge=5, le=10)
 
     _text = field_validator("keyword", "scope")(_strip_nonblank)
 
