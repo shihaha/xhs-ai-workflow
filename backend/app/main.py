@@ -176,7 +176,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             runtime_dir=app.state.settings.runtime_dir,
         )
         app.state.content_research_service = ContentResearchService(
-            app.state.database
+            app.state.database,
+            app.state.bailian_adapter,
         )
         app.state.artifact_cleanup_service = ArtifactCleanupService(
             app.state.database,
