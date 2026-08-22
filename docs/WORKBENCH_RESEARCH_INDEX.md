@@ -4,60 +4,123 @@
 
 This branch is the isolated research workspace for evaluating a next-generation Xiaohongshu AI workbench.
 
-The goal is to build durable project knowledge before architecture selection or implementation. Research in this branch must not change the current proven business behavior unless a later explicit implementation decision says so.
+The goal is to build durable project knowledge before implementation. Research in this branch must not change the current proven business behavior unless a later explicit implementation branch does so under the recorded guardrails.
 
 ## Current research status
 
-### Phase 1 — Internal project/tutorial audit: COMPLETE (first deep pass)
+### Phase 1 — Internal project/tutorial audit: COMPLETE
 
-Completed 2026-08-23. Durable outputs:
+Completed 2026-08-23.
+
+Durable outputs:
 
 - `docs/architecture-knowledge/00_PROJECT_MAP.md`
-- `docs/architecture-knowledge/01_TUTORIAL_BUSINESS_MODEL.md`
-- `docs/architecture-knowledge/02_CURRENT_SYSTEM_ARCHITECTURE.md`
-- `docs/architecture-knowledge/03_CURRENT_SYSTEM_CAPABILITIES.md`
-- `docs/architecture-knowledge/04_CURRENT_SYSTEM_PROBLEMS.md`
-- `docs/architecture-knowledge/09_MIGRATION_RULES.md`
+- `01_TUTORIAL_BUSINESS_MODEL.md`
+- `02_CURRENT_SYSTEM_ARCHITECTURE.md`
+- `03_CURRENT_SYSTEM_CAPABILITIES.md`
+- `04_CURRENT_SYSTEM_PROBLEMS.md`
+- `09_MIGRATION_RULES.md`
 
-This pass established the current system as a hardened evidence/state modular monolith rather than a generic Agent Runtime, separated implemented code from currently authorized business stages, and froze migration guardrails.
+Conclusion: the current system is a hardened evidence/state modular monolith rather than a generic Agent Runtime. Jobs, evidence, adapters, validators, business gates and real UAT history are migration assets.
 
 ### Phase 2 — External agent architecture study + requirements: COMPLETE
 
 Completed 2026-08-23.
 
-External systems studied:
+Studied:
 
 - reconstructed Claude Code 2.1.88 architecture — study only; no open-source license found for the reconstructed proprietary source;
 - Pydantic AI + Pydantic AI Harness — MIT;
 - OpenHands Agent Canvas + Software Agent SDK — MIT;
 - LangGraph/checkpoint architecture — MIT;
 - Microsoft Agent Framework — MIT;
-- AutoGen as historical reference only; current repository is in maintenance mode and points new projects to Microsoft Agent Framework.
+- AutoGen — historical reference; current upstream is in maintenance mode.
 
-Durable source-research outputs:
+Source research:
 
 - `docs/source-research/CLAUDE_CODE_2_1_88_ARCHITECTURE_STUDY.md`
 - `docs/source-research/PYDANTIC_AI_HARNESS_STUDY.md`
 - `docs/source-research/OPENHANDS_AGENT_CANVAS_STUDY.md`
 - `docs/source-research/DURABLE_ORCHESTRATION_PATTERNS_STUDY.md`
 
-Derived XHS architecture requirements:
+Derived requirements:
 
-- `docs/architecture-knowledge/05_CLAUDE_CODE_ARCHITECTURE_NOTES.md`
-- `docs/architecture-knowledge/06_AGENT_RUNTIME_REQUIREMENTS.md`
-- `docs/architecture-knowledge/07_WORKBENCH_REQUIREMENTS.md`
-- `docs/architecture-knowledge/08_BACKEND_REQUIREMENTS.md`
+- `05_CLAUDE_CODE_ARCHITECTURE_NOTES.md`
+- `06_AGENT_RUNTIME_REQUIREMENTS.md`
+- `07_WORKBENCH_REQUIREMENTS.md`
+- `08_BACKEND_REQUIREMENTS.md`
 
-### Phase 2 key conclusion
+### Phase 3 — Open-source candidate selection: COMPLETE (research recommendation)
 
-Do **not** merge Claude Code source + a random workbench + a random backend.
+Completed 2026-08-23.
 
-The target architecture is now constrained as:
+Detailed scorecard:
+
+- `docs/architecture-knowledge/10_OPEN_SOURCE_CANDIDATES.md`
+
+Additional candidates evaluated include:
+
+- AG-UI — MIT;
+- CopilotKit — MIT;
+- assistant-ui — MIT;
+- AionUi — Apache-2.0;
+- Langflow — MIT;
+- Refly — rejected because its Apache-derived license adds commercial/frontend restrictions.
+
+#### Recommended stack for isolated spike
 
 ```text
-Workbench UI / control surface
+Runtime:
+  Pydantic AI + selected Pydantic AI Harness capabilities
+
+Agent/UI interaction:
+  AG-UI-compatible event contract
+
+React Agent/HITL primitives:
+  selective CopilotKit
+  assistant-ui as backup primitive library
+
+Workbench shell:
+  evolve our current XHS React shell/domain pages
+  OpenHands Agent Canvas + AionUi are UX/component references, not monolithic foundations
+
+Backend:
+  retain current FastAPI + SQLite + JobService + domain services
+
+Durability:
+  add AgentRun / AgentStep / PermissionDecision / HumanAction / Checkpoint in SQLite
+  do not add a distributed workflow engine in V1
+```
+
+The AG-UI repository contains verified Pydantic AI integration/examples, so this is a real compatibility path rather than an invented three-project combination.
+
+### Phase 4 — Architecture decisions + implementation roadmap: COMPLETE
+
+Completed 2026-08-23.
+
+Core outputs:
+
+- `docs/architecture-knowledge/11_ARCHITECTURE_DECISIONS.md`
+- `docs/architecture-knowledge/12_IMPLEMENTATION_ROADMAP.md`
+
+ADRs:
+
+- `docs/adr/ADR-001-preserve-domain-core.md` — accepted
+- `docs/adr/ADR-002-agent-runtime-spike.md` — proposed/approved for isolated spike
+- `docs/adr/ADR-003-agent-ui-contract.md` — proposed/approved for isolated spike
+- `docs/adr/ADR-004-local-durability-first.md` — accepted
+- `docs/adr/ADR-005-product-definition-gate.md` — accepted
+
+## Central architecture decision
+
+Do **not** merge Claude Code source + a giant workbench + a second generic backend.
+
+Target:
+
+```text
+XHS Workbench UI
         ↓
-Stable Workbench API + event stream
+Stable API + AG-UI-compatible event layer
         ↓
 Bounded Agent Runtime
   ContextBuilder / ToolRegistry / PermissionPolicy
@@ -72,78 +135,74 @@ Qianfan / XHS / Android / Bailian / optional MCP
 SQLite + managed evidence/artifacts
 ```
 
-The current Jobs/evidence/adapters/validators/business gates are migration assets. The new layer is orchestration, context, permission, run/step persistence and generic workbench primitives.
+The model gets more autonomy over **sequence**, not over **truth or authority**.
 
-### Phase 3 — Open-source selection: NEXT
+## Next step — implementation spike
 
-Now that requirements are explicit:
+Research is now complete enough to stop broad architecture searching.
 
-1. search licensed Workbench UI candidates;
-2. search licensed Agent Runtime/orchestration candidates;
-3. evaluate backend/task/runtime components only where an actual gap remains;
-4. score maintenance, licensing, Windows/local fit, integration cost and removal cost;
-5. test the most promising candidates against a minimal integration spike where necessary;
-6. write `10_OPEN_SOURCE_CANDIDATES.md` plus per-candidate evaluations;
-7. record architecture-changing choices as ADRs.
+Next execution should follow `12_IMPLEMENTATION_ROADMAP.md`:
 
-Important candidate families already identified for deeper Phase 3 evaluation, without selecting them yet:
+### Stage 0 — baseline freeze
 
-- Pydantic AI / Pydantic AI Harness for typed runtime/capabilities;
-- OpenHands Agent Canvas for workbench-shell patterns/components;
-- LangGraph or Microsoft Agent Framework only where their durability/workflow primitives solve a measured need rather than adding infrastructure for its own sake.
+- create an isolated spike branch;
+- run current backend/frontend verification;
+- record current green/red baseline;
+- freeze representative parity/context benchmarks.
 
-### Phase 4 — Architecture decision and implementation roadmap
+### Stage 1 — pure Agent Runtime spike
 
-Outputs:
+Recommended branch name:
 
-- `11_ARCHITECTURE_DECISIONS.md`
-- `12_IMPLEMENTATION_ROADMAP.md`
-- ADRs
+```text
+spike/agent-runtime-pydantic-v1
+```
 
-Only then decide whether to evolve `xhs-ai-workflow` or create a new `xhs-workbench-next` repository.
+Build only:
+
+- AgentRun/AgentStep persistence;
+- Tool protocol/registry;
+- PermissionPolicy;
+- ContextBuilder skeleton;
+- bounded Pydantic AI loop with fake model/fake tools;
+- checkpoint/resume;
+- lifecycle events/usage tests.
+
+Do not connect Android, Qianfan, live XHS collection, Opportunity approval, Product Build or publishing in the first slice.
+
+### Stage 2+ after spike passes
+
+- wrap one safe read-only domain path;
+- run context-token benchmark;
+- build AG-UI/CopilotKit UI spike;
+- only then introduce real collection and later B/C/D stages.
 
 ## Authority and guardrails
 
-The existing project remains the source of truth for proven business behavior and acceptance rules. Research must preserve evidence integrity, fail-closed behavior, explicit human gates, and current Phase boundaries.
+The existing project remains the source of truth for proven business behavior and acceptance rules. Research/implementation must preserve evidence integrity, fail-closed behavior, explicit human gates and current phase boundaries.
 
-Recovered or reconstructed proprietary source code may be studied for architecture, but must not be copied or vendored into the product without a valid license and explicit legal basis.
+Recovered/reconstructed proprietary source may be studied for architecture but must not be copied or vendored without valid license/legal basis.
 
-## Research order
+## Core document status
 
-1. Understand the tutorial/business workflow. **DONE — first deep pass.**
-2. Deeply map the current XHS system. **DONE — first deep pass.**
-3. Separate proven capabilities from incomplete/experimental capabilities and historical debt. **DONE — first deep pass.**
-4. Study mature agent architectures and Claude Code concepts. **DONE.**
-5. Derive concrete Agent Runtime, workbench and backend requirements. **DONE.**
-6. Search and evaluate open-source candidates against those requirements and licenses. **NEXT.**
-7. Record architecture decisions as ADRs.
-8. Decide whether to evolve this repository or create `xhs-workbench-next`.
-
-## Knowledge map
-
-- `docs/architecture-knowledge/` — durable understanding of our product and target architecture.
-- `docs/source-research/` — external architecture/source studies.
-- `docs/open-source-evaluation/` — candidate repositories, licenses, fit scores, rejection reasons and spikes.
-- `docs/adr/` — Architecture Decision Records.
-
-## Core documents
-
-- `00_PROJECT_MAP.md` — **Created.**
-- `01_TUTORIAL_BUSINESS_MODEL.md` — **Created.**
-- `02_CURRENT_SYSTEM_ARCHITECTURE.md` — **Created.**
-- `03_CURRENT_SYSTEM_CAPABILITIES.md` — **Created.**
-- `04_CURRENT_SYSTEM_PROBLEMS.md` — **Created.**
-- `05_CLAUDE_CODE_ARCHITECTURE_NOTES.md` — **Created.**
-- `06_AGENT_RUNTIME_REQUIREMENTS.md` — **Created.**
-- `07_WORKBENCH_REQUIREMENTS.md` — **Created.**
-- `08_BACKEND_REQUIREMENTS.md` — **Created.**
-- `09_MIGRATION_RULES.md` — **Created.**
-- `10_OPEN_SOURCE_CANDIDATES.md` — Phase 3.
-- `11_ARCHITECTURE_DECISIONS.md` — Phase 4.
-- `12_IMPLEMENTATION_ROADMAP.md` — Phase 4.
+- `00_PROJECT_MAP.md` — **Created**
+- `01_TUTORIAL_BUSINESS_MODEL.md` — **Created**
+- `02_CURRENT_SYSTEM_ARCHITECTURE.md` — **Created**
+- `03_CURRENT_SYSTEM_CAPABILITIES.md` — **Created**
+- `04_CURRENT_SYSTEM_PROBLEMS.md` — **Created**
+- `05_CLAUDE_CODE_ARCHITECTURE_NOTES.md` — **Created**
+- `06_AGENT_RUNTIME_REQUIREMENTS.md` — **Created**
+- `07_WORKBENCH_REQUIREMENTS.md` — **Created**
+- `08_BACKEND_REQUIREMENTS.md` — **Created**
+- `09_MIGRATION_RULES.md` — **Created**
+- `10_OPEN_SOURCE_CANDIDATES.md` — **Created**
+- `11_ARCHITECTURE_DECISIONS.md` — **Created**
+- `12_IMPLEMENTATION_ROADMAP.md` — **Created**
 
 ## Rule for future AI sessions
 
 Do not rely on chat memory as the project record. Any material finding, constraint, rejected option, architecture decision or experiment result that would otherwise need to be rediscovered must be written into this branch and committed.
 
-When a new research session starts, read this index and the already-created knowledge documents before repeating broad repository scans.
+A new session should read this index, `11_ARCHITECTURE_DECISIONS.md`, `12_IMPLEMENTATION_ROADMAP.md` and the relevant requirement/ADR files before repeating research.
+
+Broad architecture research should not be restarted unless an implementation spike disproves a recorded assumption.
