@@ -29,6 +29,10 @@ from backend.app.features.content.cleanup import (
     ArtifactCleanupWorker,
 )
 from backend.app.features.content.service import ContentService
+from backend.app.features.content_research.api import router as content_research_router
+from backend.app.features.content_research.benchmark_api import router as benchmark_research_router
+from backend.app.features.content_research.benchmark_service import BenchmarkResearchService
+from backend.app.features.content_research.service import ContentResearchService
 from backend.app.features.media.api import router as media_router
 from backend.app.features.media.service import ContentMediaService
 from backend.app.features.media.worker import ContentMediaWorker
@@ -100,6 +104,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.shop_service = None
     app.state.analysis_service = None
     app.state.content_service = None
+    app.state.content_research_service = None
+    app.state.benchmark_research_service = None
     app.state.artifact_cleanup_service = None
     app.state.artifact_cleanup_worker = None
     app.state.bailian_vision_adapter = BailianVisionAdapter(
@@ -172,6 +178,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.bailian_adapter,
             runtime_dir=app.state.settings.runtime_dir,
         )
+        app.state.content_research_service = ContentResearchService(
+            app.state.database,
+            app.state.bailian_adapter,
+        )
+        app.state.benchmark_research_service = BenchmarkResearchService(
+            app.state.database,
+            app.state.xhs_collection_service,
+        )
         app.state.artifact_cleanup_service = ArtifactCleanupService(
             app.state.database,
             runtime_dir=app.state.settings.runtime_dir,
@@ -217,6 +231,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.qianfan_collection_service = None
         app.state.analysis_service = None
         app.state.content_service = None
+        app.state.content_research_service = None
+        app.state.benchmark_research_service = None
         app.state.artifact_cleanup_service = None
         app.state.artifact_cleanup_worker = None
         app.state.content_media_service = None
@@ -238,6 +254,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(radar_router)
     app.include_router(shops_router)
     app.include_router(analysis_router)
+    app.include_router(content_research_router)
+    app.include_router(benchmark_research_router)
     app.include_router(content_router)
     app.include_router(media_router)
     app.include_router(xhs_router)

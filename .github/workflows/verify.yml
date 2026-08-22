@@ -1,0 +1,72 @@
+name: verify
+
+on:
+  pull_request:
+    branches:
+      - feature/system-v1
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  software-verification:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: python -m pip install -e ".[dev]"
+
+      - name: Install frontend dependencies
+        shell: pwsh
+        working-directory: frontend
+        run: npm ci
+
+      - name: Backend tests
+        shell: pwsh
+        run: python -m pytest -q
+
+      - name: Python compile
+        shell: pwsh
+        run: python -m compileall -q backend tools frontend/e2e/fixture_app.py
+
+      - name: Frontend tests
+        shell: pwsh
+        working-directory: frontend
+        run: npm test -- --run
+
+      - name: Frontend build
+        shell: pwsh
+        working-directory: frontend
+        run: npm run build
+
+      - name: Controlled fresh-runtime E2E
+        shell: pwsh
+        working-directory: frontend
+        run: npm run test:e2e
+
+      - name: Frontend dependency audit
+        shell: pwsh
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      - name: Boundary source scan
+        shell: pwsh
+        run: python tools/scan_release_boundaries.py --root .
