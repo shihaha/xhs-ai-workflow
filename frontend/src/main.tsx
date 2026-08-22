@@ -8,6 +8,7 @@ import { OpportunitiesPage } from "./pages/OpportunitiesPage";
 import { RadarPage } from "./pages/RadarPage";
 import { SystemStatusPage } from "./pages/SystemStatusPage";
 import "./styles.css";
+import "./workbench-shell.css";
 
 type NavItem = {
   label: string;
