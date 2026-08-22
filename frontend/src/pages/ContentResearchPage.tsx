@@ -4,6 +4,7 @@ import {
   createFinishedProductDossier,
   fetchFinishedProductDossiers,
   fetchKeywordPlan,
+  generateKeywordPlan as postGenerateKeywordPlan,
   type FinishedProductDossier,
   type FinishedProductDossierCreate,
   type KeywordPlan,
@@ -54,11 +55,13 @@ const defaultLoad = async (): Promise<ResearchData> => {
 export interface ContentResearchPageProps {
   loadResearch?: () => Promise<ResearchData>;
   createDossier?: (payload: FinishedProductDossierCreate) => Promise<FinishedProductDossier>;
+  generateKeywordPlan?: (dossierId: string) => Promise<KeywordPlan>;
 }
 
 export function ContentResearchPage({
   loadResearch = defaultLoad,
   createDossier = createFinishedProductDossier,
+  generateKeywordPlan = postGenerateKeywordPlan,
 }: ContentResearchPageProps) {
   const [state, setState] = useState<
     | { kind: "loading" }
@@ -84,13 +87,25 @@ export function ContentResearchPage({
     void refresh();
   }, [refresh]);
 
-  const submit = async () => {
+  const runAction = async (action: () => Promise<string>) => {
     if (pendingRef.current) return;
     pendingRef.current = true;
     setPending(true);
     setActionError(null);
     setNotice(null);
     try {
+      setNotice(await action());
+      setState({ kind: "ready", data: await loadResearch() });
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "操作失败。" );
+    } finally {
+      pendingRef.current = false;
+      setPending(false);
+    }
+  };
+
+  const submit = async () => {
+    await runAction(async () => {
       const payload: FinishedProductDossierCreate = {
         product_key: draft.product_key.trim(),
         name: draft.name.trim(),
@@ -106,15 +121,9 @@ export function ContentResearchPage({
         uat_status: "passed",
       };
       const created = await createDossier(payload);
-      setNotice(`已接入成品资料：${created.name} ${created.version}`);
       setDraft(EMPTY_DRAFT);
-      setState({ kind: "ready", data: await loadResearch() });
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : "成品资料接入失败。" );
-    } finally {
-      pendingRef.current = false;
-      setPending(false);
-    }
+      return `已接入成品资料：${created.name} ${created.version}`;
+    });
   };
 
   if (state.kind === "loading") {
@@ -139,19 +148,34 @@ export function ContentResearchPage({
         <div className="panel-heading"><h2>已接入产品</h2><p>{state.data.dossiers.length} 个版本</p></div>
         {state.data.dossiers.length === 0 ? <p className="panel-empty">还没有完成 UAT 的成品资料。</p> : (
           <div className="record-stack">
-            {state.data.dossiers.map(dossier => (
-              <article className="studio-record" key={dossier.id}>
-                <header>
-                  <div><h3>{dossier.name}</h3><code>{dossier.product_key} · {dossier.version}</code></div>
-                  <span className="state state--succeeded">UAT 已通过</span>
-                </header>
-                <p><strong>目标用户：</strong>{dossier.target_user}</p>
-                <p><strong>核心需求：</strong>{dossier.core_need}</p>
-                <p><strong>交付物：</strong>{dossier.deliverables.join("；")}</p>
-                <p><strong>可用 claims：</strong>{dossier.allowed_claims.join("；")}</p>
-                <p><strong>关键词网络：</strong>{state.data.keywordPlans[dossier.id]?.count ?? 0} / 10–20</p>
-              </article>
-            ))}
+            {state.data.dossiers.map(dossier => {
+              const plan = state.data.keywordPlans[dossier.id];
+              return (
+                <article className="studio-record" key={dossier.id}>
+                  <header>
+                    <div><h3>{dossier.name}</h3><code>{dossier.product_key} · {dossier.version}</code></div>
+                    <span className="state state--succeeded">UAT 已通过</span>
+                  </header>
+                  <p><strong>目标用户：</strong>{dossier.target_user}</p>
+                  <p><strong>核心需求：</strong>{dossier.core_need}</p>
+                  <p><strong>交付物：</strong>{dossier.deliverables.join("；")}</p>
+                  <p><strong>可用 claims：</strong>{dossier.allowed_claims.join("；")}</p>
+                  <div className="button-row">
+                    <button
+                      disabled={pending}
+                      type="button"
+                      onClick={() => void runAction(async () => {
+                        const generated = await generateKeywordPlan(dossier.id);
+                        return `已生成关键词网络：${dossier.name} · ${generated.count} 个词`;
+                      })}
+                    >
+                      {plan?.count ? "重新生成关键词网络" : "AI 生成关键词网络"}
+                    </button>
+                  </div>
+                  <KeywordPlanView plan={plan} />
+                </article>
+              );
+            })}
           </div>
         )}
       </section>
@@ -175,6 +199,37 @@ export function ContentResearchPage({
         </form>
       </section>
     </main>
+  );
+}
+
+function KeywordPlanView({ plan }: { plan?: KeywordPlan }) {
+  if (!plan?.run_id || plan.count === 0) {
+    return <p className="field-help">还没有关键词网络。教程要求每个成品建立 10–20 个找对标用的关键词。</p>;
+  }
+  return (
+    <section aria-label="关键词网络">
+      <p className="field-help">
+        最新 Run：{plan.source === "ai" ? "AI" : "人工"} · {plan.count} 个词
+        {plan.model ? ` · ${plan.model}` : ""}
+        {plan.prompt_version ? ` · ${plan.prompt_version}` : ""}
+      </p>
+      <div className="table-scroll">
+        <table>
+          <thead><tr><th>顺序</th><th>关键词</th><th>类型</th><th>扩展</th><th>目标笔记</th></tr></thead>
+          <tbody>
+            {plan.items.map(item => (
+              <tr key={item.id}>
+                <td>{item.position}</td>
+                <td>{item.keyword}</td>
+                <td>{item.category}</td>
+                <td>{item.expand ? "是" : "否"}</td>
+                <td>{item.target_count}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
