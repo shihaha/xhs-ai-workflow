@@ -108,3 +108,27 @@ class AgentRunDetailRead(AgentRunSummaryRead):
 class AgentEvidenceRefsRead(BaseModel):
     job_id: str
     evidence_refs: list[str] = Field(default_factory=list)
+
+
+class ChatGPTHandoffTaskRead(BaseModel):
+    """Redacted lifecycle/identity projection for one durable ChatGPT handoff."""
+
+    handoff_id: str
+    job_id: str
+    source_run_id: str
+    human_action_id: str
+    status: str
+    human_action_status: str
+    job_state: str
+    current_stage: str | None = None
+    stage_revision: str
+    schema_version: str
+    input_hash: str
+    context_ref_count: int
+    has_result: bool
+    is_current_binding: bool
+    authority_ambiguous: bool
+    needs_chatgpt: bool
+    result_ready: bool
+    created_at: datetime
+    accepted_at: datetime | None = None
