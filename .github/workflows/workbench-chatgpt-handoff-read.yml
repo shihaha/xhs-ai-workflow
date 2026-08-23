@@ -1,0 +1,75 @@
+name: Workbench ChatGPT Handoff Read Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/workbench-agent-projections-v2
+    paths:
+      - 'backend/app/api/agent_runtime.py'
+      - 'backend/app/agent_runtime/workbench_read.py'
+      - 'backend/app/agent_runtime/manual_chatgpt_handoff.py'
+      - 'backend/app/schemas/agent_runtime.py'
+      - 'backend/tests/agent_runtime/test_manual_chatgpt_handoff.py'
+      - 'backend/tests/agent_runtime/test_workbench_read_api.py'
+      - 'backend/tests/agent_runtime/test_workbench_projection_api_v2.py'
+      - 'backend/tests/agent_runtime/test_workbench_chatgpt_handoff_api.py'
+      - '.github/workflows/workbench-chatgpt-handoff-read.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  workbench-chatgpt-handoff-read:
+    name: Durable ChatGPT handoff workbench projection
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Verify validated bridge blob fold-in
+        shell: bash
+        run: |
+          test "$(git hash-object backend/app/agent_runtime/manual_chatgpt_handoff.py)" = "88c4dd18a9f55325cd76f22790f9799f82205e23"
+          test "$(git hash-object backend/tests/agent_runtime/test_manual_chatgpt_handoff.py)" = "c2eaf16b3a22838d1b63bfe8695d0d0e4bdb584d"
+
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+
+      - name: Compile handoff projection slice
+        run: >-
+          python -m compileall -q
+          backend/app/api/agent_runtime.py
+          backend/app/agent_runtime/workbench_read.py
+          backend/app/agent_runtime/manual_chatgpt_handoff.py
+          backend/app/schemas/agent_runtime.py
+          backend/tests/agent_runtime/test_manual_chatgpt_handoff.py
+          backend/tests/agent_runtime/test_workbench_read_api.py
+          backend/tests/agent_runtime/test_workbench_projection_api_v2.py
+          backend/tests/agent_runtime/test_workbench_chatgpt_handoff_api.py
+
+      - name: Run validated handoff and Workbench projection tests
+        run: >-
+          python -m pytest
+          backend/tests/agent_runtime/test_manual_chatgpt_handoff.py
+          backend/tests/agent_runtime/test_workbench_read_api.py
+          backend/tests/agent_runtime/test_workbench_projection_api_v2.py
+          backend/tests/agent_runtime/test_workbench_chatgpt_handoff_api.py
+          -q
+
+      - name: Run existing Jobs API regression
+        run: python -m pytest backend/tests/test_jobs_api.py backend/tests/test_jobs_hardening.py -q
+
+      - name: Run complete Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q

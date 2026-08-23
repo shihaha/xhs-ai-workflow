@@ -1,0 +1,70 @@
+name: Manual ChatGPT AgentDock Handoff Verification
+
+on:
+  pull_request:
+    branches:
+      - fix/job-bound-terminal-foldin-v1
+    paths:
+      - 'backend/app/agent_runtime/manual_chatgpt_handoff.py'
+      - 'backend/tests/agent_runtime/test_manual_chatgpt_handoff.py'
+      - 'docs/architecture-knowledge/18_AGENTDOCK_HANDOFF_BRIDGE.md'
+      - '.github/workflows/manual-chatgpt-handoff.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  handoff-bridge:
+    name: Durable handoff and AgentDock return tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *deps])
+          PY
+      - name: Compile handoff bridge
+        run: |
+          python -m compileall -q \
+            backend/app/agent_runtime/manual_chatgpt_handoff.py \
+            backend/tests/agent_runtime/test_manual_chatgpt_handoff.py
+      - name: Run focused AgentDock handoff tests
+        shell: bash
+        run: |
+          set +e
+          python -m pytest backend/tests/agent_runtime/test_manual_chatgpt_handoff.py -vv --tb=short > handoff-focused-pytest.log 2>&1
+          status=$?
+          cat handoff-focused-pytest.log
+          echo "$status" > handoff-focused-status.txt
+          exit 0
+      - name: Upload focused pytest diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-chatgpt-handoff-focused-log
+          path: |
+            handoff-focused-pytest.log
+            handoff-focused-status.txt
+      - name: Enforce focused handoff result
+        shell: bash
+        run: |
+          status="$(cat handoff-focused-status.txt)"
+          test "$status" -eq 0
+      - name: Run complete Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
+      - name: Run existing Job state-machine tests
+        run: |
+          python -m pytest \
+            backend/tests/test_job_state_machine.py \
+            backend/tests/test_job_batch.py \
+            -q
