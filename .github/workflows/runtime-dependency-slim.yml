@@ -6,6 +6,7 @@ on:
       - spike/agent-runtime-pydantic-v1
     paths:
       - 'pyproject.toml'
+      - 'tools/qianfan_shutdown_probe.py'
       - '.github/workflows/runtime-dependency-slim.yml'
   workflow_dispatch:
 
@@ -62,11 +63,14 @@ jobs:
               raise SystemExit(f'heavy optional distribution(s) leaked into slim install: {leaked}')
           PY
 
-      - name: Compile runtime and driver tests
-        run: python -m compileall -q backend/app/agent_runtime backend/tests/agent_runtime
+      - name: Compile runtime, tests, and shutdown probe
+        run: python -m compileall -q backend/app/agent_runtime backend/tests/agent_runtime tools/qianfan_shutdown_probe.py
 
       - name: Run Agent Runtime acceptance
         run: python -m pytest backend/tests/agent_runtime -q
+
+      - name: Measure Qianfan child-process phases
+        run: python tools/qianfan_shutdown_probe.py
 
       - name: Recheck blocked Qianfan process exit ten times
         run: |
