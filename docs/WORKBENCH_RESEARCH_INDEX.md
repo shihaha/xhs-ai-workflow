@@ -102,6 +102,8 @@ Core outputs:
 
 - `docs/architecture-knowledge/11_ARCHITECTURE_DECISIONS.md`
 - `docs/architecture-knowledge/12_IMPLEMENTATION_ROADMAP.md`
+- `docs/architecture-knowledge/13_RUNTIME_EXPERIMENT_RESULTS.md`
+- `docs/architecture-knowledge/14_IMPLEMENTATION_SCOPE_OVERRIDE.md`
 
 ADRs:
 
@@ -110,6 +112,31 @@ ADRs:
 - `docs/adr/ADR-003-agent-ui-contract.md` — proposed/approved for isolated spike
 - `docs/adr/ADR-004-local-durability-first.md` — accepted
 - `docs/adr/ADR-005-product-definition-gate.md` — accepted
+- `docs/adr/ADR-006-defer-bc-systemization.md` — accepted
+
+## Current B/C scope decision
+
+The A/B/C/D labels remain useful business concepts, but B and C are **not current workflow-automation targets**.
+
+```text
+A system
+  Opportunity
+      ↓
+  human approval
+      ↓
+B — external / human + AI / product-specific
+  output: Product Definition handoff
+      ↓
+C — external / human + AI / Codex / product-specific
+  output: Finished Product + human UAT handoff
+      ↓
+D system
+  Content research / production
+```
+
+Do not build a generic B Agent, C Agent, B/C state machine, universal product builder or speculative B/C workflow until enough varied completed products exist to demonstrate recurring patterns.
+
+When older roadmap Stage 7–10 text conflicts with this decision, `ADR-006` and `14_IMPLEMENTATION_SCOPE_OVERRIDE.md` are authoritative.
 
 ## Central architecture decision
 
@@ -128,7 +155,7 @@ Bounded Agent Runtime
         ↓
 Existing hardened Domain Services
         ↓
-Adapter Registry
+Adapter Registry / durable Jobs
         ↓
 Qianfan / XHS / Android / Bailian / optional MCP
         ↓
@@ -137,45 +164,43 @@ SQLite + managed evidence/artifacts
 
 The model gets more autonomy over **sequence**, not over **truth or authority**.
 
-## Next step — implementation spike
+## Implementation status
 
-Research is now complete enough to stop broad architecture searching.
+### Stage 0 / Stage 1 — baseline + Agent Runtime: IMPLEMENTED IN SPIKE
 
-Next execution should follow `12_IMPLEMENTATION_ROADMAP.md`:
-
-### Stage 0 — baseline freeze
-
-- create an isolated spike branch;
-- run current backend/frontend verification;
-- record current green/red baseline;
-- freeze representative parity/context benchmarks.
-
-### Stage 1 — pure Agent Runtime spike
-
-Recommended branch name:
+Primary spike branch:
 
 ```text
 spike/agent-runtime-pydantic-v1
 ```
 
-Build only:
+The isolated runtime has durable runs/steps, permissions, human waits, checkpoints, budgets, typed tools, fail-closed uncertain-side-effect handling, recovery semantics and regression comparison infrastructure.
 
-- AgentRun/AgentStep persistence;
-- Tool protocol/registry;
-- PermissionPolicy;
-- ContextBuilder skeleton;
-- bounded Pydantic AI loop with fake model/fake tools;
-- checkpoint/resume;
-- lifecycle events/usage tests.
+### Stage 2 — safe real domain path: PROVEN IN SPIKE
 
-Do not connect Android, Qianfan, live XHS collection, Opportunity approval, Product Build or publishing in the first slice.
+The existing `AnalysisService` was wrapped rather than rewritten. Controlled parity tests preserve business status/evidence behavior.
 
-### Stage 2+ after spike passes
+### Stage 3 — context compaction: PROVEN AS ISOLATED EXPERIMENT
 
-- wrap one safe read-only domain path;
-- run context-token benchmark;
-- build AG-UI/CopilotKit UI spike;
-- only then introduce real collection and later B/C/D stages.
+Branch/PR experiment proves deterministic model projection can materially reduce prompt structure without deleting authoritative raw evidence or changing service grounding. Real provider token savings still require a controlled live provider A/B before claiming an exact token number.
+
+### Runtime cleanup still pending dynamic acceptance
+
+Draft PR #6 (`fix/agent-runtime-foldin-v1`) makes the hardened Stage 2 semantics the canonical `runtime.AgentRuntime` entry and removes the easy bypass through two public implementations.
+
+Its latest dynamic verification is blocked by GitHub Actions jobs failing before any step is created. Do not claim PR #6 passed until the jobs actually execute and pass.
+
+## Next implementation direction
+
+After canonical Runtime dynamic acceptance:
+
+1. define the minimal relationship between `AgentRun` and the existing durable `Job` lifecycle;
+2. keep `JobService` authoritative for lease/task/physical-worker lifecycle;
+3. do not let synchronous Agent tool execution replace physical XHS/Android workers;
+4. expose safe Job-oriented Agent tools such as create/read/status/result rather than direct raw device actions;
+5. continue toward Project/Run/Human Action/Evidence workbench views;
+6. preserve only thin B/C handoffs;
+7. connect D after Finished Product + human UAT.
 
 ## Authority and guardrails
 
@@ -196,13 +221,15 @@ Recovered/reconstructed proprietary source may be studied for architecture but m
 - `08_BACKEND_REQUIREMENTS.md` — **Created**
 - `09_MIGRATION_RULES.md` — **Created**
 - `10_OPEN_SOURCE_CANDIDATES.md` — **Created**
-- `11_ARCHITECTURE_DECISIONS.md` — **Created**
-- `12_IMPLEMENTATION_ROADMAP.md` — **Created**
+- `11_ARCHITECTURE_DECISIONS.md` — **Updated for ADR-006**
+- `12_IMPLEMENTATION_ROADMAP.md` — **Historical roadmap; Stage 7–10 partially superseded**
+- `13_RUNTIME_EXPERIMENT_RESULTS.md` — **Created**
+- `14_IMPLEMENTATION_SCOPE_OVERRIDE.md` — **Active override**
 
 ## Rule for future AI sessions
 
 Do not rely on chat memory as the project record. Any material finding, constraint, rejected option, architecture decision or experiment result that would otherwise need to be rediscovered must be written into this branch and committed.
 
-A new session should read this index, `11_ARCHITECTURE_DECISIONS.md`, `12_IMPLEMENTATION_ROADMAP.md` and the relevant requirement/ADR files before repeating research.
+A new session should read this index, `11_ARCHITECTURE_DECISIONS.md`, `14_IMPLEMENTATION_SCOPE_OVERRIDE.md`, the relevant requirement/ADR files, and then the historical roadmap before repeating research.
 
 Broad architecture research should not be restarted unless an implementation spike disproves a recorded assumption.
