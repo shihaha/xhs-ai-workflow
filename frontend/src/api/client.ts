@@ -50,6 +50,132 @@ export interface Job {
 
 export type JobListResponse = Job[];
 
+export interface AgentRunSummary {
+  run_id: string;
+  goal: string;
+  state: string;
+  model_name: string | null;
+  prompt_version: string | null;
+  step_count: number;
+  model_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  final_output: Record<string, unknown> | null;
+  error_category: string | null;
+  error_detail: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface AgentRunListItem extends AgentRunSummary {
+  job_id: string;
+}
+
+export interface AgentStepSummary {
+  step_index: number;
+  kind: string;
+  tool_name: string | null;
+  tool_call_id: string | null;
+  status: string;
+  evidence_refs: string[];
+  error_category: string | null;
+  error_detail: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentHumanAction {
+  id: string;
+  run_id: string;
+  job_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  status: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export interface AgentHumanActionSummary {
+  id: string;
+  run_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  status: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export interface AgentJobArtifactSummary {
+  id: number;
+  job_id: string;
+  kind: string;
+  producer: string;
+  created_at: string;
+}
+
+export interface AgentJobSummary {
+  job_id: string;
+  job_state: string;
+  current_stage: string | null;
+  error_category: string | null;
+  retry_count: number;
+  current_run_id: string | null;
+  authority_ambiguous: boolean;
+  run_count: number;
+  pending_human_action_count: number;
+  evidence_count: number;
+  artifact_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentJobRuntime {
+  job_id: string;
+  job_state: string;
+  current_stage: string | null;
+  error_category: string | null;
+  retry_count: number;
+  lease_expires_at: string | null;
+  created_at: string;
+  updated_at: string;
+  current_run_id: string | null;
+  authority_ambiguous: boolean;
+  runs: AgentRunSummary[];
+  pending_human_actions: AgentHumanActionSummary[];
+  evidence_refs: string[];
+  artifacts: AgentJobArtifactSummary[];
+}
+
+export interface AgentRunDetail extends AgentRunSummary {
+  job_id: string;
+  steps: AgentStepSummary[];
+  human_actions: AgentHumanActionSummary[];
+  evidence_refs: string[];
+}
+
+export interface ChatGPTHandoffTask {
+  handoff_id: string;
+  job_id: string;
+  source_run_id: string;
+  human_action_id: string;
+  status: string;
+  human_action_status: string;
+  job_state: string;
+  current_stage: string | null;
+  stage_revision: string;
+  schema_version: string;
+  input_hash: string;
+  context_ref_count: number;
+  has_result: boolean;
+  is_current_binding: boolean;
+  authority_ambiguous: boolean;
+  needs_chatgpt: boolean;
+  result_ready: boolean;
+  created_at: string;
+  accepted_at: string | null;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -219,3 +345,10 @@ export const startContentImageAnalysis = (itemId: string, payload: { expected_re
 export const fetchContentMediaRuns = (itemId: string) => getJson<ContentMediaRun[]>(`/api/v1/content-items/${encodeURIComponent(itemId)}/media-runs`);
 export const fetchContentMediaRun = (runId: string) => getJson<ContentMediaRun>(`/api/v1/content-media-runs/${encodeURIComponent(runId)}`);
 export const fetchContentMediaAssessment = (runId: string) => getJson<ContentMediaAssessment>(`/api/v1/content-media-runs/${encodeURIComponent(runId)}/assessment`);
+
+export const fetchAgentJobs = () => getJson<AgentJobSummary[]>("/api/v1/agent-runtime/jobs");
+export const fetchAgentJob = (jobId: string) => getJson<AgentJobRuntime>(`/api/v1/agent-runtime/jobs/${encodeURIComponent(jobId)}`);
+export const fetchAgentRuns = () => getJson<AgentRunListItem[]>("/api/v1/agent-runtime/runs");
+export const fetchAgentRun = (runId: string) => getJson<AgentRunDetail>(`/api/v1/agent-runtime/runs/${encodeURIComponent(runId)}`);
+export const fetchAgentHumanActions = (status?: "pending" | "approved" | "denied" | "completed") => getJson<AgentHumanAction[]>(`/api/v1/agent-runtime/human-actions${status ? `?status=${encodeURIComponent(status)}` : ""}`);
+export const fetchChatGPTHandoffs = (status?: "pending" | "accepted") => getJson<ChatGPTHandoffTask[]>(`/api/v1/agent-runtime/chatgpt-handoffs${status ? `?status=${encodeURIComponent(status)}` : ""}`);

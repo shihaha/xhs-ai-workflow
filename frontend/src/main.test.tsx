@@ -9,6 +9,7 @@ describe("App workflow routes", () => {
     expect(screen.getByRole("link", { name: "需求雷达" })).toHaveAttribute("href", "/radar");
     expect(screen.getByRole("link", { name: "机会审核" })).toHaveAttribute("href", "/opportunities");
     expect(screen.getByRole("link", { name: "内容工作台" })).toHaveAttribute("href", "/content");
+    expect(screen.getByRole("link", { name: "Agent 工作台" })).toHaveAttribute("href", "/agent");
   });
 
   it("routes encoded account identities to the account workbench", () => {
