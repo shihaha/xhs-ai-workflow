@@ -1,343 +1,107 @@
-"""Bounded, durable, fail-closed Agent Runtime loop."""
+"""Canonical bounded, durable, fail-closed Agent Runtime.
+
+Stage 2 recovery, replay, and uncertain-side-effect semantics are the public
+runtime behavior.  The original Stage 1 loop lives in the private
+``_runtime_core`` module only as an implementation scaffold.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from contextvars import ContextVar
 from typing import Any
 
-from backend.app.agent_runtime.context import DefaultContextBuilder
-from backend.app.agent_runtime.events import (
-    EventSink,
-    NullEventSink,
-    RuntimeEvent,
-    RuntimeEventType,
-    SafeEventSink,
-)
-from backend.app.agent_runtime.model import ModelDriver
-from backend.app.agent_runtime.permissions import PermissionPolicy, PermissionRequest
-from backend.app.agent_runtime.persistence import AgentRunRecord, AgentRunStore
+from backend.app.agent_runtime._runtime_core import AgentRuntime as _BaseAgentRuntime
+from backend.app.agent_runtime.events import RuntimeEventType
 from backend.app.agent_runtime.tools import (
-    ToolInputError,
-    ToolRegistry,
+    ToolDomainFailureError,
+    ToolNeedsHumanError,
     ToolTimeoutError,
-    ToolUnavailableError,
 )
 from backend.app.agent_runtime.types import (
     AgentRunState,
     AgentStepKind,
     NextAction,
-    PermissionDecision,
     RunBudget,
     RuntimeOutcome,
 )
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+class AgentRuntime(_BaseAgentRuntime):
+    """Fail-closed runtime proven by the Stage 2 acceptance suite.
 
+    Persisted run budgets are scoped with a ContextVar rather than by mutating a
+    shared ``self.budget`` value.  This keeps reconstructed/resumed runs bound to
+    their original budget without leaking that budget into another concurrent
+    run using the same runtime instance.
+    """
 
-class AgentRuntime:
-    def __init__(
-        self,
-        *,
-        store: AgentRunStore,
-        model: ModelDriver,
-        tools: ToolRegistry,
-        permissions: PermissionPolicy,
-        context_builder: DefaultContextBuilder | None = None,
-        budget: RunBudget | None = None,
-        prompt_version: str = "agent-runtime-spike-v1",
-        event_sink: EventSink | None = None,
-    ) -> None:
-        self.store = store
-        self.model = model
-        self.tools = tools
-        self.permissions = permissions
-        self.context_builder = context_builder or DefaultContextBuilder()
-        self.budget = budget or RunBudget()
-        self.prompt_version = prompt_version
-        self.events = SafeEventSink(event_sink or NullEventSink())
-
-    def start(self, goal: str) -> RuntimeOutcome:
-        run = self.store.create_run(
-            goal=goal,
-            budget=self.budget,
-            prompt_version=self.prompt_version,
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._budget_scope: ContextVar[RunBudget | None] = ContextVar(
+            f"agent_runtime_budget_{id(self)}",
+            default=None,
         )
-        self._emit(
-            RuntimeEventType.run_started,
-            run.id,
-            payload={"prompt_version": self.prompt_version},
-        )
-        return self._drive(run.id)
+        self._default_budget = RunBudget()
+        super().__init__(*args, **kwargs)
 
-    def resume(self, run_id: str, *, approved: bool, note: str | None = None) -> RuntimeOutcome:
-        run = self.store.get_run(run_id)
-        if run.state != AgentRunState.needs_human.value:
-            raise ValueError("only needs_human runs can be resumed")
-        human = self.store.pending_human_action(run_id)
-        if human is None:
-            raise ValueError("run has no pending human action")
-        self.store.resolve_human_action(
-            human.id,
-            approved=approved,
-            note=note,
-            resume_run=approved,
-        )
-        if not approved:
-            return self._fail(
-                run_id,
-                "human_denied",
-                f"Human denied tool call {human.tool_call_id} ({human.tool_name}).",
-            )
+    @property
+    def budget(self) -> RunBudget:
+        scoped = self._budget_scope.get()
+        return scoped if scoped is not None else self._default_budget
 
-        try:
-            action = NextAction.model_validate(human.request_json["action"])
-            assert action.tool_name is not None
-            tool = self.tools.resolve(action.tool_name)
-            self._emit(
-                RuntimeEventType.before_tool_validate,
-                run_id,
-                tool_name=tool.name,
-                tool_call_id=action.tool_call_id,
-                payload={"resume": True},
-            )
-            validated = self.tools.validate(tool, action.arguments)
-            self._emit(
-                RuntimeEventType.after_tool_validate,
-                run_id,
-                tool_name=tool.name,
-                tool_call_id=action.tool_call_id,
-                payload={"resume": True, "valid": True},
-            )
-        except (KeyError, AssertionError, ToolUnavailableError, ToolInputError, ValueError) as exc:
-            return self._fail(run_id, "resume_validation_failed", str(exc))
-
-        outcome = self._execute_tool(run_id, action, tool, validated.model_dump(mode="json"))
-        if outcome is not None:
-            return outcome
-        return self._drive(run_id)
-
-    def recover_interrupted(self, run_id: str) -> RuntimeOutcome:
-        before = self.store.get_run(run_id)
-        recovered = self.store.recover_interrupted(run_id)
-        if before.state == AgentRunState.running.value and recovered.state == AgentRunState.needs_human.value:
-            self._emit(
-                RuntimeEventType.run_error,
-                run_id,
-                payload={
-                    "category": recovered.error_category,
-                    "detail": recovered.error_detail,
-                    "recoverable": True,
-                },
-            )
-        return self._outcome(run_id)
+    @budget.setter
+    def budget(self, value: RunBudget) -> None:
+        self._default_budget = value
 
     def _drive(self, run_id: str) -> RuntimeOutcome:
-        while True:
-            run = self.store.get_run(run_id)
-            exceeded = self._budget_failure(run, before_model=True)
-            if exceeded is not None:
-                return self._fail(run_id, "budget_exhausted", exceeded)
+        # A reconstructed/resumed process must honor the budget persisted with
+        # the run, not constructor defaults that may have changed after restart.
+        run = self.store.get_run(run_id)
+        persisted_budget = RunBudget.model_validate(run.budget_json)
+        token = self._budget_scope.set(persisted_budget)
+        try:
+            return super()._drive(run_id)
+        finally:
+            self._budget_scope.reset(token)
 
-            context = self.context_builder.build(
-                goal=run.goal,
-                run_id=run.id,
-                steps=self.store.list_steps(run_id),
-                tools=self.tools.public_definitions(),
-                usage={
-                    "model_calls": run.model_calls,
-                    "input_tokens": run.input_tokens,
-                    "output_tokens": run.output_tokens,
-                },
-                remaining_budget={
-                    "steps": max(0, self.budget.max_steps - run.step_count),
-                    "model_calls": max(0, self.budget.max_model_calls - run.model_calls),
-                    "input_tokens": max(0, self.budget.max_input_tokens - run.input_tokens),
-                    "output_tokens": max(0, self.budget.max_output_tokens - run.output_tokens),
-                    "wall_time_seconds": max(
-                        0.0,
-                        self.budget.max_wall_time_seconds
-                        - (_utcnow() - run.created_at).total_seconds(),
-                    ),
-                },
-            )
+    def resume_interrupted(
+        self,
+        run_id: str,
+        *,
+        acknowledge_uncertain: bool = False,
+    ) -> RuntimeOutcome:
+        """Explicitly resume a recovered run without replaying an old tool call.
 
-            self._emit(
-                RuntimeEventType.before_model,
-                run_id,
-                payload={"model_call_index": run.model_calls + 1},
-            )
-            try:
-                turn = self.model.next_action(context)
-            except Exception as exc:
-                return self._fail(run_id, "model_error", f"{type(exc).__name__}: {exc}")
+        Approval-gated runs must continue through ``resume``.  An uncertain
+        in-flight side effect additionally requires an explicit acknowledgement.
+        The old tool call is never executed by this method.
+        """
 
-            self.store.add_model_usage(run_id, turn)
-            model_step = self.store.append_step(
-                run_id,
-                kind=AgentStepKind.model.value,
-                status="succeeded",
-                tool_name=turn.action.tool_name,
-                tool_call_id=turn.action.tool_call_id,
-                output_json={"action": turn.action.model_dump(mode="json")},
-            )
-            self._emit(
-                RuntimeEventType.after_model,
-                run_id,
-                step_index=model_step.step_index,
-                tool_name=turn.action.tool_name,
-                tool_call_id=turn.action.tool_call_id,
-                payload={
-                    "action": turn.action.action,
-                    "input_tokens": turn.input_tokens,
-                    "output_tokens": turn.output_tokens,
-                    "model_name": turn.model_name,
-                },
-            )
+        run = self.store.get_run(run_id)
+        if run.state != AgentRunState.needs_human.value:
+            raise ValueError("only needs_human runs can resume after interruption")
+        if self.store.pending_human_action(run_id) is not None:
+            raise ValueError("approval-gated run must use resume()")
+        if run.error_category not in {"interrupted", "uncertain_tool_side_effect"}:
+            raise ValueError("run is not in an interruption recovery state")
+        if run.error_category == "uncertain_tool_side_effect" and not acknowledge_uncertain:
+            raise ValueError("uncertain side effect requires explicit acknowledgement")
 
-            run = self.store.get_run(run_id)
-            exceeded = self._budget_failure(run, before_model=False)
-            if exceeded is not None:
-                return self._fail(run_id, "budget_exhausted", exceeded)
-
-            action = turn.action
-            if action.action == "finish":
-                assert action.final_output is not None
-                output_step = self.store.append_step(
-                    run_id,
-                    kind=AgentStepKind.output.value,
-                    status="succeeded",
-                    output_json=action.final_output,
-                )
-                self.store.set_state(
-                    run_id,
-                    AgentRunState.succeeded,
-                    final_output=action.final_output,
-                )
-                checkpoint = self.store.checkpoint(
-                    run_id,
-                    state_json={"state": AgentRunState.succeeded.value, "final_output": action.final_output},
-                )
-                self._emit(
-                    RuntimeEventType.checkpoint_committed,
-                    run_id,
-                    step_index=checkpoint.step_index,
-                    payload={"state": AgentRunState.succeeded.value},
-                )
-                outcome = self._outcome(run_id)
-                self._emit(
-                    RuntimeEventType.run_finished,
-                    run_id,
-                    step_index=output_step.step_index,
-                    payload={"state": outcome.state.value},
-                )
-                return outcome
-
-            assert action.tool_name is not None
-            self._emit(
-                RuntimeEventType.before_tool_validate,
-                run_id,
-                tool_name=action.tool_name,
-                tool_call_id=action.tool_call_id,
-            )
-            try:
-                tool = self.tools.resolve(action.tool_name)
-                validated = self.tools.validate(tool, action.arguments)
-            except ToolUnavailableError as exc:
-                return self._fail(run_id, "tool_unavailable", str(exc))
-            except ToolInputError as exc:
-                return self._fail(run_id, "tool_input_invalid", str(exc))
-            self._emit(
-                RuntimeEventType.after_tool_validate,
-                run_id,
-                tool_name=tool.name,
-                tool_call_id=action.tool_call_id,
-                payload={"valid": True},
-            )
-
-            permission = self.permissions.decide(
-                PermissionRequest(
-                    run_id=run_id,
-                    tool_call_id=action.tool_call_id,
-                    tool=tool,
-                    arguments=validated.model_dump(mode="json"),
-                )
-            )
-            self.store.record_permission(
-                run_id=run_id,
-                tool_call_id=action.tool_call_id,
-                tool_name=tool.name,
-                decision=permission.decision.value,
-                reason=permission.reason,
-            )
-            permission_step = self.store.append_step(
-                run_id,
-                kind=AgentStepKind.permission.value,
-                status=permission.decision.value,
-                tool_name=tool.name,
-                tool_call_id=action.tool_call_id,
-                input_json={"arguments": validated.model_dump(mode="json")},
-                output_json={"decision": permission.decision.value, "reason": permission.reason},
-            )
-            self._emit(
-                RuntimeEventType.permission_decision,
-                run_id,
-                step_index=permission_step.step_index,
-                tool_name=tool.name,
-                tool_call_id=action.tool_call_id,
-                payload={"decision": permission.decision.value, "reason": permission.reason},
-            )
-
-            if permission.decision == PermissionDecision.deny:
-                return self._fail(run_id, "permission_denied", permission.reason)
-            if permission.decision == PermissionDecision.ask:
-                human = self.store.create_human_action(
-                    run_id=run_id,
-                    tool_call_id=action.tool_call_id,
-                    tool_name=tool.name,
-                    request_json={"action": action.model_dump(mode="json"), "reason": permission.reason},
-                )
-                self.store.set_state(
-                    run_id,
-                    AgentRunState.needs_human,
-                    error_category="approval_required",
-                    error_detail=permission.reason,
-                )
-                checkpoint = self.store.checkpoint(
-                    run_id,
-                    state_json={
-                        "state": AgentRunState.needs_human.value,
-                        "human_action_id": human.id,
-                        "tool_call_id": action.tool_call_id,
-                    },
-                )
-                self._emit(
-                    RuntimeEventType.checkpoint_committed,
-                    run_id,
-                    step_index=checkpoint.step_index,
-                    tool_name=tool.name,
-                    tool_call_id=action.tool_call_id,
-                    payload={"state": AgentRunState.needs_human.value},
-                )
-                self._emit(
-                    RuntimeEventType.human_action_required,
-                    run_id,
-                    step_index=permission_step.step_index,
-                    tool_name=tool.name,
-                    tool_call_id=action.tool_call_id,
-                    payload={"human_action_id": human.id, "reason": permission.reason},
-                )
-                return self._outcome(run_id, human_action_id=human.id)
-
-            outcome = self._execute_tool(
-                run_id,
-                action,
-                tool,
-                validated.model_dump(mode="json"),
-            )
-            if outcome is not None:
-                return outcome
+        self.store.set_state(run_id, AgentRunState.running)
+        checkpoint = self.store.checkpoint(
+            run_id,
+            state_json={
+                "state": AgentRunState.running.value,
+                "recovery": "explicit_resume_without_replay",
+                "uncertain_acknowledged": acknowledge_uncertain,
+            },
+        )
+        self._emit(
+            RuntimeEventType.checkpoint_committed,
+            run_id,
+            step_index=checkpoint.step_index,
+            payload={"state": AgentRunState.running.value, "recovery": True},
+        )
+        return self._drive(run_id)
 
     def _execute_tool(
         self,
@@ -347,6 +111,16 @@ class AgentRuntime:
         validated_json: dict[str, Any],
     ) -> RuntimeOutcome | None:
         validated = self.tools.validate(tool, validated_json)
+
+        duplicate = self._duplicate_tool_call(
+            run_id,
+            action=action,
+            tool=tool,
+            validated_json=validated_json,
+        )
+        if duplicate is not False:
+            return duplicate
+
         step = self.store.append_step(
             run_id,
             kind=AgentStepKind.tool.value,
@@ -367,6 +141,7 @@ class AgentRuntime:
             tool_call_id=action.tool_call_id,
             payload={"timeout_seconds": tool.timeout_seconds},
         )
+
         try:
             result = self.tools.execute_validated(
                 tool,
@@ -375,8 +150,38 @@ class AgentRuntime:
                 tool_call_id=action.tool_call_id,
             )
             persisted = result.model_dump(mode="json")
+        except ToolNeedsHumanError as exc:
+            return self._domain_needs_human(run_id, step, action, tool, exc)
+        except ToolDomainFailureError as exc:
+            persisted = exc.result.model_dump(mode="json") if exc.result is not None else None
+            evidence_refs = exc.result.evidence_refs if exc.result is not None else None
+            self.store.update_step(
+                step.id,
+                status="failed",
+                output_json=persisted,
+                evidence_refs=evidence_refs,
+                error_category=exc.category,
+                error_detail=exc.detail,
+            )
+            self._emit(
+                RuntimeEventType.after_tool,
+                run_id,
+                step_index=step.step_index,
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                payload={"status": "failed", "error_category": exc.category},
+            )
+            return self._fail(run_id, exc.category, exc.detail)
         except ToolTimeoutError as exc:
             detail = str(exc)
+            if self._tool_may_have_side_effect(tool):
+                return self._uncertain_tool_side_effect(
+                    run_id,
+                    step=step,
+                    action=action,
+                    tool=tool,
+                    detail=detail,
+                )
             self.store.update_step(
                 step.id,
                 status="failed",
@@ -394,6 +199,14 @@ class AgentRuntime:
             return self._fail(run_id, "tool_timeout", detail)
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
+            if self._tool_may_have_side_effect(tool):
+                return self._uncertain_tool_side_effect(
+                    run_id,
+                    step=step,
+                    action=action,
+                    tool=tool,
+                    detail=detail,
+                )
             self.store.update_step(
                 step.id,
                 status="failed",
@@ -442,80 +255,191 @@ class AgentRuntime:
         )
         return None
 
-    def _budget_failure(self, run: AgentRunRecord, *, before_model: bool) -> str | None:
-        if run.step_count >= self.budget.max_steps:
-            return f"max_steps={self.budget.max_steps} reached"
-        # Equality blocks the *next* request but must not invalidate the request
-        # that just consumed the final allowed slot.
-        if before_model and run.model_calls >= self.budget.max_model_calls:
-            return f"max_model_calls={self.budget.max_model_calls} reached"
-        if run.input_tokens > self.budget.max_input_tokens:
-            return f"input token budget exceeded ({run.input_tokens}>{self.budget.max_input_tokens})"
-        if run.output_tokens > self.budget.max_output_tokens:
-            return f"output token budget exceeded ({run.output_tokens}>{self.budget.max_output_tokens})"
-        elapsed = (_utcnow() - run.created_at).total_seconds()
-        if elapsed > self.budget.max_wall_time_seconds:
-            return f"wall-time budget exceeded ({elapsed:.3f}s>{self.budget.max_wall_time_seconds}s)"
-        return None
+    def _duplicate_tool_call(
+        self,
+        run_id: str,
+        *,
+        action: NextAction,
+        tool: Any,
+        validated_json: dict[str, Any],
+    ) -> RuntimeOutcome | None | bool:
+        matches = [
+            step
+            for step in self.store.list_steps(run_id)
+            if step.kind == AgentStepKind.tool.value
+            and step.tool_call_id == action.tool_call_id
+        ]
+        if not matches:
+            return False
 
-    def _fail(self, run_id: str, category: str, detail: str) -> RuntimeOutcome:
-        error_step = self.store.append_step(
+        previous = matches[-1]
+        previous_arguments = (previous.input_json or {}).get("arguments")
+        if previous.tool_name != tool.name or previous_arguments != validated_json:
+            return self._fail(
+                run_id,
+                "tool_call_id_conflict",
+                "A tool_call_id was reused with different tool identity or arguments.",
+            )
+        if previous.status in {"started", "uncertain", "needs_human"}:
+            self.store.set_state(
+                run_id,
+                AgentRunState.needs_human,
+                error_category="uncertain_tool_side_effect",
+                error_detail="A prior execution of this tool_call_id has no safe committed outcome.",
+            )
+            return self._outcome(run_id)
+        if previous.status in {"succeeded", "reused"}:
+            if not tool.idempotent:
+                return self._fail(
+                    run_id,
+                    "duplicate_non_idempotent_call",
+                    "Automatic replay of a committed non-idempotent tool call is forbidden.",
+                )
+            reused = self.store.append_step(
+                run_id,
+                kind=AgentStepKind.tool.value,
+                status="reused",
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                input_json={
+                    "arguments": validated_json,
+                    "idempotent": True,
+                    "reused_from_step": previous.step_index,
+                },
+                output_json=previous.output_json,
+                evidence_refs=list(previous.evidence_refs_json or []),
+            )
+            checkpoint = self.store.checkpoint(
+                run_id,
+                state_json={
+                    "state": AgentRunState.running.value,
+                    "reused_tool_call_id": action.tool_call_id,
+                    "reused_from_step": previous.step_index,
+                },
+            )
+            self._emit(
+                RuntimeEventType.after_tool,
+                run_id,
+                step_index=reused.step_index,
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                payload={"status": "reused", "executed": False},
+            )
+            self._emit(
+                RuntimeEventType.checkpoint_committed,
+                run_id,
+                step_index=checkpoint.step_index,
+                tool_name=tool.name,
+                tool_call_id=action.tool_call_id,
+                payload={"state": AgentRunState.running.value, "reused": True},
+            )
+            return None
+        return self._fail(
             run_id,
-            kind=AgentStepKind.error.value,
-            status="failed",
-            error_category=category,
+            "duplicate_tool_call_blocked",
+            f"Previous tool_call_id outcome is not replay-safe: {previous.status}.",
+        )
+
+    def _domain_needs_human(
+        self,
+        run_id: str,
+        step: Any,
+        action: NextAction,
+        tool: Any,
+        exc: ToolNeedsHumanError,
+    ) -> RuntimeOutcome:
+        persisted = exc.result.model_dump(mode="json") if exc.result is not None else None
+        evidence_refs = exc.result.evidence_refs if exc.result is not None else None
+        self.store.update_step(
+            step.id,
+            status="needs_human",
+            output_json=persisted,
+            evidence_refs=evidence_refs,
+            error_category=exc.category,
+            error_detail=exc.detail,
+        )
+        self.store.set_state(
+            run_id,
+            AgentRunState.needs_human,
+            error_category=exc.category,
+            error_detail=exc.detail,
+        )
+        checkpoint = self.store.checkpoint(
+            run_id,
+            state_json={
+                "state": AgentRunState.needs_human.value,
+                "tool_call_id": action.tool_call_id,
+                "domain_category": exc.category,
+            },
+        )
+        self._emit(
+            RuntimeEventType.after_tool,
+            run_id,
+            step_index=step.step_index,
+            tool_name=tool.name,
+            tool_call_id=action.tool_call_id,
+            payload={"status": "needs_human", "error_category": exc.category},
+        )
+        self._emit(
+            RuntimeEventType.checkpoint_committed,
+            run_id,
+            step_index=checkpoint.step_index,
+            tool_name=tool.name,
+            tool_call_id=action.tool_call_id,
+            payload={"state": AgentRunState.needs_human.value},
+        )
+        return self._outcome(run_id)
+
+    def _uncertain_tool_side_effect(
+        self,
+        run_id: str,
+        *,
+        step: Any,
+        action: NextAction,
+        tool: Any,
+        detail: str,
+    ) -> RuntimeOutcome:
+        self.store.update_step(
+            step.id,
+            status="uncertain",
+            error_category="uncertain_tool_side_effect",
             error_detail=detail,
         )
         self.store.set_state(
             run_id,
-            AgentRunState.failed,
-            error_category=category,
-            error_detail=detail,
+            AgentRunState.needs_human,
+            error_category="uncertain_tool_side_effect",
+            error_detail=(
+                "Tool execution ended without a provably safe outcome; automatic replay is forbidden. "
+                + detail
+            ),
         )
-        outcome = self._outcome(run_id)
-        self._emit(
-            RuntimeEventType.run_error,
+        checkpoint = self.store.checkpoint(
             run_id,
-            step_index=error_step.step_index,
-            payload={"category": category, "detail": detail, "recoverable": False},
+            state_json={
+                "state": AgentRunState.needs_human.value,
+                "uncertain_tool_call_id": action.tool_call_id,
+                "automatic_replay_forbidden": True,
+            },
         )
         self._emit(
-            RuntimeEventType.run_finished,
+            RuntimeEventType.after_tool,
             run_id,
-            step_index=error_step.step_index,
-            payload={"state": outcome.state.value},
+            step_index=step.step_index,
+            tool_name=tool.name,
+            tool_call_id=action.tool_call_id,
+            payload={"status": "uncertain", "error_category": "uncertain_tool_side_effect"},
         )
-        return outcome
+        self._emit(
+            RuntimeEventType.checkpoint_committed,
+            run_id,
+            step_index=checkpoint.step_index,
+            tool_name=tool.name,
+            tool_call_id=action.tool_call_id,
+            payload={"state": AgentRunState.needs_human.value},
+        )
+        return self._outcome(run_id)
 
-    def _outcome(self, run_id: str, *, human_action_id: str | None = None) -> RuntimeOutcome:
-        run = self.store.get_run(run_id)
-        return RuntimeOutcome(
-            run_id=run.id,
-            state=AgentRunState(run.state),
-            final_output=run.final_output_json,
-            needs_human_action_id=human_action_id,
-            error_category=run.error_category,
-            error_detail=run.error_detail,
-            usage=self.store.usage(run_id),
-        )
-
-    def _emit(
-        self,
-        event_type: RuntimeEventType,
-        run_id: str,
-        *,
-        step_index: int | None = None,
-        tool_name: str | None = None,
-        tool_call_id: str | None = None,
-        payload: dict[str, Any] | None = None,
-    ) -> None:
-        self.events.emit(
-            RuntimeEvent(
-                event_type=event_type,
-                run_id=run_id,
-                step_index=step_index,
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                payload=payload or {},
-            )
-        )
+    @staticmethod
+    def _tool_may_have_side_effect(tool: Any) -> bool:
+        return bool(tool.external_side_effect or tool.destructive or not tool.read_only)

@@ -1,0 +1,158 @@
+name: Canonical Agent Runtime Fold-in Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/agent-runtime-pydantic-v1
+    paths:
+      - 'backend/app/agent_runtime/**'
+      - 'backend/tests/agent_runtime/**'
+      - '.github/workflows/agent-runtime-foldin.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  baseline-backend:
+    name: Capture Stage 2 baseline backend failures
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: spike/agent-runtime-pydantic-v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Stage 2 baseline dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Capture Stage 2 baseline backend result
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=no > pytest.log 2>&1
+          status=$?
+          set -e
+          cat pytest.log
+          python - "$status" <<'PY'
+          import json, pathlib, re, sys
+          status = int(sys.argv[1])
+          text = pathlib.Path('pytest.log').read_text(encoding='utf-8', errors='replace')
+          issues = sorted({
+              match.group(1)
+              for line in text.splitlines()
+              if (match := re.match(r'^(?:FAILED|ERROR)\s+([^\s]+)', line))
+          })
+          pathlib.Path('backend-result.json').write_text(
+              json.dumps({'exit_code': status, 'issues': issues}, indent=2, ensure_ascii=False),
+              encoding='utf-8',
+          )
+          print(f'Stage 2 baseline backend: exit={status}, issues={len(issues)}')
+          if status not in (0, 1):
+              raise SystemExit(f'pytest infrastructure/collection failure: exit {status}')
+          if status == 1 and not issues:
+              raise SystemExit('pytest failed but no FAILED/ERROR node ids could be extracted')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foldin-baseline-backend-result
+          path: backend-result.json
+
+  foldin-backend:
+    name: Verify canonical runtime and capture backend failures
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install fold-in dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compile canonical runtime
+        run: python -m compileall -q backend/app/agent_runtime backend/tests/agent_runtime
+      - name: Run canonical Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
+      - name: Capture fold-in full-backend result
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=no > pytest.log 2>&1
+          status=$?
+          set -e
+          cat pytest.log
+          python - "$status" <<'PY'
+          import json, pathlib, re, sys
+          status = int(sys.argv[1])
+          text = pathlib.Path('pytest.log').read_text(encoding='utf-8', errors='replace')
+          issues = sorted({
+              match.group(1)
+              for line in text.splitlines()
+              if (match := re.match(r'^(?:FAILED|ERROR)\s+([^\s]+)', line))
+          })
+          pathlib.Path('backend-result.json').write_text(
+              json.dumps({'exit_code': status, 'issues': issues}, indent=2, ensure_ascii=False),
+              encoding='utf-8',
+          )
+          print(f'fold-in backend: exit={status}, issues={len(issues)}')
+          if status not in (0, 1):
+              raise SystemExit(f'pytest infrastructure/collection failure: exit {status}')
+          if status == 1 and not issues:
+              raise SystemExit('pytest failed but no FAILED/ERROR node ids could be extracted')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foldin-spike-backend-result
+          path: backend-result.json
+
+  backend-regression-guard:
+    name: Stage 2 to canonical runtime regression guard
+    needs: [baseline-backend, foldin-backend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: foldin-baseline-backend-result
+          path: .ci/baseline
+      - uses: actions/download-artifact@v4
+        with:
+          name: foldin-spike-backend-result
+          path: .ci/spike
+      - name: Compare and recheck apparent regressions
+        run: |
+          python tools/agent_runtime_regression_guard.py \
+            --baseline-result .ci/baseline/backend-result.json \
+            --spike-result .ci/spike/backend-result.json \
+            --baseline-ref spike/agent-runtime-pydantic-v1 \
+            --repeats 5 \
+            --report foldin-backend-regression-recheck.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: foldin-backend-regression-recheck
+          path: foldin-backend-regression-recheck.json
+          if-no-files-found: warn
