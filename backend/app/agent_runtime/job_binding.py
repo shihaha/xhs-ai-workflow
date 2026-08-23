@@ -202,30 +202,45 @@ class AgentJobCoordinator:
 
 
 class JobAuthorityGuard:
-    """Read-only authority check for dedicated Agent orchestration Jobs only."""
+    """Validate Job authority through a durable AgentRun→Job binding only."""
 
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def require_running(self, job_id: str, *, now: datetime | None = None) -> None:
+    def require_run_running(self, run_id: str, *, now: datetime | None = None) -> str:
+        """Return the bound Job ID only when that exact run still has authority."""
+
+        with self.database.sessions() as session:
+            binding = session.get(AgentJobBindingRecord, run_id)
+            if binding is None:
+                raise JobAuthorityError(
+                    f"Agent run {run_id} has no durable Job binding; Agent work must stop."
+                )
+            job_id = binding.job_id
+        self._require_job_running(job_id, now=now)
+        return job_id
+
+    def _require_job_running(self, job_id: str, *, now: datetime | None = None) -> None:
         current_time = now or _utcnow()
         with self.database.sessions() as session:
             record = session.get(JobRecord, job_id)
             if record is None:
-                raise JobNotFound(f"Job {job_id} does not exist.")
+                raise JobAuthorityError(
+                    f"Bound Job {job_id} does not exist; Agent work must stop."
+                )
             if record.type != AGENT_ORCHESTRATION_JOB_TYPE:
                 raise JobAuthorityError(
-                    f"Job {job_id} has type {record.type!r}; Agent authority requires "
+                    f"Bound Job {job_id} has type {record.type!r}; Agent authority requires "
                     f"{AGENT_ORCHESTRATION_JOB_TYPE!r}."
                 )
             state = JobState(record.state)
             if state is not JobState.running:
                 raise JobAuthorityError(
-                    f"Job {job_id} is {state.value}; Agent work requires running authority."
+                    f"Bound Job {job_id} is {state.value}; Agent work requires running authority."
                 )
             if record.lease_expires_at is None or record.lease_expires_at <= current_time:
                 raise JobAuthorityError(
-                    f"Job {job_id} has no valid running lease; Agent work must stop."
+                    f"Bound Job {job_id} has no valid running lease; Agent work must stop."
                 )
 
 
