@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AgentRunSummaryRead(BaseModel):
@@ -140,7 +141,38 @@ class AgentActionCapabilitiesRead(BaseModel):
     cancel_job: bool
     deny_permission_action: bool
     approve_continuation: bool
+    start_grounded_orchestration: bool = False
     continuation_reason: str | None = None
+
+
+class AgentGroundedOrchestrationCreate(BaseModel):
+    goal: str = Field(min_length=1, max_length=2000)
+    evidence_ids: list[str] = Field(min_length=1, max_length=20)
+
+    @field_validator("goal")
+    @classmethod
+    def normalize_goal(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("goal must not be blank")
+        return normalized
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def validate_evidence_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("evidence_ids must be unique")
+        pattern = re.compile(r"^(?:account-note|artifact|rank-item):[1-9][0-9]*$", re.ASCII)
+        if any(pattern.fullmatch(item) is None for item in value):
+            raise ValueError("evidence_ids must use canonical durable evidence identities")
+        return value
+
+
+class AgentGroundedOrchestrationRead(BaseModel):
+    job_id: str
+    run_id: str
+    evidence_count: int = Field(ge=1, le=20)
+    dispatch_enqueued: Literal[True]
 
 
 class AgentJobCancelRead(BaseModel):

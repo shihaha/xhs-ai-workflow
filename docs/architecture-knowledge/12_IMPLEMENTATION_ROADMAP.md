@@ -282,6 +282,56 @@ The Agent should orchestrate existing domain services; the existing AnalysisServ
 
 ---
 
+# Stage 5.5 — Workbench usability + Chinese localization pass
+
+## Goal
+
+Before the workbench is allowed to drive real physical/browser collection, make the operator surface understandable to the actual user rather than leaving it as an engineering console.
+
+This pass must **not** rewrite the backend lifecycle or delay Stage 5 correctness work. It is a dedicated UI/usability slice between Stage 5 and Stage 6.
+
+## Chinese-first UI rule
+
+The primary workbench language is Chinese.
+
+All operator-facing content must be Chinese by default, including:
+
+- page headings and section names;
+- buttons and confirmation text;
+- Job / AgentRun / HumanAction status labels;
+- error and warning messages;
+- capability/permission explanations;
+- empty states and help text;
+- timeline descriptions and action results.
+
+Technical identities such as `Job`, `AgentRun`, `HumanAction`, `Evidence`, `Artifact`, tool names, IDs and raw backend enum values may remain visible where useful for debugging/audit, but they must not be the only explanation shown to the user. The UI should present a clear Chinese label/explanation alongside them.
+
+Examples:
+
+```text
+Agent Runs -> Agent 执行记录
+Human Actions -> 等待人工处理
+Pending -> 等待处理
+needs_human -> 需要人工处理
+Grounded Agent analysis -> 基于证据的 Agent 分析
+Backend-authoritative -> 状态以后台真实记录为准
+```
+
+## Acceptance
+
+1. a non-programmer can understand the main `/agent` page without knowing English technical terminology;
+2. every actionable button and destructive confirmation is Chinese-first;
+3. important runtime states are translated consistently across list/detail/timeline pages;
+4. backend enum/tool identifiers remain available for audit but never replace the human-readable Chinese explanation;
+5. no user-facing English-only error is emitted for normal workbench operations;
+6. localization changes do not alter Job/AgentRun/HumanAction authority semantics.
+
+## UI layout review in the same pass
+
+Use this stage to review whether the current vertically stacked engineering-console layout should evolve toward a more operator-oriented AI workbench (for example: task/project navigation, central Agent execution/timeline, evidence/artifact side context). Do not couple that visual redesign to Stage 5 backend correctness.
+
+---
+
 # Stage 6 — Permission-gated real collection
 
 ## Goal

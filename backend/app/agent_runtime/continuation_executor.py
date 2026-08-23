@@ -24,6 +24,7 @@ from backend.app.agent_runtime.job_bound_runtime import (
     ActiveRunJobAuthorityGuard,
     JobBoundAgentRuntime,
 )
+from backend.app.agent_runtime.job_binding import AgentJobBindingRecord
 from backend.app.agent_runtime.job_continuation import (
     AgentContinuationDispatchRecord,
     ApprovedContinuation,
@@ -32,7 +33,12 @@ from backend.app.agent_runtime.job_continuation import (
 )
 from backend.app.agent_runtime.job_terminal_projection import JobTerminalProjector
 from backend.app.agent_runtime.job_wait_projection import JobHumanWaitProjector
-from backend.app.agent_runtime.persistence import AgentRunRecord, AgentRunStore, HumanActionRecord
+from backend.app.agent_runtime.persistence import (
+    AgentRunRecord,
+    AgentRunStore,
+    AgentStepRecord,
+    HumanActionRecord,
+)
 from backend.app.agent_runtime.tools import ToolInputError, ToolUnavailableError
 from backend.app.agent_runtime.types import AgentRunState, NextAction
 from backend.app.db import Database
@@ -199,7 +205,16 @@ class AgentContinuationExecutor:
                         "Only an exact persisted Tool action may be approved."
                     )
                 tool = runtime.tools.resolve(action.tool_name)
-                runtime.tools.validate(tool, action.arguments)
+                validated = runtime.tools.validate(tool, action.arguments)
+                if action.tool_name == "analysis.run_grounded":
+                    requested_ids = set(
+                        validated.model_dump(mode="json").get("evidence_ids", [])
+                    )
+                    allowed_ids = self._job_history_evidence_refs(source_run_id)
+                    if not requested_ids or not requested_ids.issubset(allowed_ids):
+                        raise ContinuationApprovalError(
+                            "Grounded analysis may use only evidence already present in the durable Job history."
+                        )
             except ContinuationApprovalError:
                 raise
             except (ToolUnavailableError, ToolInputError, ValueError) as error:
@@ -215,6 +230,31 @@ class AgentContinuationExecutor:
             self._idle.clear()
             self._wake.set()
             return approved
+
+    def _job_history_evidence_refs(self, source_run_id: str) -> set[str]:
+        """Return the durable evidence ceiling for this exact Job history."""
+
+        job_id = self.guard.require_current_binding(source_run_id)
+        with self.database.sessions() as session:
+            run_ids = list(
+                session.scalars(
+                    select(AgentJobBindingRecord.run_id).where(
+                        AgentJobBindingRecord.job_id == job_id
+                    )
+                )
+            )
+            if not run_ids:
+                return set()
+            steps = list(
+                session.scalars(
+                    select(AgentStepRecord).where(AgentStepRecord.run_id.in_(run_ids))
+                )
+            )
+        return {
+            evidence_id
+            for step in steps
+            for evidence_id in list(step.evidence_refs_json or [])
+        }
 
     def dispatch_view(self, run_id: str) -> ContinuationDispatchView:
         with self.database.sessions() as session:

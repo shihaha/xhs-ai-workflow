@@ -264,6 +264,7 @@ def test_app_only_enables_auto_continuation_when_model_is_configured(tmp_path: P
         "cancel_job": True,
         "deny_permission_action": True,
         "approve_continuation": True,
+        "start_grounded_orchestration": True,
         "continuation_reason": None,
     }
     runtime = executor.runtime_factory()

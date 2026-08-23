@@ -1,0 +1,96 @@
+name: Real Agent Orchestration V1 Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/agent-continuation-executor-v1
+    paths:
+      - 'frontend/src/api/client.ts'
+      - 'frontend/src/pages/AgentWorkbenchPage.tsx'
+      - 'frontend/src/pages/AgentWorkbenchPage.test.tsx'
+      - 'backend/app/api/agent_runtime.py'
+      - 'backend/app/api/jobs.py'
+      - 'backend/app/agent_runtime/continuation_executor.py'
+      - 'backend/app/agent_runtime/initial_execution.py'
+      - 'backend/app/agent_runtime/orchestration_service.py'
+      - 'backend/app/agent_runtime/production_runtime.py'
+      - 'backend/app/agent_runtime/workbench_actions.py'
+      - 'backend/app/main.py'
+      - 'backend/app/schemas/agent_runtime.py'
+      - 'backend/app/services/jobs.py'
+      - 'backend/tests/agent_runtime/test_real_agent_orchestration_api.py'
+      - 'backend/tests/agent_runtime/test_continuation_executor_api.py'
+      - 'backend/tests/agent_runtime/test_analysis_tool_parity.py'
+      - 'backend/tests/agent_runtime/test_job_bound_approved_continuation.py'
+      - 'backend/tests/agent_runtime/test_workbench_operator_actions_api.py'
+      - 'backend/tests/agent_runtime/test_workbench_read_api.py'
+      - 'backend/tests/agent_runtime/test_workbench_projection_api_v2.py'
+      - 'backend/tests/agent_runtime/test_workbench_chatgpt_handoff_api.py'
+      - 'docs/architecture-knowledge/24_REAL_AGENT_ORCHESTRATION_V1.md'
+      - '.github/workflows/real-agent-orchestration-v1.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  frontend:
+    name: Real Agent orchestration workbench frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Run focused Agent workbench tests
+        run: npm test -- --run src/pages/AgentWorkbenchPage.test.tsx src/main.test.tsx
+      - name: Run complete frontend regression
+        run: npm test -- --run
+      - name: Build production frontend
+        run: npm run build
+
+  backend-contract:
+    name: Real Agent orchestration contract regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compile orchestration boundary
+        run: python -m compileall -q backend tools frontend/e2e/fixture_app.py
+      - name: Run initial orchestration and continuation contracts
+        run: >-
+          python -m pytest
+          backend/tests/agent_runtime/test_real_agent_orchestration_api.py
+          backend/tests/agent_runtime/test_continuation_executor_api.py
+          backend/tests/agent_runtime/test_job_bound_approved_continuation.py
+          backend/tests/agent_runtime/test_workbench_operator_actions_api.py
+          backend/tests/agent_runtime/test_workbench_read_api.py
+          backend/tests/agent_runtime/test_workbench_projection_api_v2.py
+          backend/tests/agent_runtime/test_workbench_chatgpt_handoff_api.py
+          -q
+      - name: Run direct AnalysisService parity contracts
+        run: python -m pytest backend/tests/agent_runtime/test_analysis_tool_parity.py -q
+      - name: Run complete Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
+      - name: Scan release boundaries
+        run: python tools/scan_release_boundaries.py --root .
