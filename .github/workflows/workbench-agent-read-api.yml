@@ -1,0 +1,57 @@
+name: Workbench Agent Read API Verification
+
+on:
+  pull_request:
+    branches:
+      - fix/job-bound-terminal-foldin-v1
+    paths:
+      - 'backend/app/api/agent_runtime.py'
+      - 'backend/app/agent_runtime/workbench_read.py'
+      - 'backend/app/schemas/agent_runtime.py'
+      - 'backend/app/main.py'
+      - 'backend/tests/agent_runtime/test_workbench_read_api.py'
+      - '.github/workflows/workbench-agent-read-api.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  workbench-agent-read-api:
+    name: Durable redacted Agent workbench read API
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+
+      - name: Compile workbench read slice
+        run: >-
+          python -m compileall -q
+          backend/app/api/agent_runtime.py
+          backend/app/agent_runtime/workbench_read.py
+          backend/app/schemas/agent_runtime.py
+          backend/app/main.py
+          backend/tests/agent_runtime/test_workbench_read_api.py
+
+      - name: Run focused workbench read API tests
+        run: python -m pytest backend/tests/agent_runtime/test_workbench_read_api.py -q
+
+      - name: Run existing Jobs API regression
+        run: python -m pytest backend/tests/test_jobs_api.py backend/tests/test_jobs_hardening.py -q
+
+      - name: Run complete Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
