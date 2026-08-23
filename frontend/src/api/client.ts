@@ -184,7 +184,15 @@ export interface AgentOperatorCapabilities {
   cancel_job: boolean;
   deny_permission_action: boolean;
   approve_continuation: boolean;
+  start_grounded_orchestration: boolean;
   continuation_reason: string | null;
+}
+
+export interface AgentGroundedOrchestration {
+  job_id: string;
+  run_id: string;
+  evidence_count: number;
+  dispatch_enqueued: true;
 }
 
 export interface AgentJobCancelResult {
@@ -389,6 +397,7 @@ export const fetchAgentRuns = () => getJson<AgentRunListItem[]>("/api/v1/agent-r
 export const fetchAgentRun = (runId: string) => getJson<AgentRunDetail>(`/api/v1/agent-runtime/runs/${encodeURIComponent(runId)}`);
 export const fetchAgentHumanActions = (status?: "pending" | "approved" | "denied" | "completed") => getJson<AgentHumanAction[]>(`/api/v1/agent-runtime/human-actions${status ? `?status=${encodeURIComponent(status)}` : ""}`);
 export const fetchAgentOperatorCapabilities = () => getJson<AgentOperatorCapabilities>("/api/v1/agent-runtime/operator-capabilities");
+export const startGroundedAgentOrchestration = (payload: { goal: string; evidence_ids: string[] }) => postJson<AgentGroundedOrchestration>("/api/v1/agent-runtime/jobs", payload);
 export const cancelAgentJob = (jobId: string) => postJson<AgentJobCancelResult>(`/api/v1/agent-runtime/jobs/${encodeURIComponent(jobId)}/cancel`, {});
 export const denyAgentHumanAction = (actionId: string, payload: { note?: string }) => postJson<AgentHumanActionDecision>(`/api/v1/agent-runtime/human-actions/${encodeURIComponent(actionId)}/deny`, payload);
 export const approveAgentHumanAction = (actionId: string, payload: { note?: string }) => postJson<AgentHumanActionApproval>(`/api/v1/agent-runtime/human-actions/${encodeURIComponent(actionId)}/approve`, payload);

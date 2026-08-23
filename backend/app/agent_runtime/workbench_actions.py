@@ -17,6 +17,7 @@ from backend.app.agent_runtime.continuation_executor import (
     AgentContinuationExecutor,
     ContinuationExecutorClosed,
 )
+from backend.app.agent_runtime.initial_execution import AgentInitialExecutor
 from backend.app.agent_runtime.job_continuation import ContinuationApprovalError
 from backend.app.agent_runtime.job_binding import (
     AGENT_ORCHESTRATION_JOB_TYPE,
@@ -76,9 +77,11 @@ class AgentWorkbenchActionService:
         database: Database,
         *,
         continuation_executor: AgentContinuationExecutor | None = None,
+        initial_executor: AgentInitialExecutor | None = None,
     ) -> None:
         self.database = database
         self.continuation_executor = continuation_executor
+        self.initial_executor = initial_executor
         # Ensure staged Agent tables exist on a fresh local database.
         self.store = AgentRunStore(database)
         AgentJobBindingRecord.__table__.create(bind=database.engine, checkfirst=True)
@@ -88,10 +91,14 @@ class AgentWorkbenchActionService:
             self.continuation_executor is not None
             and self.continuation_executor.accepting
         )
+        initial_ready = bool(
+            self.initial_executor is not None and self.initial_executor.accepting
+        )
         return {
             "cancel_job": True,
             "deny_permission_action": True,
             "approve_continuation": executor_ready,
+            "start_grounded_orchestration": initial_ready,
             "continuation_reason": (
                 None
                 if executor_ready

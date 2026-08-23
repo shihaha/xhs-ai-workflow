@@ -10,6 +10,10 @@ from backend.app.agent_runtime.workbench_actions import (
     AgentWorkbenchActionError,
     AgentWorkbenchActionService,
 )
+from backend.app.agent_runtime.orchestration_service import (
+    AgentOrchestrationService,
+    AgentOrchestrationStartError,
+)
 from backend.app.agent_runtime.workbench_read import (
     AgentWorkbenchReadError,
     AgentWorkbenchReader,
@@ -17,6 +21,8 @@ from backend.app.agent_runtime.workbench_read import (
 from backend.app.schemas.agent_runtime import (
     AgentActionCapabilitiesRead,
     AgentEvidenceRefsRead,
+    AgentGroundedOrchestrationCreate,
+    AgentGroundedOrchestrationRead,
     AgentJobCancelRead,
     AgentJobRuntimeRead,
     AgentJobSummaryRead,
@@ -53,6 +59,15 @@ def _reader(request: Request) -> AgentWorkbenchReader:
     return reader
 
 
+def _orchestration(request: Request) -> AgentOrchestrationService:
+    service: AgentOrchestrationService | None = getattr(
+        request.app.state, "agent_orchestration_service", None
+    )
+    if service is None:
+        raise HTTPException(status_code=503, detail="Agent orchestration is unavailable.")
+    return service
+
+
 def _job_view(job_id: str, request: Request) -> dict:
     try:
         return _reader(request).job_view(job_id)
@@ -71,6 +86,30 @@ def list_agent_jobs(request: Request) -> list[AgentJobSummaryRead]:
         ]
     except AgentWorkbenchReadError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/jobs",
+    response_model=AgentGroundedOrchestrationRead,
+    status_code=202,
+)
+def start_grounded_agent_job(
+    payload: AgentGroundedOrchestrationCreate,
+    request: Request,
+) -> AgentGroundedOrchestrationRead:
+    try:
+        result = _orchestration(request).start_grounded_analysis(
+            goal=payload.goal,
+            evidence_ids=payload.evidence_ids,
+        )
+    except AgentOrchestrationStartError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return AgentGroundedOrchestrationRead(
+        job_id=result.job_id,
+        run_id=result.run_id,
+        evidence_count=result.evidence_count,
+        dispatch_enqueued=True,
+    )
 
 
 @router.get("/jobs/{job_id}", response_model=AgentJobRuntimeRead)

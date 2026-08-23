@@ -22,6 +22,8 @@ from backend.app.adapters.qianfan_playwright import (
     persistent_qianfan_page_factory,
 )
 from backend.app.agent_runtime.continuation_executor import AgentContinuationExecutor
+from backend.app.agent_runtime.initial_execution import AgentInitialExecutor
+from backend.app.agent_runtime.orchestration_service import AgentOrchestrationService
 from backend.app.agent_runtime.production_runtime import (
     automatic_agent_configured,
     build_production_job_bound_runtime,
@@ -63,7 +65,12 @@ async def _lifespan(app: FastAPI):
     continuation_executor: AgentContinuationExecutor | None = getattr(
         app.state, "agent_continuation_executor", None
     )
+    initial_executor: AgentInitialExecutor | None = getattr(
+        app.state, "agent_initial_executor", None
+    )
     try:
+        if initial_executor is not None:
+            initial_executor.start()
         if continuation_executor is not None:
             continuation_executor.start()
         if media_worker is not None:
@@ -72,6 +79,9 @@ async def _lifespan(app: FastAPI):
             cleanup_worker.start()
         yield
     finally:
+        initial_safe = True
+        if initial_executor is not None:
+            initial_safe = initial_executor.close()
         continuation_safe = True
         if continuation_executor is not None:
             continuation_safe = continuation_executor.close()
@@ -95,6 +105,8 @@ async def _lifespan(app: FastAPI):
             cleanup_worker.close()
         elif database is not None:
             database.close()
+        if not initial_safe:
+            raise RuntimeError("Initial Agent executor did not stop safely.")
         if not continuation_safe:
             raise RuntimeError("Agent continuation executor did not stop safely.")
         if not xhs_safe:
@@ -113,6 +125,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.agent_workbench_reader = None
     app.state.agent_workbench_actions = None
     app.state.agent_continuation_executor = None
+    app.state.agent_initial_executor = None
+    app.state.agent_orchestration_service = None
     app.state.radar_service = None
     app.state.adapter_registry = None
     app.state.xhs_collection_service = None
@@ -211,9 +225,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             approval_enabled=automatic_agent_configured(app.state.bailian_adapter),
         )
         app.state.agent_continuation_executor = executor
+        initial_executor = AgentInitialExecutor(
+            app.state.database,
+            runtime_factory=runtime_factory,
+            launch_enabled=automatic_agent_configured(app.state.bailian_adapter),
+        )
+        app.state.agent_initial_executor = initial_executor
+        app.state.agent_orchestration_service = AgentOrchestrationService(
+            analysis_service=app.state.analysis_service,
+            initial_executor=initial_executor,
+        )
         app.state.agent_workbench_actions = AgentWorkbenchActionService(
             app.state.database,
             continuation_executor=executor,
+            initial_executor=initial_executor,
         )
         app.state.artifact_cleanup_service = ArtifactCleanupService(
             app.state.database,
@@ -257,6 +282,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.agent_workbench_reader = None
         app.state.agent_workbench_actions = None
         app.state.agent_continuation_executor = None
+        app.state.agent_initial_executor = None
+        app.state.agent_orchestration_service = None
         app.state.adapter_registry = None
         app.state.xhs_collection_service = None
         app.state.radar_service = None

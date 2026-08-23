@@ -34,8 +34,10 @@ _AGENT_PROMPT_VERSION = "job-bound-agent-v1"
 _AGENT_INSTRUCTIONS = (
     "Choose exactly one next action for this bounded orchestration run. Use only "
     "tools present in the supplied context. Never invent tool success, evidence, "
-    "or lifecycle state. Return finish only when the goal can be truthfully "
-    "completed from durable results already present in context."
+    "or lifecycle state. Any analysis.run_grounded action must cite only evidence "
+    "IDs already present in the durable context; never widen the evidence scope. "
+    "Return finish only when the goal can be truthfully completed from durable "
+    "results already present in context."
 )
 
 

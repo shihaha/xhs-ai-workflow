@@ -52,6 +52,11 @@ def _service(request: Request) -> JobService:
 
 @router.post("", response_model=JobRead, status_code=status.HTTP_201_CREATED)
 def create_job(payload: JobCreate, request: Request) -> JobRead:
+    if payload.type == AGENT_ORCHESTRATION_JOB_TYPE:
+        raise HTTPException(
+            status_code=422,
+            detail="Agent orchestration Jobs must be created through /api/v1/agent-runtime/jobs.",
+        )
     if payload.type in _RESERVED_JOB_TYPES:
         raise HTTPException(status_code=422, detail="Reserved worker job type.")
     return _job_read(

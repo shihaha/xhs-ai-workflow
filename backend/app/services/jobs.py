@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import case, exists, func, select, update
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import Session, selectinload
 
 from backend.app.db import Database
 from backend.app.models.jobs import JobArtifactRecord, JobLogRecord, JobRecord, JobState
@@ -115,6 +115,49 @@ class JobService:
             session.commit()
             session.refresh(record)
             return _as_job(record)
+
+    def create_running_in_session(
+        self,
+        session: Session,
+        *,
+        job_id: str,
+        job_type: str,
+        input_data: dict[str, Any],
+        lease_expires_at: datetime,
+        current_stage: str | None = None,
+        progress_current: int = 0,
+        progress_total: int | None = None,
+        now: datetime | None = None,
+    ) -> JobRecord:
+        """Admit an already-owned running Job inside a caller transaction.
+
+        This narrow entrypoint exists for coordinators that must atomically
+        create the Job together with the durable worker/run that owns its first
+        lease.  It does not commit and must not be used to skip claim semantics
+        for a pre-existing Job.
+        """
+
+        created_at = now or _utc_now()
+        if lease_expires_at <= created_at:
+            raise InvalidJobTransition("A newly running Job requires a future lease.")
+        record = JobRecord(
+            id=job_id,
+            type=job_type,
+            input_data=input_data,
+            state=JobState.running.value,
+            progress_current=progress_current,
+            progress_total=progress_total,
+            current_stage=current_stage,
+            error_category=None,
+            retry_count=0,
+            created_at=created_at,
+            updated_at=created_at,
+            started_at=created_at,
+            completed_at=None,
+            lease_expires_at=lease_expires_at,
+        )
+        session.add(record)
+        return record
 
     def create_batch(self, specs: list[JobCreateSpec]) -> list[Job]:
         """Reserve a related job set in one transaction or persist none of it."""

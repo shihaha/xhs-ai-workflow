@@ -10,7 +10,10 @@ import {
   fetchAgentOperatorCapabilities,
   fetchAgentRun,
   fetchAgentRuns,
+  fetchAnalysisEvidence,
   fetchChatGPTHandoffs,
+  startGroundedAgentOrchestration,
+  type AgentGroundedOrchestration,
   type AgentHumanAction,
   type AgentHumanActionApproval,
   type AgentHumanActionDecision,
@@ -20,6 +23,7 @@ import {
   type AgentOperatorCapabilities,
   type AgentRunDetail,
   type AgentRunListItem,
+  type AnalysisEvidence,
   type ChatGPTHandoffTask,
 } from "../api/client";
 
@@ -34,6 +38,8 @@ export interface AgentWorkbenchPageProps {
   loadHumanActions?: () => Promise<AgentHumanAction[]>;
   loadHandoffs?: () => Promise<ChatGPTHandoffTask[]>;
   loadCapabilities?: () => Promise<AgentOperatorCapabilities>;
+  loadEvidence?: () => Promise<AnalysisEvidence[]>;
+  startOrchestration?: (payload: { goal: string; evidence_ids: string[] }) => Promise<AgentGroundedOrchestration>;
   approveAction?: (actionId: string, payload: { note?: string }) => Promise<AgentHumanActionApproval>;
   denyAction?: (actionId: string, payload: { note?: string }) => Promise<AgentHumanActionDecision>;
 }
@@ -44,6 +50,7 @@ interface AgentWorkbenchData {
   humanActions: AgentHumanAction[];
   handoffs: ChatGPTHandoffTask[];
   capabilities: AgentOperatorCapabilities;
+  evidence: AnalysisEvidence[];
 }
 
 export function AgentWorkbenchPage({
@@ -52,6 +59,8 @@ export function AgentWorkbenchPage({
   loadHumanActions = fetchAgentHumanActions,
   loadHandoffs = fetchChatGPTHandoffs,
   loadCapabilities = fetchAgentOperatorCapabilities,
+  loadEvidence = fetchAnalysisEvidence,
+  startOrchestration = startGroundedAgentOrchestration,
   approveAction = approveAgentHumanAction,
   denyAction = denyAgentHumanAction,
 }: AgentWorkbenchPageProps) {
@@ -67,11 +76,12 @@ export function AgentWorkbenchPage({
         loadHandoffs(),
         loadCapabilities(),
       ]);
-      setResource({ kind: "ready", value: { jobs, runs, humanActions, handoffs, capabilities } });
+      const evidence = capabilities.start_grounded_orchestration ? await loadEvidence() : [];
+      setResource({ kind: "ready", value: { jobs, runs, humanActions, handoffs, capabilities, evidence } });
     } catch {
       setResource({ kind: "error" });
     }
-  }, [loadCapabilities, loadHandoffs, loadHumanActions, loadJobs, loadRuns]);
+  }, [loadCapabilities, loadEvidence, loadHandoffs, loadHumanActions, loadJobs, loadRuns]);
 
   useEffect(() => {
     void refresh();
@@ -87,10 +97,14 @@ export function AgentWorkbenchPage({
     await denyAction(actionId, {});
     await refresh();
   };
-  return <AgentWorkbenchView data={resource.value} onApprove={approve} onDeny={deny} />;
+  const start = async (goal: string, evidenceIds: string[]) => {
+    await startOrchestration({ goal, evidence_ids: evidenceIds });
+    await refresh();
+  };
+  return <AgentWorkbenchView data={resource.value} onApprove={approve} onDeny={deny} onStart={start} />;
 }
 
-export function AgentWorkbenchView({ data, onApprove, onDeny }: { data: AgentWorkbenchData; onApprove?: (actionId: string) => Promise<void>; onDeny?: (actionId: string) => Promise<void> }) {
+export function AgentWorkbenchView({ data, onApprove, onDeny, onStart }: { data: AgentWorkbenchData; onApprove?: (actionId: string) => Promise<void>; onDeny?: (actionId: string) => Promise<void>; onStart?: (goal: string, evidenceIds: string[]) => Promise<void> }) {
   const pendingHuman = data.humanActions.filter((item) => item.status === "pending").length;
   const activeChatGPT = data.handoffs.filter((item) => item.needs_chatgpt).length;
 
@@ -112,6 +126,11 @@ export function AgentWorkbenchView({ data, onApprove, onDeny }: { data: AgentWor
         <SummaryCard label="需要 ChatGPT 处理" value={activeChatGPT} />
       </section>
 
+      <GroundedAgentStartSection
+        enabled={data.capabilities.start_grounded_orchestration}
+        evidence={data.evidence}
+        onStart={onStart}
+      />
       <HandoffSection handoffs={data.handoffs} />
       <JobsSection jobs={data.jobs} />
       <RunsSection runs={data.runs} />
@@ -132,6 +151,94 @@ function SummaryCard({ label, value }: { label: string; value: number }) {
       <p>{label}</p>
       <strong>{value}</strong>
     </article>
+  );
+}
+
+function GroundedAgentStartSection({
+  enabled,
+  evidence,
+  onStart,
+}: {
+  enabled: boolean;
+  evidence: AnalysisEvidence[];
+  onStart?: (goal: string, evidenceIds: string[]) => Promise<void>;
+}) {
+  const [goal, setGoal] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const toggle = (evidenceId: string) => {
+    setConfirming(false);
+    setSelected((current) => current.includes(evidenceId)
+      ? current.filter((item) => item !== evidenceId)
+      : current.length < 20 ? [...current, evidenceId] : current);
+  };
+  const canSubmit = enabled && Boolean(onStart) && goal.trim().length > 0 && selected.length > 0;
+  const submit = async () => {
+    if (!onStart || !canSubmit) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await onStart(goal.trim(), selected);
+      setGoal("");
+      setSelected([]);
+      setConfirming(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Grounded Agent orchestration failed to start.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="operator-panel" aria-labelledby="agent-start-heading">
+      <div className="panel-heading">
+        <div>
+          <h2 id="agent-start-heading">启动 grounded Agent 分析</h2>
+          <p>只从已持久化 Evidence 启动；Agent 可读取 Job，并可提出 grounded analysis，但真实分析仍需 HumanAction 批准。</p>
+        </div>
+        <span>{selected.length}/20 selected</span>
+      </div>
+      {!enabled ? <p className="field-help">当前未配置自动 Agent 模型，因此不能启动新的 orchestration Job。</p> : null}
+      {error ? <p className="action-error" role="alert">{error}</p> : null}
+      <div className="action-form">
+        <label>
+          本次目标
+          <textarea
+            disabled={!enabled || busy}
+            maxLength={2000}
+            onChange={(event) => { setGoal(event.target.value); setConfirming(false); }}
+            placeholder="例如：根据这些已有证据，判断是否需要进一步 grounded analysis，并给出可审计结论。"
+            value={goal}
+          />
+        </label>
+        <fieldset disabled={!enabled || busy}>
+          <legend>选择 Evidence（最多 20 条）</legend>
+          {evidence.length === 0 ? <p className="panel-empty">当前没有可用于 AnalysisService 的 durable Evidence。</p> : evidence.map((item) => (
+            <label className="check-label" key={item.evidence_id}>
+              <input
+                checked={selected.includes(item.evidence_id)}
+                disabled={!selected.includes(item.evidence_id) && selected.length >= 20}
+                onChange={() => toggle(item.evidence_id)}
+                type="checkbox"
+              />
+              <span><code>{item.evidence_id}</code> · {item.kind} · {item.account_user_id ?? "no account"}</span>
+            </label>
+          ))}
+        </fieldset>
+        {confirming ? (
+          <div className="record-stack">
+            <p className="action-notice">将创建一个真实 durable Agent Job，并允许模型在所选 Evidence 范围内开始执行。</p>
+            <div className="button-row">
+              <button disabled={busy} onClick={() => void submit()} type="button">确认启动 Agent</button>
+              <button disabled={busy} onClick={() => setConfirming(false)} type="button">返回</button>
+            </div>
+          </div>
+        ) : <button disabled={!canSubmit || busy} onClick={() => setConfirming(true)} type="button">启动 grounded Agent 分析</button>}
+      </div>
+    </section>
   );
 }
 
