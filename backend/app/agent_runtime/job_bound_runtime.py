@@ -1,17 +1,18 @@
 """Job-bound integration adapter for the canonical Agent Runtime.
 
 This staged adapter keeps the proven canonical ``AgentRuntime`` unchanged while
-we verify Job authority at real model/tool execution boundaries.  It is not
+we verify Job authority at real model/tool execution boundaries. It is not
 exported from ``backend.app.agent_runtime`` and must not own physical workers.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import func, select
 
 from backend.app.agent_runtime.job_binding import (
+    AGENT_ORCHESTRATION_JOB_TYPE,
     AgentJobBindingRecord,
     JobAuthorityError,
     JobAuthorityGuard,
@@ -19,44 +20,59 @@ from backend.app.agent_runtime.job_binding import (
 from backend.app.agent_runtime.persistence import AgentRunRecord
 from backend.app.agent_runtime.runtime import AgentRuntime
 from backend.app.agent_runtime.types import AgentRunState, NextAction, RuntimeOutcome
+from backend.app.models.jobs import JobRecord
+
+
+class JobWaitProjector(Protocol):
+    def project_wait(self, run_id: str) -> Any: ...
 
 
 class ActiveRunJobAuthorityGuard(JobAuthorityGuard):
-    """Require a runnable Job lease and one unambiguous current AgentRun.
+    """Require one unambiguous current binding, then runnable execution authority.
 
     A Job may accumulate historical AgentRun bindings across human-wait /
     continuation claims. Merely checking that the Job is currently ``running``
     is therefore insufficient: an older run must not regain authority after a
     newer continuation run has been created.
 
-    The newest binding timestamp must identify exactly one run. If two bindings
-    ever share the same newest timestamp, authority is ambiguous and all runs
-    fail closed rather than choosing a winner from UUID/string ordering.
+    ``require_current_binding`` deliberately does *not* require the AgentRun or
+    Job to be running. It exists for state projection/reconciliation after an
+    AgentRun has already durably moved to ``needs_human``. Real model/tool
+    execution must use ``require_run_running`` instead.
     """
 
-    def require_run_running(self, run_id: str, *, now=None) -> str:
-        job_id = super().require_run_running(run_id, now=now)
+    def require_current_binding(self, run_id: str) -> str:
         with self.database.sessions() as session:
-            run = session.get(AgentRunRecord, run_id)
-            if run is None or run.state != AgentRunState.running.value:
-                state = None if run is None else run.state
+            binding = session.get(AgentJobBindingRecord, run_id)
+            if binding is None:
                 raise JobAuthorityError(
-                    f"Agent run {run_id} is not running (state={state!r}); Agent work must stop."
+                    f"Agent run {run_id} has no durable Job binding; Agent work must stop."
+                )
+            job_id = binding.job_id
+            job = session.get(JobRecord, job_id)
+            if job is None:
+                raise JobAuthorityError(
+                    f"Bound Job {job_id} does not exist; Agent work must stop."
+                )
+            if job.type != AGENT_ORCHESTRATION_JOB_TYPE:
+                raise JobAuthorityError(
+                    f"Bound Job {job.id} has type {job.type!r}; current AgentRun authority "
+                    f"requires {AGENT_ORCHESTRATION_JOB_TYPE!r}."
                 )
 
             latest_created_at = session.scalar(
                 select(func.max(AgentJobBindingRecord.created_at)).where(
-                    AgentJobBindingRecord.job_id == job_id
+                    AgentJobBindingRecord.job_id == job.id
                 )
             )
             if latest_created_at is None:
                 raise JobAuthorityError(
-                    f"Bound Job {job_id} has no current AgentRun binding; Agent work must stop."
+                    f"Bound Job {job.id} has no current AgentRun binding; Agent work must stop."
                 )
             latest_run_ids = list(
                 session.scalars(
                     select(AgentJobBindingRecord.run_id).where(
-                        AgentJobBindingRecord.job_id == job_id,
+                        AgentJobBindingRecord.job_id == job.id,
                         AgentJobBindingRecord.created_at == latest_created_at,
                     )
                 )
@@ -71,6 +87,18 @@ class ActiveRunJobAuthorityGuard(JobAuthorityGuard):
                 f"Agent run {run_id} has been superseded by a newer continuation run; "
                 "Agent work must stop."
             )
+        return job_id
+
+    def require_run_running(self, run_id: str, *, now=None) -> str:
+        job_id = self.require_current_binding(run_id)
+        self._require_job_running(job_id, now=now)
+        with self.database.sessions() as session:
+            run = session.get(AgentRunRecord, run_id)
+            if run is None or run.state != AgentRunState.running.value:
+                state = None if run is None else run.state
+                raise JobAuthorityError(
+                    f"Agent run {run_id} is not running (state={state!r}); Agent work must stop."
+                )
         return job_id
 
 
@@ -99,7 +127,7 @@ class _AuthorityCheckedModel:
 
 
 class JobBoundAgentRuntime(AgentRuntime):
-    """Canonical runtime plus fail-closed Job authority boundaries.
+    """Canonical runtime plus fail-closed Job authority/state projection.
 
     This class is intentionally an integration spike and is not package-root
     exported. New bound runs must be created by ``AgentJobCoordinator`` first;
@@ -110,9 +138,11 @@ class JobBoundAgentRuntime(AgentRuntime):
         self,
         *args: Any,
         authority_guard: ActiveRunJobAuthorityGuard,
+        wait_projector: JobWaitProjector | None = None,
         **kwargs: Any,
     ) -> None:
         self.authority_guard = authority_guard
+        self.wait_projector = wait_projector
         super().__init__(*args, **kwargs)
         self.model = _AuthorityCheckedModel(self.model, authority_guard)
 
@@ -142,7 +172,18 @@ class JobBoundAgentRuntime(AgentRuntime):
         run = self.store.get_run(run_id)
         if run.state != AgentRunState.running.value:
             raise ValueError("only a running bound AgentRun can be driven")
-        return self._drive(run_id)
+        outcome = self._drive(run_id)
+        if outcome.state is AgentRunState.needs_human:
+            # AgentRuntime has already durably persisted the wait/checkpoint at
+            # this point. Projection may therefore safely tighten Job authority
+            # and clear its lease. Crash reconciliation calls the same projector.
+            if self.wait_projector is None:
+                raise RuntimeError(
+                    "Job-bound Runtime reached needs_human without a Job wait projector; "
+                    "the persisted Agent wait requires explicit restart reconciliation."
+                )
+            self.wait_projector.project_wait(run_id)
+        return outcome
 
     def _execute_tool(
         self,
