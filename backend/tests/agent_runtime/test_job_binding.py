@@ -2,6 +2,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.agent_runtime.job_binding import (
@@ -20,6 +21,11 @@ from backend.app.services.jobs import InvalidJobTransition, JobNotFound, JobServ
 
 def _database(tmp_path: Path) -> Database:
     return Database(tmp_path / "workbench.sqlite3")
+
+
+def _run_count(database: Database) -> int:
+    with database.sessions() as session:
+        return int(session.scalar(select(func.count()).select_from(AgentRunRecord)) or 0)
 
 
 def test_claim_creates_job_run_and_binding_in_one_committed_state(tmp_path: Path) -> None:
@@ -52,6 +58,7 @@ def test_claim_creates_job_run_and_binding_in_one_committed_state(tmp_path: Path
 def test_missing_job_cannot_create_bound_agent_run(tmp_path: Path) -> None:
     database = _database(tmp_path)
     coordinator = AgentJobCoordinator(database)
+    before = _run_count(database)
 
     with pytest.raises(JobNotFound):
         coordinator.claim_and_create_run(
@@ -60,14 +67,14 @@ def test_missing_job_cannot_create_bound_agent_run(tmp_path: Path) -> None:
             budget=RunBudget(),
         )
 
-    with database.sessions() as session:
-        assert session.get(AgentRunRecord, "missing-job") is None
+    assert _run_count(database) == before
 
 
 def test_persistence_conflict_rolls_back_job_claim_and_run_together(tmp_path: Path) -> None:
     database = _database(tmp_path)
     jobs = JobService(database)
     job = jobs.create(job_type="agent_orchestration", input_data={})
+    AgentRunStore(database)  # create the Agent tables before seeding the PK conflict
 
     # Force the coordinator's AgentRun insert to violate the AgentRun PK at
     # transaction flush/commit. The Job CAS must roll back with it.
@@ -104,6 +111,7 @@ def test_persistence_conflict_rolls_back_job_claim_and_run_together(tmp_path: Pa
     assert unchanged.started_at is None
     assert unchanged.lease_expires_at is None
     assert coordinator.run_ids_for_job(job.id) == []
+    assert _run_count(database) == 1  # only the preexisting conflict row
 
 
 def test_terminal_job_cannot_be_reclaimed_for_agent_run(tmp_path: Path) -> None:
