@@ -112,6 +112,12 @@ class AgentContinuationExecutor:
             if not self._accepting or self._thread is not None:
                 return
             self._recover_previous_process_dispatches()
+            # An unconfigured app still owns restart reconciliation, but it must
+            # not create an idle SQLite polling thread when there is no durable
+            # continuation to reconcile. This keeps unrelated workers isolated.
+            if not self.approval_enabled and not self._has_recoverable_dispatch():
+                self._idle.set()
+                return
             # Startup recovery may have returned durable work to queued. Clear
             # idle before the thread starts so observers cannot race ahead of
             # the first durable claim.
@@ -235,6 +241,17 @@ class AgentContinuationExecutor:
                     lease_expires_at=None,
                     updated_at=now,
                 )
+            )
+
+    def _has_recoverable_dispatch(self) -> bool:
+        with self.database.sessions() as session:
+            return (
+                session.scalar(
+                    select(AgentContinuationDispatchRecord.run_id)
+                    .where(AgentContinuationDispatchRecord.status == "queued")
+                    .limit(1)
+                )
+                is not None
             )
 
     def _claim_next(self) -> str | None:

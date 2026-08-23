@@ -64,6 +64,7 @@ Shutdown closes new approval admission before database disposal and waits for th
 ## Production model and Tool surface
 
 The app always owns the durable executor so restart reconciliation can consume old dispatch rows even if model configuration later disappears. **New approval admission** is enabled only when the existing Bailian text-model configuration has a non-empty API key. With no model configuration the executor rejects new approvals and fail-closes any already-durable queued/running continuation back to a human-review boundary instead of leaving a false `running` Job.
+When automatic execution is unconfigured and there is no queued/running continuation to reconcile, startup does not create an idle polling thread. This preserves worker isolation while retaining restart recovery whenever durable continuation work actually exists.
 
 The production Job-bound Agent reuses the existing `BailianModelAdapter`, including its bounded retry/timeout/error-normalization path. Agent Runtime does not create a second provider client. No credential is persisted into AgentRun/Step/dispatch/workbench rows.
 

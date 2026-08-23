@@ -250,6 +250,8 @@ def test_app_only_enables_auto_continuation_when_model_is_configured(tmp_path: P
     assert isinstance(unconfigured_executor, AgentContinuationExecutor)
     assert unconfigured_executor.accepting is False
     assert unconfigured.state.agent_workbench_actions.capabilities()["approve_continuation"] is False
+    unconfigured_executor.start()
+    assert unconfigured_executor.is_alive is False
     unconfigured_executor.close()
 
     configured_settings = _settings(tmp_path / "on").model_copy(
