@@ -1,0 +1,44 @@
+name: Job-bound Terminal Projection Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/job-bound-approved-continuation-v1
+    paths:
+      - 'backend/app/agent_runtime/job_terminal_projection.py'
+      - 'backend/app/agent_runtime/job_terminal_runtime.py'
+      - 'backend/tests/agent_runtime/test_job_bound_terminal*.py'
+      - '.github/workflows/job-bound-terminal-projection.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  focused:
+    name: Terminal projection and recovery tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compile terminal-projection slice
+        run: python -m compileall -q backend/app/agent_runtime/job_terminal_projection.py backend/app/agent_runtime/job_terminal_runtime.py backend/tests/agent_runtime/test_job_bound_terminal*.py
+      - name: Run focused terminal-projection tests
+        run: python -m pytest backend/tests/agent_runtime/test_job_bound_terminal*.py -q
+      - name: Run complete Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
+      - name: Run existing Job state-machine tests
+        run: python -m pytest backend/tests/test_job_state_machine.py backend/tests/test_job_batch.py -q
