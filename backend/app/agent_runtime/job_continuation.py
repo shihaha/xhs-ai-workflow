@@ -260,6 +260,15 @@ class JobContinuationCoordinator:
                     created_at=now,
                 )
             )
+
+            # These mapped tables do not declare ORM relationships that would
+            # give SQLAlchemy an insert dependency graph. Flush the AgentRun and
+            # its binding/link explicitly before inserting a checkpoint whose
+            # SQLite FK references agent_runs. This remains inside the same
+            # transaction: any later failure still rolls back Job claim,
+            # HumanAction approval, run, binding, and continuation link together.
+            session.flush()
+
             # A checkpoint does not increment Agent step_count, so the audit link
             # does not silently consume the continuation's remaining step budget.
             session.add(
