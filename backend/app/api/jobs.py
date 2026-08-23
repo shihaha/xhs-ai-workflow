@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 from fastapi import APIRouter, HTTPException, Request, status
 
+from backend.app.agent_runtime.job_binding import AGENT_ORCHESTRATION_JOB_TYPE
 from backend.app.models.jobs import JobState
 from backend.app.schemas.jobs import (
     JobArtifactCreate,
@@ -76,6 +77,7 @@ def get_job(job_id: str, request: Request) -> JobRead:
 
 @router.post("/{job_id}/claim", response_model=JobRead)
 def claim_job(job_id: str, request: Request) -> JobRead:
+    _reject_agent_orchestration_job(job_id, request)
     _reject_reserved_worker_job(job_id, request)
     return _job_read_or_409(lambda: _service(request).claim(job_id))
 
@@ -83,6 +85,11 @@ def claim_job(job_id: str, request: Request) -> JobRead:
 @router.post("/{job_id}/transition", response_model=JobRead)
 def transition_job(job_id: str, payload: JobTransition, request: Request) -> JobRead:
     job = _get_job_or_404(job_id, request)
+    if job.type == AGENT_ORCHESTRATION_JOB_TYPE:
+        raise HTTPException(
+            status_code=422,
+            detail="Agent orchestration lifecycle is controlled by /api/v1/agent-runtime operator endpoints.",
+        )
     if job.type in MEDIA_RESERVED_JOB_TYPES:
         raise HTTPException(status_code=422, detail="Reserved media job is read-only.")
     if job.type in _RESERVED_JOB_TYPES:
@@ -167,6 +174,13 @@ def _get_job_or_404(job_id: str, request: Request) -> Job:
         return _service(request).get(job_id)
     except JobNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+def _reject_agent_orchestration_job(job_id: str, request: Request) -> None:
+    if _get_job_or_404(job_id, request).type == AGENT_ORCHESTRATION_JOB_TYPE:
+        raise HTTPException(
+            status_code=422,
+            detail="Agent orchestration Job mutations must use /api/v1/agent-runtime operator endpoints.",
+        )
 
 
 def _reject_reserved_worker_job(job_id: str, request: Request) -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -45,6 +45,7 @@ class HumanActionSummaryRead(BaseModel):
     tool_call_id: str
     tool_name: str
     status: str
+    can_deny: bool = False
     created_at: datetime
     resolved_at: datetime | None = None
 
@@ -132,3 +133,31 @@ class ChatGPTHandoffTaskRead(BaseModel):
     result_ready: bool
     created_at: datetime
     accepted_at: datetime | None = None
+
+
+class AgentActionCapabilitiesRead(BaseModel):
+    cancel_job: bool
+    deny_permission_action: bool
+    approve_continuation: bool
+    continuation_reason: str | None = None
+
+
+class AgentJobCancelRead(BaseModel):
+    job_id: str
+    job_state: Literal["cancelled"]
+    cancelled_run_ids: list[str] = Field(default_factory=list)
+    resolved_human_action_ids: list[str] = Field(default_factory=list)
+    already_cancelled: bool = False
+
+
+class HumanActionDenyRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class HumanActionDecisionRead(BaseModel):
+    human_action_id: str
+    job_id: str
+    run_id: str
+    human_action_status: Literal["denied"]
+    job_state: Literal["failed"]
+    run_state: Literal["failed"]

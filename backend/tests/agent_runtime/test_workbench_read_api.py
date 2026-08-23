@@ -113,6 +113,7 @@ async def test_job_runtime_read_surface_is_durable_and_redacts_raw_inputs(
             "tool_call_id": "approval-call-1",
             "tool_name": "sensitive.write",
             "status": "pending",
+            "can_deny": True,
             "created_at": body["pending_human_actions"][0]["created_at"],
             "resolved_at": None,
         }

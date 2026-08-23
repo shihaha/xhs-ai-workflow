@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import type {
@@ -53,6 +53,7 @@ const action: AgentHumanAction = {
   tool_call_id: "manual-chatgpt:handoff-1",
   tool_name: "manual_chatgpt",
   status: "pending",
+  can_deny: false,
   created_at: "2026-08-23T10:01:00Z",
   resolved_at: null,
 };
@@ -98,6 +99,36 @@ describe("AgentWorkbenchPage", () => {
     expect(screen.queryByText(/runtime\/external-results/i)).not.toBeInTheDocument();
   });
 
+
+  it("offers denial only when the backend projection explicitly authorizes it", async () => {
+    let deniedActionId: string | null = null;
+    render(
+      <AgentWorkbenchPage
+        loadJobs={async () => [job]}
+        loadRuns={async () => [run]}
+        loadHumanActions={async () => [{ ...action, can_deny: true }]}
+        loadHandoffs={async () => [handoff]}
+        denyAction={async (actionId) => {
+          deniedActionId = actionId;
+          return {
+            human_action_id: actionId,
+            job_id: "job-1",
+            run_id: "run-1",
+            human_action_status: "denied",
+            job_state: "failed",
+            run_state: "failed",
+          };
+        }}
+      />,
+    );
+
+    const denyButton = await screen.findByRole("button", { name: "拒绝此操作" });
+    fireEvent.click(denyButton);
+    expect(screen.getByRole("button", { name: "确认拒绝并终止" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认拒绝并终止" }));
+    await waitFor(() => expect(deniedActionId).toBe("human-1"));
+  });
+
   it("shows accepted handoff as result ready while explicitly leaving continuation to backend", async () => {
     render(
       <AgentWorkbenchPage
@@ -139,6 +170,49 @@ describe("Agent detail pages", () => {
     expect(screen.getByText("evidence:one")).toBeInTheDocument();
     expect(screen.getByText("agent-runtime")).toBeInTheDocument();
     expect(screen.queryByText(/C:\\|runtime\/|metadata/i)).not.toBeInTheDocument();
+  });
+
+
+  it("requires a second explicit confirmation before requesting Job cancellation", async () => {
+    const detail: AgentJobRuntime = {
+      job_id: job.job_id,
+      job_state: job.job_state,
+      current_stage: job.current_stage,
+      error_category: job.error_category,
+      retry_count: 0,
+      lease_expires_at: null,
+      created_at: job.created_at,
+      updated_at: job.updated_at,
+      current_run_id: run.run_id,
+      authority_ambiguous: false,
+      runs: [run],
+      pending_human_actions: [{ ...action, can_deny: false }],
+      evidence_refs: [],
+      artifacts: [],
+    };
+    let cancelCalls = 0;
+    render(
+      <AgentJobDetailPage
+        jobId="job-1"
+        loadJob={async () => detail}
+        cancelJob={async () => {
+          cancelCalls += 1;
+          return {
+            job_id: "job-1",
+            job_state: "cancelled",
+            cancelled_run_ids: ["run-1"],
+            resolved_human_action_ids: ["human-1"],
+            already_cancelled: false,
+          };
+        }}
+      />,
+    );
+
+    const requestButton = await screen.findByRole("button", { name: "取消 Agent Job" });
+    fireEvent.click(requestButton);
+    expect(cancelCalls).toBe(0);
+    fireEvent.click(screen.getByRole("button", { name: "确认取消 Agent Job" }));
+    await waitFor(() => expect(cancelCalls).toBe(1));
   });
 
   it("renders the durable step timeline without raw tool input/output", async () => {
