@@ -34,8 +34,8 @@ jobs:
           subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
           PY
       - name: Compile staged binding
-        run: python -m compileall -q backend/app/agent_runtime/job_binding.py backend/tests/agent_runtime/test_job_binding.py backend/tests/agent_runtime/test_job_binding_metadata.py
+        run: python -m compileall -q backend/app/agent_runtime/job_binding.py backend/tests/agent_runtime
       - name: Run Agent Job binding tests
-        run: python -m pytest backend/tests/agent_runtime/test_job_binding.py backend/tests/agent_runtime/test_job_binding_metadata.py -q
+        run: python -m pytest backend/tests/agent_runtime/test_job_binding*.py -q
       - name: Run existing Job state-machine tests
         run: python -m pytest backend/tests/test_job_state_machine.py backend/tests/test_job_batch.py -q
