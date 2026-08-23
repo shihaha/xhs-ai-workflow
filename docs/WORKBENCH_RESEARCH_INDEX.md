@@ -185,7 +185,7 @@ The existing `AnalysisService` was wrapped rather than rewritten. Controlled par
 
 Branch/PR experiment proves deterministic model projection can materially reduce prompt structure without deleting authoritative raw evidence or changing service grounding. Real provider token savings still require a controlled live provider A/B before claiming an exact token number.
 
-### Runtime canonicalization — DRAFT PR #6, dynamic gate still required
+### Runtime canonicalization — DRAFT PR #6, DYNAMIC GATE PASSED
 
 Branch:
 
@@ -195,9 +195,19 @@ fix/agent-runtime-foldin-v1
 
 Draft PR #6 makes the hardened Stage 2 semantics the canonical `runtime.AgentRuntime` entry and removes the easy bypass through two public implementations.
 
-Its latest verification attempts have been affected by GitHub Actions jobs failing before any step is created. Do not claim PR #6 passed until the jobs actually execute and pass.
+After the repository was made public, the previous GitHub Actions billing/spending-limit block disappeared and dedicated workflow run `32617924385` executed normally.
 
-### AgentRun ↔ Job binding — STACKED DRAFT PR #7
+Passed gates:
+
+- Stage 2 baseline backend capture;
+- canonical runtime compile;
+- canonical Agent Runtime acceptance;
+- canonical full-backend capture;
+- Stage 2 -> canonical runtime regression guard.
+
+PR #6 therefore satisfies its dedicated dynamic acceptance gate. It remains Draft intentionally; no automatic merge has been performed.
+
+### AgentRun ↔ Job binding — STACKED DRAFT PR #7, DEDICATED GATE PASSED
 
 Branch:
 
@@ -218,11 +228,18 @@ Current spike scope is intentionally narrow:
 - Job lease derived from persisted Agent wall-time budget plus shutdown margin;
 - dedicated `agent_orchestration` Job type only;
 - physical/domain worker Jobs cannot be stolen by the Agent coordinator;
-- read-only `JobAuthorityGuard` contract;
+- run-bound `JobAuthorityGuard` resolved as `run_id -> binding -> Job`;
 - narrow `job.read` Tool that omits input/logs/artifacts;
-- focused tests for atomicity, rollback, retry/continuation, terminal authority, metadata isolation, lease derivation and physical-job takeover prevention.
+- focused tests for atomicity, rollback, retry/continuation, single-active-run enforcement, terminal authority, metadata isolation, lease derivation, restart reconstruction, stale-lease recovery, orphan bindings and physical-job takeover prevention.
 
-PR #7 does **not** modify the Runtime loop, does not connect live XHS/Android collection, and is not merge-eligible until PR #6 is dynamically accepted first.
+Dedicated workflow run `32619260055` was re-run after the billing/spending-limit block was removed and passed:
+
+- dependency installation;
+- binding compile;
+- Agent Job binding tests;
+- existing Job state-machine tests.
+
+PR #7 does **not** modify the Runtime loop and does not connect live XHS/Android collection. It remains Draft intentionally.
 
 Authority rule:
 
@@ -235,16 +252,17 @@ See `15_AGENTRUN_JOB_BINDING.md` for the full contract.
 
 ## Next implementation direction
 
-After canonical Runtime dynamic acceptance:
+With PR #6 canonical Runtime and PR #7 binding persistence dynamically accepted in their dedicated gates:
 
-1. dynamically validate PR #7 focused binding tests;
-2. keep `JobService` authoritative for lease/task/physical-worker lifecycle;
-3. integrate a JobAuthorityGuard at model/tool boundaries only after the persistence slice is proven;
+1. integrate the run-bound `JobAuthorityGuard` at the next model-call and Tool-execution boundaries in a new isolated slice;
+2. preserve `JobService` as the only lease/task/physical-worker lifecycle authority;
+3. treat guard success as a point-in-time precondition only — every state-changing Job/domain command must still CAS/re-check at its own write boundary;
 4. do not let synchronous Agent tool execution replace physical XHS/Android workers;
-5. expose safe Job-oriented Agent commands/results rather than raw device actions;
-6. continue toward Project/Run/Human Action/Evidence workbench views;
-7. preserve only thin B/C handoffs;
-8. connect D after Finished Product + human UAT.
+5. add cancellation / needs_human / expired-lease blocking tests before exposing any mutating Job command;
+6. expose safe Job-oriented Agent commands/results rather than raw device actions;
+7. continue toward Project/Run/Human Action/Evidence workbench views;
+8. preserve only thin B/C handoffs;
+9. connect D after Finished Product + human UAT.
 
 ## Authority and guardrails
 
