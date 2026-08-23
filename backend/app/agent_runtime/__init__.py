@@ -1,4 +1,4 @@
-"""Bounded Agent Runtime spike package."""
+"""Bounded Agent Runtime package."""
 
 from backend.app.agent_runtime.context import DefaultContextBuilder, RuntimeContext
 from backend.app.agent_runtime.events import (
@@ -9,7 +9,7 @@ from backend.app.agent_runtime.events import (
 from backend.app.agent_runtime.model import ModelDriver, PydanticDecisionModel
 from backend.app.agent_runtime.permissions import RuleBasedPermissionPolicy
 from backend.app.agent_runtime.persistence import AgentRunStore
-from backend.app.agent_runtime.stage2_runtime import Stage2AgentRuntime as AgentRuntime
+from backend.app.agent_runtime.runtime import AgentRuntime
 from backend.app.agent_runtime.tools import (
     ToolDomainFailureError,
     ToolExecutionContext,
