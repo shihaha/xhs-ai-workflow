@@ -7,7 +7,7 @@ on:
     paths:
       - 'backend/app/agent_runtime/job_bound_runtime.py'
       - 'backend/app/agent_runtime/job_wait_projection.py'
-      - 'backend/tests/agent_runtime/test_job_bound_human_wait.py'
+      - 'backend/tests/agent_runtime/test_job_bound_human_wait*.py'
       - '.github/workflows/job-bound-human-wait.yml'
   workflow_dispatch:
 
@@ -35,9 +35,9 @@ jobs:
           subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
           PY
       - name: Compile human-wait slice
-        run: python -m compileall -q backend/app/agent_runtime/job_bound_runtime.py backend/app/agent_runtime/job_wait_projection.py backend/tests/agent_runtime/test_job_bound_human_wait.py
+        run: python -m compileall -q backend/app/agent_runtime/job_bound_runtime.py backend/app/agent_runtime/job_wait_projection.py backend/tests/agent_runtime/test_job_bound_human_wait.py backend/tests/agent_runtime/test_job_bound_human_wait_race.py
       - name: Run focused human-wait tests
-        run: python -m pytest backend/tests/agent_runtime/test_job_bound_human_wait.py -q
+        run: python -m pytest backend/tests/agent_runtime/test_job_bound_human_wait*.py -q
       - name: Run complete Agent Runtime acceptance
         run: python -m pytest backend/tests/agent_runtime -q
       - name: Run existing Job state-machine tests
