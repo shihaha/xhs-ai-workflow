@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from sqlalchemy import func, select
 
+from backend.app.agent_runtime.events import RuntimeEventType
 from backend.app.agent_runtime.job_binding import (
     AGENT_ORCHESTRATION_JOB_TYPE,
     AgentJobBindingRecord,
@@ -19,12 +20,17 @@ from backend.app.agent_runtime.job_binding import (
 )
 from backend.app.agent_runtime.persistence import AgentRunRecord
 from backend.app.agent_runtime.runtime import AgentRuntime
+from backend.app.agent_runtime.tools import ToolInputError, ToolUnavailableError
 from backend.app.agent_runtime.types import AgentRunState, NextAction, RuntimeOutcome
 from backend.app.models.jobs import JobRecord
 
 
 class JobWaitProjector(Protocol):
     def project_wait(self, run_id: str) -> Any: ...
+
+
+class ApprovedContinuationResolver(Protocol):
+    def approved_action_for_run(self, run_id: str) -> NextAction: ...
 
 
 class ActiveRunJobAuthorityGuard(JobAuthorityGuard):
@@ -130,8 +136,9 @@ class JobBoundAgentRuntime(AgentRuntime):
     """Canonical runtime plus fail-closed Job authority/state projection.
 
     This class is intentionally an integration spike and is not package-root
-    exported. New bound runs must be created by ``AgentJobCoordinator`` first;
-    this adapter only drives an already-bound, currently-authoritative run.
+    exported. New bound runs must be created by ``AgentJobCoordinator`` or the
+    approved continuation coordinator first; this adapter only drives an
+    already-bound, currently-authoritative run.
     """
 
     def __init__(
@@ -139,10 +146,12 @@ class JobBoundAgentRuntime(AgentRuntime):
         *args: Any,
         authority_guard: ActiveRunJobAuthorityGuard,
         wait_projector: JobWaitProjector | None = None,
+        continuation_resolver: ApprovedContinuationResolver | None = None,
         **kwargs: Any,
     ) -> None:
         self.authority_guard = authority_guard
         self.wait_projector = wait_projector
+        self.continuation_resolver = continuation_resolver
         super().__init__(*args, **kwargs)
         self.model = _AuthorityCheckedModel(self.model, authority_guard)
 
@@ -172,7 +181,89 @@ class JobBoundAgentRuntime(AgentRuntime):
         run = self.store.get_run(run_id)
         if run.state != AgentRunState.running.value:
             raise ValueError("only a running bound AgentRun can be driven")
+        return self._drive_and_project_wait(run_id)
+
+    def run_approved_continuation(self, run_id: str) -> RuntimeOutcome:
+        """Execute the exact durable approved action, then continue the model loop.
+
+        A restart may call this method again. If the exact approved Tool result is
+        already durably committed in the continuation run, execution is skipped
+        and the model loop continues. If the call is only started/uncertain, the
+        canonical duplicate-call guard moves the run to needs_human without
+        replaying the handler.
+        """
+
+        run = self.store.get_run(run_id)
+        if run.state != AgentRunState.running.value:
+            raise ValueError("only a running approved continuation can be driven")
+        if self.continuation_resolver is None:
+            raise RuntimeError(
+                "Approved continuation run has no durable continuation resolver."
+            )
+
+        action = self.continuation_resolver.approved_action_for_run(run_id)
+        if action.action != "tool" or action.tool_name is None:
+            raise RuntimeError("durable approved continuation is not a tool action")
+
+        self._emit(
+            RuntimeEventType.before_tool_validate,
+            run_id,
+            tool_name=action.tool_name,
+            tool_call_id=action.tool_call_id,
+            payload={"approved_continuation": True},
+        )
+        try:
+            tool = self.tools.resolve(action.tool_name)
+            validated = self.tools.validate(tool, action.arguments)
+        except (ToolUnavailableError, ToolInputError, ValueError) as exc:
+            return self._fail(run_id, "resume_validation_failed", str(exc))
+        validated_json = validated.model_dump(mode="json")
+        self._emit(
+            RuntimeEventType.after_tool_validate,
+            run_id,
+            tool_name=tool.name,
+            tool_call_id=action.tool_call_id,
+            payload={"approved_continuation": True, "valid": True},
+        )
+
+        matches = [
+            step
+            for step in self.store.list_steps(run_id)
+            if step.kind == "tool" and step.tool_call_id == action.tool_call_id
+        ]
+        if matches:
+            previous = matches[-1]
+            previous_arguments = (previous.input_json or {}).get("arguments")
+            if previous.tool_name != tool.name or previous_arguments != validated_json:
+                return self._fail(
+                    run_id,
+                    "tool_call_id_conflict",
+                    "Approved continuation tool_call_id no longer matches durable Tool identity/arguments.",
+                )
+            if previous.status in {"succeeded", "reused"}:
+                # The approved result already committed before a crash. Never
+                # replay even a non-idempotent handler merely to resume the loop.
+                return self._drive_and_project_wait(run_id)
+
+        outcome = self._execute_tool(
+            run_id,
+            action,
+            tool,
+            validated_json,
+        )
+        if outcome is not None:
+            return self._project_wait_if_needed(run_id, outcome)
+        return self._drive_and_project_wait(run_id)
+
+    def _drive_and_project_wait(self, run_id: str) -> RuntimeOutcome:
         outcome = self._drive(run_id)
+        return self._project_wait_if_needed(run_id, outcome)
+
+    def _project_wait_if_needed(
+        self,
+        run_id: str,
+        outcome: RuntimeOutcome,
+    ) -> RuntimeOutcome:
         if outcome.state is AgentRunState.needs_human:
             # AgentRuntime has already durably persisted the wait/checkpoint at
             # this point. Projection may therefore safely tighten Job authority
