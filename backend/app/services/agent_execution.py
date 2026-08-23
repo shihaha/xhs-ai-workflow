@@ -1,20 +1,25 @@
 """Guarded execution boundary primitives.
 
-This module intentionally does not call models or tools yet. It defines the
-single entry boundary that future agent executors must pass through.
+This module defines the single entry boundary that future agent executors must
+pass through before model/tool side effects.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
-from backend.app.services.job_authority import JobAuthorityGuard
+from backend.app.services.job_authority import (
+    ExecutionBinding,
+    JobAuthorityGuard,
+    JobSnapshot,
+)
 
 
 @dataclass(frozen=True)
 class ExecutionContext:
-    job_id: str
+    binding: ExecutionBinding
+    job: JobSnapshot
     run_id: str
-    binding_job_id: str
 
 
 class AgentExecutionDenied(Exception):
@@ -27,12 +32,13 @@ class AgentExecutionService:
 
     def authorize(self, context: ExecutionContext) -> dict[str, Any]:
         """Validate execution before any future model/tool side effect."""
-        self.authority.check(
-            job_id=context.job_id,
-            binding_job_id=context.binding_job_id,
-        )
+        try:
+            self.authority.check(context.binding, context.job)
+        except Exception as exc:
+            raise AgentExecutionDenied(str(exc)) from exc
+
         return {
-            "job_id": context.job_id,
+            "job_id": context.job.id,
             "run_id": context.run_id,
             "authorized": True,
         }
