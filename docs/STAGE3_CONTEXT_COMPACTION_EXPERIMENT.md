@@ -1,6 +1,6 @@
 # Stage 3 — Grounded Model Context Compaction Experiment
 
-Status: isolated spike; not a production-path adoption.
+Status: validated isolated spike; not a production-path adoption.
 
 Branch: `spike/context-compaction-v1`
 Base: Stage 2 head `e74181c2eadd485fd6a70d00f02a4bb7fb8b517f`
@@ -90,6 +90,22 @@ The spike is acceptable only if all of the following hold:
 8. A controlled `AnalysisService` A/B produces the same business signature with and without the decorator.
 9. Existing Stage 2 Agent Runtime acceptance remains green.
 10. No newly reproducible backend regression appears relative to Stage 2.
+
+## Verification result — 2026-08-23
+
+Stage 3 passed its intended verification boundary.
+
+- focused context-compaction acceptance: **5/5 passed**;
+- Stage 2 Agent Runtime acceptance on the same PR merge ref: **23/23 passed**;
+- Stage 2 full-backend baseline: **73 failed / 1,444 passed / 20 skipped**;
+- Stage 3 full-backend spike: **71 failed / 1,451 passed / 20 skipped**;
+- correct Stage 2 -> Stage 3 regression guard: **0 new candidates**;
+- two timing-sensitive shop cancellation failures appeared only in the baseline full-suite run and therefore counted as fixed/non-regressing for this comparison;
+- final Stage 3 backend regression guard: **success**.
+
+The earlier guard that compared the Stage 3 PR against `research/xhs-workbench-next` was not a valid Stage 3-only comparison because it included all Stage 2 Runtime changes. The Stage 3 workflow was corrected to use `spike/agent-runtime-pydantic-v1` as its baseline and retained the same fail-closed targeted-recheck logic.
+
+Conclusion: the isolated compaction layer is technically viable and did not introduce a newly reproducible backend regression relative to Stage 2. This does **not** authorize production wiring or claim a provider-token reduction percentage.
 
 ## What this spike does not prove
 
