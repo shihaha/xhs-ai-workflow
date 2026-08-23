@@ -179,7 +179,7 @@ def test_lease_is_derived_from_run_budget_plus_margin(tmp_path: Path) -> None:
     assert bound.lease_expires_at - claimed.started_at >= timedelta(seconds=68)
 
 
-def test_job_authority_guard_rejects_cancelled_or_expired_job(tmp_path: Path) -> None:
+def test_job_authority_guard_rejects_cancelled_or_expired_bound_run(tmp_path: Path) -> None:
     database = _database(tmp_path)
     jobs = JobService(database)
     job = jobs.create(job_type="agent_orchestration", input_data={})
@@ -191,14 +191,25 @@ def test_job_authority_guard_rejects_cancelled_or_expired_job(tmp_path: Path) ->
     )
     guard = JobAuthorityGuard(database)
 
-    guard.require_running(job.id)
+    assert guard.require_run_running(bound.run_id) == job.id
 
     with pytest.raises(JobAuthorityError):
-        guard.require_running(job.id, now=bound.lease_expires_at + timedelta(seconds=1))
+        guard.require_run_running(
+            bound.run_id,
+            now=bound.lease_expires_at + timedelta(seconds=1),
+        )
 
     jobs.transition(job.id, JobState.cancelled)
     with pytest.raises(JobAuthorityError):
-        guard.require_running(job.id)
+        guard.require_run_running(bound.run_id)
+
+
+def test_job_authority_guard_rejects_unbound_run(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    AgentJobCoordinator(database)  # initialize binding/runtime tables
+
+    with pytest.raises(JobAuthorityError):
+        JobAuthorityGuard(database).require_run_running("unbound-run")
 
 
 def test_job_read_tool_exposes_narrow_authoritative_projection(tmp_path: Path) -> None:
