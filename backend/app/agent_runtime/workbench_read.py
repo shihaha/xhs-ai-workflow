@@ -17,7 +17,7 @@ from backend.app.agent_runtime.persistence import (
     HumanActionRecord,
 )
 from backend.app.db import Database
-from backend.app.models.jobs import JobRecord
+from backend.app.models.jobs import JobArtifactRecord, JobRecord
 
 
 class AgentWorkbenchReadError(RuntimeError):
@@ -34,6 +34,110 @@ class AgentWorkbenchReader:
         # schema initialization only; it does not claim or mutate any Job.
         AgentRunStore(database)
         AgentJobBindingRecord.__table__.create(bind=database.engine, checkfirst=True)
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        """List durable Agent orchestration Jobs without exposing Job inputs."""
+        with self.database.sessions() as session:
+            job_ids = list(
+                session.scalars(
+                    select(JobRecord.id)
+                    .where(JobRecord.type == AGENT_ORCHESTRATION_JOB_TYPE)
+                    .order_by(JobRecord.created_at.desc(), JobRecord.id)
+                )
+            )
+
+        rows: list[dict[str, Any]] = []
+        for job_id in job_ids:
+            view = self.job_view(job_id)
+            rows.append(
+                {
+                    "job_id": view["job_id"],
+                    "job_state": view["job_state"],
+                    "current_stage": view["current_stage"],
+                    "error_category": view["error_category"],
+                    "retry_count": view["retry_count"],
+                    "current_run_id": view["current_run_id"],
+                    "authority_ambiguous": view["authority_ambiguous"],
+                    "run_count": len(view["runs"]),
+                    "pending_human_action_count": len(
+                        view["pending_human_actions"]
+                    ),
+                    "evidence_count": len(view["evidence_refs"]),
+                    "artifact_count": len(view["artifacts"]),
+                    "created_at": view["created_at"],
+                    "updated_at": view["updated_at"],
+                }
+            )
+        return rows
+
+    def list_runs(self) -> list[dict[str, Any]]:
+        """List all durable Job-bound AgentRuns with their authoritative Job id."""
+        with self.database.sessions() as session:
+            bindings = list(
+                session.scalars(
+                    select(AgentJobBindingRecord)
+                    .join(JobRecord, JobRecord.id == AgentJobBindingRecord.job_id)
+                    .where(JobRecord.type == AGENT_ORCHESTRATION_JOB_TYPE)
+                    .order_by(
+                        AgentJobBindingRecord.created_at.desc(),
+                        AgentJobBindingRecord.run_id,
+                    )
+                )
+            )
+            run_ids = [binding.run_id for binding in bindings]
+            if not run_ids:
+                return []
+            runs_by_id = {
+                run.id: run
+                for run in session.scalars(
+                    select(AgentRunRecord).where(AgentRunRecord.id.in_(run_ids))
+                )
+            }
+            missing = [run_id for run_id in run_ids if run_id not in runs_by_id]
+            if missing:
+                raise AgentWorkbenchReadError(
+                    "Job binding references missing AgentRun records; projection is incomplete."
+                )
+            return [
+                {
+                    "job_id": binding.job_id,
+                    **self._run_summary(runs_by_id[binding.run_id]),
+                }
+                for binding in bindings
+            ]
+
+    def list_human_actions(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        """List HumanActions attached to authoritative Agent orchestration Jobs."""
+        with self.database.sessions() as session:
+            bindings = list(
+                session.scalars(
+                    select(AgentJobBindingRecord)
+                    .join(JobRecord, JobRecord.id == AgentJobBindingRecord.job_id)
+                    .where(JobRecord.type == AGENT_ORCHESTRATION_JOB_TYPE)
+                )
+            )
+            if not bindings:
+                return []
+            run_to_job = {binding.run_id: binding.job_id for binding in bindings}
+            statement = select(HumanActionRecord).where(
+                HumanActionRecord.run_id.in_(list(run_to_job))
+            )
+            if status is not None:
+                statement = statement.where(HumanActionRecord.status == status)
+            actions = list(
+                session.scalars(
+                    statement.order_by(
+                        HumanActionRecord.created_at.desc(), HumanActionRecord.id
+                    )
+                )
+            )
+            return [
+                {
+                    "job_id": run_to_job[action.run_id],
+                    **self._human_action_summary(action),
+                }
+                for action in actions
+            ]
 
     def job_view(self, job_id: str) -> dict[str, Any]:
         with self.database.sessions() as session:
@@ -91,6 +195,13 @@ class AgentWorkbenchReader:
                         )
                     )
                 )
+            artifacts = list(
+                session.scalars(
+                    select(JobArtifactRecord)
+                    .where(JobArtifactRecord.job_id == job_id)
+                    .order_by(JobArtifactRecord.id)
+                )
+            )
 
             current_run_id, authority_ambiguous = self._current_binding(bindings)
             evidence_refs = self._evidence_refs(steps)
@@ -107,11 +218,14 @@ class AgentWorkbenchReader:
                 "error_category": job.error_category,
                 "retry_count": job.retry_count,
                 "lease_expires_at": job.lease_expires_at,
+                "created_at": job.created_at,
+                "updated_at": job.updated_at,
                 "current_run_id": current_run_id,
                 "authority_ambiguous": authority_ambiguous,
                 "runs": [self._run_summary(runs_by_id[run_id]) for run_id in run_ids],
                 "pending_human_actions": pending_actions,
                 "evidence_refs": evidence_refs,
+                "artifacts": [self._artifact_summary(artifact) for artifact in artifacts],
             }
 
     def run_view(self, run_id: str) -> dict[str, Any]:
@@ -148,6 +262,13 @@ class AgentWorkbenchReader:
                 ],
                 "evidence_refs": self._evidence_refs(steps),
             }
+
+    def job_artifacts(self, job_id: str) -> list[dict[str, Any]]:
+        return list(self.job_view(job_id)["artifacts"])
+
+    def job_evidence(self, job_id: str) -> dict[str, Any]:
+        view = self.job_view(job_id)
+        return {"job_id": job_id, "evidence_refs": view["evidence_refs"]}
 
     @staticmethod
     def _current_binding(
@@ -226,4 +347,18 @@ class AgentWorkbenchReader:
             "status": action.status,
             "created_at": action.created_at,
             "resolved_at": action.resolved_at,
+        }
+
+    @staticmethod
+    def _artifact_summary(artifact: JobArtifactRecord) -> dict[str, Any]:
+        # Generic workbench projections expose artifact identity/lifecycle only.
+        # Local paths and arbitrary metadata remain behind explicit artifact
+        # capabilities because either may contain machine- or account-specific
+        # information.
+        return {
+            "id": artifact.id,
+            "job_id": artifact.job_id,
+            "kind": artifact.kind,
+            "producer": artifact.producer,
+            "created_at": artifact.created_at,
         }

@@ -1,0 +1,61 @@
+name: Workbench Agent Projection V2 Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/workbench-agent-read-api-v1
+    paths:
+      - 'backend/app/api/agent_runtime.py'
+      - 'backend/app/agent_runtime/workbench_read.py'
+      - 'backend/app/schemas/agent_runtime.py'
+      - 'backend/tests/agent_runtime/test_workbench_read_api.py'
+      - 'backend/tests/agent_runtime/test_workbench_projection_api_v2.py'
+      - '.github/workflows/workbench-agent-projections-v2.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  workbench-agent-projections-v2:
+    name: Durable Agent workbench projection collections
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+
+      - name: Compile workbench projection slice
+        run: >-
+          python -m compileall -q
+          backend/app/api/agent_runtime.py
+          backend/app/agent_runtime/workbench_read.py
+          backend/app/schemas/agent_runtime.py
+          backend/tests/agent_runtime/test_workbench_read_api.py
+          backend/tests/agent_runtime/test_workbench_projection_api_v2.py
+
+      - name: Run focused workbench projection tests
+        run: >-
+          python -m pytest
+          backend/tests/agent_runtime/test_workbench_read_api.py
+          backend/tests/agent_runtime/test_workbench_projection_api_v2.py
+          -q
+
+      - name: Run existing Jobs API regression
+        run: python -m pytest backend/tests/test_jobs_api.py backend/tests/test_jobs_hardening.py -q
+
+      - name: Run complete Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
