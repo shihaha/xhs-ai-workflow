@@ -371,6 +371,10 @@ class ManualChatGPTHandoffService:
                     resolved_at=None,
                 )
             )
+            # The handoff row has a real FK to human_actions.  SQLAlchemy has no
+            # ORM relationship between these isolated spike records, so make the
+            # parent ordering explicit while preserving the single transaction.
+            session.flush()
             session.add(
                 ManualChatGPTHandoffRecord(
                     id=handoff_id,
@@ -633,12 +637,14 @@ class ManualChatGPTHandoffService:
             )
             session.flush()
             job_id = job.id
+            accepted_source_run_id = record.source_run_id
+            accepted_human_action_id = record.human_action_id
 
         return AcceptedManualChatGPTResult(
             handoff_id=handoff_id,
             job_id=job_id,
-            source_run_id=record.source_run_id,
-            human_action_id=record.human_action_id,
+            source_run_id=accepted_source_run_id,
+            human_action_id=accepted_human_action_id,
             evidence_ref=evidence_ref,
             result=result,
         )
