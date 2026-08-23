@@ -1,0 +1,44 @@
+name: Job-bound Approved Continuation Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/job-bound-human-wait-v1
+    paths:
+      - 'backend/app/agent_runtime/job_bound_runtime.py'
+      - 'backend/app/agent_runtime/job_continuation.py'
+      - 'backend/tests/agent_runtime/test_job_bound_approved_continuation.py'
+      - '.github/workflows/job-bound-approved-continuation.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  focused:
+    name: Approved continuation and carry-forward tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compile approved-continuation slice
+        run: python -m compileall -q backend/app/agent_runtime/job_continuation.py backend/app/agent_runtime/job_bound_runtime.py backend/tests/agent_runtime/test_job_bound_approved_continuation.py
+      - name: Run focused approved-continuation tests
+        run: python -m pytest backend/tests/agent_runtime/test_job_bound_approved_continuation.py -q
+      - name: Run complete Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
+      - name: Run existing Job state-machine tests
+        run: python -m pytest backend/tests/test_job_state_machine.py backend/tests/test_job_batch.py -q
