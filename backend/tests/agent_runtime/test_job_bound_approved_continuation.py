@@ -177,7 +177,6 @@ def test_approval_reclaims_job_and_creates_new_run_with_remaining_budget(tmp_pat
         human.id,
         note="approved exactly",
     )
-
     assert approved.job_id == job.id
     assert approved.source_run_id == bound.run_id
     assert approved.run_id == "continuation-run"
@@ -347,8 +346,11 @@ def test_runtime_executes_exact_approved_action_before_model(tmp_path: Path) -> 
     assert outcome.final_output == {"continued": True}
     assert calls == {"count": 1, "value": 7}
     assert model.calls == 1
-    # Terminal Job projection is deliberately a later slice.
-    assert jobs.get(job.id).state is JobState.running
+    # Terminal projection is now part of the canonical Job-bound Runtime.
+    finished = jobs.get(job.id)
+    assert finished.state is JobState.succeeded
+    assert finished.lease_expires_at is None
+    assert finished.completed_at is not None
 
 
 def test_restart_after_committed_non_idempotent_tool_never_replays_handler(tmp_path: Path) -> None:
