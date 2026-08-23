@@ -1,7 +1,7 @@
 """Project durable terminal AgentRun proof into the authoritative Job state.
 
 The Agent execution trace may reach ``succeeded``/``failed`` before the Job row
-is finalized.  This module closes that crash window without letting a stale run
+is finalized. This module closes that crash window without letting a stale run
 overwrite cancellation, a newer continuation claim, or an expired claim.
 """
 
@@ -52,13 +52,14 @@ class JobTerminalProjector:
     - success requires durable final output plus its durable output step;
     - failure requires a durable matching error step;
     - no pending HumanAction or unresolved Tool step may remain;
+    - completion evidence is aggregated across the Job's full bound-run history;
     - optional evidence/artifact requirements are read from durable Job input;
     - the AgentRun terminal timestamp must be within the observed Job lease;
     - the final UPDATE re-checks claim generation and latest-binding identity.
 
     Because ``completed_at <= lease_expires_at`` is durable proof that the run
     finished while it still owned that claim, restart reconciliation may safely
-    finalize even when wall-clock time is now past the lease expiry.  If the run
+    finalize even when wall-clock time is now past the lease expiry. If the run
     itself completed after lease expiry, projection is refused and normal Job
     lease recovery remains authoritative.
     """
@@ -121,14 +122,10 @@ class JobTerminalProjector:
                 f"Terminal Agent run {run_id} still has unresolved Tool step(s)."
             )
 
-        evidence_refs = tuple(
-            dict.fromkeys(
-                ref
-                for step in steps
-                if step.status in {"succeeded", "reused"}
-                for ref in (step.evidence_refs_json or [])
-            )
-        )
+        # Evidence belongs to the authoritative Job history, not only the final
+        # continuation run. A prior run may have durably collected evidence and
+        # then paused for approval before a later run performed the final step.
+        evidence_refs = self._collect_job_evidence_refs(job_id)
 
         if desired is JobState.succeeded:
             self._require_success_proof(run, steps)
@@ -136,7 +133,7 @@ class JobTerminalProjector:
         else:
             self._require_failure_proof(run, steps)
 
-        # A provider/error path may complete after its claim expires.  In that
+        # A provider/error path may complete after its claim expires. In that
         # case the Agent trace is retained, but it may not terminalize the Job;
         # lease recovery will move the Job to needs_human instead.
         if run.completed_at > current.lease_expires_at:
@@ -242,6 +239,33 @@ class JobTerminalProjector:
 
         return self.project_terminal(run_id)
 
+    def _collect_job_evidence_refs(self, job_id: str) -> tuple[str, ...]:
+        with self.database.sessions() as session:
+            run_ids = list(
+                session.scalars(
+                    select(AgentJobBindingRecord.run_id)
+                    .where(AgentJobBindingRecord.job_id == job_id)
+                    .order_by(
+                        AgentJobBindingRecord.created_at,
+                        AgentJobBindingRecord.run_id,
+                    )
+                )
+            )
+
+        refs: list[str] = []
+        for historical_run_id in run_ids:
+            try:
+                self.store.get_run(historical_run_id)
+            except KeyError as exc:
+                raise JobTerminalProjectionError(
+                    f"Bound AgentRun {historical_run_id} is missing; Job evidence history is incomplete."
+                ) from exc
+            for step in self.store.list_steps(historical_run_id):
+                if step.status not in {"succeeded", "reused"}:
+                    continue
+                refs.extend(step.evidence_refs_json or [])
+        return tuple(dict.fromkeys(refs))
+
     def _require_current_binding(self, run_id: str) -> str:
         with self.database.sessions() as session:
             binding = session.get(AgentJobBindingRecord, run_id)
@@ -249,10 +273,11 @@ class JobTerminalProjector:
                 raise JobTerminalProjectionError(
                     f"Agent run {run_id} has no durable Job binding."
                 )
-            job = session.get(JobRecord, binding.job_id)
+            job_id = binding.job_id
+            job = session.get(JobRecord, job_id)
             if job is None:
                 raise JobTerminalProjectionError(
-                    f"Bound Job {binding.job_id} does not exist."
+                    f"Bound Job {job_id} does not exist."
                 )
             if job.type != AGENT_ORCHESTRATION_JOB_TYPE:
                 raise JobTerminalProjectionError(
@@ -273,13 +298,13 @@ class JobTerminalProjector:
             )
         if len(latest_ids) != 1:
             raise JobTerminalProjectionError(
-                f"Bound Job {binding.job_id} has ambiguous latest AgentRun authority."
+                f"Bound Job {job_id} has ambiguous latest AgentRun authority."
             )
         if latest_ids[0] != run_id:
             raise JobTerminalProjectionError(
                 f"Agent run {run_id} has been superseded by a newer continuation run."
             )
-        return binding.job_id
+        return job_id
 
     @staticmethod
     def _require_success_proof(run: Any, steps: list[Any]) -> None:
