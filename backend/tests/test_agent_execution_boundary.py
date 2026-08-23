@@ -38,11 +38,21 @@ def test_running_job_is_authorized():
     assert result["authorized"] is True
 
 
-@pytest.mark.parametrize("ctx", [
-    context(state="cancelled"),
-    context(expired=True),
-    context(mismatch=True),
-])
+@pytest.mark.parametrize(
+    "ctx",
+    [
+        context(state="cancelled"),
+        context(expired=True),
+        context(mismatch=True),
+    ],
+)
 def test_invalid_execution_is_denied(ctx):
     with pytest.raises(AgentExecutionDenied):
         AgentExecutionService(JobAuthorityGuard()).authorize(ctx)
+
+
+def test_needs_human_is_denied_before_future_side_effects():
+    with pytest.raises(AgentExecutionDenied):
+        AgentExecutionService(JobAuthorityGuard()).authorize(
+            context(state="needs_human")
+        )
