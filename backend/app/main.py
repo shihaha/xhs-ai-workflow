@@ -21,6 +21,7 @@ from backend.app.adapters.qianfan_playwright import (
     QianfanPlaywrightAdapter,
     persistent_qianfan_page_factory,
 )
+from backend.app.agent_runtime.workbench_actions import AgentWorkbenchActionService
 from backend.app.agent_runtime.workbench_read import AgentWorkbenchReader
 from backend.app.db import Database
 from backend.app.features.analysis.api import router as analysis_router
@@ -95,6 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = None
     app.state.job_service = None
     app.state.agent_workbench_reader = None
+    app.state.agent_workbench_actions = None
     app.state.radar_service = None
     app.state.adapter_registry = None
     app.state.xhs_collection_service = None
@@ -143,6 +145,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.database, runtime_dir=app.state.settings.runtime_dir
         )
         app.state.agent_workbench_reader = AgentWorkbenchReader(app.state.database)
+        app.state.agent_workbench_actions = AgentWorkbenchActionService(app.state.database)
         app.state.adapter_registry = build_default_registry(app.state.settings)
         app.state.xhs_collection_service = XhsCollectionService(
             database=app.state.database,
@@ -216,6 +219,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.database = None
         app.state.job_service = None
         app.state.agent_workbench_reader = None
+        app.state.agent_workbench_actions = None
         app.state.adapter_registry = None
         app.state.xhs_collection_service = None
         app.state.radar_service = None

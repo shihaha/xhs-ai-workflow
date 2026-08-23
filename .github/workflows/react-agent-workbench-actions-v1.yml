@@ -1,0 +1,83 @@
+name: Agent Workbench Operator Actions V1 Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/react-agent-workbench-v1
+    paths:
+      - 'frontend/src/api/client.ts'
+      - 'frontend/src/pages/AgentWorkbenchPage.tsx'
+      - 'frontend/src/pages/AgentWorkbenchPage.test.tsx'
+      - 'backend/app/api/agent_runtime.py'
+      - 'backend/app/api/jobs.py'
+      - 'backend/app/agent_runtime/workbench_actions.py'
+      - 'backend/app/agent_runtime/workbench_read.py'
+      - 'backend/app/main.py'
+      - 'backend/app/schemas/agent_runtime.py'
+      - 'backend/tests/agent_runtime/test_workbench_read_api.py'
+      - 'backend/tests/agent_runtime/test_workbench_projection_api_v2.py'
+      - 'backend/tests/agent_runtime/test_workbench_chatgpt_handoff_api.py'
+      - 'backend/tests/agent_runtime/test_workbench_operator_actions_api.py'
+      - 'docs/architecture-knowledge/22_REACT_AGENT_WORKBENCH_ACTIONS_V1.md'
+      - '.github/workflows/react-agent-workbench-actions-v1.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  frontend:
+    name: Backend-authoritative operator workbench frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Run focused Agent workbench tests
+        run: npm test -- --run src/pages/AgentWorkbenchPage.test.tsx src/main.test.tsx
+      - name: Run complete frontend regression
+        run: npm test -- --run
+      - name: Build production frontend
+        run: npm run build
+
+  backend-contract:
+    name: Durable operator action contract regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compile operator boundary
+        run: python -m compileall -q backend tools frontend/e2e/fixture_app.py
+      - name: Run Workbench operator and projection contracts
+        run: >-
+          python -m pytest
+          backend/tests/agent_runtime/test_workbench_read_api.py
+          backend/tests/agent_runtime/test_workbench_projection_api_v2.py
+          backend/tests/agent_runtime/test_workbench_chatgpt_handoff_api.py
+          backend/tests/agent_runtime/test_workbench_operator_actions_api.py
+          -q
+      - name: Run complete Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
+      - name: Scan release boundaries
+        run: python tools/scan_release_boundaries.py --root .

@@ -22,6 +22,7 @@ from backend.app.agent_runtime.persistence import (
     AgentStepRecord,
     HumanActionRecord,
 )
+from backend.app.agent_runtime.types import AgentRunState
 from backend.app.db import Database
 from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 
@@ -143,7 +144,7 @@ class AgentWorkbenchReader:
             return [
                 {
                     "job_id": run_to_job[action.run_id],
-                    **self._human_action_summary(action),
+                    **self._human_action_summary(session, action, run_to_job[action.run_id]),
                 }
                 for action in actions
             ]
@@ -240,7 +241,7 @@ class AgentWorkbenchReader:
             current_run_id, authority_ambiguous = self._current_binding(bindings)
             evidence_refs = self._evidence_refs(steps)
             pending_actions = [
-                self._human_action_summary(action)
+                self._human_action_summary(session, action, job.id)
                 for action in human_actions
                 if action.status == "pending"
             ]
@@ -292,7 +293,7 @@ class AgentWorkbenchReader:
                 **self._run_summary(run),
                 "steps": [self._step_summary(step) for step in steps],
                 "human_actions": [
-                    self._human_action_summary(action) for action in human_actions
+                    self._human_action_summary(session, action, binding.job_id) for action in human_actions
                 ],
                 "evidence_refs": self._evidence_refs(steps),
             }
@@ -445,17 +446,42 @@ class AgentWorkbenchReader:
             "updated_at": step.updated_at,
         }
 
-    @staticmethod
-    def _human_action_summary(action: HumanActionRecord) -> dict[str, Any]:
+    def _human_action_summary(
+        self, session: Any, action: HumanActionRecord, job_id: str
+    ) -> dict[str, Any]:
         # request_json/resolution_json may contain Tool arguments or operator
         # notes. Those belong to explicit approval/handoff capabilities, not the
-        # generic read projection.
+        # generic read projection. ``can_deny`` is a backend-derived command
+        # capability: React must not infer permission authority from labels.
+        run = session.get(AgentRunRecord, action.run_id)
+        job = session.get(JobRecord, job_id)
+        bindings = list(
+            session.scalars(
+                select(AgentJobBindingRecord).where(
+                    AgentJobBindingRecord.job_id == job_id
+                )
+            )
+        )
+        current_run_id, authority_ambiguous = self._current_binding(bindings)
+        can_deny = bool(
+            action.status == "pending"
+            and run is not None
+            and run.state == AgentRunState.needs_human.value
+            and run.error_category == "approval_required"
+            and job is not None
+            and job.type == AGENT_ORCHESTRATION_JOB_TYPE
+            and JobState(job.state) is JobState.needs_human
+            and job.lease_expires_at is None
+            and not authority_ambiguous
+            and current_run_id == action.run_id
+        )
         return {
             "id": action.id,
             "run_id": action.run_id,
             "tool_call_id": action.tool_call_id,
             "tool_name": action.tool_name,
             "status": action.status,
+            "can_deny": can_deny,
             "created_at": action.created_at,
             "resolved_at": action.resolved_at,
         }
