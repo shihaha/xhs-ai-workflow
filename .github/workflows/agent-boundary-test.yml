@@ -1,0 +1,24 @@
+name: agent-boundary-test
+
+on:
+  pull_request:
+    paths:
+      - 'backend/**'
+      - '.github/workflows/agent-boundary-test.yml'
+
+jobs:
+  test-agent-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; fi
+          pip install pytest
+      - name: Run boundary tests
+        run: pytest backend/tests -q
