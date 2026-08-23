@@ -199,6 +199,11 @@ Recovered/reconstructed proprietary source may be studied for architecture but m
 - `11_ARCHITECTURE_DECISIONS.md` — **Created**
 - `12_IMPLEMENTATION_ROADMAP.md` — **Created**
 
+### Current implementation knowledge
+
+- `24_REAL_AGENT_ORCHESTRATION_V1.md` — real evidence-grounded Agent launch/continuation boundary.
+- `25_AGENT_WORKBENCH_ZH_LAYOUT_V1.md` — Chinese-first three-column operator workbench and UI-component integration boundary.
+
 ## Rule for future AI sessions
 
 Do not rely on chat memory as the project record. Any material finding, constraint, rejected option, architecture decision or experiment result that would otherwise need to be rediscovered must be written into this branch and committed.

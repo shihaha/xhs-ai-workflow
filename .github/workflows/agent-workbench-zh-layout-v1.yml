@@ -1,0 +1,43 @@
+name: Agent Workbench Chinese Layout V1 Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/real-agent-orchestration-v1
+    paths:
+      - 'frontend/src/pages/AgentWorkbenchPage.tsx'
+      - 'frontend/src/pages/AgentWorkbenchPage.test.tsx'
+      - 'frontend/src/styles.css'
+      - 'frontend/e2e/agent-workbench-zh-layout.spec.ts'
+      - 'frontend/playwright.agent-workbench.config.ts'
+      - 'docs/architecture-knowledge/25_AGENT_WORKBENCH_ZH_LAYOUT_V1.md'
+      - '.github/workflows/agent-workbench-zh-layout-v1.yml'
+  workflow_dispatch:
+
+jobs:
+  workbench-ui:
+    name: Chinese-first Agent workbench UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Run focused Agent workbench tests
+        run: npm test -- --run src/pages/AgentWorkbenchPage.test.tsx src/main.test.tsx
+      - name: Run complete frontend regression
+        run: npm test -- --run
+      - name: Build production frontend
+        run: npm run build
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Verify desktop and mobile workbench layout
+        run: npx playwright test --config=playwright.agent-workbench.config.ts

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import type {
@@ -121,6 +121,27 @@ describe("AgentWorkbenchPage", () => {
     expect(screen.queryByText(/runtime\/external-results/i)).not.toBeInTheDocument();
   });
 
+  it("presents the primary operator surface in Chinese while keeping technical records secondary", async () => {
+    render(
+      <AgentWorkbenchPage
+        loadJobs={async () => [job]}
+        loadRuns={async () => [{ ...run, goal: "检查现有证据是否值得继续分析" }]}
+        loadHumanActions={async () => [{ ...action, tool_name: "analysis.run_grounded", can_deny: true, can_approve: true }]}
+        loadHandoffs={async () => []}
+        loadCapabilities={async () => continuationAvailable}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Agent 工作台" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "任务记录" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Agent 现在在做什么" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "可用证据" })).toBeInTheDocument();
+    const execution = screen.getByLabelText("Agent 执行区");
+    expect(within(execution).getByText("基于证据执行分析")).toBeInTheDocument();
+    expect(within(execution).queryByRole("heading", { name: "Human Actions" })).not.toBeInTheDocument();
+    expect(screen.getByText(/查看技术详情（任务 ID \/ AgentRun \/ 原始记录）/)).toBeInTheDocument();
+  });
+
 
   it("offers denial only when the backend projection explicitly authorizes it", async () => {
     let deniedActionId: string | null = null;
@@ -163,8 +184,8 @@ describe("AgentWorkbenchPage", () => {
       />,
     );
 
-    expect(await screen.findByText("已交回 / result ready")).toBeInTheDocument();
-    expect(screen.getByText(/Job 仍等待后端安全 continuation，不由前端恢复/)).toBeInTheDocument();
+    expect(await screen.findByText("结果已交回")).toBeInTheDocument();
+    expect(screen.getByText(/任务是否继续由后台安全规则决定，页面不会自行恢复/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /resume|continue/i })).not.toBeInTheDocument();
   });
 
@@ -179,7 +200,7 @@ describe("AgentWorkbenchPage", () => {
       />,
     );
 
-    expect(await screen.findByText(/自动 continuation 当前不可用/)).toBeInTheDocument();
+    expect(await screen.findByText(/当前自动继续功能不可用/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "批准并继续" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "拒绝此操作" })).toBeInTheDocument();
   });
@@ -232,10 +253,10 @@ describe("AgentWorkbenchPage", () => {
       />,
     );
 
-    expect(await screen.findByRole("heading", { name: "启动 grounded Agent 分析" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "启动基于证据的 Agent 分析" })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("本次目标"), { target: { value: "检查这条证据并决定是否需要分析" } });
-    fireEvent.click(screen.getByLabelText(/rank-item:7/));
-    fireEvent.click(screen.getByRole("button", { name: "启动 grounded Agent 分析" }));
+    fireEvent.click(screen.getByLabelText(/选择榜单证据 rank-item:7/));
+    fireEvent.click(screen.getByRole("button", { name: "启动 Agent 分析" }));
     expect(startPayload).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "确认启动 Agent" }));
     await waitFor(() => expect(startPayload).toEqual({
@@ -266,7 +287,7 @@ describe("Agent detail pages", () => {
 
     render(<AgentJobDetailPage jobId="job-1" loadJob={async () => detail} />);
 
-    expect(await screen.findByRole("heading", { name: "Evidence" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "证据" })).toBeInTheDocument();
     expect(screen.getByText("evidence:one")).toBeInTheDocument();
     expect(screen.getByText("agent-runtime")).toBeInTheDocument();
     expect(screen.queryByText(/C:\\|runtime\/|metadata/i)).not.toBeInTheDocument();
@@ -308,10 +329,10 @@ describe("Agent detail pages", () => {
       />,
     );
 
-    const requestButton = await screen.findByRole("button", { name: "取消 Agent Job" });
+    const requestButton = await screen.findByRole("button", { name: "取消 Agent 任务" });
     fireEvent.click(requestButton);
     expect(cancelCalls).toBe(0);
-    fireEvent.click(screen.getByRole("button", { name: "确认取消 Agent Job" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认取消 Agent 任务" }));
     await waitFor(() => expect(cancelCalls).toBe(1));
   });
 
@@ -336,8 +357,8 @@ describe("Agent detail pages", () => {
 
     render(<AgentRunDetailPage runId="run-1" loadRun={async () => detail} />);
 
-    expect(await screen.findByRole("heading", { name: "Step timeline" })).toBeInTheDocument();
-    expect(screen.getByText(/Tool: job.read/)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "执行过程" })).toBeInTheDocument();
+    expect(screen.getByText(/操作：读取任务状态/)).toBeInTheDocument();
     await waitFor(() => expect(screen.getAllByText("evidence:one").length).toBeGreaterThan(0));
     expect(screen.queryByText(/input_json|output_json|provider prompt/i)).not.toBeInTheDocument();
   });
