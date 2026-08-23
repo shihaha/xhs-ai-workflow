@@ -123,7 +123,7 @@ An Agent run can therefore still be within its allowed runtime when the Job leas
 For a bound orchestration Job, require:
 
 ```text
-job_lease_seconds > agent_max_wall_time_seconds + shutdown_margin_seconds
+job_lease_seconds >= agent_max_wall_time_seconds + shutdown_margin_seconds
 ```
 
 Initial margin:
