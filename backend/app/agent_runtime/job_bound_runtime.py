@@ -9,39 +9,64 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from backend.app.agent_runtime.job_binding import (
     AgentJobBindingRecord,
     JobAuthorityError,
     JobAuthorityGuard,
 )
+from backend.app.agent_runtime.persistence import AgentRunRecord
 from backend.app.agent_runtime.runtime import AgentRuntime
 from backend.app.agent_runtime.types import AgentRunState, NextAction, RuntimeOutcome
 
 
 class ActiveRunJobAuthorityGuard(JobAuthorityGuard):
-    """Require both a runnable Job lease and the current Job claim's latest run.
+    """Require a runnable Job lease and one unambiguous current AgentRun.
 
     A Job may accumulate historical AgentRun bindings across human-wait /
-    continuation claims.  Merely checking that the Job is currently ``running``
+    continuation claims. Merely checking that the Job is currently ``running``
     is therefore insufficient: an older run must not regain authority after a
     newer continuation run has been created.
+
+    The newest binding timestamp must identify exactly one run. If two bindings
+    ever share the same newest timestamp, authority is ambiguous and all runs
+    fail closed rather than choosing a winner from UUID/string ordering.
     """
 
     def require_run_running(self, run_id: str, *, now=None) -> str:
         job_id = super().require_run_running(run_id, now=now)
         with self.database.sessions() as session:
-            latest_run_id = session.scalar(
-                select(AgentJobBindingRecord.run_id)
-                .where(AgentJobBindingRecord.job_id == job_id)
-                .order_by(
-                    AgentJobBindingRecord.created_at.desc(),
-                    AgentJobBindingRecord.run_id.desc(),
+            run = session.get(AgentRunRecord, run_id)
+            if run is None or run.state != AgentRunState.running.value:
+                state = None if run is None else run.state
+                raise JobAuthorityError(
+                    f"Agent run {run_id} is not running (state={state!r}); Agent work must stop."
                 )
-                .limit(1)
+
+            latest_created_at = session.scalar(
+                select(func.max(AgentJobBindingRecord.created_at)).where(
+                    AgentJobBindingRecord.job_id == job_id
+                )
             )
-        if latest_run_id != run_id:
+            if latest_created_at is None:
+                raise JobAuthorityError(
+                    f"Bound Job {job_id} has no current AgentRun binding; Agent work must stop."
+                )
+            latest_run_ids = list(
+                session.scalars(
+                    select(AgentJobBindingRecord.run_id).where(
+                        AgentJobBindingRecord.job_id == job_id,
+                        AgentJobBindingRecord.created_at == latest_created_at,
+                    )
+                )
+            )
+
+        if len(latest_run_ids) != 1:
+            raise JobAuthorityError(
+                f"Bound Job {job_id} has ambiguous latest AgentRun authority; Agent work must stop."
+            )
+        if latest_run_ids[0] != run_id:
             raise JobAuthorityError(
                 f"Agent run {run_id} has been superseded by a newer continuation run; "
                 "Agent work must stop."
@@ -64,8 +89,8 @@ class _AuthorityCheckedModel:
 
         turn = self._delegate.next_action(context)
 
-        # A cancel/lease loss can happen while the provider is in flight.  Do
-        # not apply a stale finish/tool decision after authority was revoked.
+        # A cancel/lease loss can happen while the provider is in flight. Do not
+        # apply a stale finish/tool decision after authority was revoked.
         try:
             self._guard.require_run_running(context.run_id)
         except JobAuthorityError as exc:
@@ -77,7 +102,7 @@ class JobBoundAgentRuntime(AgentRuntime):
     """Canonical runtime plus fail-closed Job authority boundaries.
 
     This class is intentionally an integration spike and is not package-root
-    exported.  New bound runs must be created by ``AgentJobCoordinator`` first;
+    exported. New bound runs must be created by ``AgentJobCoordinator`` first;
     this adapter only drives an already-bound, currently-authoritative run.
     """
 
@@ -134,7 +159,7 @@ class JobBoundAgentRuntime(AgentRuntime):
 
     def _fail(self, run_id: str, category: str, detail: str) -> RuntimeOutcome:
         # The canonical Stage 1 loop intentionally catches provider exceptions
-        # generically.  The guarded model raises JobAuthorityError to stop before
+        # generically. The guarded model raises JobAuthorityError to stop before
         # calling/applying the model; normalize that one known control failure.
         if category == "model_error" and detail.startswith("JobAuthorityError: "):
             category = "job_authority_lost"
