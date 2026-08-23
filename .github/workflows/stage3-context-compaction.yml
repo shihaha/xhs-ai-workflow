@@ -1,0 +1,42 @@
+name: Stage 3 Context Compaction Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/agent-runtime-pydantic-v1
+    paths:
+      - 'backend/app/features/analysis/model_context.py'
+      - 'backend/tests/analysis/test_model_context_compaction.py'
+      - 'docs/STAGE3_CONTEXT_COMPACTION_EXPERIMENT.md'
+      - '.github/workflows/stage3-context-compaction.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  focused-stage3:
+    name: Compact context A/B acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compile Stage 3 module and tests
+        run: python -m compileall -q backend/app/features/analysis/model_context.py backend/tests/analysis/test_model_context_compaction.py
+      - name: Run Stage 3 A/B acceptance
+        run: python -m pytest backend/tests/analysis/test_model_context_compaction.py -q
+      - name: Re-run Stage 2 Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
