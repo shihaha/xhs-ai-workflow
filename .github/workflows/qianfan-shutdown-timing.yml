@@ -1,0 +1,68 @@
+name: Qianfan Shutdown Timing Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/agent-runtime-pydantic-v1
+    paths:
+      - 'backend/tests/radar/test_qianfan_shutdown_timing.py'
+      - '.github/workflows/qianfan-shutdown-timing.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  ready-boundary-shutdown:
+    name: Ready-boundary shutdown acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *deps])
+          PY
+
+      - name: Compile corrected shutdown test
+        run: python -m compileall -q backend/tests/radar/test_qianfan_shutdown_timing.py
+
+      - name: Run corrected shutdown test twenty times
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          node = 'backend/tests/radar/test_qianfan_shutdown_timing.py::test_blocked_browser_worker_exits_within_two_seconds_after_ready'
+          env = dict(os.environ)
+          env['PYTHONPATH'] = '.'
+          failures = []
+          for attempt in range(1, 21):
+              result = subprocess.run(
+                  [sys.executable, '-m', 'pytest', node, '-q', '--tb=short'],
+                  env=env,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+                  errors='replace',
+              )
+              print(f'attempt {attempt}: exit={result.returncode}')
+              if result.returncode != 0:
+                  failures.append((attempt, result.stdout[-6000:]))
+          if failures:
+              for attempt, output in failures:
+                  print(f'--- failure attempt {attempt} ---')
+                  print(output)
+              raise SystemExit(f'corrected shutdown test failed {len(failures)}/20 attempts')
+          print('corrected shutdown test passed 20/20 attempts')
+          PY
