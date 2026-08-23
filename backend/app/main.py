@@ -21,6 +21,11 @@ from backend.app.adapters.qianfan_playwright import (
     QianfanPlaywrightAdapter,
     persistent_qianfan_page_factory,
 )
+from backend.app.agent_runtime.continuation_executor import AgentContinuationExecutor
+from backend.app.agent_runtime.production_runtime import (
+    automatic_agent_configured,
+    build_production_job_bound_runtime,
+)
 from backend.app.agent_runtime.workbench_actions import AgentWorkbenchActionService
 from backend.app.agent_runtime.workbench_read import AgentWorkbenchReader
 from backend.app.db import Database
@@ -55,13 +60,21 @@ async def _lifespan(app: FastAPI):
     media_worker: ContentMediaWorker | None = getattr(
         app.state, "content_media_worker", None
     )
+    continuation_executor: AgentContinuationExecutor | None = getattr(
+        app.state, "agent_continuation_executor", None
+    )
     try:
+        if continuation_executor is not None:
+            continuation_executor.start()
         if media_worker is not None:
             media_worker.start()
         if cleanup_worker is not None:
             cleanup_worker.start()
         yield
     finally:
+        continuation_safe = True
+        if continuation_executor is not None:
+            continuation_safe = continuation_executor.close()
         media_safe = True
         if media_worker is not None:
             media_safe = media_worker.close()
@@ -82,6 +95,8 @@ async def _lifespan(app: FastAPI):
             cleanup_worker.close()
         elif database is not None:
             database.close()
+        if not continuation_safe:
+            raise RuntimeError("Agent continuation executor did not stop safely.")
         if not xhs_safe:
             raise RuntimeError("XHS collection process tree did not stop safely.")
         if not media_safe:
@@ -97,6 +112,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.job_service = None
     app.state.agent_workbench_reader = None
     app.state.agent_workbench_actions = None
+    app.state.agent_continuation_executor = None
     app.state.radar_service = None
     app.state.adapter_registry = None
     app.state.xhs_collection_service = None
@@ -145,7 +161,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.database, runtime_dir=app.state.settings.runtime_dir
         )
         app.state.agent_workbench_reader = AgentWorkbenchReader(app.state.database)
-        app.state.agent_workbench_actions = AgentWorkbenchActionService(app.state.database)
         app.state.adapter_registry = build_default_registry(app.state.settings)
         app.state.xhs_collection_service = XhsCollectionService(
             database=app.state.database,
@@ -178,6 +193,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.database,
             app.state.bailian_adapter,
             runtime_dir=app.state.settings.runtime_dir,
+        )
+        executor: AgentContinuationExecutor
+
+        def runtime_factory():
+            return build_production_job_bound_runtime(
+                database=app.state.database,
+                job_service=app.state.job_service,
+                analysis_service=app.state.analysis_service,
+                bailian_adapter=app.state.bailian_adapter,
+                continuations=executor.coordinator,
+            )
+
+        executor = AgentContinuationExecutor(
+            app.state.database,
+            runtime_factory=runtime_factory,
+            approval_enabled=automatic_agent_configured(app.state.bailian_adapter),
+        )
+        app.state.agent_continuation_executor = executor
+        app.state.agent_workbench_actions = AgentWorkbenchActionService(
+            app.state.database,
+            continuation_executor=executor,
         )
         app.state.artifact_cleanup_service = ArtifactCleanupService(
             app.state.database,
@@ -220,6 +256,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.job_service = None
         app.state.agent_workbench_reader = None
         app.state.agent_workbench_actions = None
+        app.state.agent_continuation_executor = None
         app.state.adapter_registry = None
         app.state.xhs_collection_service = None
         app.state.radar_service = None

@@ -1,19 +1,23 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  approveAgentHumanAction,
   cancelAgentJob,
   denyAgentHumanAction,
   fetchAgentHumanActions,
   fetchAgentJob,
   fetchAgentJobs,
+  fetchAgentOperatorCapabilities,
   fetchAgentRun,
   fetchAgentRuns,
   fetchChatGPTHandoffs,
   type AgentHumanAction,
+  type AgentHumanActionApproval,
   type AgentHumanActionDecision,
   type AgentJobCancelResult,
   type AgentJobRuntime,
   type AgentJobSummary,
+  type AgentOperatorCapabilities,
   type AgentRunDetail,
   type AgentRunListItem,
   type ChatGPTHandoffTask,
@@ -29,6 +33,8 @@ export interface AgentWorkbenchPageProps {
   loadRuns?: () => Promise<AgentRunListItem[]>;
   loadHumanActions?: () => Promise<AgentHumanAction[]>;
   loadHandoffs?: () => Promise<ChatGPTHandoffTask[]>;
+  loadCapabilities?: () => Promise<AgentOperatorCapabilities>;
+  approveAction?: (actionId: string, payload: { note?: string }) => Promise<AgentHumanActionApproval>;
   denyAction?: (actionId: string, payload: { note?: string }) => Promise<AgentHumanActionDecision>;
 }
 
@@ -37,6 +43,7 @@ interface AgentWorkbenchData {
   runs: AgentRunListItem[];
   humanActions: AgentHumanAction[];
   handoffs: ChatGPTHandoffTask[];
+  capabilities: AgentOperatorCapabilities;
 }
 
 export function AgentWorkbenchPage({
@@ -44,6 +51,8 @@ export function AgentWorkbenchPage({
   loadRuns = fetchAgentRuns,
   loadHumanActions = fetchAgentHumanActions,
   loadHandoffs = fetchChatGPTHandoffs,
+  loadCapabilities = fetchAgentOperatorCapabilities,
+  approveAction = approveAgentHumanAction,
   denyAction = denyAgentHumanAction,
 }: AgentWorkbenchPageProps) {
   const [resource, setResource] = useState<ResourceState<AgentWorkbenchData>>({ kind: "loading" });
@@ -51,17 +60,18 @@ export function AgentWorkbenchPage({
   const refresh = useCallback(async () => {
     setResource({ kind: "loading" });
     try {
-      const [jobs, runs, humanActions, handoffs] = await Promise.all([
+      const [jobs, runs, humanActions, handoffs, capabilities] = await Promise.all([
         loadJobs(),
         loadRuns(),
         loadHumanActions(),
         loadHandoffs(),
+        loadCapabilities(),
       ]);
-      setResource({ kind: "ready", value: { jobs, runs, humanActions, handoffs } });
+      setResource({ kind: "ready", value: { jobs, runs, humanActions, handoffs, capabilities } });
     } catch {
       setResource({ kind: "error" });
     }
-  }, [loadHandoffs, loadHumanActions, loadJobs, loadRuns]);
+  }, [loadCapabilities, loadHandoffs, loadHumanActions, loadJobs, loadRuns]);
 
   useEffect(() => {
     void refresh();
@@ -69,14 +79,18 @@ export function AgentWorkbenchPage({
 
   if (resource.kind === "loading") return <AgentLoading label="Loading Agent workbench" />;
   if (resource.kind === "error") return <AgentLoadError onRetry={refresh} />;
+  const approve = async (actionId: string) => {
+    await approveAction(actionId, {});
+    await refresh();
+  };
   const deny = async (actionId: string) => {
     await denyAction(actionId, {});
     await refresh();
   };
-  return <AgentWorkbenchView data={resource.value} onDeny={deny} />;
+  return <AgentWorkbenchView data={resource.value} onApprove={approve} onDeny={deny} />;
 }
 
-export function AgentWorkbenchView({ data, onDeny }: { data: AgentWorkbenchData; onDeny?: (actionId: string) => Promise<void> }) {
+export function AgentWorkbenchView({ data, onApprove, onDeny }: { data: AgentWorkbenchData; onApprove?: (actionId: string) => Promise<void>; onDeny?: (actionId: string) => Promise<void> }) {
   const pendingHuman = data.humanActions.filter((item) => item.status === "pending").length;
   const activeChatGPT = data.handoffs.filter((item) => item.needs_chatgpt).length;
 
@@ -88,7 +102,7 @@ export function AgentWorkbenchView({ data, onDeny }: { data: AgentWorkbenchData;
           <h1>Agent 工作台</h1>
           <p>展示 durable Job/Run/HumanAction 状态；有限 operator 命令提交给后端重新校验，不由 React 修改 lifecycle。</p>
         </div>
-        <p className="boundary-note">Backend-authoritative · continuation remains fail-closed</p>
+        <p className="boundary-note">Backend-authoritative · durable continuation dispatch</p>
       </header>
 
       <section aria-label="Agent workbench summary" className="agent-summary-grid">
@@ -101,7 +115,13 @@ export function AgentWorkbenchView({ data, onDeny }: { data: AgentWorkbenchData;
       <HandoffSection handoffs={data.handoffs} />
       <JobsSection jobs={data.jobs} />
       <RunsSection runs={data.runs} />
-      <HumanActionsSection actions={data.humanActions} onDeny={onDeny} />
+      <HumanActionsSection
+        actions={data.humanActions}
+        approveEnabled={data.capabilities.approve_continuation}
+        continuationReason={data.capabilities.continuation_reason}
+        onApprove={onApprove}
+        onDeny={onDeny}
+      />
     </main>
   );
 }
@@ -222,10 +242,37 @@ function RunsSection({ runs }: { runs: AgentRunListItem[] }) {
   );
 }
 
-function HumanActionsSection({ actions, onDeny }: { actions: AgentHumanAction[]; onDeny?: (actionId: string) => Promise<void> }) {
-  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+function HumanActionsSection({
+  actions,
+  approveEnabled,
+  continuationReason,
+  onApprove,
+  onDeny,
+}: {
+  actions: AgentHumanAction[];
+  approveEnabled: boolean;
+  continuationReason: string | null;
+  onApprove?: (actionId: string) => Promise<void>;
+  onDeny?: (actionId: string) => Promise<void>;
+}) {
+  const [approveConfirmingId, setApproveConfirmingId] = useState<string | null>(null);
+  const [denyConfirmingId, setDenyConfirmingId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const approve = async (actionId: string) => {
+    if (!onApprove) return;
+    setBusyId(actionId);
+    setError(null);
+    try {
+      await onApprove(actionId);
+      setApproveConfirmingId(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "HumanAction approval failed.");
+    } finally {
+      setBusyId(null);
+    }
+  };
 
   const deny = async (actionId: string) => {
     if (!onDeny) return;
@@ -233,7 +280,7 @@ function HumanActionsSection({ actions, onDeny }: { actions: AgentHumanAction[];
     setError(null);
     try {
       await onDeny(actionId);
-      setConfirmingId(null);
+      setDenyConfirmingId(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "HumanAction denial failed.");
     } finally {
@@ -244,29 +291,44 @@ function HumanActionsSection({ actions, onDeny }: { actions: AgentHumanAction[];
   return (
     <section className="operator-panel" aria-labelledby="agent-human-heading">
       <div className="panel-heading"><div><h2 id="agent-human-heading">Human Actions</h2><p>只展示身份、工具和 durable lifecycle，不展示 request/resolution JSON。</p></div><span>{actions.length} actions</span></div>
+      {!approveEnabled && continuationReason ? <p className="field-help">自动 continuation 当前不可用：{continuationReason}</p> : null}
       {error ? <p className="action-error" role="alert">{error}</p> : null}
       {actions.length === 0 ? <p className="panel-empty">当前没有 HumanAction。</p> : (
         <div className="table-scroll">
           <table>
             <thead><tr><th>Action</th><th>Status</th><th>Tool</th><th>Job / Run</th><th>Created</th><th>Operator</th></tr></thead>
             <tbody>
-              {actions.map((action) => (
-                <tr key={action.id}>
-                  <th scope="row"><code>{action.id}</code></th>
-                  <td><strong>{action.status}</strong></td>
-                  <td>{action.tool_name}</td>
-                  <td><a href={`/agent/jobs/${encodeURIComponent(action.job_id)}`}><code>{action.job_id}</code></a><br /><a href={`/agent/runs/${encodeURIComponent(action.run_id)}`}><code>{action.run_id}</code></a></td>
-                  <td><time dateTime={action.created_at}>{action.created_at}</time></td>
-                  <td>{action.can_deny && onDeny ? (
-                    confirmingId === action.id ? (
-                      <span className="button-row">
-                        <button disabled={busyId === action.id} onClick={() => void deny(action.id)} type="button">确认拒绝并终止</button>
-                        <button disabled={busyId === action.id} onClick={() => setConfirmingId(null)} type="button">返回</button>
-                      </span>
-                    ) : <button onClick={() => setConfirmingId(action.id)} type="button">拒绝此操作</button>
-                  ) : <span>—</span>}</td>
-                </tr>
-              ))}
+              {actions.map((action) => {
+                const canApprove = action.can_approve && approveEnabled && Boolean(onApprove);
+                const canDeny = action.can_deny && Boolean(onDeny);
+                return (
+                  <tr key={action.id}>
+                    <th scope="row"><code>{action.id}</code></th>
+                    <td><strong>{action.status}</strong></td>
+                    <td>{action.tool_name}</td>
+                    <td><a href={`/agent/jobs/${encodeURIComponent(action.job_id)}`}><code>{action.job_id}</code></a><br /><a href={`/agent/runs/${encodeURIComponent(action.run_id)}`}><code>{action.run_id}</code></a></td>
+                    <td><time dateTime={action.created_at}>{action.created_at}</time></td>
+                    <td>
+                      {canApprove || canDeny ? (
+                        <span className="button-row">
+                          {canApprove ? (approveConfirmingId === action.id ? (
+                            <>
+                              <button disabled={busyId === action.id} onClick={() => void approve(action.id)} type="button">确认批准并继续</button>
+                              <button disabled={busyId === action.id} onClick={() => setApproveConfirmingId(null)} type="button">返回</button>
+                            </>
+                          ) : <button onClick={() => { setDenyConfirmingId(null); setApproveConfirmingId(action.id); }} type="button">批准并继续</button>) : null}
+                          {canDeny ? (denyConfirmingId === action.id ? (
+                            <>
+                              <button disabled={busyId === action.id} onClick={() => void deny(action.id)} type="button">确认拒绝并终止</button>
+                              <button disabled={busyId === action.id} onClick={() => setDenyConfirmingId(null)} type="button">返回</button>
+                            </>
+                          ) : <button onClick={() => { setApproveConfirmingId(null); setDenyConfirmingId(action.id); }} type="button">拒绝此操作</button>) : null}
+                        </span>
+                      ) : <span>—</span>}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -333,7 +395,7 @@ export function AgentJobDetailPage({
       <section className="operator-panel" aria-labelledby="agent-operator-actions-heading">
         <div className="panel-heading"><div><h2 id="agent-operator-actions-heading">Operator actions</h2><p>命令只提交请求；后端会在写入时重新校验 Job authority。</p></div><span>backend-authoritative</span></div>
         <div className="record-stack">
-          <p>Continuation / resume 暂不开放：当前 FastAPI 尚未接入 durable Agent executor，避免制造“running 但无人执行”的假状态。</p>
+          <p>Continuation 只从精确的 pending HumanAction 发起；Job detail 不自行推断或合成 resume 权限。</p>
           {canRequestCancel ? (confirmCancel ? (
             <div className="button-row"><button disabled={cancelling} onClick={() => void cancel()} type="button">确认取消 Agent Job</button><button disabled={cancelling} onClick={() => setConfirmCancel(false)} type="button">返回</button></div>
           ) : <button onClick={() => setConfirmCancel(true)} type="button">取消 Agent Job</button>) : <p className="field-help">当前 durable lifecycle 不接受取消请求。</p>}

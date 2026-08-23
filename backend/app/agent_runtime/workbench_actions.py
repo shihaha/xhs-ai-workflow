@@ -1,14 +1,9 @@
 """Safe operator mutations for the durable Agent workbench.
 
-This slice intentionally exposes only actions that can be completed
-transactionally without an Agent execution driver. Job remains lifecycle
-authority; AgentRun/HumanAction rows are reconciled in the same SQLite
-transaction so the UI never manufactures lifecycle state.
-
-Approved continuation is deliberately *not* enabled here. The repository has a
-validated continuation coordinator, but the FastAPI application does not yet
-own a durable Agent executor. Exposing approval before that executor exists
-would create a running Job with no process responsible for driving it.
+Job remains lifecycle authority. Cancel/deny reconcile Job, AgentRun, and
+HumanAction state transactionally. Approval delegates to the app-owned durable
+continuation executor, whose dispatch row is committed atomically with the new
+continuation AgentRun. React never manufactures lifecycle authority.
 """
 
 from __future__ import annotations
@@ -18,6 +13,11 @@ from datetime import datetime, timezone
 
 from sqlalchemy import func, select, update
 
+from backend.app.agent_runtime.continuation_executor import (
+    AgentContinuationExecutor,
+    ContinuationExecutorClosed,
+)
+from backend.app.agent_runtime.job_continuation import ContinuationApprovalError
 from backend.app.agent_runtime.job_binding import (
     AGENT_ORCHESTRATION_JOB_TYPE,
     AgentJobBindingRecord,
@@ -60,26 +60,68 @@ class HumanActionDenialResult:
     run_state: str
 
 
+@dataclass(frozen=True, slots=True)
+class HumanActionApprovalResult:
+    human_action_id: str
+    job_id: str
+    source_run_id: str
+    continuation_run_id: str
+
+
 class AgentWorkbenchActionService:
     """Narrow, backend-authoritative operator command surface."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        continuation_executor: AgentContinuationExecutor | None = None,
+    ) -> None:
         self.database = database
+        self.continuation_executor = continuation_executor
         # Ensure staged Agent tables exist on a fresh local database.
         self.store = AgentRunStore(database)
         AgentJobBindingRecord.__table__.create(bind=database.engine, checkfirst=True)
 
-    @staticmethod
-    def capabilities() -> dict[str, object]:
+    def capabilities(self) -> dict[str, object]:
+        executor_ready = bool(
+            self.continuation_executor is not None
+            and self.continuation_executor.accepting
+        )
         return {
             "cancel_job": True,
             "deny_permission_action": True,
-            "approve_continuation": False,
+            "approve_continuation": executor_ready,
             "continuation_reason": (
-                "The durable continuation coordinator is validated, but no FastAPI-owned "
-                "Agent continuation executor is wired yet. Approval remains fail-closed."
+                None
+                if executor_ready
+                else "Automatic Agent continuation requires a configured app-owned executor/model."
             ),
         }
+
+    def approve_permission_action(
+        self,
+        human_action_id: str,
+        *,
+        note: str | None = None,
+    ) -> HumanActionApprovalResult:
+        executor = self.continuation_executor
+        if executor is None or not executor.accepting:
+            raise AgentWorkbenchActionError(
+                "Automatic Agent continuation executor is unavailable."
+            )
+        try:
+            approved = executor.approve(human_action_id, note=note)
+        except KeyError:
+            raise
+        except (ContinuationApprovalError, ContinuationExecutorClosed) as error:
+            raise AgentWorkbenchActionError(str(error)) from error
+        return HumanActionApprovalResult(
+            human_action_id=approved.human_action_id,
+            job_id=approved.job_id,
+            source_run_id=approved.source_run_id,
+            continuation_run_id=approved.run_id,
+        )
 
     def cancel_job(self, job_id: str) -> AgentCancelResult:
         """Cancel one Agent orchestration Job and stop its current execution trace.

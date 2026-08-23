@@ -46,6 +46,7 @@ class HumanActionSummaryRead(BaseModel):
     tool_name: str
     status: str
     can_deny: bool = False
+    can_approve: bool = False
     created_at: datetime
     resolved_at: datetime | None = None
 
@@ -152,6 +153,19 @@ class AgentJobCancelRead(BaseModel):
 
 class HumanActionDenyRequest(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
+
+
+class HumanActionApproveRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class HumanActionApprovalRead(BaseModel):
+    human_action_id: str
+    job_id: str
+    source_run_id: str
+    continuation_run_id: str
+    human_action_status: Literal["approved"]
+    continuation_enqueued: Literal[True]
 
 
 class HumanActionDecisionRead(BaseModel):

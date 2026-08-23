@@ -23,6 +23,8 @@ from backend.app.schemas.agent_runtime import (
     AgentRunDetailRead,
     AgentRunListItemRead,
     ChatGPTHandoffTaskRead,
+    HumanActionApprovalRead,
+    HumanActionApproveRequest,
     HumanActionDecisionRead,
     HumanActionDenyRequest,
     HumanActionWorkbenchRead,
@@ -135,6 +137,34 @@ def cancel_agent_job(job_id: str, request: Request) -> AgentJobCancelRead:
         cancelled_run_ids=list(result.cancelled_run_ids),
         resolved_human_action_ids=list(result.resolved_human_action_ids),
         already_cancelled=result.already_cancelled,
+    )
+
+
+@router.post(
+    "/human-actions/{human_action_id}/approve",
+    response_model=HumanActionApprovalRead,
+)
+def approve_agent_human_action(
+    human_action_id: str,
+    payload: HumanActionApproveRequest,
+    request: Request,
+) -> HumanActionApprovalRead:
+    try:
+        result = _actions(request).approve_permission_action(
+            human_action_id,
+            note=payload.note,
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except AgentWorkbenchActionError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return HumanActionApprovalRead(
+        human_action_id=result.human_action_id,
+        job_id=result.job_id,
+        source_run_id=result.source_run_id,
+        continuation_run_id=result.continuation_run_id,
+        human_action_status="approved",
+        continuation_enqueued=True,
     )
 
 

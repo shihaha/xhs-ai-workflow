@@ -482,6 +482,7 @@ class AgentWorkbenchReader:
             "tool_name": action.tool_name,
             "status": action.status,
             "can_deny": can_deny,
+            "can_approve": can_deny,
             "created_at": action.created_at,
             "resolved_at": action.resolved_at,
         }
