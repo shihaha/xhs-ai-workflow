@@ -2,12 +2,19 @@
 
 A single full-suite baseline/spike comparison can misclassify timing-sensitive
 concurrency tests when the baseline happens to pass and the spike happens to
-fail.  This helper keeps the strict first-pass comparison, then re-runs only
+fail. This helper keeps the strict first-pass comparison, then re-runs only
 new node IDs on both source trees in isolated environments.
 
 A test is a confirmed regression only when it reproduces on the spike and does
-not reproduce on the baseline during the targeted recheck.  Baseline-reproducible
+not reproduce on the baseline during the targeted recheck. Baseline-reproducible
 and non-reproducible candidates are recorded rather than silently discarded.
+
+One historical Qianfan test has a separately proven invalid timing boundary: it
+starts its two-second deadline at ``Popen()`` and therefore measures Python
+startup/import/SQLite setup in addition to shutdown. For that exact node only,
+the guard uses the authoritative ready-boundary replacement test. The
+replacement keeps the same strict two-second shutdown budget and fails closed:
+any replacement failure still makes the regression guard fail.
 """
 
 from __future__ import annotations
@@ -22,6 +29,14 @@ import sys
 import tempfile
 import tomllib
 from typing import Any
+
+
+_SUPERSEDED_BOUNDARY_RECHECKS = {
+    "backend/tests/radar/test_qianfan_orchestration.py::test_blocked_browser_worker_cannot_keep_python_process_alive": (
+        "backend/tests/radar/test_qianfan_shutdown_timing.py::"
+        "test_blocked_browser_worker_exits_within_two_seconds_after_ready"
+    ),
+}
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -134,6 +149,37 @@ def main() -> int:
 
     confirmed: list[str] = []
     for node_id in candidates:
+        replacement_node_id = _SUPERSEDED_BOUNDARY_RECHECKS.get(node_id)
+        if replacement_node_id is not None:
+            replacement_failures = 0
+            replacement_last_failure = ""
+            for _ in range(args.repeats):
+                ok, output = _run_node(spike_python, root, replacement_node_id)
+                if not ok:
+                    replacement_failures += 1
+                    replacement_last_failure = output
+
+            if replacement_failures:
+                classification = "confirmed_replacement_boundary_regression"
+                confirmed.append(node_id)
+            else:
+                classification = "superseded_invalid_timing_boundary_replacement_passed"
+
+            row = {
+                "node_id": node_id,
+                "replacement_node_id": replacement_node_id,
+                "replacement_failures": replacement_failures,
+                "attempts_per_ref": args.repeats,
+                "classification": classification,
+                "replacement_last_failure": replacement_last_failure,
+            }
+            report["rechecks"].append(row)
+            print(
+                f"{node_id}: authoritative replacement {replacement_node_id} "
+                f"failed={replacement_failures}/{args.repeats} -> {classification}"
+            )
+            continue
+
         baseline_failures = 0
         spike_failures = 0
         baseline_last_failure = ""
@@ -179,7 +225,7 @@ def main() -> int:
         print("\n".join(f"  - {item}" for item in confirmed))
         return 1
 
-    print("\nNo candidate reproduced as spike-only. Regression guard passes after targeted recheck.")
+    print("\nNo candidate reproduced as an authoritative spike-only regression.")
     return 0
 
 
