@@ -126,40 +126,36 @@ jobs:
     name: Backend regression guard
     needs: [baseline-backend, spike-backend]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: actions/download-artifact@v4
         with:
           name: baseline-backend-result
-          path: baseline
+          path: .ci/baseline
       - uses: actions/download-artifact@v4
         with:
           name: spike-backend-result
-          path: spike
-      - name: Fail only on newly failing backend tests
+          path: .ci/spike
+      - name: Compare and recheck apparent regressions
         run: |
-          python - <<'PY'
-          import json
-          import pathlib
-
-          baseline = json.loads(pathlib.Path('baseline/backend-result.json').read_text(encoding='utf-8'))
-          spike = json.loads(pathlib.Path('spike/backend-result.json').read_text(encoding='utf-8'))
-          baseline_issues = set(baseline['issues'])
-          spike_issues = set(spike['issues'])
-          new = sorted(spike_issues - baseline_issues)
-          fixed = sorted(baseline_issues - spike_issues)
-
-          print(f"baseline issues: {len(baseline_issues)}")
-          print(f"spike issues:    {len(spike_issues)}")
-          print(f"new issues:      {len(new)}")
-          print(f"fixed issues:    {len(fixed)}")
-          if fixed:
-              print('\nFixed relative to baseline:')
-              print('\n'.join(f'  - {item}' for item in fixed))
-          if new:
-              print('\nNEW regressions:')
-              print('\n'.join(f'  - {item}' for item in new))
-              raise SystemExit(1)
-          PY
+          python tools/agent_runtime_regression_guard.py \
+            --baseline-result .ci/baseline/backend-result.json \
+            --spike-result .ci/spike/backend-result.json \
+            --baseline-ref research/xhs-workbench-next \
+            --repeats 5 \
+            --report backend-regression-recheck.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-regression-recheck
+          path: backend-regression-recheck.json
+          if-no-files-found: warn
 
   baseline-frontend:
     name: Existing baseline frontend tests and build
