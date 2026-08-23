@@ -27,6 +27,7 @@ class JobSnapshot:
 
 
 _TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+_HUMAN_GATED_STATES = {"needs_human", "paused", "blocked"}
 
 
 class JobAuthorityGuard:
@@ -39,6 +40,11 @@ class JobAuthorityGuard:
         if job.state in _TERMINAL_STATES:
             raise JobAuthorityDenied(
                 f"Job is terminal and cannot continue: {job.state}."
+            )
+
+        if job.state in _HUMAN_GATED_STATES:
+            raise JobAuthorityDenied(
+                f"Job requires human handling and cannot continue: {job.state}."
             )
 
         expires_at = binding.lease_expires_at or job.lease_expires_at
