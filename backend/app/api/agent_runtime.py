@@ -16,6 +16,7 @@ from backend.app.schemas.agent_runtime import (
     AgentJobSummaryRead,
     AgentRunDetailRead,
     AgentRunListItemRead,
+    ChatGPTHandoffTaskRead,
     HumanActionWorkbenchRead,
     JobArtifactSummaryRead,
 )
@@ -101,9 +102,39 @@ def get_agent_run_detail(run_id: str, request: Request) -> AgentRunDetailRead:
 @router.get("/human-actions", response_model=list[HumanActionWorkbenchRead])
 def list_human_actions(
     request: Request,
-    status: Literal["pending", "approved", "denied"] | None = None,
+    status: Literal["pending", "approved", "denied", "completed"] | None = None,
 ) -> list[HumanActionWorkbenchRead]:
     return [
         HumanActionWorkbenchRead.model_validate(item)
         for item in _reader(request).list_human_actions(status=status)
     ]
+
+
+@router.get("/chatgpt-handoffs", response_model=list[ChatGPTHandoffTaskRead])
+def list_chatgpt_handoffs(
+    request: Request,
+    status: Literal["pending", "accepted"] | None = None,
+) -> list[ChatGPTHandoffTaskRead]:
+    try:
+        return [
+            ChatGPTHandoffTaskRead.model_validate(item)
+            for item in _reader(request).list_chatgpt_handoffs(status=status)
+        ]
+    except AgentWorkbenchReadError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get(
+    "/chatgpt-handoffs/{handoff_id}", response_model=ChatGPTHandoffTaskRead
+)
+def get_chatgpt_handoff(
+    handoff_id: str, request: Request
+) -> ChatGPTHandoffTaskRead:
+    try:
+        return ChatGPTHandoffTaskRead.model_validate(
+            _reader(request).chatgpt_handoff_view(handoff_id)
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except AgentWorkbenchReadError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
