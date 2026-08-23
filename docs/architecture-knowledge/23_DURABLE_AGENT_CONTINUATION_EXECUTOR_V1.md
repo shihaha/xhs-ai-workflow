@@ -104,6 +104,7 @@ The dedicated workflow for this slice must cover:
 - prior Job-bound continuation and Workbench operator/read/handoff contracts;
 - focused and complete React tests plus production build;
 - complete Agent Runtime acceptance;
+- an executor-specific FastAPI lifespan coexistence check proving existing app-owned workers are not displaced;
 - Python compile and release-boundary scan.
 
 Repository-wide `Agent Runtime Spike Verification` remains the broad baseline-vs-spike regression gate. No PR is merged automatically.

@@ -85,12 +85,11 @@ jobs:
           -q
       - name: Run complete Agent Runtime acceptance
         run: python -m pytest backend/tests/agent_runtime -q
-      - name: Run application lifecycle regression
+      - name: Run application lifecycle boundary regression
         run: >-
           python -m pytest
-          backend/tests/test_jobs_hardening.py
+          backend/tests/agent_runtime/test_continuation_executor_api.py::test_app_lifespan_composes_continuation_executor_with_existing_workers
           backend/tests/xhs/test_s2a_round1_hardening.py::test_lifespan_does_not_ignore_unsafe_xhs_close
-          backend/tests/content/test_cleanup_worker.py::test_app_lifespan_worker_processes_due_cleanup
           backend/tests/shops/test_shop_service.py::test_app_lifespan_closes_shop_background_workers
           -q
       - name: Scan release boundaries

@@ -274,6 +274,41 @@ def test_app_only_enables_auto_continuation_when_model_is_configured(tmp_path: P
     executor.close()
 
 
+@pytest.mark.anyio
+async def test_app_lifespan_composes_continuation_executor_with_existing_workers(tmp_path: Path) -> None:
+    unconfigured = create_app(_settings(tmp_path / "off-lifespan"))
+    executor = unconfigured.state.agent_continuation_executor
+    cleanup_worker = unconfigured.state.artifact_cleanup_worker
+    media_worker = unconfigured.state.content_media_worker
+    assert isinstance(executor, AgentContinuationExecutor)
+    assert cleanup_worker is not None
+    assert media_worker is not None
+
+    async with unconfigured.router.lifespan_context(unconfigured):
+        # No model and no durable dispatch: continuation stays threadless while
+        # the pre-existing app-owned workers still start normally.
+        assert executor.is_alive is False
+        assert cleanup_worker.is_alive is True
+        assert media_worker.is_alive is True
+
+    assert executor.is_alive is False
+    assert cleanup_worker.wait_stopped(2) is True
+    assert media_worker.wait_stopped(2) is True
+
+    configured_settings = _settings(tmp_path / "on-lifespan").model_copy(
+        update={"bailian_api_key": "test-only-key"}
+    )
+    configured = create_app(configured_settings)
+    configured_executor = configured.state.agent_continuation_executor
+    assert isinstance(configured_executor, AgentContinuationExecutor)
+
+    async with configured.router.lifespan_context(configured):
+        assert configured_executor.is_alive is True
+
+    assert configured_executor.wait_stopped(2) is True
+    assert configured_executor.is_alive is False
+
+
 def test_unconfigured_restart_fail_closes_existing_queued_dispatch(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     job, source, human = _seed_wait(app)
