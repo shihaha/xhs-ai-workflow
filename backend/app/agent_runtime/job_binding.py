@@ -27,6 +27,7 @@ from backend.app.models.jobs import JobLogRecord, JobRecord, JobState
 from backend.app.services.jobs import InvalidJobTransition, JobNotFound, JobService
 
 
+AGENT_ORCHESTRATION_JOB_TYPE = "agent_orchestration"
 DEFAULT_SHUTDOWN_MARGIN_SECONDS = 60
 JOB_READ_TOOL_NAME = "job.read"
 
@@ -84,10 +85,11 @@ class AgentJobCoordinator:
         prompt_version: str | None = None,
         shutdown_margin_seconds: int = DEFAULT_SHUTDOWN_MARGIN_SECONDS,
     ) -> BoundAgentRun:
-        """Claim one queued/waiting Job and create its AgentRun atomically.
+        """Claim one orchestration Job and create its AgentRun atomically.
 
         A failure anywhere before transaction commit rolls back the Job claim,
-        AgentRun insert, binding insert, and audit log together.
+        AgentRun insert, binding insert, and audit log together. Physical/domain
+        worker Job types are intentionally ineligible for this coordinator.
         """
 
         if shutdown_margin_seconds < 1:
@@ -102,6 +104,11 @@ class AgentJobCoordinator:
             current = session.get(JobRecord, job_id)
             if current is None:
                 raise JobNotFound(f"Job {job_id} does not exist.")
+            if current.type != AGENT_ORCHESTRATION_JOB_TYPE:
+                raise InvalidJobTransition(
+                    f"Job type {current.type!r} cannot be claimed by AgentRuntime; "
+                    f"expected {AGENT_ORCHESTRATION_JOB_TYPE!r}."
+                )
 
             current_state = JobState(current.state)
             if current_state not in {JobState.queued, JobState.needs_human}:
@@ -113,6 +120,7 @@ class AgentJobCoordinator:
                 update(JobRecord)
                 .where(
                     JobRecord.id == job_id,
+                    JobRecord.type == AGENT_ORCHESTRATION_JOB_TYPE,
                     JobRecord.state == current_state.value,
                 )
                 .values(
@@ -134,7 +142,7 @@ class AgentJobCoordinator:
             )
             if changed.rowcount != 1:
                 raise InvalidJobTransition(
-                    "Job state changed while creating the Agent run; no partial claim was committed."
+                    "Job authority changed while creating the Agent run; no partial claim was committed."
                 )
 
             session.add(
