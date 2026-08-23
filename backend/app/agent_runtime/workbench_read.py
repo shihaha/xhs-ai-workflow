@@ -10,6 +10,12 @@ from backend.app.agent_runtime.job_binding import (
     AGENT_ORCHESTRATION_JOB_TYPE,
     AgentJobBindingRecord,
 )
+from backend.app.agent_runtime.manual_chatgpt_handoff import (
+    MANUAL_CHATGPT_REQUIRED,
+    MANUAL_CHATGPT_RESULT_READY,
+    MANUAL_CHATGPT_TOOL_NAME,
+    ManualChatGPTHandoffRecord,
+)
 from backend.app.agent_runtime.persistence import (
     AgentRunRecord,
     AgentRunStore,
@@ -17,7 +23,7 @@ from backend.app.agent_runtime.persistence import (
     HumanActionRecord,
 )
 from backend.app.db import Database
-from backend.app.models.jobs import JobArtifactRecord, JobRecord
+from backend.app.models.jobs import JobArtifactRecord, JobRecord, JobState
 
 
 class AgentWorkbenchReadError(RuntimeError):
@@ -34,6 +40,9 @@ class AgentWorkbenchReader:
         # schema initialization only; it does not claim or mutate any Job.
         AgentRunStore(database)
         AgentJobBindingRecord.__table__.create(bind=database.engine, checkfirst=True)
+        ManualChatGPTHandoffRecord.__table__.create(
+            bind=database.engine, checkfirst=True
+        )
 
     def list_jobs(self) -> list[dict[str, Any]]:
         """List durable Agent orchestration Jobs without exposing Job inputs."""
@@ -138,6 +147,31 @@ class AgentWorkbenchReader:
                 }
                 for action in actions
             ]
+
+    def list_chatgpt_handoffs(
+        self, *, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List durable manual-ChatGPT task identities without raw task/result data."""
+        with self.database.sessions() as session:
+            statement = select(ManualChatGPTHandoffRecord)
+            if status is not None:
+                statement = statement.where(ManualChatGPTHandoffRecord.status == status)
+            records = list(
+                session.scalars(
+                    statement.order_by(
+                        ManualChatGPTHandoffRecord.created_at.desc(),
+                        ManualChatGPTHandoffRecord.id,
+                    )
+                )
+            )
+            return [self._chatgpt_handoff_summary(session, record) for record in records]
+
+    def chatgpt_handoff_view(self, handoff_id: str) -> dict[str, Any]:
+        with self.database.sessions() as session:
+            record = session.get(ManualChatGPTHandoffRecord, handoff_id)
+            if record is None:
+                raise KeyError(f"ChatGPT handoff {handoff_id} does not exist.")
+            return self._chatgpt_handoff_summary(session, record)
 
     def job_view(self, job_id: str) -> dict[str, Any]:
         with self.database.sessions() as session:
@@ -269,6 +303,83 @@ class AgentWorkbenchReader:
     def job_evidence(self, job_id: str) -> dict[str, Any]:
         view = self.job_view(job_id)
         return {"job_id": job_id, "evidence_refs": view["evidence_refs"]}
+
+    def _chatgpt_handoff_summary(
+        self, session: Any, record: ManualChatGPTHandoffRecord
+    ) -> dict[str, Any]:
+        binding = session.get(AgentJobBindingRecord, record.source_run_id)
+        source = session.get(AgentRunRecord, record.source_run_id)
+        human = session.get(HumanActionRecord, record.human_action_id)
+        if binding is None or source is None or human is None:
+            raise AgentWorkbenchReadError(
+                "ChatGPT handoff lost its Job binding, AgentRun, or HumanAction; projection is incomplete."
+            )
+        job = session.get(JobRecord, binding.job_id)
+        if job is None or job.type != AGENT_ORCHESTRATION_JOB_TYPE:
+            raise AgentWorkbenchReadError(
+                "ChatGPT handoff is not attached to a durable Agent orchestration Job."
+            )
+        bindings = list(
+            session.scalars(
+                select(AgentJobBindingRecord)
+                .where(AgentJobBindingRecord.job_id == job.id)
+                .order_by(
+                    AgentJobBindingRecord.created_at,
+                    AgentJobBindingRecord.run_id,
+                )
+            )
+        )
+        current_run_id, binding_ambiguous = self._current_binding(bindings)
+        identity_valid = (
+            human.run_id == record.source_run_id
+            and human.tool_name == MANUAL_CHATGPT_TOOL_NAME
+            and human.tool_call_id == f"manual-chatgpt:{record.id}"
+        )
+        is_current_binding = not binding_ambiguous and current_run_id == record.source_run_id
+        lease_free = job.lease_expires_at is None
+        needs_chatgpt = (
+            record.status == "pending"
+            and identity_valid
+            and is_current_binding
+            and human.status == "pending"
+            and source.state == "needs_human"
+            and source.error_category == MANUAL_CHATGPT_REQUIRED
+            and job.state == JobState.needs_human.value
+            and job.current_stage == MANUAL_CHATGPT_REQUIRED
+            and lease_free
+        )
+        result_ready = (
+            record.status == "accepted"
+            and identity_valid
+            and is_current_binding
+            and human.status == "completed"
+            and source.state == "needs_human"
+            and source.error_category == MANUAL_CHATGPT_RESULT_READY
+            and job.state == JobState.needs_human.value
+            and job.current_stage == MANUAL_CHATGPT_RESULT_READY
+            and lease_free
+        )
+        return {
+            "handoff_id": record.id,
+            "job_id": job.id,
+            "source_run_id": record.source_run_id,
+            "human_action_id": record.human_action_id,
+            "status": record.status,
+            "human_action_status": human.status,
+            "job_state": job.state,
+            "current_stage": job.current_stage,
+            "stage_revision": record.stage_revision,
+            "schema_version": record.schema_version,
+            "input_hash": record.input_hash,
+            "context_ref_count": len(record.context_refs_json or []),
+            "has_result": record.result_json is not None,
+            "is_current_binding": is_current_binding,
+            "authority_ambiguous": binding_ambiguous or not identity_valid,
+            "needs_chatgpt": needs_chatgpt,
+            "result_ready": result_ready,
+            "created_at": record.created_at,
+            "accepted_at": record.accepted_at,
+        }
 
     @staticmethod
     def _current_binding(
