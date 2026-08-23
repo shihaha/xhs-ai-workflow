@@ -1,48 +1,48 @@
 """Tests for the guarded agent execution boundary."""
 
-from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from backend.app.services.agent_execution import (
+    AgentExecutionDenied,
     AgentExecutionService,
     ExecutionContext,
 )
+from backend.app.services.job_authority import (
+    ExecutionBinding,
+    JobAuthorityGuard,
+    JobSnapshot,
+)
 
 
-@dataclass
-class FakeAuthority:
-    allowed: bool = True
-
-    def check(self, *, job_id: str, binding_job_id: str):
-        if not self.allowed:
-            raise RuntimeError("execution denied")
-        return None
-
-
-def test_execution_boundary_requires_authority_check():
-    service = AgentExecutionService(FakeAuthority())
-
-    result = service.authorize(
-        ExecutionContext(
-            job_id="job-1",
+def context(state="running", expired=False, mismatch=False):
+    expires = datetime.now(UTC) + timedelta(minutes=-1 if expired else 5)
+    return ExecutionContext(
+        binding=ExecutionBinding(
+            job_id="job-1" if not mismatch else "job-x",
             run_id="run-1",
-            binding_job_id="job-1",
-        )
+            lease_expires_at=expires,
+        ),
+        job=JobSnapshot(
+            id="job-1",
+            state=state,
+            lease_expires_at=expires,
+        ),
+        run_id="run-1",
     )
 
+
+def test_running_job_is_authorized():
+    result = AgentExecutionService(JobAuthorityGuard()).authorize(context())
     assert result["authorized"] is True
-    assert result["run_id"] == "run-1"
 
 
-def test_execution_boundary_denies_when_authority_rejects():
-    service = AgentExecutionService(FakeAuthority(allowed=False))
-
-    with pytest.raises(RuntimeError):
-        service.authorize(
-            ExecutionContext(
-                job_id="job-1",
-                run_id="run-1",
-                binding_job_id="job-1",
-            )
-        )
+@pytest.mark.parametrize("ctx", [
+    context(state="cancelled"),
+    context(expired=True),
+    context(mismatch=True),
+])
+def test_invalid_execution_is_denied(ctx):
+    with pytest.raises(AgentExecutionDenied):
+        AgentExecutionService(JobAuthorityGuard()).authorize(ctx)
