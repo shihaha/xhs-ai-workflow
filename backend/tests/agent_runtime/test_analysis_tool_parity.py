@@ -215,9 +215,12 @@ def test_stage2_agent_analysis_matches_existing_service_success(tmp_path: Path) 
 
 def test_stage2_preserves_deep_verification_needs_human(tmp_path: Path) -> None:
     baseline_db = _database(tmp_path / "baseline-needs-human")
+    # The analysis scope contains two accounts, but deliberately only one
+    # non-shop evidence row.  That is sufficient to prove the existing
+    # product_cluster deep-verification gate without inventing a second
+    # ranking snapshot that violates its natural unique scope key.
     baseline_ids = [
         _seed_rank_item(baseline_db, user_id="account-a", stable_suffix="a"),
-        _seed_rank_item(baseline_db, user_id="account-b", stable_suffix="b"),
     ]
     payload = AnalysisCreate(
         analysis_type="product_cluster",
@@ -236,7 +239,6 @@ def test_stage2_preserves_deep_verification_needs_human(tmp_path: Path) -> None:
     agent_db = _database(tmp_path / "agent-needs-human")
     agent_ids = [
         _seed_rank_item(agent_db, user_id="account-a", stable_suffix="a"),
-        _seed_rank_item(agent_db, user_id="account-b", stable_suffix="b"),
     ]
     assert agent_ids == baseline_ids
     agent_model = StubDomainModel(_successful_output(agent_ids[0]))
