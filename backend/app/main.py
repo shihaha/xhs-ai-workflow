@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from backend.app.api.agent_runtime import router as agent_runtime_router
 from backend.app.api.health import router as health_router
 from backend.app.api.jobs import router as jobs_router
 from backend.app.adapters.android_device import AndroidDeviceAdapter
@@ -20,6 +21,7 @@ from backend.app.adapters.qianfan_playwright import (
     QianfanPlaywrightAdapter,
     persistent_qianfan_page_factory,
 )
+from backend.app.agent_runtime.workbench_read import AgentWorkbenchReader
 from backend.app.db import Database
 from backend.app.features.analysis.api import router as analysis_router
 from backend.app.features.analysis.service import AnalysisService
@@ -92,6 +94,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     assert database_path is not None
     app.state.database = None
     app.state.job_service = None
+    app.state.agent_workbench_reader = None
     app.state.radar_service = None
     app.state.adapter_registry = None
     app.state.xhs_collection_service = None
@@ -139,6 +142,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.job_service = JobService(
             app.state.database, runtime_dir=app.state.settings.runtime_dir
         )
+        app.state.agent_workbench_reader = AgentWorkbenchReader(app.state.database)
         app.state.adapter_registry = build_default_registry(app.state.settings)
         app.state.xhs_collection_service = XhsCollectionService(
             database=app.state.database,
@@ -211,6 +215,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.qianfan_collection_service.close()
         app.state.database = None
         app.state.job_service = None
+        app.state.agent_workbench_reader = None
         app.state.adapter_registry = None
         app.state.xhs_collection_service = None
         app.state.radar_service = None
@@ -235,6 +240,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
     app.include_router(health_router)
     app.include_router(jobs_router)
+    app.include_router(agent_runtime_router)
     app.include_router(radar_router)
     app.include_router(shops_router)
     app.include_router(analysis_router)
