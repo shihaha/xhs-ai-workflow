@@ -1,0 +1,104 @@
+name: Runtime Dependency Slim Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/agent-runtime-pydantic-v1
+    paths:
+      - 'pyproject.toml'
+      - 'tools/qianfan_shutdown_probe.py'
+      - '.github/workflows/runtime-dependency-slim.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  slim-runtime-dependency:
+    name: Slim dependency and shutdown acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install project dependencies in a clean environment
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *deps])
+          PY
+
+      - name: Prove slim distribution boundary
+        run: |
+          python - <<'PY'
+          from importlib import metadata
+
+          installed = {dist.metadata['Name'].lower() for dist in metadata.distributions() if dist.metadata.get('Name')}
+          required = {'pydantic-ai-slim'}
+          forbidden = {
+              'pydantic-ai',
+              'anthropic',
+              'openai',
+              'google-genai',
+              'mcp',
+              'fastmcp',
+              'fastmcp-slim',
+              'logfire',
+              'pydantic-evals',
+          }
+          missing = sorted(required - installed)
+          leaked = sorted(forbidden & installed)
+          print(f'installed distributions: {len(installed)}')
+          print(f'required present: {sorted(required & installed)}')
+          print(f'forbidden present: {leaked}')
+          if missing:
+              raise SystemExit(f'missing required slim distribution(s): {missing}')
+          if leaked:
+              raise SystemExit(f'heavy optional distribution(s) leaked into slim install: {leaked}')
+          PY
+
+      - name: Compile runtime, tests, and shutdown probe
+        run: python -m compileall -q backend/app/agent_runtime backend/tests/agent_runtime tools/qianfan_shutdown_probe.py
+
+      - name: Run Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
+
+      - name: Measure Qianfan child-process phases
+        run: python tools/qianfan_shutdown_probe.py
+
+      - name: Recheck blocked Qianfan process exit ten times
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          node = 'backend/tests/radar/test_qianfan_orchestration.py::test_blocked_browser_worker_cannot_keep_python_process_alive'
+          env = dict(os.environ)
+          env['PYTHONPATH'] = '.'
+          failures = []
+          for attempt in range(1, 11):
+              result = subprocess.run(
+                  [sys.executable, '-m', 'pytest', node, '-q', '--tb=short'],
+                  env=env,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+                  errors='replace',
+              )
+              print(f'attempt {attempt}: exit={result.returncode}')
+              if result.returncode != 0:
+                  failures.append((attempt, result.stdout[-6000:]))
+          if failures:
+              for attempt, output in failures:
+                  print(f'--- failure attempt {attempt} ---')
+                  print(output)
+              raise SystemExit(f'Qianfan shutdown test failed {len(failures)}/10 attempts')
+          print('Qianfan shutdown test passed 10/10 attempts.')
+          PY
