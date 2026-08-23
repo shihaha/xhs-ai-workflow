@@ -233,20 +233,54 @@ On approval/resume:
 
 For V1, prefer a **new continuation AgentRun for a re-claimed Job** when doing so improves audit clarity. If existing-run resume is retained, record each Job re-claim/retry boundary durably.
 
-## 9. Cancellation
+## 9. Cancellation and run-bound authority
 
 Job cancellation is authoritative.
 
-Before every new model request and before every Tool execution boundary, a bound runtime must verify the Job is still `running` and the lease is valid.
+Authority checks must resolve from the actual AgentRun identity:
 
-If the Job is cancelled or no longer runnable:
+```text
+run_id -> agent_job_bindings -> authoritative Job
+```
+
+Do not let callers or model-generated input choose an arbitrary `job_id` for the runtime authority check.
+
+Before every new model request and before every Tool execution boundary, a bound runtime must verify that the Job bound to that exact `run_id`:
+
+- exists;
+- has the dedicated orchestration Job type;
+- is still `running`;
+- has a valid lease.
+
+If the Job is cancelled, waiting, terminal, missing, wrong-type, or lease-expired:
 
 - do not call the model again;
 - do not execute the Tool;
 - persist an Agent-side stop/cancel trace if safe;
 - return control to the operator.
 
-This requires a project-owned run-control/job-authority guard rather than giving Tool handlers direct raw-table access.
+### TOCTOU / stale-authorization rule
+
+A successful guard check is only a **point-in-time precondition**, not a durable capability token.
+
+There is always a possible race:
+
+```text
+guard passes
+   ↓
+operator cancels Job
+   ↓
+Tool attempts a mutation
+```
+
+Therefore every state-changing domain command must still enforce its own authoritative Job/domain precondition with an atomic CAS or equivalent transaction at the write boundary. The guard reduces stale work; it does **not** replace domain-service authority.
+
+Consequences:
+
+- read-only tools may rely on the run-bound guard plus their normal read constraints;
+- state-changing Job/domain tools must re-check/CAS inside the domain service transaction;
+- physical worker actions remain behind their existing durable Job/worker state machine;
+- a failed CAS after a prior guard pass is an expected concurrent-state outcome and must fail closed, not be retried blindly.
 
 ## 10. First implementation slice
 
@@ -257,8 +291,9 @@ First slice only:
 ```text
 agent_job_bindings table
 AgentJobCoordinator
+run-bound JobAuthorityGuard contract
 job.read read-only Tool
-transaction/lease tests
+transaction/lease/restart tests
 ```
 
 Do **not** modify the canonical Runtime loop or connect Android/XHS collection in this slice.
@@ -288,30 +323,33 @@ Then add the JobAuthorityGuard at model/tool boundaries, followed by human wait/
 
 ### Authority
 
-6. Job cancellation blocks the next model step;
-7. Job cancellation blocks the next Tool execution;
-8. terminal Job can never be reopened by AgentRun;
-9. Agent success only finalizes a currently running Job via allowed CAS;
-10. CAS loss causes re-read/fail-closed, not overwrite.
+6. unbound run is rejected;
+7. wrong-type/physical Job binding is rejected;
+8. Job cancellation blocks the next model step;
+9. Job cancellation blocks the next Tool execution;
+10. terminal Job can never be reopened by AgentRun;
+11. Agent success only finalizes a currently running Job via allowed CAS;
+12. CAS loss after guard success causes re-read/fail-closed, not overwrite.
 
 ### Lease
 
-11. lease derives from Agent wall-time budget + margin;
-12. default 300-second run never receives a 300-second-or-shorter lease;
-13. human wait clears lease;
-14. resume/re-claim establishes a new valid lease.
+13. lease derives from Agent wall-time budget + margin;
+14. default 300-second run never receives a 300-second-or-shorter lease;
+15. human wait clears lease;
+16. resume/re-claim establishes a new valid lease.
 
 ### Recovery
 
-15. crash after atomic claim/run/binding creation leaves all three reconstructable;
-16. stale Job lease recovery remains owned by JobService;
-17. uncertain external/physical work is never auto-replayed by Agent recovery.
+17. crash/restart after atomic claim/run/binding creation reconstructs all three records;
+18. stale Job lease recovery remains owned by JobService;
+19. orphaned binding fails closed;
+20. uncertain external/physical work is never auto-replayed by Agent recovery.
 
 ### Evidence / result
 
-18. AgentRun steps preserve evidence refs;
-19. Job final success is not written before required authoritative domain result/evidence is committed;
-20. refresh/restart reconstructs the same Job↔Run relationship.
+21. AgentRun steps preserve evidence refs;
+22. Job final success is not written before required authoritative domain result/evidence is committed;
+23. refresh/restart reconstructs the same Job↔Run relationship.
 
 ## 12. Explicit non-goals
 
