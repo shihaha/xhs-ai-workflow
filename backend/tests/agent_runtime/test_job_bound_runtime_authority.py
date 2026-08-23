@@ -16,7 +16,11 @@ from backend.app.agent_runtime import (
     ToolRegistry,
     ToolSpec,
 )
-from backend.app.agent_runtime.job_binding import AgentJobCoordinator, JobAuthorityError
+from backend.app.agent_runtime.job_binding import (
+    AgentJobBindingRecord,
+    AgentJobCoordinator,
+    JobAuthorityError,
+)
 from backend.app.agent_runtime.job_bound_runtime import (
     ActiveRunJobAuthorityGuard,
     JobBoundAgentRuntime,
@@ -226,6 +230,50 @@ def test_new_continuation_supersedes_old_run_authority(tmp_path: Path) -> None:
         guard.require_run_running(first.run_id)
 
     assert guard.require_run_running(second.run_id) == job.id
+
+
+def test_ambiguous_latest_binding_timestamp_fails_closed_for_every_run(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    jobs = JobService(database)
+    job = jobs.create(job_type="agent_orchestration", input_data={})
+    coordinator = AgentJobCoordinator(
+        database,
+        run_id_factory=iter(("run-1", "run-2")).__next__,
+    )
+    first = coordinator.claim_and_create_run(
+        job.id,
+        goal="first claim",
+        budget=RunBudget(max_wall_time_seconds=10),
+    )
+    jobs.transition(job.id, JobState.needs_human)
+    second = coordinator.claim_and_create_run(
+        job.id,
+        goal="second claim",
+        budget=RunBudget(max_wall_time_seconds=10),
+    )
+
+    tied_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    with database.sessions.begin() as session:
+        first_binding = session.get(AgentJobBindingRecord, first.run_id)
+        second_binding = session.get(AgentJobBindingRecord, second.run_id)
+        assert first_binding is not None and second_binding is not None
+        first_binding.created_at = tied_at
+        second_binding.created_at = tied_at
+
+    guard = ActiveRunJobAuthorityGuard(database)
+    with pytest.raises(JobAuthorityError, match="ambiguous"):
+        guard.require_run_running(first.run_id)
+    with pytest.raises(JobAuthorityError, match="ambiguous"):
+        guard.require_run_running(second.run_id)
+
+
+def test_guard_rejects_non_running_agent_run_even_when_job_lease_is_valid(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    _jobs, _job, _coordinator, bound = _claim(database)
+    AgentRunStore(database).set_state(bound.run_id, AgentRunState.cancelled)
+
+    with pytest.raises(JobAuthorityError, match="not running"):
+        ActiveRunJobAuthorityGuard(database).require_run_running(bound.run_id)
 
 
 def test_job_bound_runtime_forbids_unbound_start_and_old_resume(tmp_path: Path) -> None:
