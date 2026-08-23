@@ -5,6 +5,7 @@ import type {
   AgentHumanAction,
   AgentJobRuntime,
   AgentJobSummary,
+  AgentOperatorCapabilities,
   AgentRunDetail,
   AgentRunListItem,
   ChatGPTHandoffTask,
@@ -54,8 +55,22 @@ const action: AgentHumanAction = {
   tool_name: "manual_chatgpt",
   status: "pending",
   can_deny: false,
+  can_approve: false,
   created_at: "2026-08-23T10:01:00Z",
   resolved_at: null,
+};
+
+const continuationUnavailable: AgentOperatorCapabilities = {
+  cancel_job: true,
+  deny_permission_action: true,
+  approve_continuation: false,
+  continuation_reason: "Automatic Agent continuation requires a configured app-owned executor/model.",
+};
+
+const continuationAvailable: AgentOperatorCapabilities = {
+  ...continuationUnavailable,
+  approve_continuation: true,
+  continuation_reason: null,
 };
 
 const handoff: ChatGPTHandoffTask = {
@@ -88,6 +103,7 @@ describe("AgentWorkbenchPage", () => {
         loadRuns={async () => [run]}
         loadHumanActions={async () => [action]}
         loadHandoffs={async () => [handoff]}
+        loadCapabilities={async () => continuationUnavailable}
       />,
     );
 
@@ -108,6 +124,7 @@ describe("AgentWorkbenchPage", () => {
         loadRuns={async () => [run]}
         loadHumanActions={async () => [{ ...action, can_deny: true }]}
         loadHandoffs={async () => [handoff]}
+        loadCapabilities={async () => continuationUnavailable}
         denyAction={async (actionId) => {
           deniedActionId = actionId;
           return {
@@ -136,12 +153,60 @@ describe("AgentWorkbenchPage", () => {
         loadRuns={async () => [{ ...run, error_category: "manual_chatgpt_result_ready" }]}
         loadHumanActions={async () => [{ ...action, status: "completed", resolved_at: "2026-08-23T10:02:00Z" }]}
         loadHandoffs={async () => [{ ...handoff, status: "accepted", human_action_status: "completed", current_stage: "manual_chatgpt_result_ready", has_result: true, needs_chatgpt: false, result_ready: true, accepted_at: "2026-08-23T10:02:00Z" }]}
+        loadCapabilities={async () => continuationUnavailable}
       />,
     );
 
     expect(await screen.findByText("已交回 / result ready")).toBeInTheDocument();
     expect(screen.getByText(/Job 仍等待后端安全 continuation，不由前端恢复/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /resume|continue/i })).not.toBeInTheDocument();
+  });
+
+  it("requires backend action authority and executor capability before offering approval", async () => {
+    render(
+      <AgentWorkbenchPage
+        loadJobs={async () => [job]}
+        loadRuns={async () => [run]}
+        loadHumanActions={async () => [{ ...action, tool_name: "analysis.run_grounded", can_deny: true, can_approve: true }]}
+        loadHandoffs={async () => []}
+        loadCapabilities={async () => continuationUnavailable}
+      />,
+    );
+
+    expect(await screen.findByText(/自动 continuation 当前不可用/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "批准并继续" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "拒绝此操作" })).toBeInTheDocument();
+  });
+
+  it("requires explicit confirmation before approving and continuing", async () => {
+    let approvedActionId: string | null = null;
+    render(
+      <AgentWorkbenchPage
+        loadJobs={async () => [job]}
+        loadRuns={async () => [run]}
+        loadHumanActions={async () => [{ ...action, tool_name: "analysis.run_grounded", can_deny: true, can_approve: true }]}
+        loadHandoffs={async () => []}
+        loadCapabilities={async () => continuationAvailable}
+        approveAction={async (actionId) => {
+          approvedActionId = actionId;
+          return {
+            human_action_id: actionId,
+            job_id: "job-1",
+            source_run_id: "run-1",
+            continuation_run_id: "run-2",
+            human_action_status: "approved",
+            continuation_enqueued: true,
+          };
+        }}
+      />,
+    );
+
+    const approveButton = await screen.findByRole("button", { name: "批准并继续" });
+    fireEvent.click(approveButton);
+    expect(approvedActionId).toBeNull();
+    expect(screen.getByRole("button", { name: "确认批准并继续" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认批准并继续" }));
+    await waitFor(() => expect(approvedActionId).toBe("human-1"));
   });
 });
 

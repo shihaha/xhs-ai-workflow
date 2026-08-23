@@ -16,7 +16,7 @@ from math import ceil
 from typing import Any, Callable
 from uuid import uuid4
 
-from sqlalchemy import DateTime, String, case, exists, func, select, update
+from sqlalchemy import DateTime, Integer, String, case, exists, func, select, update
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.app.agent_runtime.context import DefaultContextBuilder
@@ -57,6 +57,26 @@ class AgentContinuationRecord(AgentJobBindingBase):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class AgentContinuationDispatchRecord(AgentJobBindingBase):
+    """Durable executor admission for one approved continuation run.
+
+    The row is inserted in the same transaction that approves the HumanAction,
+    re-claims the Job, and creates the child AgentRun. The executor therefore
+    never relies on an in-memory queue as proof that a running continuation has
+    somebody responsible for driving it.
+    """
+
+    __tablename__ = "agent_continuation_dispatches"
+
+    run_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    outcome_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovedContinuation:
     job_id: str
@@ -93,6 +113,9 @@ class JobContinuationCoordinator:
         self.store = AgentRunStore(database)
         AgentJobBindingRecord.__table__.create(bind=database.engine, checkfirst=True)
         AgentContinuationRecord.__table__.create(bind=database.engine, checkfirst=True)
+        AgentContinuationDispatchRecord.__table__.create(
+            bind=database.engine, checkfirst=True
+        )
 
     def approve_and_create_continuation(
         self,
@@ -258,6 +281,17 @@ class JobContinuationCoordinator:
                     human_action_id=human_action_id,
                     tool_call_id=action.tool_call_id,
                     created_at=now,
+                )
+            )
+            session.add(
+                AgentContinuationDispatchRecord(
+                    run_id=new_run_id,
+                    status="queued",
+                    attempts=0,
+                    lease_expires_at=None,
+                    outcome_state=None,
+                    created_at=now,
+                    updated_at=now,
                 )
             )
 

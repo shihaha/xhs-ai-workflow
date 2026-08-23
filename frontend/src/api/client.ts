@@ -93,6 +93,7 @@ export interface AgentHumanAction {
   tool_name: string;
   status: string;
   can_deny: boolean;
+  can_approve: boolean;
   created_at: string;
   resolved_at: string | null;
 }
@@ -104,6 +105,7 @@ export interface AgentHumanActionSummary {
   tool_name: string;
   status: string;
   can_deny: boolean;
+  can_approve: boolean;
   created_at: string;
   resolved_at: string | null;
 }
@@ -200,6 +202,15 @@ export interface AgentHumanActionDecision {
   human_action_status: "denied";
   job_state: "failed";
   run_state: "failed";
+}
+
+export interface AgentHumanActionApproval {
+  human_action_id: string;
+  job_id: string;
+  source_run_id: string;
+  continuation_run_id: string;
+  human_action_status: "approved";
+  continuation_enqueued: true;
 }
 
 export class ApiError extends Error {
@@ -380,4 +391,5 @@ export const fetchAgentHumanActions = (status?: "pending" | "approved" | "denied
 export const fetchAgentOperatorCapabilities = () => getJson<AgentOperatorCapabilities>("/api/v1/agent-runtime/operator-capabilities");
 export const cancelAgentJob = (jobId: string) => postJson<AgentJobCancelResult>(`/api/v1/agent-runtime/jobs/${encodeURIComponent(jobId)}/cancel`, {});
 export const denyAgentHumanAction = (actionId: string, payload: { note?: string }) => postJson<AgentHumanActionDecision>(`/api/v1/agent-runtime/human-actions/${encodeURIComponent(actionId)}/deny`, payload);
+export const approveAgentHumanAction = (actionId: string, payload: { note?: string }) => postJson<AgentHumanActionApproval>(`/api/v1/agent-runtime/human-actions/${encodeURIComponent(actionId)}/approve`, payload);
 export const fetchChatGPTHandoffs = (status?: "pending" | "accepted") => getJson<ChatGPTHandoffTask[]>(`/api/v1/agent-runtime/chatgpt-handoffs${status ? `?status=${encodeURIComponent(status)}` : ""}`);
