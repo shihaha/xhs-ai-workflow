@@ -49,6 +49,34 @@ class HumanActionSummaryRead(BaseModel):
     resolved_at: datetime | None = None
 
 
+class HumanActionWorkbenchRead(HumanActionSummaryRead):
+    job_id: str
+
+
+class JobArtifactSummaryRead(BaseModel):
+    id: int
+    job_id: str
+    kind: str
+    producer: str
+    created_at: datetime
+
+
+class AgentJobSummaryRead(BaseModel):
+    job_id: str
+    job_state: str
+    current_stage: str | None = None
+    error_category: str | None = None
+    retry_count: int
+    current_run_id: str | None = None
+    authority_ambiguous: bool = False
+    run_count: int
+    pending_human_action_count: int
+    evidence_count: int
+    artifact_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
 class AgentJobRuntimeRead(BaseModel):
     job_id: str
     job_state: str
@@ -56,15 +84,27 @@ class AgentJobRuntimeRead(BaseModel):
     error_category: str | None = None
     retry_count: int
     lease_expires_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
     current_run_id: str | None = None
     authority_ambiguous: bool = False
     runs: list[AgentRunSummaryRead] = Field(default_factory=list)
     pending_human_actions: list[HumanActionSummaryRead] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
+    artifacts: list[JobArtifactSummaryRead] = Field(default_factory=list)
+
+
+class AgentRunListItemRead(AgentRunSummaryRead):
+    job_id: str
 
 
 class AgentRunDetailRead(AgentRunSummaryRead):
     job_id: str
     steps: list[AgentStepRead] = Field(default_factory=list)
     human_actions: list[HumanActionSummaryRead] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class AgentEvidenceRefsRead(BaseModel):
+    job_id: str
     evidence_refs: list[str] = Field(default_factory=list)
