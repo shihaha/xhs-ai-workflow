@@ -10,7 +10,7 @@
 │ XHS Workbench UI                                             │
 │                                                              │
 │ Project / Stage / Runs / Human Actions / Evidence            │
-│ Radar / Accounts / Opportunities / future B-C-D domain views │
+│ Radar / Accounts / Opportunities / B-C handoffs / Content   │
 │ + selective CopilotKit agent interaction components          │
 └───────────────────────┬──────────────────────────────────────┘
                         │ AG-UI-compatible events/commands
@@ -34,7 +34,7 @@
 ┌──────────────────────────────────────────────────────────────┐
 │ Existing hardened Domain Services                            │
 │ Radar / XHS / Shops / Analysis / Opportunity / Content       │
-│ future Product Definition / Product Build handoff            │
+│ + thin Product Definition / Finished Product handoffs        │
 └───────────────────────┬──────────────────────────────────────┘
                         ▼
 ┌───────────────────────────────┬──────────────────────────────┐
@@ -59,25 +59,32 @@ Keep JobService + SQLite as V1 durability. Add AgentRun/AgentStep/checkpoint rec
 
 ADR: `ADR-004-local-durability-first.md`.
 
-### C. Product Definition is a separate human gate
+### C. Product Definition remains a separate human gate
 
-`approved Opportunity` means product research may continue. It does not authorize build.
+`approved Opportunity` does not authorize product build.
 
-Required chain:
+The authority chain remains:
 
 ```text
 approved Opportunity
- -> Product Research
- -> Product Definition candidate
- -> human Product Definition approval
- -> Product Build
+ -> external/product-specific B work
+ -> human-approved Product Definition handoff
+ -> external/product-specific C work
  -> Finished Product + human UAT
  -> Content
 ```
 
 ADR: `ADR-005-product-definition-gate.md`.
 
-### D. Claude Code is a design reference, not a dependency
+### D. B/C are not systemized yet
+
+Phase B (product research/definition work) and Phase C (product creation/build work) vary too much by product type to justify a generic workflow today.
+
+Current implementation must therefore preserve only thin durable handoff records around B/C. Do not build a generic B Agent, C Agent, B/C state machine, universal product builder or speculative product workflow until enough diverse completed products exist to extract recurring patterns from evidence.
+
+ADR: `ADR-006-defer-bc-systemization.md`.
+
+### E. Claude Code is a design reference, not a dependency
 
 Use its mature architecture concepts — Tool contract, permission, context, sub-agent isolation, hooks, usage — but independently implement domain-specific behavior with licensed components.
 
@@ -148,6 +155,10 @@ Visual workflow builder, not our business operator workbench/runtime.
 
 Rejected on license/commercial/frontend restrictions before technical adoption.
 
+### Generic B/C workflow engine
+
+Rejected for the current phase because the recurring B/C process has not yet been proven across sufficiently varied finished products.
+
 ## 5. Why we are not using a full open-source workbench unchanged
 
 Our product has domain-specific screens and facts that generic Agent workbenches do not understand:
@@ -156,7 +167,7 @@ Our product has domain-specific screens and facts that generic Agent workbenches
 - account/profile/note/shop evidence;
 - evidence eligibility and lineage;
 - Opportunity review;
-- future Product Definition;
+- Product Definition and Finished Product handoffs;
 - Finished Product/UAT;
 - content research/production gates.
 
@@ -204,7 +215,8 @@ CopilotKit/AG-UI may render/transport events, but backend events and commands re
 | Agent operational lifecycle | AgentRun/AgentStep persistence |
 | Permission decision | backend PermissionPolicy + persisted human authority |
 | Opportunity review | domain human-review record |
-| Product Definition approval | future domain human-review record |
+| Product Definition approval | human-approved handoff record |
+| Finished Product / UAT | accepted product handoff / dossier |
 | UI streaming state | projection only |
 | compact Agent context | non-authoritative projection |
 | model conversation history | reasoning input/history, never business truth |
@@ -221,7 +233,7 @@ It may:
 - run bounded analysis;
 - summarize operational status;
 - prepare a human decision;
-- later draft Product Definitions/content within the correct stage.
+- orchestrate A-side research/analysis and later D-side content work within the correct gates.
 
 It may not:
 
@@ -230,10 +242,31 @@ It may not:
 - approve its own business decisions;
 - replay unsafe physical actions blindly;
 - publish/like/favorite/comment automatically;
-- mark success because a model said so.
+- mark success because a model said so;
+- invent a generic B/C process simply because the A/B/C/D business diagram contains those labels.
 
-## 9. Final architecture statement
+## 9. B/C handoff principle
+
+The workbench should be capable of representing:
+
+```text
+Opportunity
+  ↓
+Product Definition handoff
+  ↓
+Finished Product handoff + UAT
+  ↓
+Content
+```
+
+But the internal work between Opportunity → Product Definition and Product Definition → Finished Product remains product-specific and external to the generalized workbench workflow for now.
+
+This keeps the business gates explicit without pretending the product-making process is already standardized.
+
+## 10. Final architecture statement
 
 The next XHS system should become **agentic around a deterministic evidence-backed core**, not replace that core with an autonomous agent platform.
+
+It should automate what has been proven repeatable, preserve explicit handoffs for what is still product-specific, and only extract new workflows after repeated real cases demonstrate a stable pattern.
 
 That is the central decision all implementation work must preserve.
