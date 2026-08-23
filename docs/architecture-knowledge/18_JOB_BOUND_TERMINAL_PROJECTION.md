@@ -43,6 +43,8 @@ Current completion-policy keys are staged under `job.input_data.agent_completion
 
 Evidence requirements are explicit rather than globally forced because some valid deterministic/synthesis tasks may have no external evidence, while evidence-backed research Jobs can require it.
 
+When evidence is required, it is evaluated over the **entire durable Job-bound AgentRun history**, not only the final continuation run. A prior run may have collected valid evidence before entering `needs_human`, while a later continuation run only performs the approved action and finishes. Historical evidence is read through the durable Job bindings; it is not copied into the child AgentRun. A missing historical bound AgentRun makes the evidence history incomplete and must fail closed.
+
 ### Failure
 
 Before `Job.running -> failed`, require:
