@@ -10,9 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import update
+from sqlalchemy import exists, func, select, update
 
-from backend.app.agent_runtime.job_binding import AGENT_ORCHESTRATION_JOB_TYPE
+from backend.app.agent_runtime.job_binding import (
+    AGENT_ORCHESTRATION_JOB_TYPE,
+    AgentJobBindingRecord,
+)
 from backend.app.agent_runtime.job_bound_runtime import ActiveRunJobAuthorityGuard
 from backend.app.agent_runtime.persistence import AgentRunStore
 from backend.app.agent_runtime.types import AgentRunState
@@ -46,9 +49,8 @@ class JobHumanWaitProjector:
         latest AgentRun needs_human + same Job claim running -> Job needs_human
 
     A terminal Job always wins a race and is never reopened or overwritten.
-    The write CAS is bound to the observed claim generation (retry count + lease)
-    so a stale projector cannot push a newly re-claimed continuation back into
-    ``needs_human``.
+    The write CAS is bound both to the observed claim generation and to the
+    AgentRun still being the unique latest binding *inside the UPDATE itself*.
     """
 
     def __init__(self, database: Database) -> None:
@@ -99,11 +101,37 @@ class JobHumanWaitProjector:
                 f"Job {job_id} is running without a lease; refusing wait projection."
             )
 
-        # Do not call the generic JobService.transition here: its CAS protects
-        # state, but not *which claim generation* owns that running state. A new
-        # continuation can be re-claimed between our read and write. Matching
-        # retry_count + lease makes this integration CAS claim-specific while
-        # preserving the existing permitted running -> needs_human transition.
+        # There are two distinct TOCTOU windows to close:
+        # 1. a newer claim can replace retry_count/lease after we read Job;
+        # 2. a newer binding can appear after require_current_binding but before
+        #    we read Job, in which case reading retry_count/lease alone would
+        #    accidentally capture the *new* claim and let the old run clobber it.
+        #
+        # Therefore the same SQL UPDATE must prove both claim generation and
+        # unique-latest-binding identity at its own write boundary.
+        binding_table = AgentJobBindingRecord.__table__
+        max_binding = binding_table.alias("wait_max_binding")
+        count_binding = binding_table.alias("wait_count_binding")
+        latest_created_at = (
+            select(func.max(max_binding.c.created_at))
+            .where(max_binding.c.job_id == job_id)
+            .scalar_subquery()
+        )
+        latest_binding_count = (
+            select(func.count())
+            .select_from(count_binding)
+            .where(
+                count_binding.c.job_id == job_id,
+                count_binding.c.created_at == latest_created_at,
+            )
+            .scalar_subquery()
+        )
+        current_run_is_latest = exists().where(
+            binding_table.c.job_id == job_id,
+            binding_table.c.run_id == run_id,
+            binding_table.c.created_at == latest_created_at,
+        )
+
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         with self.database.sessions.begin() as session:
             changed = session.execute(
@@ -114,6 +142,8 @@ class JobHumanWaitProjector:
                     JobRecord.state == JobState.running.value,
                     JobRecord.retry_count == current.retry_count,
                     JobRecord.lease_expires_at == current.lease_expires_at,
+                    current_run_is_latest,
+                    latest_binding_count == 1,
                 )
                 .values(
                     state=JobState.needs_human.value,
@@ -144,7 +174,8 @@ class JobHumanWaitProjector:
                     projected=False,
                 )
             raise JobWaitProjectionError(
-                f"Job {job_id} claim changed during wait projection; stale Agent wait was not applied."
+                f"Job {job_id} claim/binding changed during wait projection; "
+                "stale Agent wait was not applied."
             )
 
         latest = self.jobs.get(job_id)
