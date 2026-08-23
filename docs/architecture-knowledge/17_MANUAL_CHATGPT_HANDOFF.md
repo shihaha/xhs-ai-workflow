@@ -8,6 +8,8 @@ Some reasoning-heavy or quality-sensitive stages may be handled poorly by the de
 
 This is a deliberate product mode, not a temporary workaround.
 
+The **canonical return path is AgentDock automatic return into the local workbench**. Copy/paste is not the normal product flow and should not be presented as the primary UX.
+
 ## Required behavior
 
 When a stage is configured for manual ChatGPT handling, the system must not silently fall back to Bailian. It should:
@@ -17,46 +19,53 @@ When a stage is configured for manual ChatGPT handling, the system must not sile
 3. generate a bounded handoff package containing the exact task, required evidence/context references, relevant files/inputs, and expected output schema;
 4. surface a clear UI prompt such as `需要 ChatGPT 处理`;
 5. let the operator send that handoff package to ChatGPT in a normal ChatGPT conversation;
-6. accept a returned structured result only if it matches the current `handoff_id`, expected schema, stage revision/input hash, and still-authoritative Job state;
-7. persist the accepted result/evidence before the Job continues.
+6. when that conversation exposes AgentDock, let ChatGPT write the structured result back automatically to the local workbench inbox;
+7. accept the returned structured result only if it matches the current `handoff_id`, expected schema, stage revision/input hash, and still-authoritative Job state;
+8. persist the accepted result/evidence before the Job continues.
 
-The system must never treat a copied/pasted ChatGPT answer as authority for a different or stale task.
+The system must never treat a ChatGPT answer as authority for a different or stale task.
 
-## Two return paths
+## Canonical AgentDock return bridge
 
-### Manual paste/import
-
-The operator copies the ChatGPT result back into the workbench (or uploads a result file). This works whether the workbench is local or hosted.
-
-### AgentDock local bridge
-
-When ChatGPT has AgentDock access, ChatGPT may write a structured result file into a local inbox such as:
+When ChatGPT has AgentDock access, ChatGPT writes a structured result file into a local inbox such as:
 
 `runtime/external-results/<handoff_id>.json`
 
-The local workbench may watch/import this inbox. Import must still validate `handoff_id`, schema, input hash/revision, and Job authority before accepting the result.
+The local workbench watches/imports this inbox. Import must validate all of the following before accepting the result:
 
-ChatGPT must not be given direct physical-worker authority through this bridge. Android/XHS/browser actions remain behind the existing durable Job/worker boundary.
+- exact `handoff_id`;
+- expected output schema/version;
+- input hash or stage revision;
+- still-authoritative Job / continuation state;
+- result file is not a duplicate or stale replay.
 
-## Local runtime recommendation
+After validation, the workbench persists the accepted result and any derived evidence, records an audit event, and only then resumes the Job.
 
-A local Windows runtime is the preferred deployment for the current product because:
+ChatGPT must not receive direct physical-worker authority through this bridge. Android/XHS/browser actions remain behind the existing durable Job/worker boundary.
+
+## Copy/paste policy
+
+Manual paste/import may exist only as an emergency recovery/debug path. It is **not** the default operator workflow and should not be the main UI path while AgentDock is available.
+
+## Local runtime decision
+
+The current product should be designed for a **local Windows runtime** as the primary deployment model because:
 
 - Android/XHS physical workers are already local;
 - SQLite/runtime artifacts are local;
 - AgentDock can operate on local files and commands when the conversation exposes that connector;
-- a file-based external-result inbox is simple and does not require exposing a localhost API to the public internet.
+- the external-result inbox can stay on disk without exposing a localhost API to the public internet.
 
-The UI may still be a browser-based React workbench served from localhost. Local runtime does **not** require a native desktop UI.
+The UI remains a browser-based React workbench served from localhost. Local runtime does **not** require a native desktop UI.
 
-This is a recommendation, not a hard architectural requirement. A hosted orchestrator can also support manual paste/import, but the AgentDock bridge is most natural when the authoritative runtime is local.
+A hosted deployment may be supported later, but it must preserve the same handoff identity, schema, authority, and replay-safety rules.
 
 ## Provider policy
 
 Treat model choice as a stage-level policy rather than a global setting. Example modes:
 
 - `bailian_auto` — default automatic model execution;
-- `manual_chatgpt` — stop and create a ChatGPT handoff package;
+- `manual_chatgpt` — stop and create a ChatGPT handoff package, then return via AgentDock;
 - future providers may be added without changing Job semantics.
 
 Quality-sensitive stages may default to `manual_chatgpt` even if Bailian is available.
