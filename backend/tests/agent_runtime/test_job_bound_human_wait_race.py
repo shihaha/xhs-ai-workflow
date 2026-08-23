@@ -55,7 +55,7 @@ def test_old_wait_projection_cannot_clobber_concurrently_reclaimed_job(
 
     monkeypatch.setattr(projector.jobs, "get", get_with_reclaim)
 
-    with pytest.raises(JobWaitProjectionError, match="claim changed"):
+    with pytest.raises(JobWaitProjectionError, match="claim/binding changed"):
         projector.project_wait(old.run_id)
 
     new = new_bound["value"]
