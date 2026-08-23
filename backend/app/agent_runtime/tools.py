@@ -28,6 +28,30 @@ class ToolTimeoutError(TimeoutError):
     pass
 
 
+class ToolControlError(RuntimeError):
+    """A tool completed enough work to return a durable domain control outcome."""
+
+    def __init__(
+        self,
+        *,
+        category: str,
+        detail: str,
+        result: ToolExecutionResult | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.category = category
+        self.detail = detail
+        self.result = result
+
+
+class ToolNeedsHumanError(ToolControlError):
+    """The domain workflow requires explicit human intervention before continuing."""
+
+
+class ToolDomainFailureError(ToolControlError):
+    """The domain workflow reached a known durable failed outcome."""
+
+
 @dataclass(frozen=True, slots=True)
 class ToolExecutionContext:
     run_id: str
