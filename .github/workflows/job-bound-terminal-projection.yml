@@ -7,7 +7,7 @@ on:
     paths:
       - 'backend/app/agent_runtime/job_terminal_projection.py'
       - 'backend/app/agent_runtime/job_terminal_runtime.py'
-      - 'backend/tests/agent_runtime/test_job_bound_terminal_projection.py'
+      - 'backend/tests/agent_runtime/test_job_bound_terminal*.py'
       - '.github/workflows/job-bound-terminal-projection.yml'
   workflow_dispatch:
 
@@ -35,9 +35,9 @@ jobs:
           subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
           PY
       - name: Compile terminal-projection slice
-        run: python -m compileall -q backend/app/agent_runtime/job_terminal_projection.py backend/app/agent_runtime/job_terminal_runtime.py backend/tests/agent_runtime/test_job_bound_terminal_projection.py
+        run: python -m compileall -q backend/app/agent_runtime/job_terminal_projection.py backend/app/agent_runtime/job_terminal_runtime.py backend/tests/agent_runtime/test_job_bound_terminal*.py
       - name: Run focused terminal-projection tests
-        run: python -m pytest backend/tests/agent_runtime/test_job_bound_terminal_projection.py -q
+        run: python -m pytest backend/tests/agent_runtime/test_job_bound_terminal*.py -q
       - name: Run complete Agent Runtime acceptance
         run: python -m pytest backend/tests/agent_runtime -q
       - name: Run existing Job state-machine tests
