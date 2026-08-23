@@ -202,7 +202,7 @@ class AgentJobCoordinator:
 
 
 class JobAuthorityGuard:
-    """Read-only authority check to be inserted at future model/tool boundaries."""
+    """Read-only authority check for dedicated Agent orchestration Jobs only."""
 
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -213,6 +213,11 @@ class JobAuthorityGuard:
             record = session.get(JobRecord, job_id)
             if record is None:
                 raise JobNotFound(f"Job {job_id} does not exist.")
+            if record.type != AGENT_ORCHESTRATION_JOB_TYPE:
+                raise JobAuthorityError(
+                    f"Job {job_id} has type {record.type!r}; Agent authority requires "
+                    f"{AGENT_ORCHESTRATION_JOB_TYPE!r}."
+                )
             state = JobState(record.state)
             if state is not JobState.running:
                 raise JobAuthorityError(
