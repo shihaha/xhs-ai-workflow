@@ -104,6 +104,7 @@ Core outputs:
 - `docs/architecture-knowledge/12_IMPLEMENTATION_ROADMAP.md`
 - `docs/architecture-knowledge/13_RUNTIME_EXPERIMENT_RESULTS.md`
 - `docs/architecture-knowledge/14_IMPLEMENTATION_SCOPE_OVERRIDE.md`
+- `docs/architecture-knowledge/15_AGENTRUN_JOB_BINDING.md`
 
 ADRs:
 
@@ -184,23 +185,66 @@ The existing `AnalysisService` was wrapped rather than rewritten. Controlled par
 
 Branch/PR experiment proves deterministic model projection can materially reduce prompt structure without deleting authoritative raw evidence or changing service grounding. Real provider token savings still require a controlled live provider A/B before claiming an exact token number.
 
-### Runtime cleanup still pending dynamic acceptance
+### Runtime canonicalization — DRAFT PR #6, dynamic gate still required
 
-Draft PR #6 (`fix/agent-runtime-foldin-v1`) makes the hardened Stage 2 semantics the canonical `runtime.AgentRuntime` entry and removes the easy bypass through two public implementations.
+Branch:
 
-Its latest dynamic verification is blocked by GitHub Actions jobs failing before any step is created. Do not claim PR #6 passed until the jobs actually execute and pass.
+```text
+fix/agent-runtime-foldin-v1
+```
+
+Draft PR #6 makes the hardened Stage 2 semantics the canonical `runtime.AgentRuntime` entry and removes the easy bypass through two public implementations.
+
+Its latest verification attempts have been affected by GitHub Actions jobs failing before any step is created. Do not claim PR #6 passed until the jobs actually execute and pass.
+
+### AgentRun ↔ Job binding — STACKED DRAFT PR #7
+
+Branch:
+
+```text
+spike/agent-job-binding-v1
+```
+
+Base:
+
+```text
+fix/agent-runtime-foldin-v1
+```
+
+Current spike scope is intentionally narrow:
+
+- isolated `agent_job_bindings` relationship table;
+- atomic Job claim + AgentRun + binding + audit-log transaction;
+- Job lease derived from persisted Agent wall-time budget plus shutdown margin;
+- dedicated `agent_orchestration` Job type only;
+- physical/domain worker Jobs cannot be stolen by the Agent coordinator;
+- read-only `JobAuthorityGuard` contract;
+- narrow `job.read` Tool that omits input/logs/artifacts;
+- focused tests for atomicity, rollback, retry/continuation, terminal authority, metadata isolation, lease derivation and physical-job takeover prevention.
+
+PR #7 does **not** modify the Runtime loop, does not connect live XHS/Android collection, and is not merge-eligible until PR #6 is dynamically accepted first.
+
+Authority rule:
+
+```text
+JobService / Job = authoritative task lifecycle
+AgentRun          = execution trace
+```
+
+See `15_AGENTRUN_JOB_BINDING.md` for the full contract.
 
 ## Next implementation direction
 
 After canonical Runtime dynamic acceptance:
 
-1. define the minimal relationship between `AgentRun` and the existing durable `Job` lifecycle;
+1. dynamically validate PR #7 focused binding tests;
 2. keep `JobService` authoritative for lease/task/physical-worker lifecycle;
-3. do not let synchronous Agent tool execution replace physical XHS/Android workers;
-4. expose safe Job-oriented Agent tools such as create/read/status/result rather than direct raw device actions;
-5. continue toward Project/Run/Human Action/Evidence workbench views;
-6. preserve only thin B/C handoffs;
-7. connect D after Finished Product + human UAT.
+3. integrate a JobAuthorityGuard at model/tool boundaries only after the persistence slice is proven;
+4. do not let synchronous Agent tool execution replace physical XHS/Android workers;
+5. expose safe Job-oriented Agent commands/results rather than raw device actions;
+6. continue toward Project/Run/Human Action/Evidence workbench views;
+7. preserve only thin B/C handoffs;
+8. connect D after Finished Product + human UAT.
 
 ## Authority and guardrails
 
@@ -225,11 +269,12 @@ Recovered/reconstructed proprietary source may be studied for architecture but m
 - `12_IMPLEMENTATION_ROADMAP.md` — **Historical roadmap; Stage 7–10 partially superseded**
 - `13_RUNTIME_EXPERIMENT_RESULTS.md` — **Created**
 - `14_IMPLEMENTATION_SCOPE_OVERRIDE.md` — **Active override**
+- `15_AGENTRUN_JOB_BINDING.md` — **Active binding contract**
 
 ## Rule for future AI sessions
 
 Do not rely on chat memory as the project record. Any material finding, constraint, rejected option, architecture decision or experiment result that would otherwise need to be rediscovered must be written into this branch and committed.
 
-A new session should read this index, `11_ARCHITECTURE_DECISIONS.md`, `14_IMPLEMENTATION_SCOPE_OVERRIDE.md`, the relevant requirement/ADR files, and then the historical roadmap before repeating research.
+A new session should read this index, `11_ARCHITECTURE_DECISIONS.md`, `14_IMPLEMENTATION_SCOPE_OVERRIDE.md`, `15_AGENTRUN_JOB_BINDING.md`, the relevant requirement/ADR files, and then the historical roadmap before repeating research.
 
 Broad architecture research should not be restarted unless an implementation spike disproves a recorded assumption.
