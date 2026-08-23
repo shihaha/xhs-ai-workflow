@@ -40,3 +40,149 @@ jobs:
         run: python -m pytest backend/tests/analysis/test_model_context_compaction.py -q
       - name: Re-run Stage 2 Agent Runtime acceptance
         run: python -m pytest backend/tests/agent_runtime -q
+
+  stage2-baseline-backend:
+    name: Capture Stage 2 baseline backend failures
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: spike/agent-runtime-pydantic-v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Stage 2 baseline dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Capture Stage 2 baseline backend result
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=no > pytest.log 2>&1
+          status=$?
+          set -e
+          cat pytest.log
+          python - "$status" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          status = int(sys.argv[1])
+          text = pathlib.Path('pytest.log').read_text(encoding='utf-8', errors='replace')
+          issues = sorted({
+              match.group(1)
+              for line in text.splitlines()
+              if (match := re.match(r'^(?:FAILED|ERROR)\s+([^\s]+)', line))
+          })
+          pathlib.Path('backend-result.json').write_text(
+              json.dumps({'exit_code': status, 'issues': issues}, indent=2, ensure_ascii=False),
+              encoding='utf-8',
+          )
+          print(f'Stage 2 baseline backend: exit={status}, issues={len(issues)}')
+          if status not in (0, 1):
+              raise SystemExit(f'pytest infrastructure/collection failure: exit {status}')
+          if status == 1 and not issues:
+              raise SystemExit('pytest failed but no FAILED/ERROR node ids could be extracted')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage2-baseline-backend-result
+          path: backend-result.json
+
+  stage3-spike-backend:
+    name: Capture Stage 3 spike backend failures
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Stage 3 spike dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Capture Stage 3 spike backend result
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=no > pytest.log 2>&1
+          status=$?
+          set -e
+          cat pytest.log
+          python - "$status" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          status = int(sys.argv[1])
+          text = pathlib.Path('pytest.log').read_text(encoding='utf-8', errors='replace')
+          issues = sorted({
+              match.group(1)
+              for line in text.splitlines()
+              if (match := re.match(r'^(?:FAILED|ERROR)\s+([^\s]+)', line))
+          })
+          pathlib.Path('backend-result.json').write_text(
+              json.dumps({'exit_code': status, 'issues': issues}, indent=2, ensure_ascii=False),
+              encoding='utf-8',
+          )
+          print(f'Stage 3 spike backend: exit={status}, issues={len(issues)}')
+          if status not in (0, 1):
+              raise SystemExit(f'pytest infrastructure/collection failure: exit {status}')
+          if status == 1 and not issues:
+              raise SystemExit('pytest failed but no FAILED/ERROR node ids could be extracted')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage3-spike-backend-result
+          path: backend-result.json
+
+  stage3-backend-regression-guard:
+    name: Stage 3 backend regression guard
+    needs: [stage2-baseline-backend, stage3-spike-backend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage2-baseline-backend-result
+          path: .ci/baseline
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage3-spike-backend-result
+          path: .ci/spike
+      - name: Compare Stage 3 only and recheck apparent regressions
+        run: |
+          python tools/agent_runtime_regression_guard.py \
+            --baseline-result .ci/baseline/backend-result.json \
+            --spike-result .ci/spike/backend-result.json \
+            --baseline-ref spike/agent-runtime-pydantic-v1 \
+            --repeats 5 \
+            --report stage3-backend-regression-recheck.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage3-backend-regression-recheck
+          path: stage3-backend-regression-recheck.json
