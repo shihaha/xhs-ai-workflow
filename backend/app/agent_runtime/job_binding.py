@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy import DateTime, String, case, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from backend.app.agent_runtime.persistence import AgentRunRecord
+from backend.app.agent_runtime.persistence import AgentRunRecord, AgentRunStore
 from backend.app.agent_runtime.tools import ToolSpec
 from backend.app.agent_runtime.types import AgentRunState, RunBudget, ToolExecutionResult
 from backend.app.db import Database
@@ -69,6 +69,9 @@ class AgentJobCoordinator:
     ) -> None:
         self.database = database
         self._run_id_factory = run_id_factory or (lambda: str(uuid4()))
+        # A fresh integration database must not depend on some other caller
+        # having initialized the Agent Runtime tables first.
+        self.run_store = AgentRunStore(database)
         AgentJobBindingRecord.__table__.create(bind=database.engine, checkfirst=True)
 
     def claim_and_create_run(
