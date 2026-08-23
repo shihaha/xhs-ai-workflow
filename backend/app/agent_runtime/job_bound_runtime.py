@@ -1,8 +1,9 @@
 """Job-bound integration adapter for the canonical Agent Runtime.
 
-This staged adapter keeps the proven canonical ``AgentRuntime`` unchanged while
-we verify Job authority at real model/tool execution boundaries. It is not
-exported from ``backend.app.agent_runtime`` and must not own physical workers.
+This adapter composes the proven canonical ``AgentRuntime`` with durable Job
+authority, human-wait projection, approved continuation, and terminal Job
+projection. It is not exported from ``backend.app.agent_runtime`` and must not
+own physical workers.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from backend.app.agent_runtime.job_binding import (
     JobAuthorityError,
     JobAuthorityGuard,
 )
+from backend.app.agent_runtime.job_terminal_projection import JobTerminalProjector
 from backend.app.agent_runtime.persistence import AgentRunRecord
 from backend.app.agent_runtime.runtime import AgentRuntime
 from backend.app.agent_runtime.tools import ToolInputError, ToolUnavailableError
@@ -133,12 +135,13 @@ class _AuthorityCheckedModel:
 
 
 class JobBoundAgentRuntime(AgentRuntime):
-    """Canonical runtime plus fail-closed Job authority/state projection.
+    """Canonical Runtime plus authoritative Job lifecycle projection.
 
-    This class is intentionally an integration spike and is not package-root
-    exported. New bound runs must be created by ``AgentJobCoordinator`` or the
-    approved continuation coordinator first; this adapter only drives an
-    already-bound, currently-authoritative run.
+    New bound runs must be created by ``AgentJobCoordinator`` or the approved
+    continuation coordinator first; this adapter only drives an already-bound,
+    currently-authoritative run. The AgentRun trace is persisted first. Only
+    after that durable proof exists may wait or terminal state be projected into
+    the authoritative Job.
     """
 
     def __init__(
@@ -147,11 +150,15 @@ class JobBoundAgentRuntime(AgentRuntime):
         authority_guard: ActiveRunJobAuthorityGuard,
         wait_projector: JobWaitProjector | None = None,
         continuation_resolver: ApprovedContinuationResolver | None = None,
+        terminal_projector: JobTerminalProjector | None = None,
         **kwargs: Any,
     ) -> None:
         self.authority_guard = authority_guard
         self.wait_projector = wait_projector
         self.continuation_resolver = continuation_resolver
+        self.terminal_projector = terminal_projector or JobTerminalProjector(
+            authority_guard.database
+        )
         super().__init__(*args, **kwargs)
         self.model = _AuthorityCheckedModel(self.model, authority_guard)
 
@@ -274,6 +281,10 @@ class JobBoundAgentRuntime(AgentRuntime):
                     "the persisted Agent wait requires explicit restart reconciliation."
                 )
             self.wait_projector.project_wait(run_id)
+        elif outcome.state in {AgentRunState.succeeded, AgentRunState.failed}:
+            # Final output/error proof is already durable. The terminal projector
+            # performs only the authoritative Job CAS and never replays work.
+            self.terminal_projector.project_terminal(run_id)
         return outcome
 
     def _execute_tool(
