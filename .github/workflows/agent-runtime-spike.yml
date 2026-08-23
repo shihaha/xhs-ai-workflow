@@ -9,7 +9,7 @@ env:
 
 jobs:
   baseline-backend:
-    name: Existing baseline backend tests
+    name: Capture baseline backend failures
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -29,11 +29,44 @@ jobs:
           deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
           subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
           PY
-      - name: Run baseline backend tests
-        run: python -m pytest -q
+      - name: Capture baseline backend result
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=no > pytest.log 2>&1
+          status=$?
+          set -e
+          cat pytest.log
+          python - "$status" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          status = int(sys.argv[1])
+          text = pathlib.Path('pytest.log').read_text(encoding='utf-8', errors='replace')
+          issues = sorted({
+              match.group(1)
+              for line in text.splitlines()
+              if (match := re.match(r'^(?:FAILED|ERROR)\s+([^\s]+)', line))
+          })
+          pathlib.Path('backend-result.json').write_text(
+              json.dumps({'exit_code': status, 'issues': issues}, indent=2, ensure_ascii=False),
+              encoding='utf-8',
+          )
+          print(f'baseline backend: exit={status}, issues={len(issues)}')
+          if status not in (0, 1):
+              raise SystemExit(f'pytest infrastructure/collection failure: exit {status}')
+          if status == 1 and not issues:
+              raise SystemExit('pytest failed but no FAILED/ERROR node ids could be extracted')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baseline-backend-result
+          path: backend-result.json
 
   spike-backend:
-    name: Spike backend tests
+    name: Capture spike backend failures
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -51,10 +84,82 @@ jobs:
           deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
           subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
           PY
-      - name: Run agent runtime tests
+      - name: Run Agent Runtime acceptance tests
         run: python -m pytest backend/tests/agent_runtime -q
-      - name: Run full backend tests
-        run: python -m pytest -q
+      - name: Capture spike full-backend result
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=no > pytest.log 2>&1
+          status=$?
+          set -e
+          cat pytest.log
+          python - "$status" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          status = int(sys.argv[1])
+          text = pathlib.Path('pytest.log').read_text(encoding='utf-8', errors='replace')
+          issues = sorted({
+              match.group(1)
+              for line in text.splitlines()
+              if (match := re.match(r'^(?:FAILED|ERROR)\s+([^\s]+)', line))
+          })
+          pathlib.Path('backend-result.json').write_text(
+              json.dumps({'exit_code': status, 'issues': issues}, indent=2, ensure_ascii=False),
+              encoding='utf-8',
+          )
+          print(f'spike backend: exit={status}, issues={len(issues)}')
+          if status not in (0, 1):
+              raise SystemExit(f'pytest infrastructure/collection failure: exit {status}')
+          if status == 1 and not issues:
+              raise SystemExit('pytest failed but no FAILED/ERROR node ids could be extracted')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spike-backend-result
+          path: backend-result.json
+
+  backend-regression-guard:
+    name: Backend regression guard
+    needs: [baseline-backend, spike-backend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: baseline-backend-result
+          path: baseline
+      - uses: actions/download-artifact@v4
+        with:
+          name: spike-backend-result
+          path: spike
+      - name: Fail only on newly failing backend tests
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+
+          baseline = json.loads(pathlib.Path('baseline/backend-result.json').read_text(encoding='utf-8'))
+          spike = json.loads(pathlib.Path('spike/backend-result.json').read_text(encoding='utf-8'))
+          baseline_issues = set(baseline['issues'])
+          spike_issues = set(spike['issues'])
+          new = sorted(spike_issues - baseline_issues)
+          fixed = sorted(baseline_issues - spike_issues)
+
+          print(f"baseline issues: {len(baseline_issues)}")
+          print(f"spike issues:    {len(spike_issues)}")
+          print(f"new issues:      {len(new)}")
+          print(f"fixed issues:    {len(fixed)}")
+          if fixed:
+              print('\nFixed relative to baseline:')
+              print('\n'.join(f'  - {item}' for item in fixed))
+          if new:
+              print('\nNEW regressions:')
+              print('\n'.join(f'  - {item}' for item in new))
+              raise SystemExit(1)
+          PY
 
   baseline-frontend:
     name: Existing baseline frontend tests and build
@@ -121,8 +226,88 @@ jobs:
             exit 1
           fi
 
+  baseline-controlled-e2e:
+    name: Capture baseline controlled E2E failures
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/xhs-workbench-next
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install Python dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Capture baseline Playwright result
+        working-directory: frontend
+        shell: bash
+        run: |
+          set +e
+          npx playwright test --reporter=json > e2e-report.json
+          status=$?
+          set -e
+          python - "$status" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          status = int(sys.argv[1])
+          report = json.loads(pathlib.Path('e2e-report.json').read_text(encoding='utf-8'))
+          issues = set()
+
+          def visit(suite):
+              for spec in suite.get('specs', []):
+                  failed = any(
+                      result.get('status') in {'failed', 'timedOut', 'interrupted'}
+                      for test in spec.get('tests', [])
+                      for result in test.get('results', [])
+                  )
+                  if failed:
+                      issues.add(
+                          f"{spec.get('file')}:{spec.get('line')}:{spec.get('column')}::{spec.get('title')}"
+                      )
+              for child in suite.get('suites', []):
+                  visit(child)
+
+          for suite in report.get('suites', []):
+              visit(suite)
+          pathlib.Path('e2e-result.json').write_text(
+              json.dumps({'exit_code': status, 'issues': sorted(issues)}, indent=2, ensure_ascii=False),
+              encoding='utf-8',
+          )
+          print(f'baseline E2E: exit={status}, issues={len(issues)}')
+          if status not in (0, 1):
+              raise SystemExit(f'Playwright infrastructure failure: exit {status}')
+          if status == 1 and not issues:
+              raise SystemExit('Playwright failed but no failed test ids could be extracted')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baseline-e2e-result
+          path: frontend/e2e-result.json
+
   spike-controlled-e2e:
-    name: Spike controlled fresh-runtime E2E
+    name: Capture spike controlled E2E failures
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -151,6 +336,86 @@ jobs:
       - name: Install Playwright Chromium
         working-directory: frontend
         run: npx playwright install --with-deps chromium
-      - name: Run controlled Playwright E2E
+      - name: Capture spike Playwright result
         working-directory: frontend
-        run: npm run test:e2e
+        shell: bash
+        run: |
+          set +e
+          npx playwright test --reporter=json > e2e-report.json
+          status=$?
+          set -e
+          python - "$status" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          status = int(sys.argv[1])
+          report = json.loads(pathlib.Path('e2e-report.json').read_text(encoding='utf-8'))
+          issues = set()
+
+          def visit(suite):
+              for spec in suite.get('specs', []):
+                  failed = any(
+                      result.get('status') in {'failed', 'timedOut', 'interrupted'}
+                      for test in spec.get('tests', [])
+                      for result in test.get('results', [])
+                  )
+                  if failed:
+                      issues.add(
+                          f"{spec.get('file')}:{spec.get('line')}:{spec.get('column')}::{spec.get('title')}"
+                      )
+              for child in suite.get('suites', []):
+                  visit(child)
+
+          for suite in report.get('suites', []):
+              visit(suite)
+          pathlib.Path('e2e-result.json').write_text(
+              json.dumps({'exit_code': status, 'issues': sorted(issues)}, indent=2, ensure_ascii=False),
+              encoding='utf-8',
+          )
+          print(f'spike E2E: exit={status}, issues={len(issues)}')
+          if status not in (0, 1):
+              raise SystemExit(f'Playwright infrastructure failure: exit {status}')
+          if status == 1 and not issues:
+              raise SystemExit('Playwright failed but no failed test ids could be extracted')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spike-e2e-result
+          path: frontend/e2e-result.json
+
+  e2e-regression-guard:
+    name: Controlled E2E regression guard
+    needs: [baseline-controlled-e2e, spike-controlled-e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: baseline-e2e-result
+          path: baseline
+      - uses: actions/download-artifact@v4
+        with:
+          name: spike-e2e-result
+          path: spike
+      - name: Fail only on newly failing E2E tests
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+
+          baseline = json.loads(pathlib.Path('baseline/e2e-result.json').read_text(encoding='utf-8'))
+          spike = json.loads(pathlib.Path('spike/e2e-result.json').read_text(encoding='utf-8'))
+          baseline_issues = set(baseline['issues'])
+          spike_issues = set(spike['issues'])
+          new = sorted(spike_issues - baseline_issues)
+          fixed = sorted(baseline_issues - spike_issues)
+
+          print(f"baseline E2E issues: {len(baseline_issues)}")
+          print(f"spike E2E issues:    {len(spike_issues)}")
+          print(f"new E2E issues:      {len(new)}")
+          print(f"fixed E2E issues:    {len(fixed)}")
+          if new:
+              print('\nNEW E2E regressions:')
+              print('\n'.join(f'  - {item}' for item in new))
+              raise SystemExit(1)
+          PY
