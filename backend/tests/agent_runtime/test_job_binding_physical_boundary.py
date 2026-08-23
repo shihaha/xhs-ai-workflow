@@ -1,8 +1,10 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from backend.app.agent_runtime.job_binding import (
+    AgentJobBindingRecord,
     AgentJobCoordinator,
     JobAuthorityError,
     JobAuthorityGuard,
@@ -36,7 +38,7 @@ def test_agent_coordinator_cannot_claim_physical_collection_job(tmp_path: Path) 
     assert coordinator.run_ids_for_job(physical.id) == []
 
 
-def test_agent_authority_guard_rejects_running_physical_collection_job(
+def test_run_bound_guard_rejects_even_a_corrupt_binding_to_running_physical_job(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "workbench.sqlite3")
@@ -46,9 +48,21 @@ def test_agent_authority_guard_rejects_running_physical_collection_job(
         input_data={"account": "owned-by-existing-worker"},
     )
     jobs.claim(physical.id, lease_seconds=300)
+    AgentJobCoordinator(database)  # initialize Agent/binding tables
+
+    # Defense in depth: even if the application-enforced binding table were
+    # corrupted or manually edited, a physical Job must not become Agent authority.
+    with database.sessions.begin() as session:
+        session.add(
+            AgentJobBindingRecord(
+                run_id="corrupt-physical-binding",
+                job_id=physical.id,
+                created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+        )
 
     with pytest.raises(JobAuthorityError):
-        JobAuthorityGuard(database).require_running(physical.id)
+        JobAuthorityGuard(database).require_run_running("corrupt-physical-binding")
 
     persisted = jobs.get(physical.id)
     assert persisted.state is JobState.running
