@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  demandRadarMediaUrl,
   fetchDemandRadar,
   reviewOpportunity as postReviewOpportunity,
   type DemandRadar,
@@ -37,15 +38,35 @@ function SummaryCard({ label, value, hint }: { label: string; value: number; hin
 }
 
 function ProductEvidence({ direction }: { direction: DemandRadarDirection }) {
+  const [expandedImage, setExpandedImage] = useState<{ src: string; alt: string } | null>(null);
   if (!direction.representative_products.length) {
     return <p className="demand-muted">这条历史方向没有可展示的代表商品摘要。</p>;
   }
-  return <div className="representative-products">
+  return <>
+    <div className="representative-products">
     {direction.representative_products.map(product => <article className="representative-product" key={`${product.account_user_id}:${product.product_id}`}>
-      <div className="representative-product__placeholder" aria-label={`${product.title ?? product.product_id} 的图片证据摘要`}>
+      {product.image_artifact_ids.length ? <div className="representative-product__media">
+        <div className="evidence-thumbnail-strip" aria-label={`${product.title ?? product.product_id} 的商品证据图`}>
+          {product.image_artifact_ids.map((artifactId, index) => {
+            const src = demandRadarMediaUrl(direction.opportunity_id, artifactId);
+            const alt = `${product.title ?? "商品"} 证据图 ${index + 1}`;
+            return <button
+              className="evidence-thumbnail-button"
+              key={artifactId}
+              type="button"
+              aria-label={`放大查看${alt}`}
+              onClick={() => setExpandedImage({ src, alt })}
+            >
+              <img src={src} alt={alt} loading="lazy" />
+            </button>;
+          })}
+        </div>
+        <small>{product.image_artifact_ids.length} 张已通过安全 Artifact 绑定，可逐张查看</small>
+      </div> : <div className="representative-product__placeholder" aria-label={`${product.title ?? product.product_id} 的图片证据摘要`}>
         <strong>{product.image_evidence_count}</strong>
         <span>份图片证据</span>
-      </div>
+        <small>当前记录暂没有可验证的安全预览绑定</small>
+      </div>}
       <div>
         <h4>{product.title ?? "未记录商品标题"}</h4>
         <p className="product-signal">
@@ -56,7 +77,15 @@ function ProductEvidence({ direction }: { direction: DemandRadarDirection }) {
         {product.source_url ? <a href={product.source_url} target="_blank" rel="noreferrer">查看原商品</a> : null}
       </div>
     </article>)}
-  </div>;
+    </div>
+    {expandedImage ? <div className="evidence-lightbox" role="dialog" aria-modal="true" aria-label="商品证据大图">
+      <div className="evidence-lightbox__panel">
+        <button className="button-secondary evidence-lightbox__close" type="button" onClick={() => setExpandedImage(null)}>关闭大图</button>
+        <img src={expandedImage.src} alt={expandedImage.alt} />
+        <p>{expandedImage.alt}</p>
+      </div>
+    </div> : null}
+  </>;
 }
 
 function DirectionEvidence({ direction }: { direction: DemandRadarDirection }) {
@@ -64,7 +93,7 @@ function DirectionEvidence({ direction }: { direction: DemandRadarDirection }) {
     <summary>查看支撑证据</summary>
     <div className="demand-evidence-body">
       <p><strong>证据规模：</strong> {direction.supporting_account_count} 个账号 · {direction.supporting_product_count} 个商品 · {direction.supporting_note_count} 篇笔记 · {direction.image_evidence_count} 份商品图片证据</p>
-      <p className="demand-evidence-note">当前页面只展示安全业务摘要和原商品链接，不暴露本机 Artifact 路径。教程要求的“工作台内直接逐张看商品图”需要单独的安全媒体读取接口，不能用本地路径硬接。</p>
+      <p className="demand-evidence-note">商品卡只通过 Opportunity 证据作用域内的安全媒体接口读取图片；浏览器不会获得本机 Artifact 路径。没有通过 immutable snapshot、Artifact 归属和文件完整性校验的图片不会显示。</p>
     </div>
   </details>;
 }

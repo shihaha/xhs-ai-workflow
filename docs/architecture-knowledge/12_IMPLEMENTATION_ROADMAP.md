@@ -394,6 +394,32 @@ authorized
 
 The implementation contract and local validation are recorded in `29_DEMAND_RADAR_BUSINESS_SURFACE_V1.md`.
 
+### 7.2.1 — Demand Radar safe product media: FORMALLY ACCEPTED
+
+Close the remaining A-stage image-inspection gap before Product Definition:
+
+```text
+Opportunity supporting product
+  -> immutable Analysis snapshot
+  -> trusted shop result
+  -> exact raw_evidence.detail_screen
+  -> same-Job android_screenshot Artifact
+  -> transition/SHA/file/image validation
+  -> safe browser thumbnail + click-to-inspect
+```
+
+Hard boundary:
+
+- no generic Artifact download endpoint;
+- no browser-visible local Artifact path;
+- no arbitrary Android operation screenshots presented as product evidence;
+- only the exact `detail_screen` binding already used by the trusted sample evidence contract is previewable;
+- historical rows with image counts but no provable safe binding remain placeholders;
+- no Android/XHS replay is allowed merely to render an existing image;
+- this slice does not enter Phase B.
+
+Implementation and real historical-data validation are recorded in `30_DEMAND_RADAR_SAFE_MEDIA_V1.md`.
+
 ### Important
 
 Do not retroactively rewrite historical Phase A records merely to attach them to Project/BusinessCase. If such an entity is introduced later, use stable references/migration records.

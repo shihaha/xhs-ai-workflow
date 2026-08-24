@@ -284,6 +284,18 @@ summary { cursor: pointer; font-weight: 700; }
 .representative-product__placeholder { align-content: center; aspect-ratio: 1; background: #e7ecea; border: 1px dashed #9baba7; display: grid; justify-items: center; min-width: 0; padding: 0.4rem; text-align: center; }
 .representative-product__placeholder strong { font-size: 1.35rem; }
 .representative-product__placeholder span { color: #48615c; font-size: 0.7rem; }
+.representative-product__placeholder small { color: #62736f; font-size: 0.62rem; line-height: 1.35; margin-top: 0.25rem; }
+.representative-product__media { display: grid; gap: 0.35rem; min-width: 0; }
+.representative-product__media > small { color: #48615c; font-size: 0.66rem; line-height: 1.35; }
+.evidence-thumbnail-strip { display: grid; gap: 0.3rem; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 11rem; overflow-y: auto; padding-right: 0.15rem; }
+.evidence-thumbnail-button { background: #fff; border: 1px solid #b8c5c1; cursor: zoom-in; padding: 0; }
+.evidence-thumbnail-button:focus-visible { outline: 3px solid #0a5c64; outline-offset: 2px; }
+.evidence-thumbnail-button img { aspect-ratio: 1; display: block; height: auto; object-fit: cover; width: 100%; }
+.evidence-lightbox { align-items: center; background: rgb(15 23 42 / 72%); display: flex; inset: 0; justify-content: center; padding: 1rem; position: fixed; z-index: 1000; }
+.evidence-lightbox__panel { background: #fff; box-shadow: 0 1rem 3rem rgb(0 0 0 / 30%); display: grid; gap: 0.75rem; max-height: calc(100vh - 2rem); max-width: min(58rem, calc(100vw - 2rem)); overflow: auto; padding: 0.9rem; width: fit-content; }
+.evidence-lightbox__panel img { display: block; height: auto; max-height: calc(100vh - 8rem); max-width: 100%; object-fit: contain; }
+.evidence-lightbox__panel p { color: #48615c; font-size: 0.78rem; margin: 0; }
+.evidence-lightbox__close { justify-self: end; }
 .representative-product h4 { font-size: 0.9rem; line-height: 1.35; margin: 0 0 0.45rem; overflow-wrap: anywhere; }
 .representative-product p { margin: 0.2rem 0; }
 .representative-product a { font-size: 0.8rem; }

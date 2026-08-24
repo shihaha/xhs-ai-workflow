@@ -26,6 +26,7 @@ const direction = (overrides: Partial<DemandRadarDirection> = {}): DemandRadarDi
       price: "¥19.9",
       sold: "1.2万+",
       image_evidence_count: 6,
+      image_artifact_ids: [21, 22],
     },
     {
       account_user_id: "account-b",
@@ -35,6 +36,7 @@ const direction = (overrides: Partial<DemandRadarDirection> = {}): DemandRadarDi
       price: "¥29.9",
       sold: "8300+",
       image_evidence_count: 5,
+      image_artifact_ids: [],
     },
   ],
   linked_products: [],
@@ -69,9 +71,17 @@ describe("DemandRadarPage", () => {
     expect(screen.getByText("七宗罪人格测试完整版")).toBeVisible();
     expect(screen.getByText("价格 ¥19.9")).toBeVisible();
     expect(screen.getByText("销量 1.2万+")).toBeVisible();
-    expect(screen.getByLabelText("七宗罪人格测试完整版 的图片证据摘要")).toHaveTextContent("6份图片证据");
+    const firstImage = screen.getByAltText("七宗罪人格测试完整版 证据图 1");
+    expect(firstImage).toHaveAttribute("src", "/api/v1/business/demand-radar/opp-1/media/21");
+    expect(screen.getByText("2 张已通过安全 Artifact 绑定，可逐张查看")).toBeVisible();
+    expect(screen.getByLabelText("黑暗人格测试报告 的图片证据摘要")).toHaveTextContent("5份图片证据当前记录暂没有可验证的安全预览绑定");
+    fireEvent.click(screen.getByRole("button", { name: "放大查看七宗罪人格测试完整版 证据图 1" }));
+    const lightbox = screen.getByRole("dialog", { name: "商品证据大图" });
+    expect(within(lightbox).getByAltText("七宗罪人格测试完整版 证据图 1")).toHaveAttribute("src", "/api/v1/business/demand-radar/opp-1/media/21");
+    fireEvent.click(within(lightbox).getByRole("button", { name: "关闭大图" }));
+    expect(screen.queryByRole("dialog", { name: "商品证据大图" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByText("查看支撑证据"));
-    expect(screen.getByText(/不暴露本机 Artifact 路径/)).toBeVisible();
+    expect(screen.getByText(/浏览器不会获得本机 Artifact 路径/)).toBeVisible();
     expect(screen.getByRole("link", { name: "高级：运行跨账号需求分析" })).toHaveAttribute("href", "/opportunities/analysis");
   });
 
