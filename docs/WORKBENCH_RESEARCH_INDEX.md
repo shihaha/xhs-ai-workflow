@@ -205,6 +205,7 @@ Recovered/reconstructed proprietary source may be studied for architecture but m
 - `25_AGENT_WORKBENCH_ZH_LAYOUT_V1.md` — Chinese-first three-column operator workbench and UI-component integration boundary.
 - `26_CHATGPT_PRIMARY_REASONING_PROVIDER.md` — authoritative provider override: ChatGPT is the primary external reasoning provider; Bailian/local models are optional accelerators, not required workflow dependencies.
 - `27_PHYSICAL_COLLECTION_BOUNDARY_V1.md` — first permission-gated real Android `shop.preflight` boundary, ChatGPT-primary initial/follow-up reasoning, physical-result reconciliation, restart safety and controlled real-device UAT.
+- `28_TUTORIAL_ALIGNED_BUSINESS_WORKBENCH_STANDARD.md` — Stage-7 pre-implementation product standard aligned to the tutorial text, tutorial dashboard/product/content screenshots, and the durable A/B/C/D + Skill/Human-Gate discussion; explicitly rejects a generic Project-first UI.
 
 ## Rule for future AI sessions
 
