@@ -159,6 +159,50 @@ class JobService:
         session.add(record)
         return record
 
+    def create_needs_human_in_session(
+        self,
+        session: Session,
+        *,
+        job_id: str,
+        job_type: str,
+        input_data: dict[str, Any],
+        current_stage: str,
+        error_category: str,
+        progress_current: int = 0,
+        progress_total: int | None = None,
+        now: datetime | None = None,
+    ) -> JobRecord:
+        """Atomically admit a Job whose first state is an explicit human wait.
+
+        The caller must create the durable reason for that wait in the same
+        transaction (for example an initial ChatGPT handoff). This is not a
+        shortcut for moving a pre-existing Job around the normal state machine.
+        """
+
+        created_at = now or _utc_now()
+        if not current_stage or not error_category:
+            raise InvalidJobTransition(
+                "A newly waiting Job requires an explicit stage and error category."
+            )
+        record = JobRecord(
+            id=job_id,
+            type=job_type,
+            input_data=input_data,
+            state=JobState.needs_human.value,
+            progress_current=progress_current,
+            progress_total=progress_total,
+            current_stage=current_stage,
+            error_category=error_category,
+            retry_count=0,
+            created_at=created_at,
+            updated_at=created_at,
+            started_at=None,
+            completed_at=None,
+            lease_expires_at=None,
+        )
+        session.add(record)
+        return record
+
     def create_batch(self, specs: list[JobCreateSpec]) -> list[Job]:
         """Reserve a related job set in one transaction or persist none of it."""
         now = _utc_now()

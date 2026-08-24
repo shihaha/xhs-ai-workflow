@@ -69,6 +69,15 @@ class HumanActionApprovalResult:
     continuation_run_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class InterruptedReapprovalResult:
+    human_action_id: str
+    job_id: str
+    run_id: str
+    tool_name: str
+    human_action_status: str
+
+
 class AgentWorkbenchActionService:
     """Narrow, backend-authoritative operator command surface."""
 
@@ -78,10 +87,12 @@ class AgentWorkbenchActionService:
         *,
         continuation_executor: AgentContinuationExecutor | None = None,
         initial_executor: AgentInitialExecutor | None = None,
+        initial_chatgpt_enabled: bool = False,
     ) -> None:
         self.database = database
         self.continuation_executor = continuation_executor
         self.initial_executor = initial_executor
+        self.initial_chatgpt_enabled = bool(initial_chatgpt_enabled)
         # Ensure staged Agent tables exist on a fresh local database.
         self.store = AgentRunStore(database)
         AgentJobBindingRecord.__table__.create(bind=database.engine, checkfirst=True)
@@ -91,13 +102,18 @@ class AgentWorkbenchActionService:
             self.continuation_executor is not None
             and self.continuation_executor.accepting
         )
+        physical_executor_ready = bool(
+            self.continuation_executor is not None
+            and self.continuation_executor.selective_accepting
+        )
         initial_ready = bool(
             self.initial_executor is not None and self.initial_executor.accepting
-        )
+        ) or self.initial_chatgpt_enabled
         return {
             "cancel_job": True,
             "deny_permission_action": True,
             "approve_continuation": executor_ready,
+            "approve_physical_continuation": physical_executor_ready,
             "start_grounded_orchestration": initial_ready,
             "continuation_reason": (
                 None
@@ -113,9 +129,9 @@ class AgentWorkbenchActionService:
         note: str | None = None,
     ) -> HumanActionApprovalResult:
         executor = self.continuation_executor
-        if executor is None or not executor.accepting:
+        if executor is None:
             raise AgentWorkbenchActionError(
-                "Automatic Agent continuation executor is unavailable."
+                "Agent continuation executor is unavailable."
             )
         try:
             approved = executor.approve(human_action_id, note=note)
@@ -128,6 +144,38 @@ class AgentWorkbenchActionService:
             job_id=approved.job_id,
             source_run_id=approved.source_run_id,
             continuation_run_id=approved.run_id,
+        )
+
+    def prepare_interrupted_reapproval(
+        self,
+        run_id: str,
+    ) -> InterruptedReapprovalResult:
+        """Create a fresh HumanAction only for a safely unstarted interrupted continuation."""
+
+        executor = self.continuation_executor
+        if executor is None or not executor.accepting:
+            raise AgentWorkbenchActionError(
+                "Automatic Agent continuation executor is unavailable."
+            )
+        try:
+            human = executor.coordinator.prepare_interrupted_reapproval(run_id)
+        except KeyError:
+            raise
+        except ContinuationApprovalError as error:
+            raise AgentWorkbenchActionError(str(error)) from error
+        with self.database.sessions() as session:
+            binding = session.get(AgentJobBindingRecord, run_id)
+            if binding is None:
+                raise AgentWorkbenchActionError(
+                    "Interrupted recovery lost its durable AgentRun→Job binding."
+                )
+            job_id = binding.job_id
+        return InterruptedReapprovalResult(
+            human_action_id=human.id,
+            job_id=job_id,
+            run_id=run_id,
+            tool_name=human.tool_name,
+            human_action_status="pending",
         )
 
     def cancel_job(self, job_id: str) -> AgentCancelResult:

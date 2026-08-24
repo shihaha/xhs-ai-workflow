@@ -33,6 +33,8 @@ from backend.app.agent_runtime.persistence import (
 from backend.app.agent_runtime.types import AgentRunState
 from backend.app.db import Database
 from backend.app.models.jobs import JobLogRecord, JobRecord, JobState
+from backend.app.services.jobs import JobService
+from backend.app.agent_runtime.types import RunBudget
 
 
 MANUAL_CHATGPT_TOOL_NAME = "manual_chatgpt"
@@ -220,6 +222,217 @@ class ManualChatGPTHandoffService:
         self.store = AgentRunStore(database)
         AgentJobBindingRecord.__table__.create(bind=database.engine, checkfirst=True)
         ManualChatGPTHandoffRecord.__table__.create(bind=database.engine, checkfirst=True)
+
+    def create_initial_grounded_handoff(
+        self,
+        *,
+        goal: str,
+        evidence_refs: list[str],
+        evidence_summaries: list[dict[str, Any]],
+        budget: RunBudget,
+        task: dict[str, Any],
+        stage_revision: str,
+        result_contract: HandoffResultContract,
+    ) -> ManualChatGPTHandoff:
+        """Atomically admit a grounded Agent Job whose first reasoner is ChatGPT.
+
+        No temporary ``running`` Job and no initial provider dispatch is created.
+        Job, AgentRun, evidence seed, binding, handoff wait and HumanAction are
+        committed together so a machine without Bailian has no fake-running
+        crash window.
+        """
+
+        normalized_goal = goal.strip()
+        if not normalized_goal:
+            raise ManualChatGPTHandoffError("Agent goal must not be blank.")
+        refs = tuple(dict.fromkeys(evidence_refs))
+        if not refs or len(refs) != len(evidence_refs):
+            raise ManualChatGPTHandoffError(
+                "Initial ChatGPT handoff evidence scope must be non-empty and unique."
+            )
+        summary_ids = [item.get("evidence_id") for item in evidence_summaries]
+        if summary_ids != list(refs):
+            raise ManualChatGPTHandoffError(
+                "Evidence summaries must exactly match the ordered durable evidence scope."
+            )
+        if not stage_revision or len(stage_revision) > 128:
+            raise ValueError("stage_revision must be 1..128 characters")
+        if len(refs) > 256 or any(len(ref) > 2_000 for ref in refs):
+            raise ValueError("context refs exceed the handoff safety bounds")
+        _canonical_json(task)
+        _canonical_json(evidence_summaries)
+        contract_json = result_contract.model_dump(mode="json")
+        _canonical_json(contract_json)
+
+        handoff_id = _validated_uuid(self._handoff_id_factory(), label="handoff_id")
+        human_action_id = _validated_uuid(
+            self._human_action_id_factory(), label="human_action_id"
+        )
+        job_id = str(uuid4())
+        run_id = str(uuid4())
+        context_refs = list(refs)
+        input_hash = _input_hash(
+            task=task,
+            context_refs=context_refs,
+            stage_revision=stage_revision,
+            result_contract=result_contract,
+        )
+        tool_call_id = f"manual-chatgpt:{handoff_id}"
+        package_rel = Path("chatgpt-handoffs") / "outbox" / f"{handoff_id}.json"
+        return_rel = Path("external-results") / f"{handoff_id}.json"
+        now = _utcnow()
+        jobs = JobService(self.database, runtime_dir=self.runtime_dir)
+
+        with self.database.sessions.begin() as session:
+            jobs.create_needs_human_in_session(
+                session,
+                job_id=job_id,
+                job_type=AGENT_ORCHESTRATION_JOB_TYPE,
+                input_data={
+                    "launch_kind": "grounded_chatgpt_orchestration_v1",
+                    "evidence_refs": context_refs,
+                },
+                current_stage=MANUAL_CHATGPT_REQUIRED,
+                error_category=MANUAL_CHATGPT_REQUIRED,
+                now=now,
+            )
+            session.add(
+                AgentRunRecord(
+                    id=run_id,
+                    goal=normalized_goal,
+                    state=AgentRunState.needs_human.value,
+                    model_name="chatgpt-handoff",
+                    prompt_version=stage_revision,
+                    budget_json=budget.model_dump(mode="json"),
+                    step_count=2,
+                    model_calls=0,
+                    input_tokens=0,
+                    output_tokens=0,
+                    final_output_json=None,
+                    error_category=MANUAL_CHATGPT_REQUIRED,
+                    error_detail=f"Waiting for AgentDock ChatGPT handoff {handoff_id}.",
+                    created_at=now,
+                    updated_at=now,
+                    completed_at=None,
+                )
+            )
+            # Preserve the same safe evidence seed shape used by the automatic
+            # initial executor. ChatGPT transport is a reasoning boundary, not a
+            # replacement for durable Agent history.
+            session.add(
+                AgentStepRecord(
+                    run_id=run_id,
+                    step_index=1,
+                    kind="checkpoint",
+                    tool_name=None,
+                    tool_call_id=None,
+                    input_json=None,
+                    output_json={
+                        "scope": "operator_selected_evidence",
+                        "evidence_count": len(context_refs),
+                        "evidence_summaries": evidence_summaries,
+                    },
+                    evidence_refs_json=context_refs,
+                    status="succeeded",
+                    error_category=None,
+                    error_detail=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                AgentJobBindingRecord(
+                    run_id=run_id,
+                    job_id=job_id,
+                    created_at=now,
+                )
+            )
+            session.add(
+                AgentStepRecord(
+                    run_id=run_id,
+                    step_index=2,
+                    kind="external_handoff",
+                    tool_name=MANUAL_CHATGPT_TOOL_NAME,
+                    tool_call_id=tool_call_id,
+                    input_json={
+                        "handoff_id": handoff_id,
+                        "input_hash": input_hash,
+                        "schema_version": result_contract.schema_version,
+                        "stage_revision": stage_revision,
+                    },
+                    output_json=None,
+                    evidence_refs_json=context_refs,
+                    status="needs_human",
+                    error_category=MANUAL_CHATGPT_REQUIRED,
+                    error_detail="Waiting for initial ChatGPT decision via AgentDock.",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                HumanActionRecord(
+                    id=human_action_id,
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=MANUAL_CHATGPT_TOOL_NAME,
+                    status="pending",
+                    request_json={
+                        "kind": "manual_chatgpt_initial",
+                        "handoff_id": handoff_id,
+                        "input_hash": input_hash,
+                        "schema_version": result_contract.schema_version,
+                        "stage_revision": stage_revision,
+                        "package_path": package_rel.as_posix(),
+                        "return_path": return_rel.as_posix(),
+                    },
+                    resolution_json=None,
+                    created_at=now,
+                    resolved_at=None,
+                )
+            )
+            session.flush()
+            session.add(
+                ManualChatGPTHandoffRecord(
+                    id=handoff_id,
+                    source_run_id=run_id,
+                    human_action_id=human_action_id,
+                    status="pending",
+                    stage_revision=stage_revision,
+                    schema_version=result_contract.schema_version,
+                    input_hash=input_hash,
+                    task_json=task,
+                    context_refs_json=context_refs,
+                    result_contract_json=contract_json,
+                    package_path=package_rel.as_posix(),
+                    result_path=None,
+                    result_json=None,
+                    created_at=now,
+                    accepted_at=None,
+                )
+            )
+            session.add(
+                JobLogRecord(
+                    job_id=job_id,
+                    level="info",
+                    message=(
+                        f"Initial grounded Agent run {run_id} admitted directly at "
+                        f"ChatGPT handoff {handoff_id}; no automatic provider dispatch was created."
+                    ),
+                    created_at=now,
+                )
+            )
+
+        self.materialize_package(handoff_id)
+        return ManualChatGPTHandoff(
+            handoff_id=handoff_id,
+            job_id=job_id,
+            source_run_id=run_id,
+            human_action_id=human_action_id,
+            input_hash=input_hash,
+            schema_version=result_contract.schema_version,
+            package_path=package_rel.as_posix(),
+            return_path=return_rel.as_posix(),
+        )
 
     def request_handoff(
         self,
@@ -410,6 +623,214 @@ class ManualChatGPTHandoffService:
 
         # DB wait state is authoritative.  If disk materialization fails, the
         # package can be regenerated idempotently without reopening the Job.
+        self.materialize_package(handoff_id)
+        return ManualChatGPTHandoff(
+            handoff_id=handoff_id,
+            job_id=job_id,
+            source_run_id=source_run_id,
+            human_action_id=human_action_id,
+            input_hash=input_hash,
+            schema_version=result_contract.schema_version,
+            package_path=package_rel.as_posix(),
+            return_path=return_rel.as_posix(),
+        )
+
+    def request_followup_handoff(
+        self,
+        source_run_id: str,
+        *,
+        expected_wait_category: str,
+        task: dict[str, Any],
+        context_refs: list[str],
+        stage_revision: str,
+        result_contract: HandoffResultContract,
+    ) -> ManualChatGPTHandoff:
+        """Atomically turn one durable non-permission wait into a ChatGPT wait.
+
+        This is used after a child domain/physical Job has already persisted its
+        result.  It never re-claims the parent Job and never replays the child
+        side effect.  The current AgentRun remains the exact latest binding; only
+        its wait reason is tightened from ``expected_wait_category`` to the
+        manual-ChatGPT handoff boundary.
+        """
+
+        if not expected_wait_category or len(expected_wait_category) > 100:
+            raise ValueError("expected_wait_category must be bounded non-empty text")
+        if not stage_revision or len(stage_revision) > 128:
+            raise ValueError("stage_revision must be 1..128 characters")
+        if len(context_refs) > 256:
+            raise ValueError("context_refs is too large")
+        for ref in context_refs:
+            if not isinstance(ref, str) or not ref or len(ref) > 2_000:
+                raise ValueError("context_refs entries must be bounded non-empty strings")
+        _canonical_json(task)
+        contract_json = result_contract.model_dump(mode="json")
+        _canonical_json(contract_json)
+
+        handoff_id = _validated_uuid(self._handoff_id_factory(), label="handoff_id")
+        human_action_id = _validated_uuid(
+            self._human_action_id_factory(), label="human_action_id"
+        )
+        input_hash = _input_hash(
+            task=task,
+            context_refs=context_refs,
+            stage_revision=stage_revision,
+            result_contract=result_contract,
+        )
+        tool_call_id = f"manual-chatgpt:{handoff_id}"
+        package_rel = Path("chatgpt-handoffs") / "outbox" / f"{handoff_id}.json"
+        return_rel = Path("external-results") / f"{handoff_id}.json"
+        now = _utcnow()
+
+        with self.database.sessions.begin() as session:
+            binding = session.get(AgentJobBindingRecord, source_run_id)
+            source = session.get(AgentRunRecord, source_run_id)
+            if binding is None or source is None:
+                raise ManualChatGPTHandoffError(
+                    "Source AgentRun and durable Job binding must both exist."
+                )
+            job = session.get(JobRecord, binding.job_id)
+            if job is None or job.type != AGENT_ORCHESTRATION_JOB_TYPE:
+                raise ManualChatGPTHandoffError(
+                    "Follow-up ChatGPT handoff requires an agent_orchestration Job."
+                )
+            if (
+                source.state != AgentRunState.needs_human.value
+                or source.error_category != expected_wait_category
+            ):
+                raise ManualChatGPTHandoffError(
+                    "Source AgentRun is no longer waiting at the expected durable boundary."
+                )
+            if (
+                JobState(job.state) is not JobState.needs_human
+                or job.lease_expires_at is not None
+                or job.error_category != expected_wait_category
+            ):
+                raise ManualChatGPTHandoffError(
+                    "Bound Job is no longer the expected lease-free needs_human wait."
+                )
+            pending = session.scalar(
+                select(HumanActionRecord.id).where(
+                    HumanActionRecord.run_id == source_run_id,
+                    HumanActionRecord.status == "pending",
+                )
+            )
+            if pending is not None:
+                raise ManualChatGPTHandoffError(
+                    "Source AgentRun already has a pending HumanAction."
+                )
+
+            latest_count, source_is_latest = _latest_binding_predicates(
+                job.id, source_run_id
+            )
+            tightened = session.execute(
+                update(JobRecord)
+                .where(
+                    JobRecord.id == job.id,
+                    JobRecord.type == AGENT_ORCHESTRATION_JOB_TYPE,
+                    JobRecord.state == JobState.needs_human.value,
+                    JobRecord.lease_expires_at.is_(None),
+                    JobRecord.error_category == expected_wait_category,
+                    latest_count == 1,
+                    source_is_latest,
+                )
+                .values(
+                    current_stage=MANUAL_CHATGPT_REQUIRED,
+                    error_category=MANUAL_CHATGPT_REQUIRED,
+                    updated_at=now,
+                )
+            )
+            if tightened.rowcount != 1:
+                raise ManualChatGPTHandoffError(
+                    "Job authority changed while creating follow-up ChatGPT handoff."
+                )
+
+            next_index = source.step_count + 1
+            source.step_count = next_index
+            source.error_category = MANUAL_CHATGPT_REQUIRED
+            source.error_detail = (
+                f"Durable follow-up requires ChatGPT handoff {handoff_id}."
+            )
+            source.updated_at = now
+            source.completed_at = None
+
+            session.add(
+                AgentStepRecord(
+                    run_id=source_run_id,
+                    step_index=next_index,
+                    kind="external_handoff",
+                    tool_name=MANUAL_CHATGPT_TOOL_NAME,
+                    tool_call_id=tool_call_id,
+                    input_json={
+                        "handoff_id": handoff_id,
+                        "input_hash": input_hash,
+                        "schema_version": result_contract.schema_version,
+                        "stage_revision": stage_revision,
+                    },
+                    output_json=None,
+                    evidence_refs_json=list(context_refs),
+                    status="needs_human",
+                    error_category=MANUAL_CHATGPT_REQUIRED,
+                    error_detail="Waiting for ChatGPT follow-up result via AgentDock.",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                HumanActionRecord(
+                    id=human_action_id,
+                    run_id=source_run_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=MANUAL_CHATGPT_TOOL_NAME,
+                    status="pending",
+                    request_json={
+                        "kind": "manual_chatgpt_followup",
+                        "handoff_id": handoff_id,
+                        "input_hash": input_hash,
+                        "schema_version": result_contract.schema_version,
+                        "stage_revision": stage_revision,
+                        "package_path": package_rel.as_posix(),
+                        "return_path": return_rel.as_posix(),
+                    },
+                    resolution_json=None,
+                    created_at=now,
+                    resolved_at=None,
+                )
+            )
+            session.flush()
+            session.add(
+                ManualChatGPTHandoffRecord(
+                    id=handoff_id,
+                    source_run_id=source_run_id,
+                    human_action_id=human_action_id,
+                    status="pending",
+                    stage_revision=stage_revision,
+                    schema_version=result_contract.schema_version,
+                    input_hash=input_hash,
+                    task_json=task,
+                    context_refs_json=list(context_refs),
+                    result_contract_json=contract_json,
+                    package_path=package_rel.as_posix(),
+                    result_path=None,
+                    result_json=None,
+                    created_at=now,
+                    accepted_at=None,
+                )
+            )
+            session.add(
+                JobLogRecord(
+                    job_id=job.id,
+                    level="info",
+                    message=(
+                        f"Agent run {source_run_id} converted durable wait "
+                        f"{expected_wait_category} into ChatGPT handoff {handoff_id}."
+                    ),
+                    created_at=now,
+                )
+            )
+            session.flush()
+            job_id = job.id
+
         self.materialize_package(handoff_id)
         return ManualChatGPTHandoff(
             handoff_id=handoff_id,

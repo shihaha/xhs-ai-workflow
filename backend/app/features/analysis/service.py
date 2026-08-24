@@ -523,7 +523,9 @@ class AnalysisService:
                     )
                 )
             rank_items = session.scalars(
-                select(RankItemRecord).order_by(RankItemRecord.id)
+                select(RankItemRecord)
+                .options(selectinload(RankItemRecord.snapshot))
+                .order_by(RankItemRecord.id)
             ).all()
             for item in rank_items:
                 if account_user_id is not None and item.user_id != account_user_id:
@@ -533,6 +535,7 @@ class AnalysisService:
                         evidence_id=f"rank-item:{item.id}",
                         kind="rank_item",
                         account_user_id=item.user_id,
+                        source_date=item.snapshot.source_date,
                         eligible_for_opportunity=False,
                     )
                 )

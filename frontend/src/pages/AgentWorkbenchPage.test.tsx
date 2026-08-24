@@ -54,6 +54,8 @@ const action: AgentHumanAction = {
   tool_call_id: "manual-chatgpt:handoff-1",
   tool_name: "manual_chatgpt",
   status: "pending",
+  approval_summary: null,
+  external_side_effect: false,
   can_deny: false,
   can_approve: false,
   created_at: "2026-08-23T10:01:00Z",
@@ -64,6 +66,7 @@ const continuationUnavailable: AgentOperatorCapabilities = {
   cancel_job: true,
   deny_permission_action: true,
   approve_continuation: false,
+  approve_physical_continuation: false,
   start_grounded_orchestration: false,
   continuation_reason: "Automatic Agent continuation requires a configured app-owned executor/model.",
 };
@@ -71,7 +74,13 @@ const continuationUnavailable: AgentOperatorCapabilities = {
 const continuationAvailable: AgentOperatorCapabilities = {
   ...continuationUnavailable,
   approve_continuation: true,
+  approve_physical_continuation: true,
   continuation_reason: null,
+};
+
+const physicalOnlyAvailable: AgentOperatorCapabilities = {
+  ...continuationUnavailable,
+  approve_physical_continuation: true,
 };
 
 const orchestrationAvailable: AgentOperatorCapabilities = {
@@ -236,6 +245,45 @@ describe("AgentWorkbenchPage", () => {
     await waitFor(() => expect(approvedActionId).toBe("human-1"));
   });
 
+  it("makes a real Android preflight unmistakable and requires explicit second confirmation", async () => {
+    let approvedActionId: string | null = null;
+    render(
+      <AgentWorkbenchPage
+        loadJobs={async () => [job]}
+        loadRuns={async () => [run]}
+        loadHumanActions={async () => [{
+          ...action,
+          tool_name: "shop.preflight",
+          approval_summary: "将对账号 account-a 启动真实 Android 小红书店铺预检（候选日期 2026-08-24）。",
+          external_side_effect: true,
+          can_deny: true,
+          can_approve: true,
+        }]}
+        loadHandoffs={async () => []}
+        loadCapabilities={async () => physicalOnlyAvailable}
+        approveAction={async (actionId) => {
+          approvedActionId = actionId;
+          return {
+            human_action_id: actionId,
+            job_id: "job-1",
+            source_run_id: "run-1",
+            continuation_run_id: "run-2",
+            human_action_status: "approved",
+            continuation_enqueued: true,
+          };
+        }}
+      />,
+    );
+
+    expect(await screen.findByText("Android 店铺预检")).toBeInTheDocument();
+    expect(screen.getByText(/将对账号 account-a 启动真实 Android 小红书店铺预检/)).toBeInTheDocument();
+    expect(screen.getByText(/这是真实外部操作/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "批准并继续" }));
+    expect(approvedActionId).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "确认并启动真实设备预检" }));
+    await waitFor(() => expect(approvedActionId).toBe("human-1"));
+  });
+
   it("starts grounded orchestration only after evidence selection and explicit confirmation", async () => {
     let startPayload: { goal: string; evidence_ids: string[] } | null = null;
     render(
@@ -248,7 +296,14 @@ describe("AgentWorkbenchPage", () => {
         loadEvidence={async () => [{ evidence_id: "rank-item:7", kind: "rank_item", account_user_id: "account-a", eligible_for_opportunity: false }]}
         startOrchestration={async (payload) => {
           startPayload = payload;
-          return { job_id: "job-new", run_id: "run-new", evidence_count: 1, dispatch_enqueued: true };
+          return {
+            job_id: "job-new",
+            run_id: "run-new",
+            evidence_count: 1,
+            dispatch_enqueued: true,
+            handoff_created: false,
+            handoff_id: null,
+          };
         }}
       />,
     );

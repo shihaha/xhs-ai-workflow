@@ -2,6 +2,8 @@
 
 Status: implementation slice stacked on React Agent Workbench Operator Actions V1 / PR #19.
 
+> Provider note (2026-08-24): the Bailian-only admission/configuration assumptions recorded in this historical V1 slice are superseded for new work by `26_CHATGPT_PRIMARY_REASONING_PROVIDER.md`. Keep the restart/no-replay durability behavior; do not keep Bailian as a mandatory reasoning dependency.
+
 ## Purpose
 
 Turn an exact approved permission HumanAction into real bounded Agent continuation execution without allowing React, an in-memory queue, or a physical Android/XHS/browser worker to become lifecycle authority.

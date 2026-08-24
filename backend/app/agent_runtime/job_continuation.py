@@ -30,6 +30,7 @@ from backend.app.agent_runtime.persistence import (
     AgentCheckpointRecord,
     AgentRunRecord,
     AgentRunStore,
+    AgentStepRecord,
     HumanActionRecord,
 )
 from backend.app.agent_runtime.types import AgentRunState, NextAction, RunBudget
@@ -339,6 +340,145 @@ class JobContinuationCoordinator:
             remaining_budget=remaining_budget,
             lease_expires_at=lease_expires_at,
         )
+
+    def prepare_interrupted_reapproval(self, run_id: str) -> HumanActionRecord:
+        """Create a fresh approval only when an approved continuation never started its Tool.
+
+        This is deliberately narrower than generic interruption recovery.  The
+        previous approved action is copied only when there is *no* ToolStep for
+        its tool_call_id in the interrupted continuation run.  Any started,
+        uncertain, failed, succeeded, or reused ToolStep blocks this path so an
+        external side effect can never be replayed through recovery.
+        """
+
+        now = _utcnow()
+        with self.database.sessions.begin() as session:
+            continuation = session.get(AgentContinuationRecord, run_id)
+            binding = session.get(AgentJobBindingRecord, run_id)
+            run = session.get(AgentRunRecord, run_id)
+            if continuation is None or binding is None or run is None:
+                raise ContinuationApprovalError(
+                    "Interrupted recovery requires an existing approved continuation binding."
+                )
+
+            job = session.get(JobRecord, binding.job_id)
+            original_human = session.get(
+                HumanActionRecord, continuation.human_action_id
+            )
+            if job is None or original_human is None:
+                raise ContinuationApprovalError(
+                    "Interrupted recovery lost its authoritative Job or original HumanAction."
+                )
+            if job.type != AGENT_ORCHESTRATION_JOB_TYPE:
+                raise ContinuationApprovalError("Interrupted recovery requires an Agent Job.")
+            if JobState(job.state) is not JobState.needs_human or job.lease_expires_at is not None:
+                raise ContinuationApprovalError(
+                    "Interrupted recovery requires a lease-free needs_human Job."
+                )
+            if (
+                run.state != AgentRunState.needs_human.value
+                or run.error_category != "interrupted"
+            ):
+                raise ContinuationApprovalError(
+                    "Only a plain interrupted continuation may request re-approval."
+                )
+            if original_human.status != "approved" or (
+                original_human.resolution_json or {}
+            ).get("approved") is not True:
+                raise ContinuationApprovalError(
+                    "Interrupted recovery requires the original action to be durably approved."
+                )
+
+            self._require_unique_latest_binding(session, job.id, run_id)
+            tool_step_exists = session.scalar(
+                select(AgentStepRecord.id)
+                .where(
+                    AgentStepRecord.run_id == run_id,
+                    AgentStepRecord.kind == "tool",
+                    AgentStepRecord.tool_call_id == continuation.tool_call_id,
+                )
+                .limit(1)
+            )
+            if tool_step_exists is not None:
+                raise ContinuationApprovalError(
+                    "Interrupted continuation already has durable Tool execution proof; re-approval is forbidden."
+                )
+            pending_exists = session.scalar(
+                select(HumanActionRecord.id)
+                .where(
+                    HumanActionRecord.run_id == run_id,
+                    HumanActionRecord.status == "pending",
+                )
+                .limit(1)
+            )
+            if pending_exists is not None:
+                raise ContinuationApprovalError(
+                    "Interrupted continuation already has a pending HumanAction."
+                )
+
+            try:
+                action = NextAction.model_validate(original_human.request_json["action"])
+            except (KeyError, ValueError) as exc:
+                raise ContinuationApprovalError(
+                    "Original approved HumanAction no longer contains a valid action."
+                ) from exc
+            if (
+                action.action != "tool"
+                or action.tool_name is None
+                or action.tool_call_id != continuation.tool_call_id
+                or original_human.tool_name != action.tool_name
+            ):
+                raise ContinuationApprovalError(
+                    "Original approval identity no longer matches the interrupted continuation."
+                )
+
+            recovery = HumanActionRecord(
+                id=str(uuid4()),
+                run_id=run_id,
+                tool_call_id=action.tool_call_id,
+                tool_name=action.tool_name,
+                status="pending",
+                request_json={
+                    "action": action.model_dump(mode="json"),
+                    "reason": "interrupted_before_tool_reapproval_required",
+                    "recovery_from_human_action_id": original_human.id,
+                },
+                created_at=now,
+            )
+            session.add(recovery)
+            run.error_category = "approval_required"
+            run.error_detail = (
+                "The previously approved action was interrupted before any ToolStep started; "
+                "explicit re-approval is required."
+            )
+            run.updated_at = now
+            session.add(
+                AgentCheckpointRecord(
+                    run_id=run_id,
+                    step_index=1,
+                    state_json={
+                        "state": AgentRunState.needs_human.value,
+                        "recovery": "interrupted_before_tool_reapproval",
+                        "human_action_id": recovery.id,
+                        "tool_call_id": action.tool_call_id,
+                    },
+                    created_at=now,
+                )
+            )
+            session.add(
+                JobLogRecord(
+                    job_id=job.id,
+                    level="warning",
+                    message=(
+                        f"Interrupted continuation {run_id} never started Tool call "
+                        f"{action.tool_call_id}; created recovery HumanAction {recovery.id}."
+                    ),
+                    created_at=now,
+                )
+            )
+            session.flush()
+            session.expunge(recovery)
+        return recovery
 
     def approved_action_for_run(self, run_id: str) -> NextAction:
         """Recover the exact durable approved action after a process restart."""

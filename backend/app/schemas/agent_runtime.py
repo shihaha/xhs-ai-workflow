@@ -46,6 +46,8 @@ class HumanActionSummaryRead(BaseModel):
     tool_call_id: str
     tool_name: str
     status: str
+    approval_summary: str | None = None
+    external_side_effect: bool = False
     can_deny: bool = False
     can_approve: bool = False
     created_at: datetime
@@ -103,6 +105,7 @@ class AgentRunListItemRead(AgentRunSummaryRead):
 
 class AgentRunDetailRead(AgentRunSummaryRead):
     job_id: str
+    can_request_interrupted_reapproval: bool = False
     steps: list[AgentStepRead] = Field(default_factory=list)
     human_actions: list[HumanActionSummaryRead] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
@@ -141,6 +144,7 @@ class AgentActionCapabilitiesRead(BaseModel):
     cancel_job: bool
     deny_permission_action: bool
     approve_continuation: bool
+    approve_physical_continuation: bool = False
     start_grounded_orchestration: bool = False
     continuation_reason: str | None = None
 
@@ -172,7 +176,9 @@ class AgentGroundedOrchestrationRead(BaseModel):
     job_id: str
     run_id: str
     evidence_count: int = Field(ge=1, le=20)
-    dispatch_enqueued: Literal[True]
+    dispatch_enqueued: bool
+    handoff_created: bool = False
+    handoff_id: str | None = None
 
 
 class AgentJobCancelRead(BaseModel):
@@ -198,6 +204,14 @@ class HumanActionApprovalRead(BaseModel):
     continuation_run_id: str
     human_action_status: Literal["approved"]
     continuation_enqueued: Literal[True]
+
+
+class InterruptedReapprovalRead(BaseModel):
+    human_action_id: str
+    job_id: str
+    run_id: str
+    tool_name: str
+    human_action_status: Literal["pending"]
 
 
 class HumanActionDecisionRead(BaseModel):

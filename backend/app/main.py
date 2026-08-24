@@ -22,8 +22,22 @@ from backend.app.adapters.qianfan_playwright import (
     persistent_qianfan_page_factory,
 )
 from backend.app.agent_runtime.continuation_executor import AgentContinuationExecutor
+from backend.app.agent_runtime.chatgpt_scope_result import (
+    AgentChatGPTScopeResultReconciler,
+    AgentChatGPTScopeResultWorker,
+)
 from backend.app.agent_runtime.initial_execution import AgentInitialExecutor
+from backend.app.agent_runtime.initial_chatgpt_decision import (
+    AgentInitialChatGPTDecisionReconciler,
+    AgentInitialChatGPTDecisionWorker,
+)
+from backend.app.agent_runtime.manual_chatgpt_handoff import ManualChatGPTHandoffService
 from backend.app.agent_runtime.orchestration_service import AgentOrchestrationService
+from backend.app.agent_runtime.physical_followup import (
+    AgentPhysicalFollowupReconciler,
+    AgentPhysicalFollowupWorker,
+)
+from backend.app.agent_runtime.physical_tools import SHOP_PREFLIGHT_TOOL_NAME
 from backend.app.agent_runtime.production_runtime import (
     automatic_agent_configured,
     build_production_job_bound_runtime,
@@ -68,11 +82,26 @@ async def _lifespan(app: FastAPI):
     initial_executor: AgentInitialExecutor | None = getattr(
         app.state, "agent_initial_executor", None
     )
+    physical_followup_worker: AgentPhysicalFollowupWorker | None = getattr(
+        app.state, "agent_physical_followup_worker", None
+    )
+    initial_chatgpt_worker: AgentInitialChatGPTDecisionWorker | None = getattr(
+        app.state, "agent_initial_chatgpt_worker", None
+    )
+    chatgpt_scope_worker: AgentChatGPTScopeResultWorker | None = getattr(
+        app.state, "agent_chatgpt_scope_worker", None
+    )
     try:
         if initial_executor is not None:
             initial_executor.start()
         if continuation_executor is not None:
             continuation_executor.start()
+        if physical_followup_worker is not None:
+            physical_followup_worker.start()
+        if initial_chatgpt_worker is not None:
+            initial_chatgpt_worker.start()
+        if chatgpt_scope_worker is not None:
+            chatgpt_scope_worker.start()
         if media_worker is not None:
             media_worker.start()
         if cleanup_worker is not None:
@@ -85,6 +114,12 @@ async def _lifespan(app: FastAPI):
         continuation_safe = True
         if continuation_executor is not None:
             continuation_safe = continuation_executor.close()
+        if physical_followup_worker is not None:
+            physical_followup_worker.close()
+        if initial_chatgpt_worker is not None:
+            initial_chatgpt_worker.close()
+        if chatgpt_scope_worker is not None:
+            chatgpt_scope_worker.close()
         media_safe = True
         if media_worker is not None:
             media_safe = media_worker.close()
@@ -127,6 +162,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.agent_continuation_executor = None
     app.state.agent_initial_executor = None
     app.state.agent_orchestration_service = None
+    app.state.agent_physical_followup_worker = None
+    app.state.agent_initial_chatgpt_worker = None
+    app.state.agent_chatgpt_scope_worker = None
+    app.state.agent_manual_handoff_service = None
     app.state.radar_service = None
     app.state.adapter_registry = None
     app.state.xhs_collection_service = None
@@ -217,12 +256,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 analysis_service=app.state.analysis_service,
                 bailian_adapter=app.state.bailian_adapter,
                 continuations=executor.coordinator,
+                radar_service=app.state.radar_service,
+                shop_service=app.state.shop_service,
             )
 
         executor = AgentContinuationExecutor(
             app.state.database,
             runtime_factory=runtime_factory,
             approval_enabled=automatic_agent_configured(app.state.bailian_adapter),
+            approval_admission=lambda action: (
+                automatic_agent_configured(app.state.bailian_adapter)
+                or action.tool_name == SHOP_PREFLIGHT_TOOL_NAME
+            ),
         )
         app.state.agent_continuation_executor = executor
         initial_executor = AgentInitialExecutor(
@@ -231,14 +276,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             launch_enabled=automatic_agent_configured(app.state.bailian_adapter),
         )
         app.state.agent_initial_executor = initial_executor
+        app.state.agent_manual_handoff_service = ManualChatGPTHandoffService(
+            app.state.database,
+            runtime_dir=app.state.settings.runtime_dir,
+        )
         app.state.agent_orchestration_service = AgentOrchestrationService(
             analysis_service=app.state.analysis_service,
             initial_executor=initial_executor,
+            manual_handoff_service=app.state.agent_manual_handoff_service,
         )
         app.state.agent_workbench_actions = AgentWorkbenchActionService(
             app.state.database,
             continuation_executor=executor,
             initial_executor=initial_executor,
+            initial_chatgpt_enabled=True,
+        )
+        app.state.agent_physical_followup_worker = AgentPhysicalFollowupWorker(
+            AgentPhysicalFollowupReconciler(
+                app.state.database,
+                runtime_dir=app.state.settings.runtime_dir,
+            )
+        )
+        app.state.agent_initial_chatgpt_worker = AgentInitialChatGPTDecisionWorker(
+            AgentInitialChatGPTDecisionReconciler(
+                app.state.database,
+                runtime_factory=runtime_factory,
+            )
         )
         app.state.artifact_cleanup_service = ArtifactCleanupService(
             app.state.database,
@@ -284,6 +347,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.agent_continuation_executor = None
         app.state.agent_initial_executor = None
         app.state.agent_orchestration_service = None
+        app.state.agent_physical_followup_worker = None
+        app.state.agent_initial_chatgpt_worker = None
+        app.state.agent_chatgpt_scope_worker = None
+        app.state.agent_manual_handoff_service = None
         app.state.adapter_registry = None
         app.state.xhs_collection_service = None
         app.state.radar_service = None
@@ -304,7 +371,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.shop_service = ShopCollectionService(
             job_service=app.state.job_service,
             device_adapter=app.state.android_adapter,
-            scope_model_adapter=app.state.bailian_adapter,
+            # Keep this gate deterministic and cheap.  Ambiguous scope evidence
+            # is routed through the durable ChatGPT handoff path instead of a
+            # mandatory Bailian fallback.
+            scope_model_adapter=None,
+        )
+        app.state.agent_chatgpt_scope_worker = AgentChatGPTScopeResultWorker(
+            AgentChatGPTScopeResultReconciler(
+                app.state.database,
+                shop_service=app.state.shop_service,
+            )
         )
     app.include_router(health_router)
     app.include_router(jobs_router)

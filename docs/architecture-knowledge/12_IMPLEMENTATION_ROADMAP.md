@@ -355,7 +355,8 @@ qianfan.collect_rank_scope
 - no automatic physical replay after restart;
 - every collected result goes through existing service/evidence persistence;
 - candidate order/sample semantics do not change;
-- pause/cancel/human takeover remain.
+- pause/cancel/human takeover remain;
+- missing Bailian/local-model configuration is not a Stage 6 blocker; when deterministic evidence is ambiguous, route reasoning through the durable ChatGPT handoff/result path instead of treating provider absence as failure.
 
 ## Acceptance
 

@@ -211,6 +211,8 @@ CopilotKit/AG-UI may render/transport events, but backend events and commands re
 
 ## 8. V1 role of AI
 
+**Provider decision (2026-08-24):** ChatGPT is the primary external reasoning provider for the operator workflow. Bailian/local model adapters are optional accelerators, not required dependencies. Deterministic code should decide locally when it can; ambiguous reasoning should use the durable ChatGPT handoff/result path. See `26_CHATGPT_PRIMARY_REASONING_PROVIDER.md`.
+
 The Agent gets more autonomy over **sequence**, not over **truth or authority**.
 
 It may:

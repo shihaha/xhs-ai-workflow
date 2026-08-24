@@ -92,6 +92,8 @@ export interface AgentHumanAction {
   tool_call_id: string;
   tool_name: string;
   status: string;
+  approval_summary: string | null;
+  external_side_effect: boolean;
   can_deny: boolean;
   can_approve: boolean;
   created_at: string;
@@ -104,6 +106,8 @@ export interface AgentHumanActionSummary {
   tool_call_id: string;
   tool_name: string;
   status: string;
+  approval_summary: string | null;
+  external_side_effect: boolean;
   can_deny: boolean;
   can_approve: boolean;
   created_at: string;
@@ -184,6 +188,7 @@ export interface AgentOperatorCapabilities {
   cancel_job: boolean;
   deny_permission_action: boolean;
   approve_continuation: boolean;
+  approve_physical_continuation: boolean;
   start_grounded_orchestration: boolean;
   continuation_reason: string | null;
 }
@@ -192,7 +197,9 @@ export interface AgentGroundedOrchestration {
   job_id: string;
   run_id: string;
   evidence_count: number;
-  dispatch_enqueued: true;
+  dispatch_enqueued: boolean;
+  handoff_created: boolean;
+  handoff_id: string | null;
 }
 
 export interface AgentJobCancelResult {
@@ -271,7 +278,7 @@ export interface Account {
   accessibility: number; fans: number; gmv: string; pay: string; read: string; nday: number; nboard: number;
 }
 export interface DeviceHealth { status: "available" | "unavailable" | "needs_human"; device_id: string | null; detail: string; raw_evidence: Record<string, unknown>; }
-export interface AnalysisEvidence { evidence_id: string; kind: string; account_user_id: string | null; eligible_for_opportunity: boolean; }
+export interface AnalysisEvidence { evidence_id: string; kind: string; account_user_id: string | null; source_date?: string | null; eligible_for_opportunity: boolean; }
 export interface CollectionQueued { job_id: string; status: "queued"; }
 export interface ShopPreflightCreate {
   account_user_id: string;
