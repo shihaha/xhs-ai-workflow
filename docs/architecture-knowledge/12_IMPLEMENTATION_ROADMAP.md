@@ -364,23 +364,27 @@ Run controlled real UAT for one permitted path and verify DB/files/artifacts/SHA
 
 ---
 
-# Stage 7 — Add Project + business journey
+# Stage 7 — Business journey surface
 
 ## Goal
 
-Move from a collection of pages/jobs into the complete A/B/C/D workbench model.
+Move from a collection of pages/jobs into the complete A/B/C/D business journey without forcing a generic Project-first abstraction into the operator UI.
 
-Add a lightweight Project domain layer that references, not duplicates:
+The authoritative product standard is `28_TUTORIAL_ALIGNED_BUSINESS_WORKBENCH_STANDARD.md`.
+
+### 7.1 / 7.2 — Demand Radar business projection: IMPLEMENTED LOCALLY
+
+The first slice reuses the existing durable chain:
 
 ```text
-Opportunity
-Product Definition
-Product Build handoff/result
-Finished Product
-Content work
+Analysis -> OpportunityRecord -> ProductRecord -> ContentItem
 ```
 
-UI shows:
+and adds a read-only business projection plus tutorial-aligned Demand Radar.
+
+No Project table is required for this slice. Add a lightweight Project/BusinessCase entity later only if it solves a real cross-stage relational-continuity problem that existing stable references cannot solve.
+
+The UI must keep these concepts separate:
 
 ```text
 implemented
@@ -388,11 +392,13 @@ proven
 authorized
 ```
 
-as separate concepts.
+The implementation contract and local validation are recorded in `29_DEMAND_RADAR_BUSINESS_SURFACE_V1.md`.
 
 ### Important
 
-Do not retroactively rewrite historical Phase A records merely to attach them to Project; use stable references/migration records.
+Do not retroactively rewrite historical Phase A records merely to attach them to Project/BusinessCase. If such an entity is introduced later, use stable references/migration records.
+
+Do not enter Product Definition / Phase B until Stage 7.1/7.2 are formally accepted.
 
 ---
 

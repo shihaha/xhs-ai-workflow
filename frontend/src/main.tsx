@@ -5,6 +5,7 @@ import { AgentJobDetailPage, AgentRunDetailPage, AgentWorkbenchPage } from "./pa
 import { JobsPage } from "./pages/JobsPage";
 import { AccountPage } from "./pages/AccountPage";
 import { ContentStudioPage } from "./pages/ContentStudioPage";
+import { DemandRadarPage } from "./pages/DemandRadarPage";
 import { OpportunitiesPage } from "./pages/OpportunitiesPage";
 import { RadarPage } from "./pages/RadarPage";
 import { SystemStatusPage } from "./pages/SystemStatusPage";
@@ -20,16 +21,16 @@ export function App({ pathname = window.location.pathname }: { pathname?: string
       <header className="app-header">
         <a className="product-name" href="/status">小红书需求雷达工作台</a>
         <nav aria-label="工作台导航">
-          <a aria-current={pathname === "/radar" ? "page" : undefined} href="/radar">需求雷达</a>
+          <a aria-current={pathname === "/opportunities" ? "page" : undefined} href="/opportunities">需求雷达</a>
+          <a aria-current={pathname === "/radar" ? "page" : undefined} href="/radar">采集控制</a>
           <a aria-current={pathname.startsWith("/accounts/") ? "page" : undefined} href="/radar">账号证据</a>
-          <a aria-current={pathname === "/opportunities" ? "page" : undefined} href="/opportunities">机会审核</a>
           <a aria-current={pathname === "/content" ? "page" : undefined} href="/content">内容工作台</a>
           <a aria-current={pathname === "/status" ? "page" : undefined} href="/status">系统状态</a>
           <a aria-current={pathname === "/agent" || pathname.startsWith("/agent/") ? "page" : undefined} href="/agent">Agent 工作台</a>
           <a aria-current={pathname === "/jobs" ? "page" : undefined} href="/jobs">任务记录</a>
         </nav>
       </header>
-      {pathname === "/radar" ? <RadarPage /> : accountMatch ? <AccountPage accountId={decodeURIComponent(accountMatch[1])} /> : pathname === "/opportunities" ? <OpportunitiesPage /> : pathname === "/content" ? <ContentStudioPage /> : pathname === "/status" ? <SystemStatusPage /> : pathname === "/agent" ? <AgentWorkbenchPage /> : agentJobMatch ? <AgentJobDetailPage jobId={decodeURIComponent(agentJobMatch[1])} /> : agentRunMatch ? <AgentRunDetailPage runId={decodeURIComponent(agentRunMatch[1])} /> : pathname === "/jobs" ? <JobsPage /> : <NotFoundPage />}
+      {pathname === "/radar" ? <RadarPage /> : accountMatch ? <AccountPage accountId={decodeURIComponent(accountMatch[1])} /> : pathname === "/opportunities" ? <DemandRadarPage /> : pathname === "/opportunities/analysis" ? <OpportunitiesPage /> : pathname === "/content" ? <ContentStudioPage /> : pathname === "/status" ? <SystemStatusPage /> : pathname === "/agent" ? <AgentWorkbenchPage /> : agentJobMatch ? <AgentJobDetailPage jobId={decodeURIComponent(agentJobMatch[1])} /> : agentRunMatch ? <AgentRunDetailPage runId={decodeURIComponent(agentRunMatch[1])} /> : pathname === "/jobs" ? <JobsPage /> : <NotFoundPage />}
     </div>
   );
 }
