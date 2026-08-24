@@ -34,6 +34,7 @@ const controlledRadar = {
           price: "¥19.9",
           sold: "1.2万+",
           image_evidence_count: 6,
+          image_artifact_ids: [21],
         },
         {
           account_user_id: "controlled-account-b",
@@ -43,6 +44,7 @@ const controlledRadar = {
           price: "¥29.9",
           sold: "8300+",
           image_evidence_count: 5,
+          image_artifact_ids: [],
         },
       ],
       linked_products: [],
@@ -99,6 +101,11 @@ const controlledRadar = {
 };
 
 async function openControlledRadar(page: Page) {
+  await page.route("**/api/v1/business/demand-radar/controlled-opportunity-1/media/21", route => route.fulfill({
+    status: 200,
+    contentType: "image/png",
+    body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+  }));
   await page.route("**/api/v1/business/demand-radar", route => route.fulfill({
     status: 200,
     contentType: "application/json",
@@ -117,6 +124,10 @@ test("desktop demand radar prioritizes business decisions without horizontal ove
   await expect(page.getByRole("heading", { name: "人格测试 / 七宗罪方向" })).toBeVisible();
   await expect(page.getByText("价格 ¥19.9")).toBeVisible();
   await expect(page.getByText("销量 1.2万+")).toBeVisible();
+  await expect(page.getByAltText("七宗罪人格测试完整版 证据图 1")).toBeVisible();
+  await page.getByRole("button", { name: "放大查看七宗罪人格测试完整版 证据图 1" }).click();
+  await expect(page.getByRole("dialog", { name: "商品证据大图" })).toBeVisible();
+  await page.getByRole("button", { name: "关闭大图" }).click();
   await expect(page.getByRole("button", { name: "跟进这个方向" })).toHaveCount(1);
   await expect(page.getByText("共同具体需求尚未被持久化证明，当前不能跟进。")).toBeVisible();
   await expect(page.getByText(/不等于新的 Product Definition Gate 已通过/)).toBeVisible();

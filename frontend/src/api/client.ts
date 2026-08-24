@@ -336,6 +336,7 @@ export interface DemandRadarProduct {
   price: string | null;
   sold: string | null;
   image_evidence_count: number;
+  image_artifact_ids: number[];
 }
 export interface DemandRadarLinkedProduct {
   product_id: string;
@@ -430,6 +431,8 @@ export const fetchAnalyses = () => getJson<Analysis[]>("/api/v1/analyses");
 export const fetchOpportunities = () => getJson<Opportunity[]>("/api/v1/opportunities");
 export const reviewOpportunity = (opportunityId: string, payload: { decision: "approve" | "reject"; reason?: string }) => postJson<Opportunity>(`/api/v1/opportunities/${encodeURIComponent(opportunityId)}/review`, payload);
 export const fetchDemandRadar = () => getJson<DemandRadar>("/api/v1/business/demand-radar");
+export const demandRadarMediaUrl = (opportunityId: string, artifactId: number) =>
+  `/api/v1/business/demand-radar/${encodeURIComponent(opportunityId)}/media/${artifactId}`;
 export const fetchProducts = () => getJson<Product[]>("/api/v1/products");
 export const fetchContentItems = () => getJson<ContentItem[]>("/api/v1/content-items");
 export const fetchContentPackages = () => getJson<ContentPackage[]>("/api/v1/content-packages");

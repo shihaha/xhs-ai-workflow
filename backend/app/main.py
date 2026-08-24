@@ -251,7 +251,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             runtime_dir=app.state.settings.runtime_dir,
         )
         app.state.business_workbench_service = BusinessWorkbenchService(
-            app.state.database
+            app.state.database,
+            runtime_dir=app.state.settings.runtime_dir,
         )
         executor: AgentContinuationExecutor
 

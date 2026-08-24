@@ -206,7 +206,8 @@ Recovered/reconstructed proprietary source may be studied for architecture but m
 - `26_CHATGPT_PRIMARY_REASONING_PROVIDER.md` — authoritative provider override: ChatGPT is the primary external reasoning provider; Bailian/local models are optional accelerators, not required workflow dependencies.
 - `27_PHYSICAL_COLLECTION_BOUNDARY_V1.md` — first permission-gated real Android `shop.preflight` boundary, ChatGPT-primary initial/follow-up reasoning, physical-result reconciliation, restart safety and controlled real-device UAT.
 - `28_TUTORIAL_ALIGNED_BUSINESS_WORKBENCH_STANDARD.md` — Stage-7 pre-implementation product standard aligned to the tutorial text, tutorial dashboard/product/content screenshots, and the durable A/B/C/D + Skill/Human-Gate discussion; explicitly rejects a generic Project-first UI.
-- `29_DEMAND_RADAR_BUSINESS_SURFACE_V1.md` — Stage 7.1/7.2 implementation contract: existing durable Opportunity/Product truth projected into a tutorial-aligned Demand Radar, backend-derived follow authority, desktop/mobile acceptance, and the remaining safe Artifact-image display gap.
+- `29_DEMAND_RADAR_BUSINESS_SURFACE_V1.md` — Stage 7.1/7.2 implementation contract: existing durable Opportunity/Product truth projected into a tutorial-aligned Demand Radar, backend-derived follow authority and desktop/mobile acceptance.
+- `30_DEMAND_RADAR_SAFE_MEDIA_V1.md` — Stage 7.2.1 safe-media contract: Opportunity-scoped immutable detail-screen evidence mapped to same-Job screenshot Artifacts, SHA/file/image revalidation, real product thumbnails and click-to-inspect without exposing local paths or creating a generic Artifact browser.
 
 ## Rule for future AI sessions
 

@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date
+from hashlib import sha256
+from io import BytesIO
+from pathlib import Path
 from typing import Any, Callable
 
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from backend.app.db import Database
 from backend.app.features.analysis.models import OpportunityRecord
+from backend.app.features.content.export import UnsafeContentPath, read_contained_regular
 from backend.app.features.content.models import ProductRecord
 from backend.app.features.business.schemas import (
     DemandRadarDirectionRead,
@@ -19,11 +25,48 @@ from backend.app.features.business.schemas import (
     DemandRadarRead,
     DemandRadarSummaryRead,
 )
+from backend.app.models.jobs import JobArtifactRecord
+
+
+_IMAGE_ARTIFACT_KIND = "android_screenshot"
+_SHOP_RESULT_ARTIFACT_KIND = "shop_collection_result"
+_SHOP_RESULT_PRODUCER = "android_shop_worker_v1"
+_SAFE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+_SAFE_IMAGE_TYPES = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "WEBP": "image/webp",
+}
+_MAX_IMAGE_BYTES = 12 * 1024 * 1024
+_MAX_IMAGE_PIXELS = 24_000_000
+
+
+class DemandRadarMediaNotFound(LookupError):
+    """Requested media is not part of this Opportunity's immutable evidence scope."""
+
+
+class DemandRadarMediaUnsafe(RuntimeError):
+    """An allowed Artifact failed bounded runtime-file/image integrity checks."""
+
+
+@dataclass(frozen=True)
+class DemandRadarImagePayload:
+    payload: bytes
+    media_type: str
+    sha256: str
 
 
 class BusinessWorkbenchService:
-    def __init__(self, database: Database, *, today: Callable[[], date] = date.today) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        runtime_dir: Path | None = None,
+        today: Callable[[], date] = date.today,
+    ) -> None:
         self.database = database
+        resolved_runtime = runtime_dir or database.runtime_dir
+        self.runtime_dir = resolved_runtime.resolve() if resolved_runtime is not None else None
         self.today = today
 
     def demand_radar(self) -> DemandRadarRead:
@@ -42,6 +85,8 @@ class BusinessWorkbenchService:
                 )
             )
 
+        image_context = self._image_context(opportunities)
+
         products_by_opportunity: dict[str, list[ProductRecord]] = defaultdict(list)
         for product in products:
             products_by_opportunity[product.opportunity_id].append(product)
@@ -51,6 +96,7 @@ class BusinessWorkbenchService:
                 opportunity,
                 linked_products=products_by_opportunity.get(opportunity.id, []),
                 generated_on=generated_on,
+                image_context=image_context,
             )
             for opportunity in opportunities
         ]
@@ -80,14 +126,92 @@ class BusinessWorkbenchService:
             directions=directions,
         )
 
+    def demand_radar_image(
+        self, opportunity_id: str, artifact_id: int
+    ) -> DemandRadarImagePayload:
+        """Return one bounded image only when it belongs to immutable Opportunity evidence."""
+
+        if artifact_id < 1 or self.runtime_dir is None:
+            raise DemandRadarMediaNotFound("Demand Radar media is unavailable.")
+        with self.database.session() as session:
+            opportunity = session.scalar(
+                select(OpportunityRecord)
+                .options(selectinload(OpportunityRecord.analysis))
+                .where(OpportunityRecord.id == opportunity_id)
+            )
+        if opportunity is None:
+            raise DemandRadarMediaNotFound("Demand Radar media is unavailable.")
+
+        image_context = self._image_context([opportunity])
+        allowed_ids: set[int] = set()
+        for support in opportunity.supporting_products_json or []:
+            if not isinstance(support, dict):
+                continue
+            key = _support_product_key(support)
+            if key is None:
+                continue
+            allowed_ids.update(image_context.get(key, {}).get("image_artifact_ids", []))
+        if artifact_id not in allowed_ids:
+            raise DemandRadarMediaNotFound("Demand Radar media is unavailable.")
+
+        with self.database.session() as session:
+            artifact = session.get(JobArtifactRecord, artifact_id)
+        if artifact is None or artifact.kind != _IMAGE_ARTIFACT_KIND:
+            raise DemandRadarMediaNotFound("Demand Radar media is unavailable.")
+
+        expected_sha = artifact.metadata_json.get("sha256")
+        if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+            raise DemandRadarMediaUnsafe("Image Artifact has no trusted digest.")
+        if not artifact.path.lower().endswith(_SAFE_IMAGE_SUFFIXES):
+            raise DemandRadarMediaUnsafe("Image Artifact uses an unsupported file type.")
+        try:
+            payload = read_contained_regular(
+                self.runtime_dir,
+                artifact.path,
+                limit=_MAX_IMAGE_BYTES,
+            )
+        except UnsafeContentPath as error:
+            raise DemandRadarMediaUnsafe("Image Artifact is unavailable or unsafe.") from error
+        digest = sha256(payload).hexdigest()
+        if digest != expected_sha:
+            raise DemandRadarMediaUnsafe("Image Artifact digest changed after analysis.")
+
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                image_format = image.format
+                width, height = image.size
+                if (
+                    image_format not in _SAFE_IMAGE_TYPES
+                    or width < 1
+                    or height < 1
+                    or width * height > _MAX_IMAGE_PIXELS
+                    or getattr(image, "is_animated", False)
+                ):
+                    raise DemandRadarMediaUnsafe("Image Artifact is outside the safe media contract.")
+                image.verify()
+        except DemandRadarMediaUnsafe:
+            raise
+        except (OSError, UnidentifiedImageError, ValueError, TypeError) as error:
+            raise DemandRadarMediaUnsafe("Image Artifact failed image validation.") from error
+
+        assert image_format is not None
+        return DemandRadarImagePayload(
+            payload=payload,
+            media_type=_SAFE_IMAGE_TYPES[image_format],
+            sha256=digest,
+        )
+
     def _direction(
         self,
         opportunity: OpportunityRecord,
         *,
         linked_products: list[ProductRecord],
         generated_on: date,
+        image_context: dict[tuple[str, str, str], dict[str, Any]],
     ) -> DemandRadarDirectionRead:
-        representative_products = _representative_products(opportunity)
+        representative_products = _representative_products(
+            opportunity, image_context=image_context
+        )
         if opportunity.review_status == "rejected":
             journey_stage = "closed"
             next_business_action = "这个方向已经被拒绝；保留证据用于审计，不进入产品定义。"
@@ -136,9 +260,157 @@ class BusinessWorkbenchService:
             reviewed_at=opportunity.reviewed_at,
         )
 
+    def _image_context(
+        self, opportunities: list[OpportunityRecord]
+    ) -> dict[tuple[str, str, str], dict[str, Any]]:
+        """Resolve immutable snapshot product image paths to opaque Artifact ids."""
 
-def _representative_products(opportunity: OpportunityRecord) -> list[DemandRadarProductRead]:
-    lookup = _snapshot_product_facts(opportunity)
+        result_artifact_ids: set[int] = set()
+        for opportunity in opportunities:
+            snapshot = (
+                opportunity.analysis.evidence_snapshot_json
+                if opportunity.analysis is not None
+                else None
+            )
+            facts = snapshot.get("facts") if isinstance(snapshot, dict) else None
+            if not isinstance(facts, list):
+                continue
+            for fact in facts:
+                if not isinstance(fact, dict):
+                    continue
+                artifact_id = _artifact_evidence_id(fact.get("evidence_id"))
+                if artifact_id is not None:
+                    result_artifact_ids.add(artifact_id)
+        if not result_artifact_ids:
+            return {}
+
+        with self.database.session() as session:
+            result_artifacts = list(
+                session.scalars(
+                    select(JobArtifactRecord).where(
+                        JobArtifactRecord.id.in_(result_artifact_ids),
+                        JobArtifactRecord.kind == _SHOP_RESULT_ARTIFACT_KIND,
+                        JobArtifactRecord.producer == _SHOP_RESULT_PRODUCER,
+                    )
+                )
+            )
+            job_ids = {artifact.job_id for artifact in result_artifacts}
+            screenshot_artifacts = (
+                list(
+                    session.scalars(
+                        select(JobArtifactRecord).where(
+                            JobArtifactRecord.job_id.in_(job_ids),
+                            JobArtifactRecord.kind == _IMAGE_ARTIFACT_KIND,
+                        )
+                    )
+                )
+                if job_ids
+                else []
+            )
+        result_by_id = {artifact.id: artifact for artifact in result_artifacts}
+        screenshot_by_job_path = {
+            (artifact.job_id, artifact.path): artifact for artifact in screenshot_artifacts
+        }
+
+        context: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for opportunity in opportunities:
+            snapshot = (
+                opportunity.analysis.evidence_snapshot_json
+                if opportunity.analysis is not None
+                else None
+            )
+            facts = snapshot.get("facts") if isinstance(snapshot, dict) else None
+            if not isinstance(facts, list):
+                continue
+            for fact in facts:
+                if not isinstance(fact, dict):
+                    continue
+                evidence_id = fact.get("evidence_id")
+                result_artifact_id = _artifact_evidence_id(evidence_id)
+                result_artifact = result_by_id.get(result_artifact_id or -1)
+                trusted = fact.get("trusted_shop_result")
+                if (
+                    not isinstance(evidence_id, str)
+                    or result_artifact is None
+                    or not isinstance(trusted, dict)
+                ):
+                    continue
+                items = trusted.get("items")
+                evidence_artifacts = trusted.get("evidence_artifacts")
+                if not isinstance(items, list) or not isinstance(evidence_artifacts, list):
+                    continue
+                for product in items:
+                    if not isinstance(product, dict):
+                        continue
+                    data = product.get("data") if isinstance(product.get("data"), dict) else {}
+                    raw = (
+                        product.get("raw_evidence")
+                        if isinstance(product.get("raw_evidence"), dict)
+                        else {}
+                    )
+                    product_id = str(product.get("id") or "")
+                    source_url = str(product.get("source_url") or "")
+                    key = (evidence_id, product_id, source_url)
+                    image_ids: list[int] = []
+                    detail_screen = (
+                        raw.get("detail_screen")
+                        if isinstance(raw.get("detail_screen"), dict)
+                        else None
+                    )
+                    detail_paths = (
+                        detail_screen.get("artifacts")
+                        if isinstance(detail_screen, dict)
+                        and isinstance(detail_screen.get("artifacts"), list)
+                        else []
+                    )
+                    detail_transition = (
+                        detail_screen.get("transition")
+                        if isinstance(detail_screen, dict)
+                        and isinstance(detail_screen.get("transition"), str)
+                        else None
+                    )
+                    detail_sha = (
+                        detail_screen.get("screenshot_sha256")
+                        if isinstance(detail_screen, dict)
+                        and isinstance(detail_screen.get("screenshot_sha256"), str)
+                        else None
+                    )
+                    for raw_path in detail_paths:
+                        if (
+                            not isinstance(raw_path, str)
+                            or raw_path not in evidence_artifacts
+                            or not raw_path.lower().endswith(_SAFE_IMAGE_SUFFIXES)
+                        ):
+                            continue
+                        artifact = screenshot_by_job_path.get(
+                            (result_artifact.job_id, raw_path)
+                        )
+                        if artifact is None:
+                            continue
+                        digest = artifact.metadata_json.get("sha256")
+                        transition = artifact.metadata_json.get("transition")
+                        if (
+                            not isinstance(digest, str)
+                            or len(digest) != 64
+                            or detail_sha != digest
+                            or detail_transition != transition
+                        ):
+                            continue
+                        image_ids.append(artifact.id)
+                    context[key] = {
+                        "price": data.get("price") or raw.get("price"),
+                        "sold": data.get("sold") or raw.get("sold"),
+                        "image_artifact_ids": image_ids,
+                    }
+        return context
+
+
+def _representative_products(
+    opportunity: OpportunityRecord,
+    *,
+    image_context: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[DemandRadarProductRead]:
+    fallback = _snapshot_product_facts(opportunity)
     rows: list[DemandRadarProductRead] = []
     for item in (opportunity.supporting_products_json or [])[:3]:
         if not isinstance(item, dict):
@@ -146,7 +418,8 @@ def _representative_products(opportunity: OpportunityRecord) -> list[DemandRadar
         source_url = str(item.get("source_url") or "")
         product_id = str(item.get("product_id") or "")
         account_user_id = str(item.get("account_user_id") or "")
-        observed = lookup.get((str(item.get("evidence_id") or ""), product_id, source_url), {})
+        key = (str(item.get("evidence_id") or ""), product_id, source_url)
+        observed = image_context.get(key) or fallback.get(key, {})
         rows.append(
             DemandRadarProductRead(
                 account_user_id=account_user_id,
@@ -156,9 +429,35 @@ def _representative_products(opportunity: OpportunityRecord) -> list[DemandRadar
                 price=_safe_text(observed.get("price")),
                 sold=_safe_text(observed.get("sold")),
                 image_evidence_count=max(0, int(item.get("image_evidence_count") or 0)),
+                image_artifact_ids=[
+                    int(artifact_id)
+                    for artifact_id in observed.get("image_artifact_ids", [])
+                    if isinstance(artifact_id, int) and not isinstance(artifact_id, bool)
+                ],
             )
         )
     return rows
+
+
+def _artifact_evidence_id(value: object) -> int | None:
+    if not isinstance(value, str):
+        return None
+    prefix, separator, raw_id = value.partition(":")
+    if prefix != "artifact" or separator != ":" or not raw_id.isdigit():
+        return None
+    artifact_id = int(raw_id)
+    return artifact_id if artifact_id > 0 else None
+
+
+def _support_product_key(item: dict[str, Any]) -> tuple[str, str, str] | None:
+    evidence_id = item.get("evidence_id")
+    if not isinstance(evidence_id, str) or _artifact_evidence_id(evidence_id) is None:
+        return None
+    return (
+        evidence_id,
+        str(item.get("product_id") or ""),
+        str(item.get("source_url") or ""),
+    )
 
 
 def _snapshot_product_facts(opportunity: OpportunityRecord) -> dict[tuple[str, str, str], dict[str, Any]]:

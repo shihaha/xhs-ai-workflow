@@ -1,0 +1,79 @@
+name: Demand Radar Safe Media V1 Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/project-business-journey-v1
+    paths:
+      - 'backend/app/features/business/**'
+      - 'backend/app/main.py'
+      - 'backend/tests/business/**'
+      - 'frontend/src/api/client.ts'
+      - 'frontend/src/pages/DemandRadarPage.tsx'
+      - 'frontend/src/pages/DemandRadarPage.test.tsx'
+      - 'frontend/src/styles.css'
+      - 'frontend/e2e/demand-radar-business-surface.spec.ts'
+      - 'frontend/playwright.demand-radar.config.ts'
+      - 'docs/WORKBENCH_RESEARCH_INDEX.md'
+      - 'docs/architecture-knowledge/12_IMPLEMENTATION_ROADMAP.md'
+      - 'docs/architecture-knowledge/30_DEMAND_RADAR_SAFE_MEDIA_V1.md'
+      - '.github/workflows/demand-radar-safe-media-v1.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  backend-safe-media:
+    name: Opportunity-scoped safe media boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compile backend
+        run: python -m compileall -q backend
+      - name: Verify Safe Media business contract
+        run: python -m pytest backend/tests/business -q
+      - name: Recheck Agent Runtime authority boundary
+        run: python -m pytest backend/tests/agent_runtime -q
+      - name: Scan release boundaries
+        run: python tools/scan_release_boundaries.py --root .
+
+  frontend-safe-media:
+    name: Real-image Demand Radar desktop and mobile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Run focused Demand Radar tests
+        run: npm test -- --run src/pages/DemandRadarPage.test.tsx
+      - name: Run complete frontend regression
+        run: npm test -- --run
+      - name: Build production frontend
+        run: npm run build
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Verify thumbnail/lightbox desktop and mobile layout
+        run: npx playwright test --config=playwright.demand-radar.config.ts

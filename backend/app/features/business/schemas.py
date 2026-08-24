@@ -20,6 +20,7 @@ class DemandRadarProductRead(_StrictModel):
     price: str | None = None
     sold: str | None = None
     image_evidence_count: int = Field(ge=0)
+    image_artifact_ids: list[int] = Field(default_factory=list)
 
 
 class DemandRadarLinkedProductRead(_StrictModel):
