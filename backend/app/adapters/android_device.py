@@ -33,7 +33,9 @@ from backend.app.services.shop_discovery import persist_shop_product_discovery
 
 DEFAULT_SELECTOR_PROFILE_VERSION = "xhs-android-2026-08-v1"
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9_-]{1,500}")
-_PRICE_SOLD = re.compile(r"^(?:到手价)?(¥[\d.]+)已售([\d.万+]+)")
+_PRICE_SOLD = re.compile(
+    r"^(?:到手价)?(¥\d+(?:\.\d+)?)[.·]?已售([\d.万+]+)"
+)
 _IMAGE_SCREENSHOT_KIND = "android_screenshot"
 _HIERARCHY_KIND = "android_ui_hierarchy"
 _ZERO_WIDTH = "\u200b\u200c\u200d\ufeff"
@@ -208,6 +210,14 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
 
     fixed_shop_tabs = {"综合", "销量", "新品", "价格"}
     fixed_bottom_tabs = {"首页", "分类", "上新"}
+    viewport_bottom = max(
+        (
+            node["bounds"][3]
+            for node in nodes
+            if node["bounds"] is not None
+        ),
+        default=None,
+    )
     top_occlusion = max(
         (
             node["bounds"][3]
@@ -220,7 +230,16 @@ def parse_shop_hierarchy(xml: str) -> list[ShopProductPosition]:
         (
             node["bounds"][1]
             for node in nodes
-            if node["text"] in fixed_bottom_tabs and node["bounds"] is not None
+            if (
+                node["text"] in fixed_bottom_tabs
+                and node["bounds"] is not None
+                and viewport_bottom is not None
+                # Current XHS reuses 分类/上新 in the upper shop tab row.  A
+                # true fixed bottom navigation must live in the lower portion
+                # of the observed viewport; otherwise legitimate product cards
+                # below the upper tab row would all be discarded.
+                and node["bounds"][1] >= viewport_bottom * 0.6
+            )
         ),
         default=None,
     )

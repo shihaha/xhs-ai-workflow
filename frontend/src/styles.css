@@ -242,6 +242,8 @@ summary { cursor: pointer; font-weight: 700; }
 .agent-approval-card { background: #f9fbfa; border: 1px solid #d8e0de; padding: 0.9rem; }
 .agent-approval-card--pending { background: #fffaf0; border-color: #d9a55b; }
 .agent-approval-heading p { color: #48615c; font-size: 0.85rem; margin: 0.3rem 0 0; }
+.agent-approval-summary { color: #17222a; font-size: 0.9rem; font-weight: 650; line-height: 1.55; margin: 0.7rem 0 0; }
+.agent-physical-warning { background: #fff3dc; border-left: 3px solid #b45309; color: #713f12; font-size: 0.85rem; line-height: 1.5; margin: 0.7rem 0 0; padding: 0.65rem 0.75rem; }
 .agent-technical-details { background: #f7f9f8; border: 1px solid #aebbb8; margin-top: 1rem; padding: 1rem; }
 .agent-technical-details > summary { font-size: 0.9rem; }
 .agent-technical-details > p { color: #48615c; font-size: 0.82rem; }

@@ -261,6 +261,29 @@ def test_shop_parser_skips_cards_hidden_behind_fixed_shop_chrome() -> None:
     ]
 
 
+def test_shop_parser_does_not_treat_upper_shop_tabs_as_bottom_navigation() -> None:
+    """Current XHS reuses 分类/上新 labels in upper shop chrome; those must not hide products below."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="分类" bounds="[285,1013][399,1099]" />
+  <node text="上新" bounds="[513,1013][627,1099]" />
+  <node text="综合" bounds="[57,1156][157,1228]" />
+  <node text="销量" bounds="[286,1156][386,1228]" />
+  <node class="android.view.ViewGroup" clickable="true" enabled="true" bounds="[28,1950][572,2380]">
+    <node text="repor锐珀尔·豆子捏捏枕腰部按摩仪肩颈颈椎按摩器送男友闺蜜朋友实用生日礼物" bounds="[53,2052][542,2124]" />
+    <node content-desc="¥358.已售2.3万+" bounds="[53,2213][428,2290]" />
+  </node>
+  <node bounds="[0,0][1172,2748]" />
+</hierarchy>"""
+
+    products = parse_shop_hierarchy(xml)
+
+    assert len(products) == 1
+    assert products[0].title.startswith("repor锐珀尔")
+    assert products[0].price == "¥358"
+    assert products[0].sold == "2.3万+"
+
+
 def test_shop_parser_prefers_the_current_clickable_card_safe_region() -> None:
     """A reliable clickable ancestor is safer than a moving title baseline."""
     xml = """<?xml version="1.0" encoding="UTF-8"?>

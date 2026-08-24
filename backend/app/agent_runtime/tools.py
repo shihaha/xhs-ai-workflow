@@ -83,6 +83,7 @@ class ToolSpec:
     concurrency_safe: bool = True
     requires_approval: bool = False
     available: Callable[[], bool] = lambda: True
+    pre_approval_validate: Callable[[BaseModel], None] | None = None
     timeout_seconds: float = 30.0
     idempotent: bool = True
     retry_limit: int = 0

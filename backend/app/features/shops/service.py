@@ -247,7 +247,7 @@ class AccountScopeDecision(BaseModel):
     classification: Literal[
         "unknown", "in_scope", "out_of_scope_physical", "needs_human"
     ]
-    decision_source: Literal["rule", "model", "human"]
+    decision_source: Literal["rule", "model", "human", "chatgpt"]
     reason: str = Field(min_length=1, max_length=500)
     decided_at: str = Field(min_length=1, max_length=100)
     evidence_refs: list[str] = Field(default_factory=list, max_length=20)
@@ -315,7 +315,12 @@ class ShopCollectionService:
         self._cancel_events: dict[str, Event] = {}
         self._futures: dict[str, Future[Any]] = {}
 
-    def enqueue(self, payload: ShopCollectionCreate) -> ShopCollectionQueued:
+    def enqueue(
+        self,
+        payload: ShopCollectionCreate,
+        *,
+        agent_origin: tuple[str, str] | None = None,
+    ) -> ShopCollectionQueued:
         self._resolve_verification_dir(payload.verification_dir)
         existing_scope = self.get_account_scope_decision(payload.account_user_id)
         if (
@@ -333,6 +338,18 @@ class ShopCollectionService:
                     "Shop collection service is closed."
                 )
             input_data = payload.model_dump(mode="json")
+            if agent_origin is not None:
+                origin_run_id, origin_tool_call_id = agent_origin
+                if not origin_run_id or len(origin_run_id) > 100:
+                    raise ValueError("agent origin run_id must be bounded non-empty text")
+                if not origin_tool_call_id or len(origin_tool_call_id) > 100:
+                    raise ValueError("agent origin tool_call_id must be bounded non-empty text")
+                input_data["_agent_origin"] = {
+                    "kind": "agent_tool",
+                    "run_id": origin_run_id,
+                    "tool_call_id": origin_tool_call_id,
+                    "tool_name": "shop.preflight",
+                }
             job = self.job_service.create(
                 job_type=ANDROID_SHOP_JOB_TYPE,
                 input_data=input_data,
@@ -422,16 +439,35 @@ class ShopCollectionService:
         classification: Literal[
             "unknown", "in_scope", "out_of_scope_physical", "needs_human"
         ],
-        decision_source: Literal["rule", "model", "human"],
+        decision_source: Literal["rule", "model", "human", "chatgpt"],
         reason: str,
         evidence_refs: list[str],
+        source_handoff_id: str | None = None,
     ) -> AccountScopeDecision:
-        """Persist one auditable human/rule/model account decision without editing history."""
+        """Persist one auditable scope decision without editing history."""
 
         self._require_account_evidence_refs(account_user_id, evidence_refs)
+        if source_handoff_id is not None:
+            normalized_handoff = source_handoff_id.strip()
+            if not normalized_handoff or len(normalized_handoff) > 100:
+                raise ValueError("source_handoff_id must be bounded non-empty text")
+            existing = self._account_scope_decision_for_handoff(
+                account_user_id=account_user_id,
+                source_handoff_id=normalized_handoff,
+            )
+            if existing is not None:
+                return existing
+            source_handoff_id = normalized_handoff
         job = self.job_service.create(
             job_type=ACCOUNT_SCOPE_JOB_TYPE,
-            input_data={"account_user_id": account_user_id},
+            input_data={
+                "account_user_id": account_user_id,
+                **(
+                    {"source_handoff_id": source_handoff_id}
+                    if source_handoff_id is not None
+                    else {}
+                ),
+            },
             current_stage="scope_decision_pending",
         )
         self.job_service.claim(job.id)
@@ -449,6 +485,51 @@ class ShopCollectionService:
             current_stage=f"account_scope_{classification}",
         )
         return decision
+
+    def _account_scope_decision_for_handoff(
+        self,
+        *,
+        account_user_id: str,
+        source_handoff_id: str,
+    ) -> AccountScopeDecision | None:
+        """Recover one already-persisted ChatGPT decision after retry/restart."""
+
+        with self.job_service.database.session() as session:
+            jobs = list(
+                session.scalars(
+                    select(JobRecord)
+                    .where(JobRecord.type == ACCOUNT_SCOPE_JOB_TYPE)
+                    .order_by(JobRecord.created_at, JobRecord.id)
+                )
+            )
+            for job in jobs:
+                if (
+                    job.input_data.get("account_user_id") != account_user_id
+                    or job.input_data.get("source_handoff_id") != source_handoff_id
+                    or JobState(job.state) is not JobState.succeeded
+                ):
+                    continue
+                artifact = session.scalar(
+                    select(JobArtifactRecord)
+                    .where(
+                        JobArtifactRecord.job_id == job.id,
+                        JobArtifactRecord.kind == ACCOUNT_SCOPE_ARTIFACT_KIND,
+                    )
+                    .order_by(JobArtifactRecord.id.desc())
+                    .limit(1)
+                )
+                if artifact is None:
+                    continue
+                payload = dict(artifact.metadata_json or {}).get("result")
+                if not isinstance(payload, dict):
+                    continue
+                try:
+                    decision = AccountScopeDecision.model_validate(payload)
+                except ValueError:
+                    continue
+                if decision.account_user_id == account_user_id:
+                    return decision
+        return None
 
     def _require_account_evidence_refs(
         self, account_user_id: str, evidence_refs: list[str]
@@ -476,7 +557,7 @@ class ShopCollectionService:
         classification: Literal[
             "unknown", "in_scope", "out_of_scope_physical", "needs_human"
         ],
-        decision_source: Literal["rule", "model", "human"],
+        decision_source: Literal["rule", "model", "human", "chatgpt"],
         reason: str,
         evidence_refs: list[str],
     ) -> AccountScopeDecision:

@@ -78,11 +78,13 @@ class AgentContinuationExecutor:
         *,
         runtime_factory: Callable[[], JobBoundAgentRuntime],
         approval_enabled: bool = True,
+        approval_admission: Callable[[NextAction], bool] | None = None,
         poll_seconds: float = 0.1,
     ) -> None:
         self.database = database
         self.runtime_factory = runtime_factory
         self.approval_enabled = bool(approval_enabled)
+        self.approval_admission = approval_admission
         self.poll_seconds = max(0.01, min(float(poll_seconds), 1.0))
         self.coordinator = JobContinuationCoordinator(database)
         self.store = AgentRunStore(database)
@@ -112,6 +114,26 @@ class AgentContinuationExecutor:
     def accepting(self) -> bool:
         with self._lock:
             return self._accepting and self.approval_enabled
+
+    @property
+    def selective_accepting(self) -> bool:
+        """Whether at least one explicitly admitted action can be approved."""
+
+        with self._lock:
+            return self._accepting and (
+                self.approval_enabled or self.approval_admission is not None
+            )
+
+    def can_accept_action(self, action: NextAction) -> bool:
+        with self._lock:
+            if not self._accepting:
+                return False
+            if self.approval_enabled:
+                return True
+            return bool(
+                self.approval_admission is not None
+                and self.approval_admission(action)
+            )
 
     def start(self) -> None:
         with self._lock:
@@ -167,11 +189,10 @@ class AgentContinuationExecutor:
         """Approve exactly one pending HumanAction and durably enqueue its child run."""
 
         with self._lock:
-            if not self._accepting or not self.approval_enabled:
+            if not self._accepting:
                 raise ContinuationExecutorClosed(
                     "Continuation executor is not accepting new approvals."
                 )
-            self.start()
             with self.database.sessions() as session:
                 human = session.get(HumanActionRecord, human_action_id)
                 if human is None:
@@ -193,6 +214,10 @@ class AgentContinuationExecutor:
                     raise ContinuationApprovalError(
                         "Pending HumanAction does not contain a valid persisted action."
                     ) from error
+                if not self.can_accept_action(action):
+                    raise ContinuationApprovalError(
+                        "This approved action has no configured execution path."
+                    )
 
             # Validate the production executor surface before the coordinator
             # changes any durable authority. The canonical Runtime validates the
@@ -206,6 +231,12 @@ class AgentContinuationExecutor:
                     )
                 tool = runtime.tools.resolve(action.tool_name)
                 validated = runtime.tools.validate(tool, action.arguments)
+                if tool.pre_approval_validate is not None:
+                    # Physical/external tools may bind approval to a deterministic
+                    # domain target. Re-check that target before changing any
+                    # HumanAction/Job authority; the handler validates it again
+                    # immediately before the external side effect.
+                    tool.pre_approval_validate(validated)
                 if action.tool_name == "analysis.run_grounded":
                     requested_ids = set(
                         validated.model_dump(mode="json").get("evidence_ids", [])
@@ -227,6 +258,11 @@ class AgentContinuationExecutor:
                 human_action_id,
                 note=note,
             )
+            # An unconfigured automatic model keeps the executor threadless
+            # until an explicitly admitted durable action exists.  Once this
+            # special dispatch is committed, startup recovery rules can safely
+            # consume it without widening generic model admission.
+            self.start()
             self._idle.clear()
             self._wake.set()
             return approved
@@ -308,6 +344,14 @@ class AgentContinuationExecutor:
             )
 
         for run_id in candidates:
+            try:
+                queued_action = self.coordinator.approved_action_for_run(run_id)
+            except Exception:
+                self._complete_without_execution(run_id)
+                continue
+            if not self.can_accept_action(queued_action):
+                self._complete_without_execution(run_id)
+                continue
             try:
                 job_id = self.guard.require_run_running(run_id)
                 job = self.jobs.get(job_id)

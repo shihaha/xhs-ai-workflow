@@ -75,6 +75,7 @@ const STATE_LABELS: Record<string, string> = {
 
 const TOOL_LABELS: Record<string, string> = {
   "analysis.run_grounded": "基于证据执行分析",
+  "shop.preflight": "Android 店铺预检",
   "job.read": "读取任务状态",
   manual_chatgpt: "交给 ChatGPT 处理",
 };
@@ -204,6 +205,7 @@ export function AgentWorkbenchView({ data, onApprove, onDeny, onStart }: { data:
           <HumanActionsSection
             actions={data.humanActions}
             approveEnabled={data.capabilities.approve_continuation}
+            physicalApproveEnabled={data.capabilities.approve_physical_continuation}
             continuationReason={data.capabilities.continuation_reason}
             onApprove={onApprove}
             onDeny={onDeny}
@@ -293,6 +295,7 @@ function EvidenceRail({ evidence }: { evidence: AnalysisEvidence[] }) {
             <li key={item.evidence_id}>
               <strong>{evidenceKindLabel(item.kind)}</strong>
               <span>{item.account_user_id ? `账号：${item.account_user_id}` : "未绑定账号"}</span>
+              {item.source_date ? <span>榜单日期：{item.source_date}</span> : null}
               <details><summary>查看技术标识</summary><code>{item.evidence_id}</code></details>
             </li>
           ))}
@@ -510,12 +513,14 @@ function RunsSection({ runs }: { runs: AgentRunListItem[] }) {
 function HumanActionsSection({
   actions,
   approveEnabled,
+  physicalApproveEnabled,
   continuationReason,
   onApprove,
   onDeny,
 }: {
   actions: AgentHumanAction[];
   approveEnabled: boolean;
+  physicalApproveEnabled: boolean;
   continuationReason: string | null;
   onApprove?: (actionId: string) => Promise<void>;
   onDeny?: (actionId: string) => Promise<void>;
@@ -559,12 +564,15 @@ function HumanActionsSection({
         <div><p className="eyebrow">需要确认</p><h2 id="agent-human-heading">等待你处理</h2><p>Agent 遇到需要明确授权的操作时，会停在这里等你决定。</p></div>
         <span>{actions.filter((item) => item.status === "pending").length}</span>
       </div>
-      {!approveEnabled && continuationReason ? <p className="field-help">当前自动继续功能不可用。已经等待中的任务不会被页面擅自恢复。</p> : null}
+      {!approveEnabled && !physicalApproveEnabled && continuationReason ? <p className="field-help">当前自动继续功能不可用。已经等待中的任务不会被页面擅自恢复。</p> : null}
       {error ? <p className="action-error" role="alert">{error}</p> : null}
       {actions.length === 0 ? <p className="panel-empty">目前没有需要你处理的操作。</p> : (
         <ol className="agent-approval-list">
           {actions.map((action) => {
-            const canApprove = action.can_approve && approveEnabled && Boolean(onApprove);
+            const actionApprovalEnabled = action.external_side_effect
+              ? physicalApproveEnabled
+              : approveEnabled;
+            const canApprove = action.can_approve && actionApprovalEnabled && Boolean(onApprove);
             const canDeny = action.can_deny && Boolean(onDeny);
             return (
               <li key={action.id} className={action.status === "pending" ? "agent-approval-card agent-approval-card--pending" : "agent-approval-card"}>
@@ -572,12 +580,16 @@ function HumanActionsSection({
                   <div><strong>{toolLabel(action.tool_name)}</strong><p>{action.status === "pending" ? "Agent 请求执行这一步，需要你明确确认。" : `这条请求已经${stateLabel(action.status)}。`}</p></div>
                   <span className={`agent-badge ${action.status === "pending" ? "agent-badge--attention" : ""}`}>{stateLabel(action.status)}</span>
                 </div>
+                {action.approval_summary ? <p className="agent-approval-summary">{action.approval_summary}</p> : null}
+                {action.external_side_effect && action.status === "pending" ? (
+                  <p className="agent-physical-warning">这是真实外部操作。批准后会控制已连接的 Android 设备并访问小红书，不是模拟操作。</p>
+                ) : null}
                 <p className="field-help">创建时间：{formatTime(action.created_at)}</p>
                 {canApprove || canDeny ? (
                   <div className="button-row">
                     {canApprove ? (approveConfirmingId === action.id ? (
                       <>
-                        <button disabled={busyId === action.id} onClick={() => void approve(action.id)} type="button">确认批准并继续</button>
+                        <button disabled={busyId === action.id} onClick={() => void approve(action.id)} type="button">{action.external_side_effect ? "确认并启动真实设备预检" : "确认批准并继续"}</button>
                         <button className="button-secondary" disabled={busyId === action.id} onClick={() => setApproveConfirmingId(null)} type="button">返回</button>
                       </>
                     ) : <button onClick={() => { setDenyConfirmingId(null); setApproveConfirmingId(action.id); }} type="button">批准并继续</button>) : null}

@@ -258,4 +258,5 @@ class AnalysisEvidenceRead(_StrictModel):
     evidence_id: str
     kind: str
     account_user_id: str | None
+    source_date: str | None = None
     eligible_for_opportunity: bool

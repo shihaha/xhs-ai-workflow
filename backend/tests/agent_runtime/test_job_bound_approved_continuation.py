@@ -429,6 +429,85 @@ def test_started_side_effect_is_never_replayed_and_projects_new_wait(tmp_path: P
     assert current.lease_expires_at is None
 
 
+def test_interrupted_approved_continuation_without_toolstep_requires_fresh_reapproval(
+    tmp_path: Path,
+) -> None:
+    database, jobs, job, store, bound, action, human = _setup_wait(tmp_path)
+    continuations = JobContinuationCoordinator(
+        database,
+        run_id_factory=lambda: "continuation-run",
+    )
+    approved = continuations.approve_and_create_continuation(bound.run_id, human.id)
+    store.set_state(
+        approved.run_id,
+        AgentRunState.needs_human,
+        error_category="interrupted",
+        error_detail="process ended before approved tool started",
+    )
+    jobs.transition(job.id, JobState.needs_human, error_category="interrupted")
+
+    recovery = continuations.prepare_interrupted_reapproval(approved.run_id)
+
+    assert recovery.run_id == approved.run_id
+    assert recovery.status == "pending"
+    assert recovery.tool_call_id == action.tool_call_id
+    assert recovery.tool_name == action.tool_name
+    assert NextAction.model_validate(recovery.request_json["action"]) == action
+    assert recovery.request_json["reason"] == "interrupted_before_tool_reapproval_required"
+    current_run = store.get_run(approved.run_id)
+    assert current_run.state == AgentRunState.needs_human.value
+    assert current_run.error_category == "approval_required"
+    current_job = jobs.get(job.id)
+    assert current_job.state is JobState.needs_human
+    assert current_job.lease_expires_at is None
+
+    recovery_coordinator = JobContinuationCoordinator(
+        database,
+        run_id_factory=lambda: "recovered-run",
+    )
+    recovered = recovery_coordinator.approve_and_create_continuation(
+        approved.run_id,
+        recovery.id,
+    )
+    assert recovered.source_run_id == approved.run_id
+    assert recovered.action == action
+    assert recovered.human_action_id == recovery.id
+
+
+def test_interrupted_reapproval_is_forbidden_when_toolstep_exists(tmp_path: Path) -> None:
+    database, jobs, job, store, bound, action, human = _setup_wait(tmp_path)
+    continuations = JobContinuationCoordinator(
+        database,
+        run_id_factory=lambda: "continuation-run",
+    )
+    approved = continuations.approve_and_create_continuation(bound.run_id, human.id)
+    store.append_step(
+        approved.run_id,
+        kind="tool",
+        status="started",
+        tool_name=action.tool_name,
+        tool_call_id=action.tool_call_id,
+        input_json={
+            "arguments": action.arguments,
+            "idempotent": False,
+            "timeout_seconds": 5.0,
+        },
+    )
+    store.set_state(
+        approved.run_id,
+        AgentRunState.needs_human,
+        error_category="interrupted",
+        error_detail="forced test interruption",
+    )
+    jobs.transition(job.id, JobState.needs_human, error_category="interrupted")
+
+    with pytest.raises(ContinuationApprovalError, match="Tool execution proof"):
+        continuations.prepare_interrupted_reapproval(approved.run_id)
+
+    assert store.pending_human_action(approved.run_id) is None
+    assert jobs.get(job.id).state is JobState.needs_human
+
+
 def test_job_cancellation_before_approved_tool_blocks_handler(tmp_path: Path) -> None:
     database, jobs, job, _store, bound, _action, human = _setup_wait(tmp_path)
     continuations = JobContinuationCoordinator(

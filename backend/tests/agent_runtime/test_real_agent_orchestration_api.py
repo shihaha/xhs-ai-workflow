@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -23,6 +25,9 @@ from backend.app.agent_runtime.initial_execution import (
     AgentInitialExecutor,
     AgentInitialLaunchCoordinator,
 )
+from backend.app.agent_runtime.initial_chatgpt_decision import (
+    AgentInitialChatGPTDecisionReconciler,
+)
 from backend.app.agent_runtime.job_bound_runtime import (
     ActiveRunJobAuthorityGuard,
     JobBoundAgentRuntime,
@@ -33,7 +38,14 @@ from backend.app.agent_runtime.job_continuation import (
     JobHistoryContextBuilder,
 )
 from backend.app.agent_runtime.job_wait_projection import JobHumanWaitProjector
+from backend.app.agent_runtime.manual_chatgpt_handoff import (
+    MANUAL_CHATGPT_REQUIRED,
+    MANUAL_CHATGPT_RESULT_READY,
+    ManualChatGPTHandoffRecord,
+    ManualChatGPTHandoffService,
+)
 from backend.app.agent_runtime.orchestration_service import AgentOrchestrationService
+from backend.app.agent_runtime.physical_tools import build_shop_preflight_tool
 from backend.app.agent_runtime.persistence import AgentRunRecord, HumanActionRecord
 from backend.app.agent_runtime.types import RunBudget
 from backend.app.db import Database
@@ -79,6 +91,28 @@ class NeverCalledAnalysisService:
         raise AssertionError("grounded analysis must wait for explicit approval")
 
 
+class FakePhysicalRadar:
+    def next_preflight_candidate(self, *, source_date):
+        return SimpleNamespace(
+            user_id="account-a",
+            account_name="账号A",
+            candidate_position=1,
+            source_date=source_date,
+        )
+
+
+class FakePhysicalShop:
+    def __init__(self) -> None:
+        self.enqueued = []
+        self.device_adapter = SimpleNamespace(
+            health=lambda: SimpleNamespace(status="available", device_id="device-1", detail="ready")
+        )
+
+    def enqueue(self, payload, *, agent_origin=None):
+        self.enqueued.append((payload, agent_origin))
+        return SimpleNamespace(job_id="must-not-be-created-yet", status="queued")
+
+
 def _settings(tmp_path: Path) -> Settings:
     runtime = tmp_path / "runtime"
     return Settings(runtime_dir=runtime, database_path=runtime / "workbench.sqlite3")
@@ -109,11 +143,16 @@ def _runtime_factory(
     return build
 
 
-def _evidence(evidence_id: str = "rank-item:1") -> AnalysisEvidenceRead:
+def _evidence(
+    evidence_id: str = "rank-item:1",
+    *,
+    source_date: str | None = None,
+) -> AnalysisEvidenceRead:
     return AnalysisEvidenceRead(
         evidence_id=evidence_id,
         kind="rank_item",
         account_user_id="account-a",
+        source_date=source_date,
         eligible_for_opportunity=False,
     )
 
@@ -482,6 +521,242 @@ async def test_grounded_agent_start_rejects_unknown_evidence_and_generic_job_byp
     assert "agent-runtime/jobs" in bypass.json()["detail"]
     assert app.state.agent_workbench_reader.list_jobs() == []
     initial.close()
+
+
+@pytest.mark.anyio
+async def test_grounded_start_without_bailian_creates_initial_chatgpt_handoff_atomically(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path))
+    initial = app.state.agent_initial_executor
+    assert isinstance(initial, AgentInitialExecutor)
+    assert initial.accepting is False
+    handoffs = app.state.agent_manual_handoff_service
+    assert isinstance(handoffs, ManualChatGPTHandoffService)
+    app.state.agent_orchestration_service = AgentOrchestrationService(
+        analysis_service=NeverCalledAnalysisService(
+            [_evidence(source_date="2026-08-24")]
+        ),
+        initial_executor=initial,
+        manual_handoff_service=handoffs,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        capabilities = await client.get("/api/v1/agent-runtime/operator-capabilities")
+        response = await client.post(
+            "/api/v1/agent-runtime/jobs",
+            json={
+                "goal": "检查这条候选并决定是否需要真实店铺预检",
+                "evidence_ids": ["rank-item:1"],
+            },
+        )
+
+    assert capabilities.status_code == 200
+    assert capabilities.json()["start_grounded_orchestration"] is True
+    assert response.status_code == 202
+    body = response.json()
+    assert body["dispatch_enqueued"] is False
+    assert body["handoff_created"] is True
+    assert isinstance(body["handoff_id"], str)
+
+    jobs = app.state.job_service
+    assert jobs is not None
+    job = jobs.get(body["job_id"])
+    run = AgentRunStore(app.state.database).get_run(body["run_id"])
+    assert job.state is JobState.needs_human
+    assert job.current_stage == MANUAL_CHATGPT_REQUIRED
+    assert job.error_category == MANUAL_CHATGPT_REQUIRED
+    assert job.lease_expires_at is None
+    assert run.state == AgentRunState.needs_human.value
+    assert run.error_category == MANUAL_CHATGPT_REQUIRED
+    assert run.model_calls == 0
+
+    steps = AgentRunStore(app.state.database).list_steps(run.id)
+    assert [step.kind for step in steps] == ["checkpoint", "external_handoff"]
+    assert steps[0].evidence_refs_json == ["rank-item:1"]
+    assert steps[0].output_json["evidence_summaries"][0]["source_date"] == "2026-08-24"
+    with pytest.raises(KeyError):
+        initial.dispatch_view(run.id)
+
+    with app.state.database.sessions() as session:
+        handoff = session.get(ManualChatGPTHandoffRecord, body["handoff_id"])
+        assert handoff is not None
+        assert handoff.status == "pending"
+        assert handoff.task_json["kind"] == "initial_agent_next_action"
+        assert handoff.task_json["supported_tool_names"] == ["shop.preflight"]
+        package_path = app.state.settings.runtime_dir / handoff.package_path
+    assert package_path.is_file()
+
+
+def test_accepted_initial_chatgpt_preflight_proposal_only_creates_human_approval(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3", runtime_dir=runtime_dir)
+    initial = AgentInitialExecutor(
+        database,
+        runtime_factory=lambda: (_ for _ in ()).throw(AssertionError("no initial dispatch")),
+        launch_enabled=False,
+    )
+    handoffs = ManualChatGPTHandoffService(database, runtime_dir=runtime_dir)
+    service = AgentOrchestrationService(
+        analysis_service=NeverCalledAnalysisService(
+            [_evidence(source_date="2026-08-24")]
+        ),
+        initial_executor=initial,
+        manual_handoff_service=handoffs,
+    )
+    started = service.start_grounded_analysis(
+        goal="检查候选并决定是否执行真实店铺预检",
+        evidence_ids=["rank-item:1"],
+    )
+    assert started.handoff_created is True
+    assert started.handoff_id is not None
+
+    with database.sessions() as session:
+        record = session.get(ManualChatGPTHandoffRecord, started.handoff_id)
+        assert record is not None
+        input_hash = record.input_hash
+        schema_version = record.schema_version
+    return_path = runtime_dir / "external-results" / f"{started.handoff_id}.json"
+    return_path.parent.mkdir(parents=True, exist_ok=True)
+    return_path.write_text(
+        json.dumps(
+            {
+                "handoff_id": started.handoff_id,
+                "schema_version": schema_version,
+                "input_hash": input_hash,
+                "result": {
+                    "action": "tool",
+                    "tool_name": "shop.preflight",
+                    "arguments": {
+                        "source_date": "2026-08-24",
+                        "account_user_id": "account-a",
+                    },
+                    "tool_call_id": "chatgpt-preflight-proposal",
+                    "final_output": None,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    accepted = handoffs.accept_return_file(started.handoff_id)
+    assert accepted.source_run_id == started.run_id
+    assert AgentRunStore(database).get_run(started.run_id).error_category == MANUAL_CHATGPT_RESULT_READY
+
+    radar = FakePhysicalRadar()
+    shop = FakePhysicalShop()
+    continuations = JobContinuationCoordinator(database)
+
+    def runtime_factory() -> JobBoundAgentRuntime:
+        tools = ToolRegistry()
+        tools.register(build_shop_preflight_tool(radar_service=radar, shop_service=shop))
+        return JobBoundAgentRuntime(
+            store=AgentRunStore(database),
+            model=SequenceModel(),
+            tools=tools,
+            permissions=RuleBasedPermissionPolicy(),
+            authority_guard=ActiveRunJobAuthorityGuard(database),
+            wait_projector=JobHumanWaitProjector(database),
+            continuation_resolver=continuations,
+            context_builder=JobHistoryContextBuilder(database),
+        )
+
+    applied = AgentInitialChatGPTDecisionReconciler(
+        database,
+        runtime_factory=runtime_factory,
+    ).reconcile_once()
+
+    assert len(applied) == 1
+    assert applied[0].status == "approval_required"
+    assert applied[0].human_action_id is not None
+    assert shop.enqueued == []
+    job = JobService(database, runtime_dir=runtime_dir).get(started.job_id)
+    run = AgentRunStore(database).get_run(started.run_id)
+    assert job.state is JobState.needs_human
+    assert job.current_stage == "approval_required"
+    assert job.error_category == "approval_required"
+    assert run.state == AgentRunState.needs_human.value
+    assert run.error_category == "approval_required"
+    [human] = [row for row in _human_actions(database, run.id) if row.status == "pending"]
+    assert human.tool_name == "shop.preflight"
+    assert human.request_json["proposed_by"] == "chatgpt_handoff"
+    assert human.request_json["action"]["arguments"] == {
+        "source_date": "2026-08-24",
+        "account_user_id": "account-a",
+    }
+
+
+def test_accepted_initial_chatgpt_finish_closes_job_once_without_runtime_or_tool(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    database = Database(runtime_dir / "workbench.sqlite3", runtime_dir=runtime_dir)
+    initial = AgentInitialExecutor(
+        database,
+        runtime_factory=lambda: (_ for _ in ()).throw(AssertionError("no initial runtime")),
+        launch_enabled=False,
+    )
+    handoffs = ManualChatGPTHandoffService(database, runtime_dir=runtime_dir)
+    service = AgentOrchestrationService(
+        analysis_service=NeverCalledAnalysisService(
+            [_evidence(source_date="2026-08-24")]
+        ),
+        initial_executor=initial,
+        manual_handoff_service=handoffs,
+    )
+    started = service.start_grounded_analysis(
+        goal="检查证据并决定是否还需要动作",
+        evidence_ids=["rank-item:1"],
+    )
+    assert started.handoff_id is not None
+
+    with database.sessions() as session:
+        record = session.get(ManualChatGPTHandoffRecord, started.handoff_id)
+        assert record is not None
+        input_hash = record.input_hash
+        schema_version = record.schema_version
+    return_path = runtime_dir / "external-results" / f"{started.handoff_id}.json"
+    return_path.parent.mkdir(parents=True, exist_ok=True)
+    return_path.write_text(
+        json.dumps(
+            {
+                "handoff_id": started.handoff_id,
+                "schema_version": schema_version,
+                "input_hash": input_hash,
+                "result": {
+                    "action": "finish",
+                    "tool_name": None,
+                    "arguments": {},
+                    "tool_call_id": "chatgpt-finish",
+                    "final_output": {"decision": "no_further_action"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    handoffs.accept_return_file(started.handoff_id)
+
+    reconciler = AgentInitialChatGPTDecisionReconciler(
+        database,
+        runtime_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("finish must not build or execute an Agent runtime")
+        ),
+    )
+    [applied] = reconciler.reconcile_once()
+
+    assert applied.status == "finished"
+    assert applied.continuation_run_id is not None
+    job = JobService(database, runtime_dir=runtime_dir).get(started.job_id)
+    assert job.state is JobState.succeeded
+    assert AgentRunStore(database).get_run(applied.continuation_run_id).final_output_json == {
+        "decision": "no_further_action"
+    }
+    assert reconciler.reconcile_once() == []
 
 
 @pytest.mark.anyio

@@ -23,10 +23,13 @@ from backend.app.agent_runtime.job_continuation import (
 from backend.app.agent_runtime.job_wait_projection import JobHumanWaitProjector
 from backend.app.agent_runtime.permissions import RuleBasedPermissionPolicy
 from backend.app.agent_runtime.persistence import AgentRunStore
+from backend.app.agent_runtime.physical_tools import build_shop_preflight_tool
 from backend.app.agent_runtime.tools import ToolRegistry
 from backend.app.agent_runtime.types import ModelTurn, NextAction
 from backend.app.db import Database
 from backend.app.features.analysis.service import AnalysisService
+from backend.app.features.radar.service import RadarService
+from backend.app.features.shops.service import ShopCollectionService
 from backend.app.services.jobs import JobService
 
 
@@ -36,6 +39,8 @@ _AGENT_INSTRUCTIONS = (
     "tools present in the supplied context. Never invent tool success, evidence, "
     "or lifecycle state. Any analysis.run_grounded action must cite only evidence "
     "IDs already present in the durable context; never widen the evidence scope. "
+    "A shop.preflight action must target the exact account/date currently justified "
+    "by durable context and never claim that queued physical work has completed. "
     "Return finish only when the goal can be truthfully completed from durable "
     "results already present in context."
 )
@@ -85,6 +90,15 @@ class BailianRuntimeDecisionModel:
         )
 
 
+class UnavailableAutomaticDecisionModel:
+    """Fail closed if a code path unexpectedly needs an automatic provider."""
+
+    def next_action(self, _context: RuntimeContext) -> ModelTurn:
+        raise AgentRuntimeNotConfigured(
+            "Automatic provider reasoning is unavailable; use the durable ChatGPT handoff path."
+        )
+
+
 def automatic_agent_configured(adapter: BailianModelAdapter) -> bool:
     return adapter.configured
 
@@ -96,19 +110,31 @@ def build_production_job_bound_runtime(
     analysis_service: AnalysisService,
     bailian_adapter: BailianModelAdapter,
     continuations: JobContinuationCoordinator,
+    radar_service: RadarService | None = None,
+    shop_service: ShopCollectionService | None = None,
 ) -> JobBoundAgentRuntime:
     """Build one bounded runtime from the existing adapter and domain services."""
-
-    if not bailian_adapter.configured:
-        raise AgentRuntimeNotConfigured("Bailian automatic Agent execution is not configured.")
 
     tools = ToolRegistry()
     tools.register(build_job_read_tool(job_service))
     tools.register(build_analysis_run_tool(analysis_service))
+    if radar_service is not None and shop_service is not None:
+        tools.register(
+            build_shop_preflight_tool(
+                radar_service=radar_service,
+                shop_service=shop_service,
+            )
+        )
+
+    model = (
+        BailianRuntimeDecisionModel(bailian_adapter)
+        if bailian_adapter.configured
+        else UnavailableAutomaticDecisionModel()
+    )
 
     return JobBoundAgentRuntime(
         store=AgentRunStore(database),
-        model=BailianRuntimeDecisionModel(bailian_adapter),
+        model=model,
         tools=tools,
         permissions=RuleBasedPermissionPolicy(),
         authority_guard=ActiveRunJobAuthorityGuard(database),

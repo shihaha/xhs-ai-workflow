@@ -259,7 +259,7 @@ Minimum capabilities:
 - optional tool calling if the chosen runtime uses provider tools;
 - no provider-specific business semantics.
 
-Current business rule that production language-model calls go through approved Bailian configuration remains in force until explicitly changed.
+**Superseded 2026-08-24:** ChatGPT is now the primary external reasoning provider for the operator workflow. Bailian remains an optional provider/accelerator, not a mandatory production dependency. See `26_CHATGPT_PRIMARY_REASONING_PROVIDER.md`.
 
 Framework selection must not quietly route data to another provider.
 

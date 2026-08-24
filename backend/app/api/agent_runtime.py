@@ -34,6 +34,7 @@ from backend.app.schemas.agent_runtime import (
     HumanActionDecisionRead,
     HumanActionDenyRequest,
     HumanActionWorkbenchRead,
+    InterruptedReapprovalRead,
     JobArtifactSummaryRead,
 )
 
@@ -108,7 +109,9 @@ def start_grounded_agent_job(
         job_id=result.job_id,
         run_id=result.run_id,
         evidence_count=result.evidence_count,
-        dispatch_enqueued=True,
+        dispatch_enqueued=result.dispatch_enqueued,
+        handoff_created=result.handoff_created,
+        handoff_id=result.handoff_id,
     )
 
 
@@ -155,6 +158,29 @@ def get_agent_run_detail(run_id: str, request: Request) -> AgentRunDetailRead:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except AgentWorkbenchReadError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/runs/{run_id}/prepare-interrupted-reapproval",
+    response_model=InterruptedReapprovalRead,
+)
+def prepare_interrupted_agent_reapproval(
+    run_id: str,
+    request: Request,
+) -> InterruptedReapprovalRead:
+    try:
+        result = _actions(request).prepare_interrupted_reapproval(run_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except AgentWorkbenchActionError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return InterruptedReapprovalRead(
+        human_action_id=result.human_action_id,
+        job_id=result.job_id,
+        run_id=result.run_id,
+        tool_name=result.tool_name,
+        human_action_status="pending",
+    )
 
 
 @router.get("/operator-capabilities", response_model=AgentActionCapabilitiesRead)

@@ -10,6 +10,7 @@ from backend.app.agent_runtime.job_binding import (
     AGENT_ORCHESTRATION_JOB_TYPE,
     AgentJobBindingRecord,
 )
+from backend.app.agent_runtime.job_continuation import AgentContinuationRecord
 from backend.app.agent_runtime.manual_chatgpt_handoff import (
     MANUAL_CHATGPT_REQUIRED,
     MANUAL_CHATGPT_RESULT_READY,
@@ -287,10 +288,54 @@ class AgentWorkbenchReader:
                     .order_by(HumanActionRecord.created_at, HumanActionRecord.id)
                 )
             )
+            job = session.get(JobRecord, binding.job_id)
+            continuation = session.get(AgentContinuationRecord, run_id)
+            bindings = list(
+                session.scalars(
+                    select(AgentJobBindingRecord)
+                    .where(AgentJobBindingRecord.job_id == binding.job_id)
+                    .order_by(
+                        AgentJobBindingRecord.created_at,
+                        AgentJobBindingRecord.run_id,
+                    )
+                )
+            )
+            current_run_id, authority_ambiguous = self._current_binding(bindings)
+            original_human = (
+                session.get(HumanActionRecord, continuation.human_action_id)
+                if continuation is not None
+                else None
+            )
+            matching_tool_step = bool(
+                continuation is not None
+                and any(
+                    step.kind == "tool"
+                    and step.tool_call_id == continuation.tool_call_id
+                    for step in steps
+                )
+            )
+            has_pending_action = any(action.status == "pending" for action in human_actions)
+            can_request_interrupted_reapproval = bool(
+                continuation is not None
+                and original_human is not None
+                and original_human.status == "approved"
+                and (original_human.resolution_json or {}).get("approved") is True
+                and run.state == AgentRunState.needs_human.value
+                and run.error_category == "interrupted"
+                and job is not None
+                and job.type == AGENT_ORCHESTRATION_JOB_TYPE
+                and JobState(job.state) is JobState.needs_human
+                and job.lease_expires_at is None
+                and not authority_ambiguous
+                and current_run_id == run_id
+                and not matching_tool_step
+                and not has_pending_action
+            )
 
             return {
                 "job_id": binding.job_id,
                 **self._run_summary(run),
+                "can_request_interrupted_reapproval": can_request_interrupted_reapproval,
                 "steps": [self._step_summary(step) for step in steps],
                 "human_actions": [
                     self._human_action_summary(session, action, binding.job_id) for action in human_actions
@@ -475,17 +520,50 @@ class AgentWorkbenchReader:
             and not authority_ambiguous
             and current_run_id == action.run_id
         )
+        approval_summary, external_side_effect = self._safe_approval_projection(action)
         return {
             "id": action.id,
             "run_id": action.run_id,
             "tool_call_id": action.tool_call_id,
             "tool_name": action.tool_name,
             "status": action.status,
+            "approval_summary": approval_summary,
+            "external_side_effect": external_side_effect,
             "can_deny": can_deny,
             "can_approve": can_deny,
             "created_at": action.created_at,
             "resolved_at": action.resolved_at,
         }
+
+    @staticmethod
+    def _safe_approval_projection(action: HumanActionRecord) -> tuple[str | None, bool]:
+        """Expose only a tiny operator-safe summary, never raw HumanAction JSON."""
+
+        if action.tool_name != "shop.preflight":
+            return None, False
+        generic = "将启动真实 Android 小红书店铺预检。批准后会控制已连接设备。"
+        request = action.request_json if isinstance(action.request_json, dict) else {}
+        persisted_action = request.get("action")
+        if not isinstance(persisted_action, dict):
+            return generic, True
+        arguments = persisted_action.get("arguments")
+        if not isinstance(arguments, dict):
+            return generic, True
+        account_user_id = arguments.get("account_user_id")
+        source_date = arguments.get("source_date")
+        if not isinstance(account_user_id, str) or not isinstance(source_date, str):
+            return generic, True
+        if (
+            not account_user_id
+            or len(account_user_id) > 500
+            or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for character in account_user_id)
+            or len(source_date) != 10
+        ):
+            return generic, True
+        return (
+            f"将对账号 {account_user_id} 启动真实 Android 小红书店铺预检（候选日期 {source_date}）。",
+            True,
+        )
 
     @staticmethod
     def _artifact_summary(artifact: JobArtifactRecord) -> dict[str, Any]:

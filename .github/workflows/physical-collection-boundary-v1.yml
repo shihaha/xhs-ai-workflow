@@ -1,0 +1,164 @@
+name: Physical Collection Boundary V1 Verification
+
+on:
+  pull_request:
+    branches:
+      - spike/agent-workbench-zh-layout-v1
+    paths:
+      - 'backend/app/adapters/android_device.py'
+      - 'backend/app/agent_runtime/**'
+      - 'backend/app/api/agent_runtime.py'
+      - 'backend/app/features/analysis/**'
+      - 'backend/app/features/shops/**'
+      - 'backend/app/main.py'
+      - 'backend/app/schemas/agent_runtime.py'
+      - 'backend/app/services/jobs.py'
+      - 'backend/tests/agent_runtime/**'
+      - 'backend/tests/shops/**'
+      - 'backend/tests/radar/test_candidate_api.py'
+      - 'backend/tests/radar/test_candidate_scope_funnel.py'
+      - 'frontend/src/api/client.ts'
+      - 'frontend/src/pages/AgentWorkbenchPage.tsx'
+      - 'frontend/src/pages/AgentWorkbenchPage.test.tsx'
+      - 'frontend/src/styles.css'
+      - 'docs/WORKBENCH_RESEARCH_INDEX.md'
+      - 'docs/architecture-knowledge/26_CHATGPT_PRIMARY_REASONING_PROVIDER.md'
+      - 'docs/architecture-knowledge/27_PHYSICAL_COLLECTION_BOUNDARY_V1.md'
+      - '.github/workflows/physical-collection-boundary-v1.yml'
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  backend-contract:
+    name: Physical boundary and ChatGPT handoff contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compile backend
+        run: python -m compileall -q backend
+      - name: Run Stage 6 physical and ChatGPT-primary contracts
+        run: >-
+          python -m pytest
+          backend/tests/agent_runtime/test_physical_collection_boundary_v1.py
+          backend/tests/agent_runtime/test_real_agent_orchestration_api.py
+          backend/tests/agent_runtime/test_continuation_executor_api.py
+          backend/tests/agent_runtime/test_job_bound_approved_continuation.py
+          backend/tests/agent_runtime/test_workbench_read_api.py
+          backend/tests/agent_runtime/test_workbench_operator_actions_api.py
+          -q
+      - name: Run complete Agent Runtime acceptance
+        run: python -m pytest backend/tests/agent_runtime -q
+      - name: Scan release boundaries
+        run: python tools/scan_release_boundaries.py --root .
+
+  broad-baseline-compare:
+    name: Shops/radar regression versus PR base
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compare broad failures with stacked base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = pathlib.Path.cwd()
+          base_dir = root.parent / 'stage6-pr-base'
+          subprocess.check_call(['git', 'worktree', 'add', '--detach', str(base_dir), os.environ['BASE_SHA']])
+
+          tests = [
+              'backend/tests/shops',
+              'backend/tests/radar/test_candidate_api.py',
+              'backend/tests/radar/test_candidate_scope_funnel.py',
+          ]
+
+          def run_suite(cwd: pathlib.Path, report: pathlib.Path):
+              completed = subprocess.run(
+                  [sys.executable, '-m', 'pytest', '-q', *tests, f'--junitxml={report}'],
+                  cwd=cwd,
+                  check=False,
+              )
+              tree = ET.parse(report)
+              failures = set()
+              for case in tree.iter('testcase'):
+                  if case.find('failure') is not None or case.find('error') is not None:
+                      failures.add(f"{case.attrib.get('classname', '')}::{case.attrib.get('name', '')}")
+              return completed.returncode, failures
+
+          base_report = root / 'base-broad.xml'
+          head_report = root / 'head-broad.xml'
+          _, base_failures = run_suite(base_dir, base_report)
+          _, head_failures = run_suite(root, head_report)
+
+          new_failures = sorted(head_failures - base_failures)
+          print('Base failures:', sorted(base_failures))
+          print('Head failures:', sorted(head_failures))
+          if new_failures:
+              print('New Stage-6 failures:', new_failures)
+              raise SystemExit(1)
+          print('No new shops/radar failures versus stacked PR base.')
+          PY
+
+  frontend:
+    name: Physical workbench frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Run focused Agent workbench tests
+        run: npm test -- --run src/pages/AgentWorkbenchPage.test.tsx src/main.test.tsx
+      - name: Run complete frontend regression
+        run: npm test -- --run
+      - name: Build production frontend
+        run: npm run build
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Recheck desktop/mobile Agent workbench layout
+        run: npx playwright test --config=playwright.agent-workbench.config.ts
