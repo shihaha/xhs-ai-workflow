@@ -394,7 +394,7 @@ authorized
 
 The implementation contract and local validation are recorded in `29_DEMAND_RADAR_BUSINESS_SURFACE_V1.md`.
 
-### 7.2.1 — Demand Radar safe product media: IMPLEMENTED LOCALLY
+### 7.2.1 — Demand Radar safe product media: FORMALLY ACCEPTED
 
 Close the remaining A-stage image-inspection gap before Product Definition:
 

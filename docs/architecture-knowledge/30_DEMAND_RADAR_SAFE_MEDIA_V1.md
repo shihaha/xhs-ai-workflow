@@ -1,6 +1,6 @@
 # 30 — Demand Radar Safe Media V1
 
-Status: **Stage 7.2.1 implementation complete locally; formal Draft PR / GitHub CI acceptance pending**
+Status: **Stage 7.2.1 FORMALLY ACCEPTED on Draft PR #25**
 
 Date: 2026-08-24
 
@@ -292,4 +292,25 @@ real Opportunity
 
 is proven without exposing local paths or weakening existing Evidence/Job authority.
 
-Formal completion still requires the stacked Draft PR and latest dedicated/cumulative GitHub checks to pass. Do not enter Phase B merely because the local slice is green.
+Formal acceptance was completed on stacked Draft PR #25 (`spike/demand-radar-safe-media-v1` -> `spike/project-business-journey-v1`).
+
+Latest acceptance for implementation head `1c45d32`:
+
+```text
+Demand Radar Safe Media V1 Verification
+run 32694019546: SUCCESS
+
+Agent Runtime Spike Verification cumulative regression
+run 32694019525: SUCCESS
+Backend regression guard: SUCCESS
+Controlled E2E regression guard: SUCCESS
+```
+
+Therefore the correct release statement is:
+
+```text
+Stage 7.2.1 dedicated CI: green
+current cumulative regression: green
+```
+
+PR #25 remains Draft and unmerged. Formal acceptance of this A-stage slice does not itself authorize entry into Phase B; the next stage must still follow the tutorial-aligned roadmap and explicit operator decision.
