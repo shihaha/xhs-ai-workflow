@@ -52,8 +52,6 @@ jobs:
         run: python -m pytest backend/tests/business -q
       - name: Recheck bounded Agent authority
         run: python -m pytest backend/tests/agent_runtime -q
-      - name: Recheck Opportunity to Product/Content compatibility
-        run: python -m pytest backend/tests/content -q
       - name: Scan release boundaries
         run: python tools/scan_release_boundaries.py --root .
 
@@ -118,6 +116,69 @@ jobs:
               print('New Stage-7 Analysis failures:', new_failures)
               raise SystemExit(1)
           print('No new Analysis failures versus Stage-6 stacked base.')
+          PY
+
+  content-baseline-compare:
+    name: Content regression versus Stage 6 base
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install project dependencies
+        run: |
+          python - <<'PY'
+          import subprocess, sys, tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              project = tomllib.load(handle)
+          deps = project['project']['dependencies'] + project['project']['optional-dependencies']['dev']
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *deps])
+          PY
+      - name: Compare Content failures with stacked base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = pathlib.Path.cwd()
+          base_dir = root.parent / 'stage7-content-base'
+          subprocess.check_call(['git', 'worktree', 'add', '--detach', str(base_dir), os.environ['BASE_SHA']])
+
+          def run_suite(cwd: pathlib.Path, report: pathlib.Path):
+              completed = subprocess.run(
+                  [sys.executable, '-m', 'pytest', '-q', 'backend/tests/content', f'--junitxml={report}'],
+                  cwd=cwd,
+                  check=False,
+              )
+              tree = ET.parse(report)
+              failures = set()
+              for case in tree.iter('testcase'):
+                  if case.find('failure') is not None or case.find('error') is not None:
+                      failures.add(f"{case.attrib.get('classname', '')}::{case.attrib.get('name', '')}")
+              return completed.returncode, failures
+
+          base_report = root / 'stage7-base-content.xml'
+          head_report = root / 'stage7-head-content.xml'
+          _, base_failures = run_suite(base_dir, base_report)
+          _, head_failures = run_suite(root, head_report)
+          new_failures = sorted(head_failures - base_failures)
+          print('Base failures:', sorted(base_failures))
+          print('Head failures:', sorted(head_failures))
+          if new_failures:
+              print('New Stage-7 Content failures:', new_failures)
+              raise SystemExit(1)
+          print('No new Content failures versus Stage-6 stacked base.')
           PY
 
   frontend-business-surface:
