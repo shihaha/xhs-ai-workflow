@@ -6,8 +6,8 @@ import { App } from "./main";
 describe("App workflow routes", () => {
   it("exposes every operator stage in navigation", () => {
     render(<App pathname="/unknown" />);
-    expect(screen.getByRole("link", { name: "需求雷达" })).toHaveAttribute("href", "/radar");
-    expect(screen.getByRole("link", { name: "机会审核" })).toHaveAttribute("href", "/opportunities");
+    expect(screen.getByRole("link", { name: "需求雷达" })).toHaveAttribute("href", "/opportunities");
+    expect(screen.getByRole("link", { name: "采集控制" })).toHaveAttribute("href", "/radar");
     expect(screen.getByRole("link", { name: "内容工作台" })).toHaveAttribute("href", "/content");
     expect(screen.getByRole("link", { name: "Agent 工作台" })).toHaveAttribute("href", "/agent");
   });

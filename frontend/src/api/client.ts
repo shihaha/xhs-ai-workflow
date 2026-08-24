@@ -328,6 +328,54 @@ export interface Opportunity {
   supporting_products: SupportingProduct[]; supporting_notes: SupportingNote[];
   reviewed_at: string | null; rejection_reason: string | null; next_action: string; created_at: string;
 }
+export interface DemandRadarProduct {
+  account_user_id: string;
+  product_id: string;
+  title: string | null;
+  source_url: string;
+  price: string | null;
+  sold: string | null;
+  image_evidence_count: number;
+}
+export interface DemandRadarLinkedProduct {
+  product_id: string;
+  name: string;
+  target_user: string;
+  created_at: string;
+}
+export interface DemandRadarDirection {
+  opportunity_id: string;
+  title: string;
+  summary: string;
+  evidence_level: "warming_candidate" | "validated_candidate" | "legacy_ungraded";
+  review_status: "pending_review" | "approved" | "rejected";
+  can_follow_up: boolean;
+  journey_stage: "demand_decision" | "product_definition" | "legacy_product_workspace" | "closed";
+  is_new_today: boolean;
+  supporting_account_count: number;
+  supporting_product_count: number;
+  supporting_note_count: number;
+  image_evidence_count: number;
+  representative_products: DemandRadarProduct[];
+  linked_products: DemandRadarLinkedProduct[];
+  next_business_action: string;
+  created_at: string;
+  reviewed_at: string | null;
+}
+export interface DemandRadarSummary {
+  generated_on: string;
+  total_direction_count: number;
+  new_today_count: number;
+  warming_count: number;
+  validated_count: number;
+  pending_decision_count: number;
+  approved_count: number;
+  linked_product_count: number;
+}
+export interface DemandRadar {
+  summary: DemandRadarSummary;
+  directions: DemandRadarDirection[];
+}
 export interface Material { id: string; product_id: string; logical_name: string; version: number; path: string; sha256: string; size_bytes: number; media_type: string; kind: "source" | "output_image"; availability: "available" | "missing" | "corrupt"; created_at: string; }
 export interface Product { id: string; name: string; target_user: string; opportunity_id: string; materials: Material[]; created_at?: string; }
 export interface ContentRevision { id: string; number: number; title: string; body: string; claims: Array<{ claim: string; evidence_ids: string[] }>; source_evidence_ids: string[]; image_plan: Array<{ page_number: number; material_id: string; role: "cover" | "page"; headline: string; visual_direction: string }>; model_provider: string; model_name: string; prompt_version: string; usage: Record<string, number>; attempts: Array<Record<string, unknown>>; created_at: string; }
@@ -381,6 +429,7 @@ export const fetchAnalysisEvidence = (accountId?: string) => getJson<AnalysisEvi
 export const fetchAnalyses = () => getJson<Analysis[]>("/api/v1/analyses");
 export const fetchOpportunities = () => getJson<Opportunity[]>("/api/v1/opportunities");
 export const reviewOpportunity = (opportunityId: string, payload: { decision: "approve" | "reject"; reason?: string }) => postJson<Opportunity>(`/api/v1/opportunities/${encodeURIComponent(opportunityId)}/review`, payload);
+export const fetchDemandRadar = () => getJson<DemandRadar>("/api/v1/business/demand-radar");
 export const fetchProducts = () => getJson<Product[]>("/api/v1/products");
 export const fetchContentItems = () => getJson<ContentItem[]>("/api/v1/content-items");
 export const fetchContentPackages = () => getJson<ContentPackage[]>("/api/v1/content-packages");

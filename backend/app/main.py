@@ -47,6 +47,8 @@ from backend.app.agent_runtime.workbench_read import AgentWorkbenchReader
 from backend.app.db import Database
 from backend.app.features.analysis.api import router as analysis_router
 from backend.app.features.analysis.service import AnalysisService
+from backend.app.features.business.api import router as business_router
+from backend.app.features.business.service import BusinessWorkbenchService
 from backend.app.features.content.api import router as content_router
 from backend.app.features.content.cleanup import (
     ArtifactCleanupService,
@@ -173,6 +175,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.android_adapter = None
     app.state.shop_service = None
     app.state.analysis_service = None
+    app.state.business_workbench_service = None
     app.state.content_service = None
     app.state.artifact_cleanup_service = None
     app.state.artifact_cleanup_worker = None
@@ -246,6 +249,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.database,
             app.state.bailian_adapter,
             runtime_dir=app.state.settings.runtime_dir,
+        )
+        app.state.business_workbench_service = BusinessWorkbenchService(
+            app.state.database
         )
         executor: AgentContinuationExecutor
 
@@ -356,6 +362,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.radar_service = None
         app.state.qianfan_collection_service = None
         app.state.analysis_service = None
+        app.state.business_workbench_service = None
         app.state.content_service = None
         app.state.artifact_cleanup_service = None
         app.state.artifact_cleanup_worker = None
@@ -388,6 +395,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(radar_router)
     app.include_router(shops_router)
     app.include_router(analysis_router)
+    app.include_router(business_router)
     app.include_router(content_router)
     app.include_router(media_router)
     app.include_router(xhs_router)
