@@ -1,6 +1,6 @@
 # 29 — Demand Radar Business Surface V1
 
-Status: **Stage 7.1 + 7.2 implementation complete locally; formal PR/CI acceptance pending**
+Status: **Stage 7.1 + 7.2 formally accepted on Draft PR #24; dedicated and cumulative CI green**
 
 Date: 2026-08-24
 
@@ -368,6 +368,45 @@ mobile 390px: PASS, no horizontal overflow
 ```
 
 A separate manual browser screenshot inspection was also performed for desktop and mobile. The page visibly prioritizes business summary, directions, evidence and decisions rather than Job/AgentRun details.
+
+### GitHub formal acceptance
+
+Draft PR:
+
+```text
+#24
+https://github.com/shihaha/xhs-ai-workflow/pull/24
+base: spike/physical-collection-boundary-v1
+head: spike/project-business-journey-v1
+```
+
+Latest code-bearing acceptance before this documentation-only closeout:
+
+```text
+Dedicated Stage 7 run: 32690291906 -> SUCCESS
+- business projection / Agent authority -> green
+- Analysis Stage-6 base/head comparison -> green
+- Content Stage-6 base/head comparison -> green
+- Demand Radar desktop/mobile -> green
+
+Cumulative Agent Runtime Spike Verification: 32690291902 -> SUCCESS
+- baseline/spike frontend -> green
+- compile/boundary scan -> green
+- controlled E2E regression guard -> green
+- baseline/spike full-backend capture -> completed
+- Backend regression guard -> green
+```
+
+The first dedicated Stage-7 run `32689925105` was not green: its direct Linux Content suite exposed existing platform-specific cleanup failures. That history is preserved. The CI was then corrected to compare Content failures on Stage-6 base and Stage-7 head in the same Linux environment, rather than deleting coverage or changing unrelated production logic. The corrected run `32690291906` passed.
+
+Therefore the accepted wording for this slice is:
+
+```text
+本层专用 CI 全绿。
+累计回归全绿。
+```
+
+This acceptance does not remove the safe-media image-display gap recorded in section 5 and does not authorize entry into Product Definition / Phase B without a separate next-slice decision.
 
 ---
 

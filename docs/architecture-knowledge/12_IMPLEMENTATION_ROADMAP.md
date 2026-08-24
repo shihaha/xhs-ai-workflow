@@ -372,7 +372,7 @@ Move from a collection of pages/jobs into the complete A/B/C/D business journey 
 
 The authoritative product standard is `28_TUTORIAL_ALIGNED_BUSINESS_WORKBENCH_STANDARD.md`.
 
-### 7.1 / 7.2 — Demand Radar business projection: IMPLEMENTED LOCALLY
+### 7.1 / 7.2 — Demand Radar business projection: FORMALLY ACCEPTED
 
 The first slice reuses the existing durable chain:
 
